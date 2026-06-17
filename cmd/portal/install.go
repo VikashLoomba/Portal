@@ -231,11 +231,39 @@ fi
 exit 0
 `
 
+// browserEnvSnippet is sourced by ~/.bashrc / ~/.zshrc on the dev box.
+// It sets BROWSER=xdg-open so Python's webbrowser module (used by aws sso
+// login, among others) delegates to xdg-open instead of falling through to
+// w3m or other terminal browsers. This makes `aws sso login` open the URL
+// via our wrapper and relay it to the Mac.
+const browserEnvSnippet = `
+# Added by portal — sets BROWSER so Python's webbrowser module uses xdg-open.
+export BROWSER="${BROWSER:-xdg-open}"
+`
+
 // installXdgOpenWrapper writes the wrapper script to ~/.local/bin/xdg-open
 // on the dev box. Uses a direct (non-multiplexed) ssh call with the given
 // host so it works on a fresh install before the ControlMaster exists.
 func installXdgOpenWrapper(ctx context.Context, host string, a *app.App) error {
 	tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+
+	// Write the BROWSER env snippet to ~/.config/portal/env.sh and source
+	// it from ~/.bashrc and ~/.zshrc (if they exist). This ensures Python's
+	// webbrowser module (used by aws sso login, etc.) delegates to xdg-open.
+	envScript := `mkdir -p ~/.config/portal && cat > ~/.config/portal/env.sh`
+	if _, _, err := tr.ExecBytes(ctx, []byte(browserEnvSnippet), "bash", "-c", shellQuoteRemote(envScript)); err != nil {
+		return fmt.Errorf("write env snippet: %w", err)
+	}
+	// Source the snippet from each shell rc file that exists, idempotently.
+	sourceSnippet := `
+for rc in ~/.bashrc ~/.zshrc; do
+    [ -f "$rc" ] || continue
+    grep -qF "portal/env.sh" "$rc" && continue
+    printf '\n[ -f ~/.config/portal/env.sh ] && . ~/.config/portal/env.sh\n' >> "$rc"
+done`
+	if _, err := tr.Exec(ctx, "", "bash", "-c", shellQuoteRemote(sourceSnippet)); err != nil {
+		return fmt.Errorf("source env snippet: %w", err)
+	}
 
 	// Backup any pre-existing ~/.local/bin/xdg-open that isn't ours, so
 	// uninstall can restore it. Skip the backup if it's already our wrapper.
@@ -267,8 +295,8 @@ func installXdgOpenWrapper(ctx context.Context, host string, a *app.App) error {
 	return nil
 }
 
-// removeXdgOpenWrapper removes the wrapper and portald symlink from the dev
-// box, restoring any pre-existing xdg-open that was backed up during install.
+// removeXdgOpenWrapper removes the wrapper, portald symlink, and env snippet
+// from the dev box, restoring any pre-existing xdg-open backed up at install.
 func removeXdgOpenWrapper(ctx context.Context, a *app.App) {
 	script := `
 if [ -f ~/.local/bin/xdg-open.portal-backup ]; then
@@ -276,7 +304,13 @@ if [ -f ~/.local/bin/xdg-open.portal-backup ]; then
 else
     rm -f ~/.local/bin/xdg-open
 fi
-rm -f ~/.cache/portal/portald`
+rm -f ~/.cache/portal/portald
+rm -f ~/.config/portal/env.sh
+for rc in ~/.bashrc ~/.zshrc; do
+    [ -f "$rc" ] || continue
+    grep -qF "portal/env.sh" "$rc" || continue
+    tmp=$(mktemp); grep -vF "portal/env.sh" "$rc" > "$tmp" && mv "$tmp" "$rc"
+done`
 	_, _ = a.Transport.Exec(ctx, "", "bash", "-c", shellQuoteRemote(script))
 }
 
