@@ -15,10 +15,13 @@
 package sshctl
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"time"
@@ -46,6 +49,14 @@ type Transport interface {
 	Exit(ctx context.Context) (stopped bool, err error)
 	// Exec runs argv on the remote over the master, returning stdout.
 	Exec(ctx context.Context, stdin string, argv ...string) (string, error)
+	// ExecBytes is like Exec but accepts arbitrary binary stdin (used by
+	// bootstrap to upload the agent binary via `cat > tmp`). Returns
+	// stdout, stderr, and any error.
+	ExecBytes(ctx context.Context, stdin []byte, argv ...string) (stdout, stderr string, err error)
+	// ExecStream spawns ssh ... argv with live pipes — caller closes stdin
+	// to signal EOF; wait() returns ssh's exit error after streams close.
+	// Used by the agentclient to spawn the long-lived portald RPC pipe.
+	ExecStream(ctx context.Context, argv ...string) (stdin io.WriteCloser, stdout, stderr io.ReadCloser, wait func() error, err error)
 	// Host returns the configured ssh host (used by log messages).
 	Host() string
 	// Sock returns the ControlPath socket (used by log messages).
@@ -204,6 +215,75 @@ func (s *SSH) teeStderr(stderr string) {
 		return
 	}
 	io.WriteString(s.StderrSink, stderr)
+}
+
+// ExecBytes runs argv on the remote over the master with arbitrary binary
+// stdin. Used by bootstrap to upload the agent binary via `cat > tmp`.
+func (s *SSH) ExecBytes(ctx context.Context, stdin []byte, argv ...string) (string, string, error) {
+	args := []string{"-S", s.SockPath}
+	args = append(args, s.Opts...)
+	args = append(args, s.HostID)
+	args = append(args, argv...)
+	stdoutStr, stderrStr, code, err := s.runBytes(ctx, args, stdin)
+	if err != nil {
+		return stdoutStr, stderrStr, err
+	}
+	if code != 0 {
+		return stdoutStr, stderrStr, fmt.Errorf("ssh exec exit %d: %s", code, strings.TrimSpace(stderrStr))
+	}
+	s.teeStderr(stderrStr)
+	return stdoutStr, stderrStr, nil
+}
+
+// ExecStream spawns the ssh client with live stdin/stdout/stderr pipes.
+// Caller is responsible for closing stdin (or just exiting) to terminate.
+// wait() returns the ssh exit error AFTER all three streams have been
+// drained or closed by the caller.
+func (s *SSH) ExecStream(ctx context.Context, argv ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+	args := []string{"-S", s.SockPath}
+	args = append(args, s.Opts...)
+	args = append(args, s.HostID)
+	args = append(args, argv...)
+	cmd := exec.CommandContext(ctx, "ssh", args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	wait := func() error { return cmd.Wait() }
+	return stdin, stdout, stderr, wait, nil
+}
+
+// runBytes is the binary-stdin variant of run. Implemented inline here to
+// avoid spreading exec.Cmd plumbing across packages — the OSRunner only
+// supports string stdin, which would force a base64 round-trip.
+func (s *SSH) runBytes(ctx context.Context, args []string, stdin []byte) (string, string, int, error) {
+	cmd := exec.CommandContext(ctx, "ssh", args...)
+	if len(stdin) > 0 {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+	if err == nil {
+		return outBuf.String(), errBuf.String(), 0, nil
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return outBuf.String(), errBuf.String(), ee.ExitCode(), nil
+	}
+	return outBuf.String(), errBuf.String(), -1, err
 }
 
 // Validate runs a dummy `ssh host true` over a fresh non-multiplexed

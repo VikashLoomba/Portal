@@ -30,8 +30,42 @@ type Engine struct {
 	Deny      []int
 	SkipLocal []int
 
+	// AgentEvents is the event-driven trigger source: every Connected /
+	// SnapshotReplaced / Delta nudges Reconcile (with a small debounce).
+	// Disconnected logs and KEEPS existing forwards. Nil means "no agent
+	// wired in yet" — the engine falls back to plain interval polling.
+	AgentEvents <-chan EngineEvent
+
+	// SafetyInterval fires Reconcile periodically as a backstop in case
+	// the master-side forwards drift (someone runs ssh -O cancel out of
+	// band, the master is rebuilt, etc.). Default: 60s when AgentEvents is
+	// non-nil, Interval when nil.
+	SafetyInterval time.Duration
+
 	conflicts *conflictSet
 }
+
+// EngineEvent is the local mirror of agentclient.EngineEvent — declared
+// here so internal/forward doesn't need to import internal/agentclient
+// (which would induce a layering cycle, since agentclient already imports
+// shared transport types). The local app composition root copies the few
+// fields the engine cares about.
+type EngineEvent struct {
+	Kind    EngineEventKind
+	Err     error
+	Added   []uint16
+	Removed []uint16
+}
+
+// EngineEventKind mirrors agentclient.EngineEventKind.
+type EngineEventKind uint8
+
+const (
+	EvConnected EngineEventKind = 1 + iota
+	EvDisconnected
+	EvSnapshotReplaced
+	EvDelta
+)
 
 // New constructs an Engine with a fresh in-memory conflict set.
 func New(t sshctl.Transport, pl proc.PortLister, rd discover.RemoteDiscoverer,
@@ -44,10 +78,13 @@ func New(t sshctl.Transport, pl proc.PortLister, rd discover.RemoteDiscoverer,
 	}
 }
 
-// Run executes Reconcile every Interval until ctx is cancelled. Returns nil
-// on ctx.Done() WITHOUT tearing down the master — matches the bash trap
-// `'... exit 0' TERM INT` so the master persists across daemon restarts.
-// Only `stop`/`uninstall`/`host`-switch tear the master down explicitly.
+// Run is event-driven when AgentEvents is non-nil: it reconciles whenever
+// an agent event lands (debounced 50ms to coalesce bursts) and on a 60s
+// safety ticker that catches master-side drift. When AgentEvents is nil
+// it falls back to the legacy poll-every-Interval loop. Either way, ctx
+// cancellation returns nil WITHOUT tearing down the master — matches the
+// bash trap `'... exit 0' TERM INT` so the master persists across daemon
+// restarts. Only `stop`/`uninstall`/`host`-switch tear the master down.
 func (e *Engine) Run(ctx context.Context) error {
 	allow, _ := e.Cfg.AllowedPorts()
 	host, _ := e.Cfg.ReadHost()
@@ -56,7 +93,15 @@ func (e *Engine) Run(ctx context.Context) error {
 	e.Log.Logf("deny=[%s] skip-local=[%s] allow=[%s]",
 		formatPorts(e.Deny), formatPortsOrNone(e.SkipLocal), formatPorts(allow))
 
-	// First pass immediately, then on tick — matches bash `while true; reconcile; sleep`.
+	if e.AgentEvents != nil {
+		return e.runEventDriven(ctx)
+	}
+	return e.runIntervalLegacy(ctx)
+}
+
+// runIntervalLegacy is the poll-every-Interval shape used when no agent is
+// wired in (e.g. unit tests with a synthetic discoverer).
+func (e *Engine) runIntervalLegacy(ctx context.Context) error {
 	if err := e.Reconcile(ctx); err != nil && ctx.Err() == nil {
 		// non-fatal: next tick will retry.
 	}
@@ -67,6 +112,63 @@ func (e *Engine) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			e.Log.Logf("received signal, exiting loop (master left running)")
 			return nil
+		case <-tickCh:
+			_ = e.Reconcile(ctx)
+		}
+	}
+}
+
+// runEventDriven blocks until ctx.Done(), nudging Reconcile on every agent
+// event. A 50ms debounce coalesces bursts (e.g. `docker compose up` exposing
+// 8 ports in 80ms = one Reconcile, not eight).
+func (e *Engine) runEventDriven(ctx context.Context) error {
+	safety := e.SafetyInterval
+	if safety <= 0 {
+		safety = 60 * time.Second
+	}
+	debounce := 50 * time.Millisecond
+	var pending bool
+	var debounceTimer *time.Timer
+	fireSoon := func() {
+		if debounceTimer == nil {
+			debounceTimer = time.NewTimer(debounce)
+			pending = true
+			return
+		}
+		if !pending {
+			debounceTimer.Reset(debounce)
+			pending = true
+		}
+	}
+
+	tickCh, stop := e.Clk.NewTicker(safety)
+	defer stop()
+
+	for {
+		var debounceC <-chan time.Time
+		if debounceTimer != nil {
+			debounceC = debounceTimer.C
+		}
+		select {
+		case <-ctx.Done():
+			e.Log.Logf("received signal, exiting loop (master left running)")
+			return nil
+		case ev := <-e.AgentEvents:
+			switch ev.Kind {
+			case EvConnected, EvSnapshotReplaced, EvDelta:
+				fireSoon()
+			case EvDisconnected:
+				// KEEP existing forwards — matches bash semantics for transient
+				// blips. A reconnect → SnapshotReplaced will reconverge.
+				if ev.Err != nil {
+					e.Log.Logf("agent disconnected; preserving forwards: %v", ev.Err)
+				} else {
+					e.Log.Logf("agent disconnected; preserving forwards")
+				}
+			}
+		case <-debounceC:
+			pending = false
+			_ = e.Reconcile(ctx)
 		case <-tickCh:
 			_ = e.Reconcile(ctx)
 		}

@@ -17,6 +17,11 @@ func newUninstallCmd(a *app.App) *cobra.Command {
 			_ = a.Service.Uninstall(cmd.Context())
 			host, _ := a.Cfg.ReadHost()
 			if host != "" {
+				// Best-effort: clean up the remote ~/.cache/portal/ tree
+				// before tearing down the master.
+				if a.Bootstrap != nil {
+					_ = a.Bootstrap.PruneAll(cmd.Context())
+				}
 				_, _ = a.Transport.Exit(cmd.Context())
 			}
 			_ = os.Remove(a.Paths.Sock)

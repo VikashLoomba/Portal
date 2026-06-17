@@ -45,9 +45,14 @@ func NewNetlink(cfg NetlinkConfig) (Watcher, error) {
 	if cfg.UseDestroyMulticast {
 		mc, err := netlink.Dial(unix.NETLINK_SOCK_DIAG, nil)
 		if err == nil {
-			// SKNLGRP_INET_TCP_DESTROY = 1, SKNLGRP_INET6_TCP_DESTROY = 4.
-			_ = mc.JoinGroup(1)
-			_ = mc.JoinGroup(4)
+			// Kernel UAPI sknetlink_groups (include/uapi/linux/sock_diag.h):
+			//   SKNLGRP_NONE = 0
+			//   SKNLGRP_INET_TCP_DESTROY  = 1
+			//   SKNLGRP_INET_UDP_DESTROY  = 2
+			//   SKNLGRP_INET6_TCP_DESTROY = 3   (NOT 4 — that's UDP6)
+			//   SKNLGRP_INET6_UDP_DESTROY = 4
+			_ = mc.JoinGroup(sknlgrpInetTCPDestroy)
+			_ = mc.JoinGroup(sknlgrpInet6TCPDestroy)
 			w.mcConn = mc
 		}
 	}
@@ -68,6 +73,10 @@ type nlWatcher struct {
 const (
 	// from <linux/sock_diag.h>
 	sockDiagByFamily = 20
+
+	// sknetlink_groups (kernel UAPI). Used as multicast group IDs.
+	sknlgrpInetTCPDestroy  = 1
+	sknlgrpInet6TCPDestroy = 3
 
 	// from <linux/inet_diag.h>
 	inetDiagInfo = 2
@@ -201,19 +210,33 @@ func (w *nlWatcher) SnapshotNow(ctx context.Context) ([]Listen, error) {
 }
 
 // Start launches the polling goroutine and the (optional) multicast
-// goroutine. The returned channel closes when ctx cancels.
+// goroutine. The returned channel closes ONLY after every producer has
+// returned, so a concurrent "send on closed channel" panic is impossible.
 func (w *nlWatcher) Start(ctx context.Context) (<-chan Event, error) {
 	out := make(chan Event, 256)
-	go w.pollLoop(ctx, out)
+	var producers sync.WaitGroup
+	producers.Add(1)
+	go func() {
+		defer producers.Done()
+		w.pollLoop(ctx, out)
+	}()
 	if w.useMC && w.mcConn != nil {
-		go w.mcLoop(ctx, out)
+		producers.Add(1)
+		go func() {
+			defer producers.Done()
+			w.mcLoop(ctx, out)
+		}()
 	}
 	go func() {
 		<-ctx.Done()
+		// Closing the netlink conns unblocks the in-flight Receive/Execute.
 		_ = w.dumpConn.Close()
 		if w.mcConn != nil {
 			_ = w.mcConn.Close()
 		}
+		// Then wait for the producer goroutines to finish their final
+		// loop iteration before announcing shutdown via close(out).
+		producers.Wait()
 		close(out)
 	}()
 	return out, nil
@@ -246,26 +269,56 @@ func (w *nlWatcher) diffAndEmit(now []Listen, out chan<- Event) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// We track which (key) transitions we successfully emitted this tick
+	// so we can advance the baseline ONLY for those even if a later send
+	// hit backpressure. Without this partial-progress accounting, a full
+	// channel during the Add loop would leave the baseline un-advanced
+	// and re-fire the same Adds on every subsequent tick — consuming CPU
+	// and channel slots indefinitely. (The agent.Server dedups masks the
+	// downstream damage today, but the watcher contract is "each transition
+	// fires once" and we honor that here.)
 	t := time.Now()
+	addedOK := make(map[uint64]Listen)
+	removedOK := make(map[uint64]bool)
+
 	for k, l := range cur {
-		if _, had := w.baseline[k]; !had {
-			select {
-			case out <- Event{Kind: KindAdd, Listen: l, At: t, Source: 1}:
-			default:
-				return // backpressure: stop emitting; baseline NOT advanced.
-			}
+		if _, had := w.baseline[k]; had {
+			continue
+		}
+		select {
+		case out <- Event{Kind: KindAdd, Listen: l, At: t, Source: 1}:
+			addedOK[k] = l
+		default:
+			// Backpressure — fall through to merge what we have.
+			goto merge
 		}
 	}
 	for k, l := range w.baseline {
-		if _, still := cur[k]; !still {
-			select {
-			case out <- Event{Kind: KindRemove, Listen: l, At: t, Source: 1}:
-			default:
-				return
-			}
+		if _, still := cur[k]; still {
+			continue
+		}
+		select {
+		case out <- Event{Kind: KindRemove, Listen: l, At: t, Source: 1}:
+			removedOK[k] = true
+		default:
+			goto merge
 		}
 	}
+	// All events delivered: take the new full set as the baseline.
 	w.baseline = cur
+	return
+
+merge:
+	// Partial progress: copy delivered adds into baseline, drop delivered
+	// removes from baseline. Anything we couldn't send remains pending and
+	// will be retried on the next tick, but the events we DID send won't
+	// be re-emitted.
+	for k, l := range addedOK {
+		w.baseline[k] = l
+	}
+	for k := range removedOK {
+		delete(w.baseline, k)
+	}
 }
 
 func keyForListen(l Listen) uint64 {

@@ -3,6 +3,7 @@ package forward
 import (
 	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -27,6 +28,12 @@ func (f *fakeTransport) Exit(ctx context.Context) (bool, error)                 
 func (f *fakeTransport) Exec(ctx context.Context, stdin string, argv ...string) (string, error) { return "", nil }
 func (f *fakeTransport) Host() string                                                     { return f.host }
 func (f *fakeTransport) Sock() string                                                     { return "/tmp/sock-fake" }
+func (f *fakeTransport) ExecBytes(_ context.Context, _ []byte, _ ...string) (string, string, error) {
+	return "", "", nil
+}
+func (f *fakeTransport) ExecStream(_ context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+	return nil, nil, nil, func() error { return nil }, nil
+}
 func (f *fakeTransport) Forward(ctx context.Context, l, r int) error {
 	f.addCalls = append(f.addCalls, [2]int{l, r})
 	if f.failOn != nil {

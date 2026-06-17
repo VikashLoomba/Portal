@@ -2,10 +2,13 @@ package app
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"os/user"
 	"strconv"
 
+	"github.com/vikashl/portal/internal/agentclient"
+	"github.com/vikashl/portal/internal/bootstrap"
 	"github.com/vikashl/portal/internal/clock"
 	"github.com/vikashl/portal/internal/config"
 	"github.com/vikashl/portal/internal/discover"
@@ -19,20 +22,25 @@ import (
 // App is the dependency container. NewProd wires real adapters; tests build
 // it directly with fakes.
 type App struct {
-	Paths    Paths
-	Cfg      *config.Store
-	Runner   run.Runner
-	Clk      clock.Clock
-	Log      forward.Logger
+	Paths     Paths
+	Cfg       *config.Store
+	Runner    run.Runner
+	Clk       clock.Clock
+	Log       forward.Logger
 	Transport sshctl.Transport
-	Ports    proc.PortLister
-	Discover discover.RemoteDiscoverer
-	Service  service.Manager
+	Ports     proc.PortLister
+	Discover  discover.RemoteDiscoverer
+	Service   service.Manager
+
+	// Split-daemon additions:
+	Bootstrap   *bootstrap.Manager
+	AgentClient *agentclient.Client
 }
 
-// NewProd builds an App for normal use: reads HOME, derives Paths, opens the
-// config store, and constructs production adapters. The ssh Transport is
-// built around the host stored in the config file (empty until `install`).
+// NewProd builds an App for normal use: reads HOME, derives Paths, opens
+// the config store, constructs production adapters, and wires the
+// agentclient + bootstrap manager so the engine is event-driven against
+// the remote portald agent.
 func NewProd() (*App, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -50,13 +58,12 @@ func NewProd() (*App, error) {
 
 	runner := run.OSRunner{}
 	clk := clock.Real{}
-	log := forward.StdoutLogger()
+	logf := forward.StdoutLogger()
 	transport := sshctl.New(paths.Sock, host, SSHOpts, runner)
 	// Tee ssh stderr to our stderr so launchd's StandardErrorPath captures
 	// host-key churn / mux warnings — bash relies on stderr inheritance.
 	transport.StderrSink = os.Stderr
 	ports := proc.New(LsofPath, runner)
-	rd := discover.New(transport)
 	svc := service.New(service.Spec{
 		Label:   paths.Label,
 		BinPath: paths.BinPath,
@@ -68,15 +75,55 @@ func NewProd() (*App, error) {
 		Home:    paths.Home,
 	}, runner, clk)
 
+	// Agent layer: bootstrap manager + client. The client's Events()
+	// channel is consumed by forward.Engine; AgentDiscoverer reads its
+	// cached Snapshot for desired-port lookups.
+	slogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	bs := bootstrap.New(transport, slogger)
+	ac := agentclient.New(agentclient.Config{
+		Transport:  transport,
+		Bootstrap:  bs,
+		Log:        slogger,
+		StderrSink: os.Stderr,
+	})
+	rd := discover.NewAgent(ac)
+
 	return &App{
-		Paths: paths, Cfg: cfg, Runner: runner, Clk: clk, Log: log,
+		Paths: paths, Cfg: cfg, Runner: runner, Clk: clk, Log: logf,
 		Transport: transport, Ports: ports, Discover: rd, Service: svc,
+		Bootstrap: bs, AgentClient: ac,
 	}, nil
 }
 
-// Engine constructs a fresh forward.Engine using the App's wiring. Lives
-// here (not on App) so commands that don't need the loop don't pay for it.
+// Engine constructs a fresh forward.Engine using the App's wiring. The
+// engine is event-driven via AgentClient.Events() — bursts of port
+// add/remove events from the remote netlink watcher are coalesced through
+// a 50ms debounce inside the engine, with a 60s safety reconcile as a
+// backstop for master-side drift.
 func (a *App) Engine() *forward.Engine {
-	return forward.New(a.Transport, a.Ports, a.Discover, a.Cfg, a.Clk, a.Log,
+	e := forward.New(a.Transport, a.Ports, a.Discover, a.Cfg, a.Clk, a.Log,
 		Interval, DenyPorts, SkipLocal)
+	if a.AgentClient != nil {
+		e.AgentEvents = adaptAgentEvents(a.AgentClient.Events())
+	}
+	return e
+}
+
+// adaptAgentEvents copies fields from agentclient.EngineEvent into the
+// engine-local forward.EngineEvent shape (the engine doesn't import
+// agentclient to avoid a layering cycle).
+func adaptAgentEvents(in <-chan agentclient.EngineEvent) <-chan forward.EngineEvent {
+	out := make(chan forward.EngineEvent, cap(in)+8)
+	go func() {
+		defer close(out)
+		for ev := range in {
+			out <- forward.EngineEvent{
+				Kind:    forward.EngineEventKind(ev.Kind),
+				Err:     ev.Err,
+				Added:   ev.Added,
+				Removed: ev.Removed,
+			}
+		}
+	}()
+	return out
 }

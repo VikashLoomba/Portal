@@ -1,0 +1,145 @@
+package bootstrap
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"log/slog"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/vikashl/portal/internal/sshctl"
+)
+
+// agentDigest caches the sha256 of EmbeddedAgent() so the probe can
+// compare CONTENT, not just length. Without this a same-size on-disk file
+// (partial-write leftover, attacker swap, non-deterministic rebuild that
+// happened to land on the same length) would silently bypass re-upload.
+var (
+	agentDigestOnce sync.Once
+	agentDigest     string
+)
+
+func embeddedSHA256() string {
+	agentDigestOnce.Do(func() {
+		sum := sha256.Sum256(EmbeddedAgent())
+		agentDigest = hex.EncodeToString(sum[:])
+	})
+	return agentDigest
+}
+
+// shellQuoted wraps a shell script in single quotes, escaping any embedded
+// single quotes via the standard `'\''` trick. Required because ssh joins
+// every argv argument after the host with spaces and runs the result on
+// the remote via `sh -c <joined>`. Without quoting, a multi-token script
+// gets re-tokenized and only the first word survives.
+func shellQuoted(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// remoteDir is where the agent binaries live on the dev box. We use
+// ~/.cache/portal/ rather than /tmp/ so they survive reboots — saves the
+// ~3MB upload after every reboot. The dir is created mode 0700.
+const remoteDir = "~/.cache/portal"
+
+// Manager handles the embedded-agent → remote-cache lifecycle:
+//   1. Probe for the right SHA already at ~/.cache/portal/agent-<sha>.
+//   2. If missing or wrong size, atomically upload via `cat > .tmp.$$ ; mv`.
+//   3. Best-effort prune older agent-* files.
+type Manager struct {
+	T   sshctl.Transport
+	Log *slog.Logger
+}
+
+// New constructs a Manager. If log is nil, slog.Default() is used.
+func New(t sshctl.Transport, log *slog.Logger) *Manager {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Manager{T: t, Log: log}
+}
+
+// EnsureUploaded probes the dev box for the right agent binary and uploads
+// it if missing or content-mismatched. Returns the absolute remote path of
+// the agent (with $HOME expanded by the remote shell).
+//
+// Probe contract: "right binary at this path" means BOTH (a) byte-count
+// matches and (b) sha256sum matches. Length-only verification (which we
+// did initially) was insufficient because a same-size on-disk file —
+// truncated upload leftover, attacker swap, non-deterministic rebuild
+// landing at the same length — would silently bypass re-upload.
+//
+// Upload contract: ATOMIC. The script writes to a uniquely-named .tmp
+// file, asserts the byte count matches expected, then renames into place.
+// A trap on EXIT removes the .tmp on any abnormal exit (network drop,
+// half-close, ctx cancel, kill). The previous canonical binary is left
+// intact until the final mv lands, so a partial transfer never produces
+// a corrupt agent at the canonical path.
+func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
+	sha := EmbeddedSHA()
+	if sha == "" {
+		return "", fmt.Errorf("bootstrap: embedded agent has no SHA — `make agent` must run before build")
+	}
+	agent := EmbeddedAgent()
+	if len(agent) == 0 {
+		return "", fmt.Errorf("bootstrap: embedded agent is empty — `make agent` must run before build")
+	}
+
+	remotePath := remoteDir + "/agent-" + sha
+	expectedSize := strconv.Itoa(len(agent))
+	expectedDigest := embeddedSHA256()
+
+	// 1. Probe by content hash. We still gate on length first because
+	// sha256sum on a misshapen file is wasted IO. The probe prints a
+	// SINGLE line "<size> <digest>" or "MISSING" so parsing is trivial.
+	probe := fmt.Sprintf(
+		`test -x %s && printf '%%s %%s' "$(stat -c %%s %s)" "$(sha256sum %s | awk '{print $1}')" || echo MISSING`,
+		remotePath, remotePath, remotePath,
+	)
+	out, err := m.T.Exec(ctx, "", "bash", "-c", shellQuoted(probe))
+	if err == nil {
+		got := strings.TrimSpace(out)
+		want := expectedSize + " " + expectedDigest
+		if got == want {
+			m.Log.Debug("agent already present", "remote", remotePath, "sha", sha[:min(8, len(sha))])
+			return remotePath, nil
+		}
+	}
+
+	// 2. Upload atomically with size-verification before rename.
+	m.Log.Info("uploading agent", "remote", remotePath, "sha", sha[:min(8, len(sha))], "bytes", len(agent))
+	script := fmt.Sprintf(
+		`set -e; mkdir -p %s && chmod 0700 %s && tmp=$(mktemp %s/.agent.tmp.XXXXXX) && trap 'rm -f "$tmp"' EXIT && cat > "$tmp" && [ "$(wc -c < "$tmp")" = "%s" ] && chmod 0755 "$tmp" && mv "$tmp" %s && trap - EXIT`,
+		remoteDir, remoteDir, remoteDir, expectedSize, remotePath,
+	)
+	if _, _, err := m.T.ExecBytes(ctx, agent, "bash", "-c", shellQuoted(script)); err != nil {
+		return "", fmt.Errorf("bootstrap: upload failed: %w", err)
+	}
+
+	// 3. Best-effort prune older agent-* (older than 1 day) and any leftover
+	// .agent.tmp.* fragments from earlier interrupted uploads.
+	prune := fmt.Sprintf(
+		`find %s -maxdepth 1 \( -name 'agent-*' ! -name 'agent-%s' -mtime +0 \) -o -name '.agent.tmp.*' -delete 2>/dev/null || true`,
+		remoteDir, sha,
+	)
+	_, _ = m.T.Exec(ctx, "", "bash", "-c", shellQuoted(prune))
+
+	return remotePath, nil
+}
+
+// PruneAll removes every agent-* file from the remote cache dir. Called
+// from `portal uninstall`.
+func (m *Manager) PruneAll(ctx context.Context) error {
+	cmd := fmt.Sprintf(`rm -rf %s/agent-* 2>/dev/null || true`, remoteDir)
+	_, err := m.T.Exec(ctx, "", "bash", "-c", shellQuoted(cmd))
+	return err
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

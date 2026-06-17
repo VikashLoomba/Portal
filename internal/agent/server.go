@@ -282,7 +282,13 @@ func (s *Server) handleEvent(ev watcher.Event) {
 	switch ev.Kind {
 	case watcher.KindAdd:
 		s.mu.Lock()
-		if _, dup := s.lastEmitted[ev.Listen.Port]; dup {
+		// A re-bind of the same port (e.g. a server restart) produces
+		// Add(new-inode) THEN Remove(old-inode) from the watcher. The
+		// dedup key MUST include the inode — keying by port alone would
+		// drop the new Add (lastEmitted[port] still points at the old
+		// entry), then process the subsequent Remove and report the port
+		// as gone even though the kernel is still listening.
+		if existing, dup := s.lastEmitted[ev.Listen.Port]; dup && existing.InodeNS == ev.Listen.InodeNS {
 			s.mu.Unlock()
 			return
 		}
@@ -297,7 +303,15 @@ func (s *Server) handleEvent(ev watcher.Event) {
 
 	case watcher.KindRemove:
 		s.mu.Lock()
-		if _, ok := s.lastEmitted[ev.Listen.Port]; !ok {
+		existing, ok := s.lastEmitted[ev.Listen.Port]
+		if !ok {
+			s.mu.Unlock()
+			return
+		}
+		// Ignore a Remove whose inode no longer matches what we last
+		// reported as live: the new-inode Add already replaced the entry,
+		// so this Remove refers to a generation we never advertised.
+		if ev.Listen.InodeNS != 0 && existing.InodeNS != 0 && existing.InodeNS != ev.Listen.InodeNS {
 			s.mu.Unlock()
 			return
 		}

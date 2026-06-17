@@ -89,16 +89,20 @@ func (f *Filter) Apply(in []watcher.Listen) []watcher.Listen {
 	return out
 }
 
-// isLoopback returns true iff the listener is bound to 127.0.0.0/8 or ::1.
+// isLoopback returns true iff the listener is bound to 127.0.0.0/8 or ::1
+// (or the v4-mapped form ::ffff:127.0.0.0/8, which Go's net.IP.String()
+// normalizes to dotted-decimal even when Family==AF_INET6 — common for
+// JVM/Node servers that bind a v4 loopback on a v6 socket).
+//
 // 0.0.0.0 / :: ARE loopback-reachable but match every interface; we choose
 // to forward only EXPLICIT loopback binds — the bash original made the same
 // choice (the `ss -Htln` filter row was checked against 127. or ::1).
 func isLoopback(l watcher.Listen) bool {
-	if l.Family == 4 {
-		return len(l.Addr) >= 4 && l.Addr[:4] == "127."
+	if len(l.Addr) >= 4 && l.Addr[:4] == "127." {
+		return true
 	}
-	if l.Family == 6 {
-		return l.Addr == "::1"
+	if l.Addr == "::1" {
+		return true
 	}
 	return false
 }

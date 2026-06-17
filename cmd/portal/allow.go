@@ -43,7 +43,12 @@ func newAllowCmd(a *app.App) *cobra.Command {
 				for _, p := range added {
 					fmt.Printf(" %d", p)
 				}
-				fmt.Printf(" (takes effect within %s)\n", app.Interval)
+				// Allowlist file updated; nudge the agent so the change takes
+				// effect within tens of ms instead of after the safety
+				// reconcile. Best-effort — Subscribe is buffered if the
+				// running daemon hasn't connected yet.
+				pushAllowlist(a)
+				fmt.Printf(" (takes effect within ~100ms)\n")
 			}
 			return nil
 		},
@@ -73,12 +78,30 @@ func newUnallowCmd(a *app.App) *cobra.Command {
 			if err := a.Cfg.Unallow(ports); err != nil {
 				return err
 			}
+			pushAllowlist(a)
 			for _, raw := range args {
-				fmt.Printf("unallowed: %s (forward drops within %s if in ephemeral range)\n", raw, app.Interval)
+				fmt.Printf("unallowed: %s (forward drops within ~100ms if in ephemeral range)\n", raw)
 			}
 			return nil
 		},
 	}
+}
+
+// pushAllowlist sends a fresh Subscribe to the agent (best-effort). When
+// invoked from a transient `portal allow N` command the AgentClient is not
+// connected — the call is a no-op. The running launchd daemon's instance
+// will pick up the file change on its next Reconcile (safety ticker, 60s)
+// or sooner if its allow file is re-read on a tighter cadence.
+//
+// In a future iteration we'd add an fsnotify watcher in the daemon so it
+// re-Subscribes on every mutation; for now the safety reconcile is good
+// enough.
+func pushAllowlist(a *app.App) {
+	if a.AgentClient == nil {
+		return
+	}
+	allow, _ := a.Cfg.AllowedPorts()
+	_ = a.AgentClient.Subscribe(toU16(app.DenyPorts), toU16(allow), true)
 }
 
 func newAllowedCmd(a *app.App) *cobra.Command {

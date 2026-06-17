@@ -51,6 +51,18 @@ func runStatus(ctx context.Context, a *app.App) error {
 		return nil
 	}
 	fmt.Printf("ssh master: UP (pid=%d) host=%s\n", pid, host)
+	// Agent line — populated only when the running daemon's AgentClient
+	// has completed its handshake. A short-lived `portal status` invocation
+	// won't have one (no agent connection), so we elide that field.
+	if a.AgentClient != nil {
+		if ack := a.AgentClient.HelloAck(); ack != nil {
+			sha := ack.AgentGitSHA
+			if len(sha) > 12 {
+				sha = sha[:12]
+			}
+			fmt.Printf("agent: pid=%d sha=%s kernel=%s\n", ack.AgentPID, sha, ack.Kernel)
+		}
+	}
 	fmt.Println("active forwards (local listeners owned by master):")
 	// Bash: lsof | awk 'NR>1 {print "  " $9}' | sort -u — emits the verbatim
 	// NAME column, so an IPv4+IPv6 dual-stack listener produces TWO lines.

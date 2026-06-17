@@ -27,6 +27,9 @@ import (
 	"github.com/vikashl/portal/internal/agent/watcher"
 )
 
+// readKernel is implemented per-OS (see main_linux.go / main_other.go).
+var readKernel = func() string { return "" }
+
 // gitSHA is set at build time via -ldflags "-X main.gitSHA=...".
 var gitSHA = "dev"
 
@@ -84,20 +87,6 @@ func main() {
 	}
 }
 
-func readKernel() string {
-	var u syscall.Utsname
-	if err := syscall.Uname(&u); err != nil {
-		return ""
-	}
-	b := make([]byte, 0, 65)
-	for _, c := range u.Release {
-		if c == 0 {
-			break
-		}
-		b = append(b, byte(c))
-	}
-	return string(b)
-}
 
 // panicWriter wraps os.Stdout. Only the protocol Encoder is allowed to
 // write; any rogue write (e.g. someone calls fmt.Println) panics so the
