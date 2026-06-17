@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{.Label}}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{.BinPath}}</string>{{range .Args}}
+        <string>{{.}}</string>{{end}}
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Daemon loops forever; ANY exit means relaunch. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Floor on relaunch frequency to dampen crash-loops. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- /usr/sbin for lsof; /opt/homebrew/bin (Apple Silicon) and
+             /usr/local/bin (Intel) for brew tools on either Mac. -->
+        <key>PATH</key>
+        <string>{{.EnvPATH}}</string>
+        <key>HOME</key>
+        <string>{{.Home}}</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>{{.LogPath}}</string>
+    <key>StandardErrorPath</key>
+    <string>{{.LogPath}}</string>
+</dict>
+</plist>

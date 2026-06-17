@@ -1,0 +1,183 @@
+// Package config is the file-backed mutable state: the configured dev box
+// host and the allowlist. Both files are read every reconcile pass so edits
+// take effect within the poll interval with no daemon restart — same contract
+// as the bash original.
+package config
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+type Store struct {
+	// Dir is the config directory (e.g. ~/.config/portal).
+	Dir string
+}
+
+func New(dir string) *Store { return &Store{Dir: dir} }
+
+func (s *Store) hostFile() string  { return filepath.Join(s.Dir, "host") }
+func (s *Store) allowFile() string { return filepath.Join(s.Dir, "allow") }
+
+// ReadHost returns the configured ssh host, or "" if no host file exists.
+// All whitespace is stripped to match the bash `tr -d '[:space:]'` behavior
+// (so a trailing newline or accidental spaces don't poison the alias).
+func (s *Store) ReadHost() (string, error) {
+	b, err := os.ReadFile(s.hostFile())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return stripAllWhitespace(string(b)), nil
+}
+
+// WriteHost persists the host (creating Dir if needed). Whitespace is
+// stripped before write so any Read+Write round-trip is idempotent.
+func (s *Store) WriteHost(host string) error {
+	host = stripAllWhitespace(host)
+	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(s.hostFile(), []byte(host+"\n"), 0o644)
+}
+
+// AllowedPorts reads the allowlist, stripping `#` comments, splitting on
+// whitespace, accepting only all-digit tokens, and returning sorted unique
+// ints. RE-READ EACH PASS — `allow`/`unallow` edits propagate to the running
+// daemon within the reconcile interval with no restart needed.
+func (s *Store) AllowedPorts() ([]int, error) {
+	f, err := os.Open(s.allowFile())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	seen := make(map[int]struct{})
+	out := make([]int, 0, 8)
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		for _, tok := range strings.Fields(line) {
+			n, err := strconv.Atoi(tok)
+			if err != nil || n <= 0 {
+				continue
+			}
+			if _, ok := seen[n]; ok {
+				continue
+			}
+			seen[n] = struct{}{}
+			out = append(out, n)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	sort.Ints(out)
+	return out, nil
+}
+
+// Allow appends ports to the allowlist, returning the ports actually added
+// (skipping duplicates). Numeric validation is the caller's job.
+func (s *Store) Allow(ports []int) ([]int, error) {
+	current, err := s.AllowedPorts()
+	if err != nil {
+		return nil, err
+	}
+	have := make(map[int]struct{}, len(current))
+	for _, p := range current {
+		have[p] = struct{}{}
+	}
+	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(s.allowFile(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	added := make([]int, 0, len(ports))
+	for _, p := range ports {
+		if _, ok := have[p]; ok {
+			continue
+		}
+		have[p] = struct{}{}
+		if _, err := fmt.Fprintf(f, "%d\n", p); err != nil {
+			return added, err
+		}
+		added = append(added, p)
+	}
+	return added, nil
+}
+
+// Unallow rewrites the allowlist minus the given ports. Missing ports are
+// no-ops (matches the bash command which prints "unallowed: P" regardless).
+func (s *Store) Unallow(ports []int) error {
+	current, err := s.AllowedPorts()
+	if err != nil {
+		return err
+	}
+	drop := make(map[int]struct{}, len(ports))
+	for _, p := range ports {
+		drop[p] = struct{}{}
+	}
+	kept := current[:0]
+	for _, p := range current {
+		if _, ok := drop[p]; ok {
+			continue
+		}
+		kept = append(kept, p)
+	}
+	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
+		return err
+	}
+	tmp := s.allowFile() + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	for _, p := range kept {
+		if _, err := fmt.Fprintf(f, "%d\n", p); err != nil {
+			f.Close()
+			os.Remove(tmp)
+			return err
+		}
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, s.allowFile())
+}
+
+// AllowFilePath exposes the allowlist file path for the `allowed` command's
+// "(file: ...)" hint.
+func (s *Store) AllowFilePath() string { return s.allowFile() }
+
+// HostFilePath exposes the host file path.
+func (s *Store) HostFilePath() string { return s.hostFile() }
+
+func stripAllWhitespace(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case ' ', '\t', '\n', '\r', '\v', '\f':
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
