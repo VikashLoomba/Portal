@@ -27,9 +27,14 @@ type Config struct {
 	BootID       string // /proc/sys/kernel/random/boot_id; OK to leave empty
 	EphemMin     uint16
 	EphemMax     uint16
-	HeartbeatInterval time.Duration // default 5s
-	Log               *slog.Logger  // stderr handler; nil → discard
-	Now               func() time.Time
+	HeartbeatInterval  time.Duration // default 5s
+	// BackpressureKill is the maximum time the watcher→encoder channel may
+	// stay full before the agent sends AgentError{Fatal} and exits. This
+	// is the design-spec "5-second kill-switch" for a stalled client.
+	// Default 5s. Set 0 to disable.
+	BackpressureKill   time.Duration
+	Log                *slog.Logger  // stderr handler; nil → discard
+	Now                func() time.Time
 	// CmdSockPath is the Unix socket path where `portald open <url>`
 	// connects to relay URLs back to the Mac client. Empty = disabled.
 	// The socket is only active while a Mac client is subscribed.
@@ -49,12 +54,23 @@ type Server struct {
 	lastEmitted map[uint16]protocol.Port
 	startedAt   time.Time
 	hasClient   bool // true once SubscribeAck has been sent; gates cmd socket
+
+	// bpDeadline fires if the openURLCh or the main enc write stays stalled
+	// for BackpressureKill. Nil when nothing is queued.
+	bpDeadline *time.Timer
+	bpMu       sync.Mutex
+
+	// bpKillCh is closed when the backpressure deadline fires.
+	bpKillCh chan struct{}
 }
 
 // New constructs a Server. Defaults are filled in.
 func New(cfg Config) *Server {
 	if cfg.HeartbeatInterval == 0 {
 		cfg.HeartbeatInterval = 5 * time.Second
+	}
+	if cfg.BackpressureKill == 0 {
+		cfg.BackpressureKill = 5 * time.Second
 	}
 	if cfg.Log == nil {
 		cfg.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -74,6 +90,7 @@ func New(cfg Config) *Server {
 		enc:         protocol.NewEncoder(cfg.Out),
 		dec:         protocol.NewDecoder(cfg.In),
 		lastEmitted: map[uint16]protocol.Port{},
+		bpKillCh:    make(chan struct{}),
 	}
 }
 
@@ -139,6 +156,13 @@ func (s *Server) Serve(ctx context.Context) error {
 
 	for {
 		select {
+		case <-s.bpKillCh:
+			_ = s.enc.Write(&protocol.Envelope{AgentError: &protocol.AgentError{
+				Code: protocol.CodeInternalPanic, Fatal: true,
+				Msg: "backpressure: client stalled for >5s",
+			}})
+			return errors.New("agent: client stalled (backpressure kill)")
+
 		case <-ctx.Done():
 			_ = s.enc.Write(&protocol.Envelope{Bye: &protocol.Bye{Reason: "ctx-cancel"}})
 			return nil
@@ -244,7 +268,7 @@ func (s *Server) handleCommand(ctx context.Context, env *protocol.Envelope) erro
 		s.mu.Unlock()
 		return s.enc.Write(&protocol.Envelope{Heartbeat: &protocol.Heartbeat{
 			Seq: seq, UptimeNano: s.cfg.Now().Sub(s.startedAt).Nanoseconds(),
-			Now: s.cfg.Now().UnixNano(),
+			Now: s.cfg.Now().UnixNano(), Nonce: env.Ping.Nonce,
 		}})
 	case env.Shutdown != nil:
 		_ = s.enc.Write(&protocol.Envelope{Bye: &protocol.Bye{Reason: env.Shutdown.Reason}})
@@ -436,6 +460,36 @@ func (s *Server) handleCmdConn(conn net.Conn, out chan<- string) {
 		// Channel full — tell the caller the URL was dropped rather
 		// than falsely claiming success.
 		_, _ = conn.Write([]byte("dropped\n"))
+	}
+}
+
+// armBackpressure starts the kill-timer if it isn't already running.
+// Called when a watcher event cannot be delivered because the channel is full.
+func (s *Server) armBackpressure() {
+	if s.cfg.BackpressureKill <= 0 {
+		return
+	}
+	s.bpMu.Lock()
+	defer s.bpMu.Unlock()
+	if s.bpDeadline == nil {
+		bpCh := s.bpKillCh
+		s.bpDeadline = time.AfterFunc(s.cfg.BackpressureKill, func() {
+			select {
+			case <-bpCh: // already closed
+			default:
+				close(bpCh)
+			}
+		})
+	}
+}
+
+// disarmBackpressure cancels the kill-timer on successful delivery.
+func (s *Server) disarmBackpressure() {
+	s.bpMu.Lock()
+	defer s.bpMu.Unlock()
+	if s.bpDeadline != nil {
+		s.bpDeadline.Stop()
+		s.bpDeadline = nil
 	}
 }
 

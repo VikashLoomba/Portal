@@ -9,6 +9,9 @@ import (
 	"testing"
 )
 
+// ensure errors import is used
+var _ = errors.Is
+
 func TestRoundtripHello(t *testing.T) {
 	in := &Envelope{Hello: &Hello{
 		ProtoVersion: 1, ClientGitSHA: "abc", ClientPID: 42, PollIntervalMs: 75, WantDestroyMC: true,
@@ -86,6 +89,21 @@ func TestEmptyReaderEOF(t *testing.T) {
 	var buf bytes.Buffer
 	if _, err := NewDecoder(&buf).Read(); err != io.EOF {
 		t.Errorf("got %v, want io.EOF", err)
+	}
+}
+
+func TestMultipleFieldsRejected(t *testing.T) {
+	// A frame with two non-nil fields violates the tagged-union contract.
+	in := &Envelope{
+		Hello:    &Hello{ProtoVersion: 1},
+		HelloAck: &HelloAck{ProtoVersion: 1}, // second field
+	}
+	var buf bytes.Buffer
+	if err := NewEncoder(&buf).Write(in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewDecoder(&buf).Read(); !errors.Is(err, ErrMultipleFields) {
+		t.Errorf("got %v, want ErrMultipleFields", err)
 	}
 }
 

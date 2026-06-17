@@ -44,12 +44,16 @@ var gitSHA = "dev"
 
 // cmdSockPath returns the Unix socket path for the `portald open` IPC.
 // Lives alongside the agent binary so permissions match the cache dir.
+// The PID is included so two simultaneous Mac clients each get their own
+// socket — they spawn separate agent processes, each writing to
+// ~/.cache/portal/cmd-<pid>.sock.
 func cmdSockPath() string {
+	dir := filepath.Join(os.Getenv("HOME"), ".cache", "portal")
 	self, err := os.Executable()
-	if err != nil {
-		return filepath.Join(os.Getenv("HOME"), ".cache", "portal", "cmd.sock")
+	if err == nil {
+		dir = filepath.Dir(self)
 	}
-	return filepath.Join(filepath.Dir(self), "cmd.sock")
+	return filepath.Join(dir, fmt.Sprintf("cmd-%d.sock", os.Getpid()))
 }
 
 func main() {
@@ -91,15 +95,16 @@ func main() {
 	}
 
 	srv := agent.New(agent.Config{
-		In:                os.Stdin,
-		Out:               guarded,
-		Watcher:           w,
-		AgentSHA:          gitSHA,
-		Kernel:            readKernel(),
-		BootID:            agent.ReadBootID(),
-		HeartbeatInterval: 5 * time.Second,
-		Log:               logger,
-		CmdSockPath:       cmdSockPath(),
+		In:                 os.Stdin,
+		Out:                guarded,
+		Watcher:            w,
+		AgentSHA:           gitSHA,
+		Kernel:             readKernel(),
+		BootID:             agent.ReadBootID(),
+		HeartbeatInterval:  5 * time.Second,
+		BackpressureKill:   5 * time.Second,
+		Log:                logger,
+		CmdSockPath:        cmdSockPath(),
 	})
 
 	if err := srv.Serve(ctx); err != nil {
@@ -111,35 +116,49 @@ func main() {
 	}
 }
 
-// runOpen connects to the cmd socket and sends the URL. If the socket
-// doesn't exist or the agent reports "no-client", we exit 1 so the
-// xdg-open wrapper knows to fall back to the system xdg-open.
+// runOpen connects to a cmd socket and sends the URL. Tries all
+// cmd-*.sock files in the cache dir so it works when multiple Mac
+// clients are connected simultaneously (each spawns its own agent process
+// with a distinct pid-keyed socket). Exits 0 if at least one client accepted
+// the URL; exits 1 otherwise so xdg-open falls through to the real binary.
 func runOpen(args []string) {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: portald open <url>")
 		os.Exit(1)
 	}
-	url := strings.Join(args, " ")
-	sock := cmdSockPath()
+	rawURL := strings.Join(args, " ")
 
-	conn, err := net.DialTimeout("unix", sock, 3*time.Second)
-	if err != nil {
-		// Socket not present — no active client.
-		os.Exit(1)
+	dir := filepath.Join(os.Getenv("HOME"), ".cache", "portal")
+	self, err := os.Executable()
+	if err == nil {
+		dir = filepath.Dir(self)
 	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-	if _, err := fmt.Fprintf(conn, "%s\n", url); err != nil {
+	// Collect all cmd-*.sock files (one per connected agent process).
+	entries, _ := filepath.Glob(filepath.Join(dir, "cmd-*.sock"))
+	if len(entries) == 0 {
+		os.Exit(1) // no active client
+	}
+
+	accepted := false
+	for _, sock := range entries {
+		conn, err := net.DialTimeout("unix", sock, 1*time.Second)
+		if err != nil {
+			continue
+		}
+		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		fmt.Fprintf(conn, "%s\n", rawURL)
+		buf := make([]byte, 32)
+		n, _ := conn.Read(buf)
+		conn.Close()
+		if strings.TrimSpace(string(buf[:n])) == "ok" {
+			accepted = true
+			break // first accepting client is sufficient
+		}
+	}
+	if !accepted {
 		os.Exit(1)
 	}
-	buf := make([]byte, 32)
-	n, _ := conn.Read(buf)
-	resp := strings.TrimSpace(string(buf[:n]))
-	if resp != "ok" {
-		os.Exit(1)
-	}
-	// Exit 0 — Mac will open it.
 }
 
 type panicWriter struct{ w io.Writer }

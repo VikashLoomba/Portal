@@ -255,6 +255,17 @@ func installXdgOpenWrapper(ctx context.Context, host string, a *app.App) error {
 		symlinkScript := fmt.Sprintf(`ln -sf ~/.cache/portal/agent-%s ~/.cache/portal/portald 2>/dev/null || true`, sha)
 		_, _ = tr.Exec(ctx, "", "bash", "-c", shellQuoteRemote(symlinkScript))
 	}
+
+	// Warn if ~/.local/bin is not early in the remote PATH — if something
+	// else owns /usr/bin/xdg-open and ~/.local/bin comes after it, our
+	// wrapper will be silently bypassed.
+	pathCheck := `command -v xdg-open 2>/dev/null`
+	out, _ := tr.Exec(ctx, "", "bash", "-c", shellQuoteRemote(pathCheck))
+	resolved := strings.TrimSpace(out)
+	if resolved != "" && resolved != "$HOME/.local/bin/xdg-open" && resolved != os.ExpandEnv("$HOME/.local/bin/xdg-open") {
+		// Return the warning as an error string (non-fatal; caller prints it)
+		return fmt.Errorf("xdg-open on remote resolves to %q, not ~/.local/bin/xdg-open — ensure ~/.local/bin is first in PATH on %s", resolved, host)
+	}
 	return nil
 }
 

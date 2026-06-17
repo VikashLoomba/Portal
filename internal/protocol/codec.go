@@ -86,6 +86,12 @@ type Decoder struct {
 
 func NewDecoder(r io.Reader) *Decoder { return &Decoder{r: r} }
 
+// ErrMultipleFields is returned when a received Envelope has more than one
+// non-nil field. The protocol contract is one field per frame (tagged union);
+// a malformed frame must close the connection, not silently prefer one field
+// and ignore the others (which could mask injection or desync attacks).
+var ErrMultipleFields = errors.New("protocol: envelope has multiple non-nil fields")
+
 // Read blocks until a complete frame is available or the underlying Reader
 // errors. Returns the decoded Envelope. On any framing error it returns the
 // sentinel and the caller must close the stream.
@@ -115,5 +121,29 @@ func (d *Decoder) Read() (*Envelope, error) {
 	if err := decMode.Unmarshal(d.buf, &env); err != nil {
 		return nil, fmt.Errorf("cbor unmarshal: %w", err)
 	}
+	if countEnvelopeFields(&env) > 1 {
+		return nil, ErrMultipleFields
+	}
 	return &env, nil
+}
+
+// countEnvelopeFields returns the number of non-nil pointer fields in env.
+// Used to enforce the one-field-per-frame tagged-union contract.
+func countEnvelopeFields(e *Envelope) int {
+	n := 0
+	if e.Hello != nil { n++ }
+	if e.Subscribe != nil { n++ }
+	if e.Ping != nil { n++ }
+	if e.ReqSnap != nil { n++ }
+	if e.Shutdown != nil { n++ }
+	if e.HelloAck != nil { n++ }
+	if e.SubscribeAck != nil { n++ }
+	if e.Snapshot != nil { n++ }
+	if e.PortAdded != nil { n++ }
+	if e.PortRemoved != nil { n++ }
+	if e.Heartbeat != nil { n++ }
+	if e.AgentError != nil { n++ }
+	if e.Bye != nil { n++ }
+	if e.OpenURL != nil { n++ }
+	return n
 }

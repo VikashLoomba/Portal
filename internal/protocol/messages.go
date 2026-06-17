@@ -73,14 +73,16 @@ type PortRemoved struct {
 
 // Heartbeat — agent → client. Sent every 5s when no other agent→client
 // frame has gone in that window. The client uses these to detect a hung
-// agent (10s without any frame → reconnect).
+// agent (10s without any frame → reconnect). Nonce is echoed from Ping
+// so the client can correlate responses to requests.
 type Heartbeat struct {
 	Seq        uint64 `cbor:"seq"`
 	UptimeNano int64  `cbor:"up"`
 	Now        int64  `cbor:"now"`
+	Nonce      uint64 `cbor:"n,omitempty"` // echoed from Ping when non-zero
 }
 
-// Ping — client → agent. Agent responds with Heartbeat.
+// Ping — client → agent. Agent responds with Heartbeat echoing the Nonce.
 type Ping struct {
 	Nonce uint64 `cbor:"n"`
 }

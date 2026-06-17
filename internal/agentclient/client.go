@@ -286,6 +286,14 @@ func (c *Client) runOnce(ctx context.Context) error {
 		return fmt.Errorf("expected HelloAck, got %v", envType(first))
 	}
 	if first.HelloAck.AgentGitSHA != bootstrap.EmbeddedSHA() {
+		// SHA mismatch: the running agent is stale (e.g. upload was
+		// interrupted or the binary at that path is corrupted). Force-delete
+		// the remote file so EnsureUploaded re-uploads on the next connect.
+		c.cfg.Log.Error("agent SHA mismatch — forcing re-upload",
+			"agent", first.HelloAck.AgentGitSHA, "embedded", bootstrap.EmbeddedSHA())
+		rmPath := fmt.Sprintf("~/.cache/portal/agent-%s", first.HelloAck.AgentGitSHA)
+		_, _ = c.cfg.Transport.Exec(context.Background(), "", "bash", "-c",
+			"rm -f "+rmPath)
 		return fmt.Errorf("agent SHA mismatch: agent=%s embedded=%s",
 			first.HelloAck.AgentGitSHA, bootstrap.EmbeddedSHA())
 	}
@@ -431,16 +439,26 @@ func (c *Client) demuxLoop(ctx context.Context, dec *protocol.Decoder) error {
 				pendAdded, pendRemoved = nil, nil
 				c.publish(EngineEvent{Kind: KindSnapshotReplaced})
 			case env.PortAdded != nil:
-				p := env.PortAdded.Port
 				c.snapMu.Lock()
+				// Drop stale events from a previous agent process session.
+				// After a Snapshot at seq S0, all valid events have Seq > S0.
+				if env.PortAdded.Seq <= c.snapSeq {
+					c.snapMu.Unlock()
+					continue
+				}
+				p := env.PortAdded.Port
 				c.snapSeq = env.PortAdded.Seq
 				c.snapPorts = append(c.snapPorts, p)
 				c.snapMu.Unlock()
 				pendAdded = append(pendAdded, p.Port)
 				resetTimer()
 			case env.PortRemoved != nil:
-				port := env.PortRemoved.Port
 				c.snapMu.Lock()
+				if env.PortRemoved.Seq <= c.snapSeq {
+					c.snapMu.Unlock()
+					continue
+				}
+				port := env.PortRemoved.Port
 				c.snapSeq = env.PortRemoved.Seq
 				kept := c.snapPorts[:0]
 				for _, p := range c.snapPorts {
