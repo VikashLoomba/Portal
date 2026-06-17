@@ -371,14 +371,26 @@ func (s *Server) serveCmdSock(ctx context.Context, out chan<- string) {
 		s.cfg.Log.Warn("cmd socket listen failed", "err", err)
 		return
 	}
+	// Restrict to owner-only so other users on the dev box cannot inject
+	// URLs. Defense-in-depth alongside the parent dir being 0700.
+	if err := os.Chmod(path, 0600); err != nil {
+		s.cfg.Log.Warn("cmd socket chmod failed", "err", err)
+	}
 	defer func() {
 		l.Close()
 		_ = os.Remove(path)
 	}()
 
 	// Close the listener when ctx cancels so Accept unblocks.
+	// Use a stopCh so this goroutine exits when serveCmdSock returns early
+	// for any reason — not just ctx cancellation.
+	stopCh := make(chan struct{})
+	defer close(stopCh)
 	go func() {
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+		case <-stopCh:
+		}
 		l.Close()
 	}()
 
@@ -399,8 +411,15 @@ func (s *Server) handleCmdConn(conn net.Conn, out chan<- string) {
 	if err != nil || n == 0 {
 		return
 	}
-	url := strings.TrimSpace(string(buf[:n]))
-	if url == "" {
+	rawURL := strings.TrimSpace(string(buf[:n]))
+	if rawURL == "" {
+		return
+	}
+	// Only relay http/https URLs. This is defense-in-depth: the Mac client
+	// validates too, but rejecting here prevents non-http URLs from ever
+	// reaching the wire.
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		_, _ = conn.Write([]byte("rejected\n"))
 		return
 	}
 	s.mu.Lock()
@@ -411,10 +430,12 @@ func (s *Server) handleCmdConn(conn net.Conn, out chan<- string) {
 		return
 	}
 	select {
-	case out <- url:
+	case out <- rawURL:
 		_, _ = conn.Write([]byte("ok\n"))
 	default:
-		_, _ = conn.Write([]byte("ok\n")) // best-effort; dropped URLs don't fail the opener
+		// Channel full — tell the caller the URL was dropped rather
+		// than falsely claiming success.
+		_, _ = conn.Write([]byte("dropped\n"))
 	}
 }
 

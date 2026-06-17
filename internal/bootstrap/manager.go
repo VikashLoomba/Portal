@@ -39,6 +39,10 @@ func shellQuoted(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// EmbeddedSHA exposes the package-level EmbeddedSHA function as a method
+// so callers that only have a *Manager (not the package) can access it.
+func (m *Manager) EmbeddedSHA() string { return EmbeddedSHA() }
+
 // remoteDir is where the agent binaries live on the dev box. We use
 // ~/.cache/portal/ rather than /tmp/ so they survive reboots — saves the
 // ~3MB upload after every reboot. The dir is created mode 0700.
@@ -94,9 +98,11 @@ func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
 	// 1. Probe by content hash. We still gate on length first because
 	// sha256sum on a misshapen file is wasted IO. The probe prints a
 	// SINGLE line "<size> <digest>" or "MISSING" so parsing is trivial.
+	// Portable sha256 probe: tries sha256sum (Linux), then sha256 -q (FreeBSD/macOS),
+	// then openssl dgst -sha256 as a last resort.
 	probe := fmt.Sprintf(
-		`test -x %s && printf '%%s %%s' "$(stat -c %%s %s)" "$(sha256sum %s | awk '{print $1}')" || echo MISSING`,
-		remotePath, remotePath, remotePath,
+		`test -x %s && printf '%%s %%s' "$(stat -c %%s %s 2>/dev/null || stat -f %%z %s)" "$(sha256sum %s 2>/dev/null | awk '{print $1}' || sha256 -q %s 2>/dev/null || openssl dgst -sha256 -hex %s 2>/dev/null | awk '{print $NF}')" || echo MISSING`,
+		remotePath, remotePath, remotePath, remotePath, remotePath, remotePath,
 	)
 	out, err := m.T.Exec(ctx, "", "bash", "-c", shellQuoted(probe))
 	if err == nil {
@@ -111,8 +117,10 @@ func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
 	// 2. Upload atomically with size-verification before rename.
 	m.Log.Info("uploading agent", "remote", remotePath, "sha", sha[:min(8, len(sha))], "bytes", len(agent))
 	script := fmt.Sprintf(
-		`set -e; mkdir -p %s && chmod 0700 %s && tmp=$(mktemp %s/.agent.tmp.XXXXXX) && trap 'rm -f "$tmp"' EXIT && cat > "$tmp" && [ "$(wc -c < "$tmp")" = "%s" ] && chmod 0755 "$tmp" && mv "$tmp" %s && trap - EXIT`,
-		remoteDir, remoteDir, remoteDir, expectedSize, remotePath,
+		// install -d creates the directory atomically at 0700 in one syscall,
+		// avoiding the mkdir-then-chmod window where the dir is briefly 0755.
+		`set -e; install -d -m 0700 %s && tmp=$(mktemp %s/.agent.tmp.XXXXXX) && trap 'rm -f "$tmp"' EXIT && cat > "$tmp" && [ "$(wc -c < "$tmp")" = "%s" ] && chmod 0755 "$tmp" && mv "$tmp" %s && trap - EXIT`,
+		remoteDir, remoteDir, expectedSize, remotePath,
 	)
 	if _, _, err := m.T.ExecBytes(ctx, agent, "bash", "-c", shellQuoted(script)); err != nil {
 		return "", fmt.Errorf("bootstrap: upload failed: %w", err)
@@ -125,9 +133,12 @@ func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
 
 	// 4. Best-effort prune older agent-* (older than 1 day) and any leftover
 	// .agent.tmp.* fragments from earlier interrupted uploads.
+	// Two separate find commands so -delete applies correctly to each predicate.
+	// The original single find had operator-precedence issues: -delete bound
+	// only to the last primary, silently never pruning old agent-* binaries.
 	prune := fmt.Sprintf(
-		`find %s -maxdepth 1 \( -name 'agent-*' ! -name 'agent-%s' -mtime +0 \) -o -name '.agent.tmp.*' -delete 2>/dev/null || true`,
-		remoteDir, sha,
+		`find %s -maxdepth 1 -name 'agent-*' ! -name 'agent-%s' -mtime +0 -delete 2>/dev/null; find %s -maxdepth 1 -name '.agent.tmp.*' -delete 2>/dev/null; true`,
+		remoteDir, sha, remoteDir,
 	)
 	_, _ = m.T.Exec(ctx, "", "bash", "-c", shellQuoted(prune))
 

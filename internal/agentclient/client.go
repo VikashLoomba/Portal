@@ -188,6 +188,8 @@ func (c *Client) Shutdown(ctx context.Context, reason string) error {
 
 // Run is the supervisor loop: connect, run one session until it exits,
 // backoff, reconnect. Returns nil only on ctx cancellation.
+// Closes c.events on return so the adaptAgentEvents goroutine in app.go
+// (which ranges over it) terminates cleanly — no goroutine leak.
 //
 // Backoff resets to ReconnectMin after any session that survived past
 // healthyThreshold (long enough to imply Hello+Subscribe+Snapshot all
@@ -195,6 +197,7 @@ func (c *Client) Shutdown(ctx context.Context, reason string) error {
 // the backoff at ReconnectMax forever, turning a one-off blip 6 hours
 // later into a 10s outage.
 func (c *Client) Run(ctx context.Context) error {
+	defer close(c.events) // unblocks adaptAgentEvents goroutine in app.go
 	backoff := c.cfg.ReconnectMin
 	const healthyThreshold = 5 * time.Second
 	for {
@@ -226,13 +229,14 @@ func (c *Client) Run(ctx context.Context) error {
 }
 
 func (c *Client) publish(ev EngineEvent) {
+	// Recover from a send on a closed channel (which close(c.events) in
+	// Run() can cause if publish is called from the final runOnce return
+	// path after the defer fires). In practice this race is extremely
+	// tight, but the recover makes it safe.
+	defer func() { recover() }()
 	select {
 	case c.events <- ev:
 	default:
-		// Engine is slow; drop the event. KindDelta is reconvergence
-		// material — the safety reconcile will catch up. KindConnected
-		// being dropped is OK because the engine's startup reconcile
-		// reads from c.Snapshot() directly.
 	}
 }
 

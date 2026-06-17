@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 
@@ -74,28 +76,30 @@ func newOnceCmd(a *app.App) *cobra.Command {
 			if host == "" {
 				return fmt.Errorf("no dev box configured — run: %s install <ssh-host>", app.Tool)
 			}
-			// Spin the agent up briefly to populate Snapshot, then
-			// reconcile once. Tests use this to validate end-to-end.
-			ctx := cmd.Context()
+			// Spin the agent up briefly to populate Snapshot, then reconcile
+			// once. We use a child context so we can cancel Run() directly
+			// after Shutdown — avoiding a hang if Shutdown's Bye is lost.
+			runCtx, runCancel := context.WithCancel(cmd.Context())
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
 				_ = a.AgentClient.Subscribe(toU16(app.DenyPorts), toU16(allowOrEmpty(a)), true)
-				_ = a.AgentClient.Run(ctx)
+				_ = a.AgentClient.Run(runCtx)
 			}()
 			defer func() {
-				_ = a.AgentClient.Shutdown(ctx, "once")
+				_ = a.AgentClient.Shutdown(cmd.Context(), "once")
+				runCancel() // ensure Run exits even if Shutdown Bye is lost
 				<-done
 			}()
 
 			// Wait briefly for the Subscribe→Snapshot round-trip.
-			if err := waitForSnapshot(ctx, a, snapshotWaitMS); err != nil {
+			if err := waitForSnapshot(runCtx, a, snapshotWaitMS); err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "warning: %v\n", err)
 			}
-			if err := a.Engine().Reconcile(ctx); err != nil {
+			if err := a.Engine().Reconcile(runCtx); err != nil {
 				_ = err
 			}
-			return runStatus(ctx, a)
+			return runStatus(cmd.Context(), a)
 		},
 	}
 }
@@ -103,28 +107,98 @@ func newOnceCmd(a *app.App) *cobra.Command {
 const snapshotWaitMS = 5000
 
 // runOpenURLHandler receives URLs from the agent's xdg-open interception
-// and opens them on macOS. Runs until ctx is cancelled.
+// and opens them on macOS. If the URL targets a localhost port that isn't
+// currently forwarded (e.g. an ephemeral port used by `aws sso login`), it
+// establishes a temporary forward first — the existing watcher will cancel
+// it automatically once the remote process stops listening.
 func runOpenURLHandler(ctx context.Context, ch <-chan string, a *app.App) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case url, ok := <-ch:
+		case rawURL, ok := <-ch:
 			if !ok {
 				return
 			}
-			if url == "" {
+			if rawURL == "" {
 				continue
 			}
-			a.Log.Logf("opening URL from %s: %s", a.Transport.Host(), url)
-			cmd := exec.CommandContext(ctx, "open", url)
+			// Validate scheme before acting on it. macOS 'open' honours
+			// any registered scheme including file:// and app:// handlers
+			// — restricting to http/https prevents the remote box from
+			// opening local Mac files or triggering unintended app actions.
+			if !isSafeURL(rawURL) {
+				a.Log.Logf("rejected non-http(s) URL from agent: %s", rawURL)
+				continue
+			}
+			ensureForwardedForURL(ctx, rawURL, a)
+			a.Log.Logf("opening URL from %s: %s", a.Transport.Host(), rawURL)
+			// Use "--" so a URL starting with "-" is never mistaken for
+			// a flag, and restrict to http/https schemes.
+			cmd := exec.CommandContext(ctx, "open", "--", rawURL)
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			if err := cmd.Run(); err != nil {
-				a.Log.Logf("open %q failed: %v", url, err)
+				a.Log.Logf("open %q failed: %v", rawURL, err)
 			}
 		}
 	}
+}
+
+// ensureForwardedForURL checks whether the URL's port is already forwarded
+// via the ControlMaster; if not, it adds a forward immediately so the URL
+// opens successfully on the Mac. This handles ephemeral-range ports like
+// those used by `aws sso login` (http://127.0.0.1:<random>/?code=...).
+//
+// Errors are logged and ignored — best-effort: the URL opens regardless, and
+// if the port happens to already be forwarded by another process (e.g.
+// VSCode), the existing forward is used.
+func ensureForwardedForURL(ctx context.Context, rawURL string, a *app.App) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return
+	}
+	host := u.Hostname()
+	if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+		return // not a loopback URL; open as-is
+	}
+	portStr := u.Port()
+	if portStr == "" {
+		return // no explicit port (e.g. http://localhost/ is port 80 — already accessible)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return
+	}
+
+	// Check whether the master already has this port forwarded.
+	masterPID, _ := a.Transport.MasterPID(ctx)
+	if masterPID == 0 {
+		return // master down; nothing to forward through
+	}
+	current, _ := a.Ports.MasterForwards(ctx, masterPID)
+	for _, p := range current {
+		if p == port {
+			return // already forwarded
+		}
+	}
+
+	// Not forwarded — add it now. The watcher will cancel it once the
+	// remote process closes the port.
+	if err := a.Transport.Forward(ctx, port, port); err != nil {
+		a.Log.Logf("auto-forward port %d for URL: %v", port, err)
+		return
+	}
+	a.Log.Logf("auto-forwarded localhost:%d for URL %s", port, rawURL)
+}
+
+// isSafeURL returns true only for http and https schemes.
+func isSafeURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "http" || u.Scheme == "https"
 }
 
 // runStatusCtx is a tiny helper so once.go and the root status default share.

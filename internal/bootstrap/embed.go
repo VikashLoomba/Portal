@@ -37,3 +37,17 @@ func EmbeddedAgent() []byte { return agentBinary }
 // LinkedSHA returns the SHA injected via -ldflags. Useful for diagnostics
 // when the two SHAs don't match (which would indicate a build problem).
 func LinkedSHA() string { return gitSHA }
+
+func init() {
+	// Catch build drift early (e.g. `go build` without `make agent`): the
+	// SHA written to sha.txt at build time must match the one injected via
+	// -ldflags. A mismatch means the embedded agent and the Mac binary came
+	// from different commits, which would cause a SHA-mismatch on HelloAck.
+	// Allow "dev" as the ldflags default during local `go run` / `go test`.
+	if gitSHA != "dev" && gitSHA != "" {
+		embedded := EmbeddedSHA()
+		if embedded != "" && embedded != gitSHA {
+			panic("portal: embedded agent SHA (" + embedded + ") does not match -ldflags SHA (" + gitSHA + "); run `make build`")
+		}
+	}
+}

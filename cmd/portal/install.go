@@ -218,11 +218,17 @@ _portald="${HOME}/.cache/portal/portald"
 if [ -x "$_portald" ] && "$_portald" open "$@" 2>/dev/null; then
     exit 0
 fi
-# Fall through to the real xdg-open (skip this wrapper via PATH search).
-_real=$(PATH=$(echo "$PATH" | tr ':' '\n' | grep -v "$(dirname "$0")" | tr '\n' ':') command -v xdg-open 2>/dev/null)
+# Fall through to the real xdg-open. Build a PATH that excludes the wrapper's
+# own directory so we don't call ourselves recursively. Use fixed-string
+# whole-line matching (-xF) so dots and other regex metacharacters in the
+# directory path are treated literally.
+_wrapper_dir=$(cd "$(dirname "$0")" && pwd)
+_real=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$_wrapper_dir" | tr '\n' ':' | xargs -I{} sh -c 'PATH={} command -v xdg-open 2>/dev/null' | head -1)
 if [ -n "$_real" ]; then
     exec "$_real" "$@"
 fi
+# xdg-open not installed on this box — exit silently (headless server).
+exit 0
 `
 
 // installXdgOpenWrapper writes the wrapper script to ~/.local/bin/xdg-open
@@ -231,22 +237,37 @@ fi
 func installXdgOpenWrapper(ctx context.Context, host string, a *app.App) error {
 	tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
 
+	// Backup any pre-existing ~/.local/bin/xdg-open that isn't ours, so
+	// uninstall can restore it. Skip the backup if it's already our wrapper.
+	backupScript := `if [ -f ~/.local/bin/xdg-open ] && ! grep -qF "Installed by portal" ~/.local/bin/xdg-open 2>/dev/null; then cp ~/.local/bin/xdg-open ~/.local/bin/xdg-open.portal-backup; fi`
+	_, _ = tr.Exec(ctx, "", "bash", "-c", shellQuoteRemote(backupScript))
+
 	wrapScript := `mkdir -p ~/.local/bin && cat > ~/.local/bin/xdg-open.portal.tmp && chmod 0755 ~/.local/bin/xdg-open.portal.tmp && mv ~/.local/bin/xdg-open.portal.tmp ~/.local/bin/xdg-open`
 	if _, _, err := tr.ExecBytes(ctx, []byte(xdgOpenWrapper), "bash", "-c", shellQuoteRemote(wrapScript)); err != nil {
 		return fmt.Errorf("write wrapper: %w", err)
 	}
 
-	// The portald symlink is maintained by bootstrap.Manager after each
-	// upload. Update it now for the initial install too.
-	symlinkScript := `ls -t ~/.cache/portal/agent-* 2>/dev/null | head -1 | xargs -I{} ln -sf {} ~/.cache/portal/portald`
-	_, _ = tr.Exec(ctx, "", "bash", "-c", shellQuoteRemote(symlinkScript))
+	// The bootstrap.Manager also writes this symlink after upload, but it
+	// may not have run yet on a fresh install (agent upload happens after
+	// the service starts). Force it now using the known SHA.
+	sha := a.Bootstrap.EmbeddedSHA()
+	if sha != "" {
+		symlinkScript := fmt.Sprintf(`ln -sf ~/.cache/portal/agent-%s ~/.cache/portal/portald 2>/dev/null || true`, sha)
+		_, _ = tr.Exec(ctx, "", "bash", "-c", shellQuoteRemote(symlinkScript))
+	}
 	return nil
 }
 
 // removeXdgOpenWrapper removes the wrapper and portald symlink from the dev
-// box. Uses the live transport since the master is still up at uninstall time.
+// box, restoring any pre-existing xdg-open that was backed up during install.
 func removeXdgOpenWrapper(ctx context.Context, a *app.App) {
-	script := `rm -f ~/.local/bin/xdg-open ~/.cache/portal/portald`
+	script := `
+if [ -f ~/.local/bin/xdg-open.portal-backup ]; then
+    mv ~/.local/bin/xdg-open.portal-backup ~/.local/bin/xdg-open
+else
+    rm -f ~/.local/bin/xdg-open
+fi
+rm -f ~/.cache/portal/portald`
 	_, _ = a.Transport.Exec(ctx, "", "bash", "-c", shellQuoteRemote(script))
 }
 

@@ -25,9 +25,10 @@ func (f *Fake) Start(ctx context.Context) (<-chan Event, error) {
 		<-ctx.Done()
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		// Closing the channel signals shutdown to consumers.
-		close(f.events)
-		f.events = nil
+		if f.events != nil {
+			close(f.events)
+			f.events = nil
+		}
 	}()
 	return f.events, nil
 }
@@ -49,7 +50,8 @@ func (f *Fake) SetSnapshot(ls []Listen) {
 }
 
 // Emit sends an event. Blocks if the consumer is slow and buffer is full
-// (matches the real watcher's backpressure behavior).
+// (matches the real watcher's backpressure behavior). Safe to call after
+// ctx cancellation — it recovers from the send-on-closed-channel panic.
 func (f *Fake) Emit(ev Event) {
 	if ev.At.IsZero() {
 		ev.At = time.Now()
@@ -60,6 +62,7 @@ func (f *Fake) Emit(ev Event) {
 	if ch == nil {
 		return
 	}
+	defer func() { recover() }()
 	ch <- ev
 }
 

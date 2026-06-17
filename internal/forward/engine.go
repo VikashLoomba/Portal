@@ -7,6 +7,7 @@ package forward
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,8 @@ import (
 	"github.com/vikashl/portal/internal/proc"
 	"github.com/vikashl/portal/internal/sshctl"
 )
+
+
 
 // Engine wires the dependencies the reconcile loop needs. Build with New().
 type Engine struct {
@@ -227,7 +230,12 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 	allow, _ := e.Cfg.AllowedPorts()
 	desired, err := e.RD.DesiredPorts(ctx, e.Deny, allow)
 	if err != nil {
-		e.Log.Logf("WARN: port discovery failed; keeping current forwards")
+		if errors.Is(err, discover.ErrAgentNotReady) {
+			// Normal during startup while the agent handshake is in flight.
+			e.Log.Logf("waiting for agent snapshot")
+		} else {
+			e.Log.Logf("WARN: port discovery failed; keeping current forwards")
+		}
 		return err
 	}
 
