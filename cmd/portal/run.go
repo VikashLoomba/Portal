@@ -145,51 +145,85 @@ func runOpenURLHandler(ctx context.Context, ch <-chan string, a *app.App) {
 	}
 }
 
-// ensureForwardedForURL checks whether the URL's port is already forwarded
-// via the ControlMaster; if not, it adds a forward immediately so the URL
-// opens successfully on the Mac. This handles ephemeral-range ports like
-// those used by `aws sso login` (http://127.0.0.1:<random>/?code=...).
-//
-// Errors are logged and ignored — best-effort: the URL opens regardless, and
-// if the port happens to already be forwarded by another process (e.g.
-// VSCode), the existing forward is used.
+// ensureForwardedForURL ensures any localhost ports referenced in rawURL
+// are forwarded before the browser opens it. It checks both the URL's own
+// host:port AND any localhost ports embedded in query parameter values
+// (e.g. redirect_uri=http://127.0.0.1:39041/... in AWS SSO URLs).
 func ensureForwardedForURL(ctx context.Context, rawURL string, a *app.App) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return
 	}
-	host := u.Hostname()
-	if host != "localhost" && host != "127.0.0.1" && host != "::1" {
-		return // not a loopback URL; open as-is
-	}
-	portStr := u.Port()
-	if portStr == "" {
-		return // no explicit port (e.g. http://localhost/ is port 80 — already accessible)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port <= 0 || port > 65535 {
+
+	// Collect every localhost port we need — the direct URL port first,
+	// then any localhost port found in query parameter values.
+	ports := collectLoopbackPorts(u)
+	if len(ports) == 0 {
 		return
 	}
 
-	// Check whether the master already has this port forwarded.
 	masterPID, _ := a.Transport.MasterPID(ctx)
 	if masterPID == 0 {
-		return // master down; nothing to forward through
+		return
 	}
 	current, _ := a.Ports.MasterForwards(ctx, masterPID)
+	forwarded := make(map[int]bool, len(current))
 	for _, p := range current {
-		if p == port {
-			return // already forwarded
+		forwarded[p] = true
+	}
+
+	for _, port := range ports {
+		if forwarded[port] {
+			continue
+		}
+		if err := a.Transport.Forward(ctx, port, port); err != nil {
+			a.Log.Logf("auto-forward port %d: %v", port, err)
+			continue
+		}
+		a.Log.Logf("auto-forwarded localhost:%d -> %s:%d", port, a.Transport.Host(), port)
+	}
+}
+
+// collectLoopbackPorts extracts every unique localhost port from a URL —
+// including ports embedded in query parameter values (e.g. redirect_uri).
+func collectLoopbackPorts(u *url.URL) []int {
+	seen := map[int]bool{}
+	var result []int
+
+	add := func(raw string) {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			return
+		}
+		h := parsed.Hostname()
+		if h != "localhost" && h != "127.0.0.1" && h != "::1" {
+			return
+		}
+		portStr := parsed.Port()
+		if portStr == "" {
+			return
+		}
+		p, err := strconv.Atoi(portStr)
+		if err != nil || p <= 0 || p > 65535 {
+			return
+		}
+		if !seen[p] {
+			seen[p] = true
+			result = append(result, p)
 		}
 	}
 
-	// Not forwarded — add it now. The watcher will cancel it once the
-	// remote process closes the port.
-	if err := a.Transport.Forward(ctx, port, port); err != nil {
-		a.Log.Logf("auto-forward port %d for URL: %v", port, err)
-		return
+	// Check the URL itself.
+	add(u.String())
+
+	// Check every query parameter value — handles redirect_uri, callback_url, etc.
+	for _, v := range u.Query() {
+		for _, s := range v {
+			add(s)
+		}
 	}
-	a.Log.Logf("auto-forwarded localhost:%d for URL %s", port, rawURL)
+
+	return result
 }
 
 // isSafeURL returns true only for http and https schemes.
