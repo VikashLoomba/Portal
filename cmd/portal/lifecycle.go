@@ -25,9 +25,9 @@ func newUninstallCmd(a *app.App) *cobra.Command {
 				_, _ = a.Transport.Exit(cmd.Context())
 			}
 			_ = os.Remove(a.Paths.Sock)
-			fmt.Printf("uninstalled service and tore down master (%s)\n", a.Paths.Label)
-			fmt.Printf("(kept: command at %s, config in %s — rm them to remove completely)\n",
-				a.Paths.BinPath, a.Paths.ConfigDir)
+			_ = os.Remove(a.Paths.BinPath)
+			_ = os.RemoveAll(a.Paths.ConfigDir)
+			fmt.Printf("uninstalled (%s)\n", a.Paths.Label)
 			return nil
 		},
 	}
