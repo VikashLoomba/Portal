@@ -36,6 +36,12 @@ type Engine struct {
 	// wired in yet" — the engine falls back to plain interval polling.
 	AgentEvents <-chan EngineEvent
 
+	// OpenURLSink receives URLs from EvOpenURL events. Wired by the
+	// composition root to the goroutine in cmd/portal/run.go that calls
+	// `open <url>` on macOS. Non-blocking send — drops if the consumer
+	// is slow (best-effort for a URL open is fine).
+	OpenURLSink chan<- string
+
 	// SafetyInterval fires Reconcile periodically as a backstop in case
 	// the master-side forwards drift (someone runs ssh -O cancel out of
 	// band, the master is rebuilt, etc.). Default: 60s when AgentEvents is
@@ -47,14 +53,15 @@ type Engine struct {
 
 // EngineEvent is the local mirror of agentclient.EngineEvent — declared
 // here so internal/forward doesn't need to import internal/agentclient
-// (which would induce a layering cycle, since agentclient already imports
-// shared transport types). The local app composition root copies the few
-// fields the engine cares about.
+// (which would induce a layering cycle). The composition root adapts.
+// OpenURL events are passed through but the engine itself ignores them
+// (they are consumed by cmd/portal/run.go's open-url handler goroutine).
 type EngineEvent struct {
 	Kind    EngineEventKind
 	Err     error
 	Added   []uint16
 	Removed []uint16
+	URL     string // populated on EvOpenURL
 }
 
 // EngineEventKind mirrors agentclient.EngineEventKind.
@@ -65,6 +72,7 @@ const (
 	EvDisconnected
 	EvSnapshotReplaced
 	EvDelta
+	EvOpenURL
 )
 
 // New constructs an Engine with a fresh in-memory conflict set.
@@ -122,6 +130,15 @@ func (e *Engine) runIntervalLegacy(ctx context.Context) error {
 // event. A 50ms debounce coalesces bursts (e.g. `docker compose up` exposing
 // 8 ports in 80ms = one Reconcile, not eight).
 func (e *Engine) runEventDriven(ctx context.Context) error {
+	// Run one pass immediately so the master is established and any ports
+	// already listening get forwarded before the first agent event arrives.
+	// Matches the legacy polling loop's behaviour (and the bash original's
+	// `while true; do reconcile; sleep $INTERVAL; done` which runs reconcile
+	// first). Without this the master stays DOWN until the agent connects.
+	if err := e.Reconcile(ctx); err != nil && ctx.Err() != nil {
+		return nil
+	}
+
 	safety := e.SafetyInterval
 	if safety <= 0 {
 		safety = 60 * time.Second
@@ -155,6 +172,15 @@ func (e *Engine) runEventDriven(ctx context.Context) error {
 			return nil
 		case ev := <-e.AgentEvents:
 			switch ev.Kind {
+			case EvOpenURL:
+				// Not a reconcile trigger; passed through for the open-URL
+				// handler in cmd/portal/run.go (see App.OpenURLEvents).
+				if e.OpenURLSink != nil {
+					select {
+					case e.OpenURLSink <- ev.URL:
+					default:
+					}
+				}
 			case EvConnected, EvSnapshotReplaced, EvDelta:
 				fireSoon()
 			case EvDisconnected:

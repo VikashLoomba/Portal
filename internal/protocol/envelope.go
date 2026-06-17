@@ -37,4 +37,5 @@ type Envelope struct {
 	Heartbeat    *Heartbeat    `cbor:"heartbeat,omitempty"`
 	AgentError   *AgentError   `cbor:"agent_error,omitempty"`
 	Bye          *Bye          `cbor:"bye,omitempty"`
+	OpenURL      *OpenURL      `cbor:"open_url,omitempty"`
 }

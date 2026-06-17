@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -18,17 +19,21 @@ import (
 // Config bundles the constructor inputs. Everything is injected so the
 // server is fully testable with FakeWatcher + bytes.Buffer pipes.
 type Config struct {
-	In           io.Reader     // stdin (Mac → agent)
-	Out          io.Writer     // stdout (agent → Mac)
+	In           io.Reader // stdin (Mac → agent)
+	Out          io.Writer // stdout (agent → Mac)
 	Watcher      watcher.Watcher
-	AgentSHA     string        // baked at build time via -ldflags
-	Kernel       string        // typically "uname -r"; OK to leave empty
-	BootID       string        // /proc/sys/kernel/random/boot_id; OK to leave empty
+	AgentSHA     string // baked at build time via -ldflags
+	Kernel       string // typically "uname -r"; OK to leave empty
+	BootID       string // /proc/sys/kernel/random/boot_id; OK to leave empty
 	EphemMin     uint16
 	EphemMax     uint16
 	HeartbeatInterval time.Duration // default 5s
-	Log          *slog.Logger  // stderr handler; nil → discard
-	Now          func() time.Time
+	Log               *slog.Logger  // stderr handler; nil → discard
+	Now               func() time.Time
+	// CmdSockPath is the Unix socket path where `portald open <url>`
+	// connects to relay URLs back to the Mac client. Empty = disabled.
+	// The socket is only active while a Mac client is subscribed.
+	CmdSockPath string
 }
 
 // Server is the agent's RPC top loop. One Server per ssh-exec lifetime.
@@ -43,6 +48,7 @@ type Server struct {
 	lastRSID    uint64
 	lastEmitted map[uint16]protocol.Port
 	startedAt   time.Time
+	hasClient   bool // true once SubscribeAck has been sent; gates cmd socket
 }
 
 // New constructs a Server. Defaults are filled in.
@@ -119,6 +125,15 @@ func (s *Server) Serve(ctx context.Context) error {
 	readErrCh := make(chan error, 1)
 	go s.readLoop(ctx, cmdCh, readErrCh)
 
+	// 5. Start cmd Unix socket if configured. The socket relays OpenURL
+	// requests from `portald open <url>` (typically via the xdg-open
+	// wrapper). It is only live while a client is actively subscribed;
+	// startCmdSock gates on hasClient, which is set in handleSubscribe.
+	openURLCh := make(chan string, 8) // urls from cmd socket → main loop
+	if s.cfg.CmdSockPath != "" {
+		go s.serveCmdSock(ctx, openURLCh)
+	}
+
 	hb := time.NewTicker(s.cfg.HeartbeatInterval)
 	defer hb.Stop()
 
@@ -155,6 +170,20 @@ func (s *Server) Serve(ctx context.Context) error {
 				return errors.New("watcher closed")
 			}
 			s.handleEvent(ev)
+
+		case url := <-openURLCh:
+			s.mu.Lock()
+			active := s.hasClient
+			if active {
+				s.seq++
+			}
+			seq := s.seq
+			s.mu.Unlock()
+			if active {
+				_ = s.enc.Write(&protocol.Envelope{OpenURL: &protocol.OpenURL{
+					URL: url, Seq: seq,
+				}})
+			}
 
 		case <-hb.C:
 			s.mu.Lock()
@@ -241,6 +270,10 @@ func (s *Server) handleSubscribe(ctx context.Context, sub *protocol.Subscribe) e
 
 	s.filter.SetAllowDeny(sub.Deny, sub.Allow, sub.ExcludeEphemeral)
 
+	s.mu.Lock()
+	s.hasClient = true
+	s.mu.Unlock()
+
 	if err := s.enc.Write(&protocol.Envelope{SubscribeAck: &protocol.SubscribeAck{
 		ResubscribeID: sub.ResubscribeID,
 	}}); err != nil {
@@ -323,6 +356,65 @@ func (s *Server) handleEvent(ev watcher.Event) {
 			Seq: seq, Port: ev.Listen.Port, Family: ev.Listen.Family,
 			At: ev.At.UnixNano(), Source: ev.Source,
 		}})
+	}
+}
+
+// serveCmdSock listens on CmdSockPath for connections from `portald open`.
+// Each connection sends one URL line and reads back "ok" or "no-client".
+// The socket is removed on context cancellation so stale socks don't block
+// the next session startup.
+func (s *Server) serveCmdSock(ctx context.Context, out chan<- string) {
+	path := s.cfg.CmdSockPath
+	_ = os.Remove(path) // clean up any previous session's socket
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		s.cfg.Log.Warn("cmd socket listen failed", "err", err)
+		return
+	}
+	defer func() {
+		l.Close()
+		_ = os.Remove(path)
+	}()
+
+	// Close the listener when ctx cancels so Accept unblocks.
+	go func() {
+		<-ctx.Done()
+		l.Close()
+	}()
+
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			return // ctx cancelled or listener closed
+		}
+		go s.handleCmdConn(conn, out)
+	}
+}
+
+func (s *Server) handleCmdConn(conn net.Conn, out chan<- string) {
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil || n == 0 {
+		return
+	}
+	url := strings.TrimSpace(string(buf[:n]))
+	if url == "" {
+		return
+	}
+	s.mu.Lock()
+	active := s.hasClient
+	s.mu.Unlock()
+	if !active {
+		_, _ = conn.Write([]byte("no-client\n"))
+		return
+	}
+	select {
+	case out <- url:
+		_, _ = conn.Write([]byte("ok\n"))
+	default:
+		_, _ = conn.Write([]byte("ok\n")) // best-effort; dropped URLs don't fail the opener
 	}
 }
 

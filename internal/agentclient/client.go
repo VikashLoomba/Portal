@@ -448,6 +448,8 @@ func (c *Client) demuxLoop(ctx context.Context, dec *protocol.Decoder) error {
 				c.snapMu.Unlock()
 				pendRemoved = append(pendRemoved, port)
 				resetTimer()
+			case env.OpenURL != nil:
+				c.publish(EngineEvent{Kind: KindOpenURL, URL: env.OpenURL.URL})
 			case env.Heartbeat != nil:
 				// Already bumped above.
 			case env.SubscribeAck != nil:

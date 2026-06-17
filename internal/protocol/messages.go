@@ -117,6 +117,15 @@ const (
 
 // PortRemovedSource constants.
 const (
-	SourceDumpDiff      uint8 = 1
-	SourceDestroyMulti  uint8 = 2
+	SourceDumpDiff     uint8 = 1
+	SourceDestroyMulti uint8 = 2
 )
+
+// OpenURL — agent → client. Sent when something on the remote box called
+// `portald open <url>` (typically via the ~/.local/bin/xdg-open wrapper).
+// The Mac client calls `open <url>` to open it in the default browser.
+// Only sent while a client is subscribed; silently dropped otherwise.
+type OpenURL struct {
+	URL string `cbor:"url"`
+	Seq uint64 `cbor:"seq"`
+}

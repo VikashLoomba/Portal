@@ -118,7 +118,12 @@ func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("bootstrap: upload failed: %w", err)
 	}
 
-	// 3. Best-effort prune older agent-* (older than 1 day) and any leftover
+	// 3. Update the stable `portald` symlink so the xdg-open wrapper can
+	// always find the current agent without knowing the SHA.
+	symlink := fmt.Sprintf(`ln -sf %s %s/portald`, remotePath, remoteDir)
+	_, _ = m.T.Exec(ctx, "", "bash", "-c", shellQuoted(symlink))
+
+	// 4. Best-effort prune older agent-* (older than 1 day) and any leftover
 	// .agent.tmp.* fragments from earlier interrupted uploads.
 	prune := fmt.Sprintf(
 		`find %s -maxdepth 1 \( -name 'agent-*' ! -name 'agent-%s' -mtime +0 \) -o -name '.agent.tmp.*' -delete 2>/dev/null || true`,

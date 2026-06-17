@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"os/signal"
 	"sync"
 	"syscall"
@@ -30,13 +32,13 @@ func newRunCmd(a *app.App) *cobra.Command {
 			allow, _ := a.Cfg.AllowedPorts()
 			_ = a.AgentClient.Subscribe(toU16(app.DenyPorts), toU16(allow), true)
 
-			engine := a.Engine()
+			engine, openURLCh := a.NewEngineWithOpenURL()
 
-			// Run agent supervisor + reconcile engine in parallel; either
-			// returning ends the daemon (launchd will relaunch).
+			// Run agent supervisor, reconcile engine, and URL opener in
+			// parallel; any returning ends the daemon (launchd will relaunch).
 			var wg sync.WaitGroup
-			wg.Add(2)
-			errCh := make(chan error, 2)
+			wg.Add(3)
+			errCh := make(chan error, 3)
 
 			go func() {
 				defer wg.Done()
@@ -45,6 +47,10 @@ func newRunCmd(a *app.App) *cobra.Command {
 			go func() {
 				defer wg.Done()
 				errCh <- engine.Run(ctx)
+			}()
+			go func() {
+				defer wg.Done()
+				runOpenURLHandler(ctx, openURLCh, a)
 			}()
 
 			wg.Wait()
@@ -95,6 +101,31 @@ func newOnceCmd(a *app.App) *cobra.Command {
 }
 
 const snapshotWaitMS = 5000
+
+// runOpenURLHandler receives URLs from the agent's xdg-open interception
+// and opens them on macOS. Runs until ctx is cancelled.
+func runOpenURLHandler(ctx context.Context, ch <-chan string, a *app.App) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case url, ok := <-ch:
+			if !ok {
+				return
+			}
+			if url == "" {
+				continue
+			}
+			a.Log.Logf("opening URL from %s: %s", a.Transport.Host(), url)
+			cmd := exec.CommandContext(ctx, "open", url)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				a.Log.Logf("open %q failed: %v", url, err)
+			}
+		}
+	}
+}
 
 // runStatusCtx is a tiny helper so once.go and the root status default share.
 func runStatusCtx(ctx context.Context, a *app.App) error { return runStatus(ctx, a) }

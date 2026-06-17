@@ -96,10 +96,9 @@ func NewProd() (*App, error) {
 }
 
 // Engine constructs a fresh forward.Engine using the App's wiring. The
-// engine is event-driven via AgentClient.Events() — bursts of port
-// add/remove events from the remote netlink watcher are coalesced through
-// a 50ms debounce inside the engine, with a 60s safety reconcile as a
-// backstop for master-side drift.
+// engine is event-driven via AgentClient.Events(). Callers that want to
+// handle OpenURL events should set the returned engine's OpenURLSink before
+// calling Run — or use NewEngineWithOpenURL for convenience.
 func (a *App) Engine() *forward.Engine {
 	e := forward.New(a.Transport, a.Ports, a.Discover, a.Cfg, a.Clk, a.Log,
 		Interval, DenyPorts, SkipLocal)
@@ -107,6 +106,16 @@ func (a *App) Engine() *forward.Engine {
 		e.AgentEvents = adaptAgentEvents(a.AgentClient.Events())
 	}
 	return e
+}
+
+// NewEngineWithOpenURL is like Engine but also returns a channel that
+// receives URLs from EvOpenURL events (e.g. xdg-open on the remote).
+// The channel is buffered; the engine drops URLs if the consumer is slow.
+func (a *App) NewEngineWithOpenURL() (*forward.Engine, <-chan string) {
+	e := a.Engine()
+	ch := make(chan string, 16)
+	e.OpenURLSink = ch
+	return e, ch
 }
 
 // adaptAgentEvents copies fields from agentclient.EngineEvent into the
@@ -122,6 +131,7 @@ func adaptAgentEvents(in <-chan agentclient.EngineEvent) <-chan forward.EngineEv
 				Err:     ev.Err,
 				Added:   ev.Added,
 				Removed: ev.Removed,
+				URL:     ev.URL,
 			}
 		}
 	}()

@@ -22,6 +22,9 @@ const (
 	// KindDelta fires after a coalesced burst of PortAdded/PortRemoved
 	// events (50ms debounce). The engine reconciles.
 	KindDelta
+	// KindOpenURL fires when the agent receives a request to open a URL
+	// on the client (e.g. via the xdg-open wrapper on the remote box).
+	KindOpenURL
 )
 
 // EngineEvent is the unit of communication from agentclient → engine.
@@ -30,4 +33,5 @@ type EngineEvent struct {
 	Err     error    // populated on KindDisconnected
 	Added   []uint16 // populated on KindDelta
 	Removed []uint16 // populated on KindDelta
+	URL     string   // populated on KindOpenURL
 }

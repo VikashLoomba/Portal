@@ -96,6 +96,16 @@ the headless launchd daemon can connect.`,
 			}
 			fmt.Printf("service loaded and started (%s)\n", a.Paths.Label)
 
+			// Install the xdg-open wrapper on the dev box. Use a direct
+			// ssh call rather than going through a.Transport — the
+			// transport was built before the host was configured, so its
+			// HostID is empty on a fresh install.
+			if err := installXdgOpenWrapper(cmd.Context(), host, a); err != nil {
+				fmt.Printf("WARNING: could not install xdg-open wrapper on %s: %v\n", host, err)
+			} else {
+				fmt.Printf("installed xdg-open wrapper on %s\n", host)
+			}
+
 			if !pathContains(os.Getenv("PATH"), a.Paths.BinDir) {
 				fmt.Printf("NOTE: %s is not on your PATH. Add it to your shell profile:\n", a.Paths.BinDir)
 				fmt.Printf("      export PATH=\"$HOME/.local/bin:$PATH\"\n")
@@ -185,6 +195,65 @@ func isatty(f *os.File) bool {
 		return false
 	}
 	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+// xdgOpenWrapper is installed at ~/.local/bin/xdg-open on the dev box.
+// It tries `portald open "$@"` first; if no client is active (exit 1),
+// it falls through to the real xdg-open. The real binary location is
+// resolved at call time via `command -v` so the wrapper never hard-codes
+// a path.
+//
+// Design choices:
+//   - Only intercepts when portald is reachable (cmd socket exists + client
+//     connected). Falls through gracefully otherwise — safe even when the
+//     user SSH's in directly without portal running.
+//   - Does not shadow xclip/xsel or any other tool.
+//   - The wrapper is a shell script, not a symlink, so it survives across
+//     agent upgrades (the agent path changes with each SHA; the wrapper
+//     resolves it at runtime via the `portald` symlink).
+const xdgOpenWrapper = `#!/bin/sh
+# Installed by portal. Relays xdg-open calls to the Mac client when a
+# portal session is active; otherwise falls through to the real xdg-open.
+_portald="${HOME}/.cache/portal/portald"
+if [ -x "$_portald" ] && "$_portald" open "$@" 2>/dev/null; then
+    exit 0
+fi
+# Fall through to the real xdg-open (skip this wrapper via PATH search).
+_real=$(PATH=$(echo "$PATH" | tr ':' '\n' | grep -v "$(dirname "$0")" | tr '\n' ':') command -v xdg-open 2>/dev/null)
+if [ -n "$_real" ]; then
+    exec "$_real" "$@"
+fi
+`
+
+// installXdgOpenWrapper writes the wrapper script to ~/.local/bin/xdg-open
+// on the dev box. Uses a direct (non-multiplexed) ssh call with the given
+// host so it works on a fresh install before the ControlMaster exists.
+func installXdgOpenWrapper(ctx context.Context, host string, a *app.App) error {
+	tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+
+	wrapScript := `mkdir -p ~/.local/bin && cat > ~/.local/bin/xdg-open.portal.tmp && chmod 0755 ~/.local/bin/xdg-open.portal.tmp && mv ~/.local/bin/xdg-open.portal.tmp ~/.local/bin/xdg-open`
+	if _, _, err := tr.ExecBytes(ctx, []byte(xdgOpenWrapper), "bash", "-c", shellQuoteRemote(wrapScript)); err != nil {
+		return fmt.Errorf("write wrapper: %w", err)
+	}
+
+	// The portald symlink is maintained by bootstrap.Manager after each
+	// upload. Update it now for the initial install too.
+	symlinkScript := `ls -t ~/.cache/portal/agent-* 2>/dev/null | head -1 | xargs -I{} ln -sf {} ~/.cache/portal/portald`
+	_, _ = tr.Exec(ctx, "", "bash", "-c", shellQuoteRemote(symlinkScript))
+	return nil
+}
+
+// removeXdgOpenWrapper removes the wrapper and portald symlink from the dev
+// box. Uses the live transport since the master is still up at uninstall time.
+func removeXdgOpenWrapper(ctx context.Context, a *app.App) {
+	script := `rm -f ~/.local/bin/xdg-open ~/.cache/portal/portald`
+	_, _ = a.Transport.Exec(ctx, "", "bash", "-c", shellQuoteRemote(script))
+}
+
+// shellQuoteRemote wraps a shell script in single quotes for safe remote
+// execution via ssh (which joins argv with spaces and passes to sh -c).
+func shellQuoteRemote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // silence unused-import for context (some build paths drop it).

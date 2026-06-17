@@ -17,8 +17,10 @@ func newUninstallCmd(a *app.App) *cobra.Command {
 			_ = a.Service.Uninstall(cmd.Context())
 			host, _ := a.Cfg.ReadHost()
 			if host != "" {
-				// Best-effort: clean up the remote ~/.cache/portal/ tree
-				// before tearing down the master.
+				// Remove the xdg-open wrapper and portald symlink before
+				// tearing down the master (while the connection is still live).
+				removeXdgOpenWrapper(cmd.Context(), a)
+				// Clean up the remote ~/.cache/portal/ agent binaries.
 				if a.Bootstrap != nil {
 					_ = a.Bootstrap.PruneAll(cmd.Context())
 				}
