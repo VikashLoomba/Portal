@@ -16,7 +16,13 @@ SHA_PATH      := $(AGENT_DIR)/sha.txt
 LDFLAGS_AGENT  := -s -w -X main.gitSHA=$(GIT_SHA)
 LDFLAGS_PORTAL := -X github.com/vikashl/portal/internal/bootstrap.gitSHA=$(GIT_SHA)
 
-.PHONY: build agent portal test clean print-sha
+# Cross-compilation targets for the Mac client binary.
+# The agent is always linux-amd64 (it runs on the dev box).
+# The Mac client ships as darwin-amd64 and darwin-arm64 (Apple Silicon).
+PORTAL_DARWIN_AMD64  := portal-darwin-amd64
+PORTAL_DARWIN_ARM64  := portal-darwin-arm64
+
+.PHONY: build agent portal portal-all test clean print-sha
 
 build: portal
 
@@ -31,6 +37,16 @@ agent:
 portal: agent
 	go build -trimpath -ldflags "$(LDFLAGS_PORTAL)" -o portal ./cmd/portal
 	@echo "built portal (sha=$(GIT_SHA))"
+
+# portal-all builds both Mac architectures — used by CI to produce release artifacts.
+portal-all: agent
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 \
+		go build -trimpath -ldflags "$(LDFLAGS_PORTAL)" \
+		-o $(PORTAL_DARWIN_AMD64) ./cmd/portal
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 \
+		go build -trimpath -ldflags "$(LDFLAGS_PORTAL)" \
+		-o $(PORTAL_DARWIN_ARM64) ./cmd/portal
+	@echo "built $(PORTAL_DARWIN_AMD64) and $(PORTAL_DARWIN_ARM64) (sha=$(GIT_SHA))"
 
 test: agent
 	go test ./...

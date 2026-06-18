@@ -1,0 +1,92 @@
+# portal CI/CD pipeline
+#
+# Jobs:
+#   test    — runs on every push/MR: build agent + run go test ./...
+#   release — runs only on version tags (v*): build both Mac architectures
+#             and publish them as a GitLab release with downloadable artifacts
+
+default:
+  image: golang:1.24
+  tags:
+    - docker
+
+variables:
+  CGO_ENABLED: "0"
+  GOFLAGS: "-trimpath"
+
+# Cache the Go module download cache across jobs on the same branch.
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .go-cache/
+before_script:
+  - export GOPATH="$CI_PROJECT_DIR/.go-cache"
+  - export GOMODCACHE="$CI_PROJECT_DIR/.go-cache/pkg/mod"
+
+# ── test ──────────────────────────────────────────────────────────────────────
+test:
+  stage: test
+  script:
+    - make test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+# ── release ───────────────────────────────────────────────────────────────────
+release-build:
+  stage: build
+  script:
+    - make portal-all
+  artifacts:
+    name: "portal-${CI_COMMIT_TAG}"
+    paths:
+      - portal-darwin-amd64
+      - portal-darwin-arm64
+    expire_in: 90 days
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+
+release-publish:
+  stage: deploy
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  tags:
+    - docker
+  needs:
+    - job: release-build
+      artifacts: true
+  script:
+    - echo "Publishing release ${CI_COMMIT_TAG}"
+  release:
+    name: "portal ${CI_COMMIT_TAG}"
+    description: |
+      ## Install
+
+      Download the binary for your Mac architecture, mark it executable, and run `portal install`:
+
+      ```sh
+      # Apple Silicon (M1/M2/M3/M4)
+      curl -L "${CI_PROJECT_URL}/-/releases/${CI_COMMIT_TAG}/downloads/portal-darwin-arm64" -o portal
+      chmod +x portal && ./portal install
+
+      # Intel Mac
+      curl -L "${CI_PROJECT_URL}/-/releases/${CI_COMMIT_TAG}/downloads/portal-darwin-amd64" -o portal
+      chmod +x portal && ./portal install
+      ```
+    tag_name: "$CI_COMMIT_TAG"
+    assets:
+      links:
+        - name: "portal-darwin-arm64 (Apple Silicon)"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/portal-darwin-arm64?job=release-build"
+          filepath: "/portal-darwin-arm64"
+          link_type: package
+        - name: "portal-darwin-amd64 (Intel Mac)"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/portal-darwin-amd64?job=release-build"
+          filepath: "/portal-darwin-amd64"
+          link_type: package
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+
+stages:
+  - test
+  - build
+  - deploy
