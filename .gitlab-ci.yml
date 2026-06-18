@@ -6,7 +6,7 @@
 #             and publish them as a GitLab release with downloadable artifacts
 
 default:
-  image: golang:1.24
+  image: golang:1.25
   tags:
     - docker
 
