@@ -48,41 +48,48 @@ release-build:
 
 release-publish:
   stage: deploy
-  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  # Use golang image (already on the runners) rather than release-cli, which
+  # fails TLS verification against the internal GitLab CA. We call the API
+  # directly with curl --insecure (internal network, job token scoped to this
+  # project).
+  image: golang:1.25
   tags:
     - docker
   needs:
     - job: release-build
       artifacts: true
   script:
-    - echo "Publishing release ${CI_COMMIT_TAG}"
-  release:
-    name: "portal ${CI_COMMIT_TAG}"
-    description: |
-      ## Install
+    - |
+      ARTIFACT_BASE="${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw"
+      DESCRIPTION="Download the binary for your Mac, mark it executable, and run portal install.
 
-      Download the binary for your Mac architecture, mark it executable, and run `portal install`:
+      Apple Silicon (M1/M2/M3/M4): ${ARTIFACT_BASE}/portal-darwin-arm64?job=release-build
+      Intel Mac:                    ${ARTIFACT_BASE}/portal-darwin-amd64?job=release-build
 
-      ```sh
-      # Apple Silicon (M1/M2/M3/M4)
-      curl -L "${CI_PROJECT_URL}/-/releases/${CI_COMMIT_TAG}/downloads/portal-darwin-arm64" -o portal
-      chmod +x portal && ./portal install
+      chmod +x portal && ./portal install"
 
-      # Intel Mac
-      curl -L "${CI_PROJECT_URL}/-/releases/${CI_COMMIT_TAG}/downloads/portal-darwin-amd64" -o portal
-      chmod +x portal && ./portal install
-      ```
-    tag_name: "$CI_COMMIT_TAG"
-    assets:
-      links:
-        - name: "portal-darwin-arm64 (Apple Silicon)"
-          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/portal-darwin-arm64?job=release-build"
-          filepath: "/portal-darwin-arm64"
-          link_type: package
-        - name: "portal-darwin-amd64 (Intel Mac)"
-          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw/portal-darwin-amd64?job=release-build"
-          filepath: "/portal-darwin-amd64"
-          link_type: package
+      # Create the release via the GitLab API.
+      curl --insecure --fail-with-body -sS \
+        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data "$(printf '{
+          "name": "portal %s",
+          "tag_name": "%s",
+          "description": %s,
+          "assets": {
+            "links": [
+              {"name": "portal-darwin-arm64 (Apple Silicon)", "url": "%s/portal-darwin-arm64?job=release-build", "link_type": "package"},
+              {"name": "portal-darwin-amd64 (Intel Mac)",     "url": "%s/portal-darwin-amd64?job=release-build", "link_type": "package"}
+            ]
+          }
+        }' \
+          "${CI_COMMIT_TAG}" \
+          "${CI_COMMIT_TAG}" \
+          "$(echo "$DESCRIPTION" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
+          "${ARTIFACT_BASE}" \
+          "${ARTIFACT_BASE}")" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
+      echo "Release ${CI_COMMIT_TAG} published."
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v/'
 
