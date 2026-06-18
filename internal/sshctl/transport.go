@@ -286,18 +286,18 @@ func (s *SSH) runBytes(ctx context.Context, args []string, stdin []byte) (string
 	return outBuf.String(), errBuf.String(), -1, err
 }
 
-// Validate runs a dummy `ssh host true` over a fresh non-multiplexed
-// connection (BatchMode=yes — no prompts), returning nil iff key auth works.
-// Used by `install` to pre-flight the host before saving it. Does NOT touch
-// the ControlMaster socket — this must work before there is one.
-func (s *SSH) Validate(ctx context.Context, host string) error {
-	args := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, "true"}
-	_, stderr, code, err := s.Runner.Run(ctx, "ssh", args, "")
-	if err != nil {
+// Validate tests key-based ssh connectivity to host by running `ssh host true`.
+// Unlike the daemon's ssh calls, this does NOT use BatchMode=yes — doing so
+// would suppress output from tools like Tailscale that print an auth URL to
+// stderr and wait for the user to visit it. stderrW receives the raw stderr
+// stream in real time (pass os.Stderr during install so the user can see and
+// act on any prompts). Returns nil iff the connection succeeded.
+// Does NOT touch the ControlMaster socket — this runs before there is one.
+func (s *SSH) Validate(ctx context.Context, host string, stderrW io.Writer) error {
+	cmd := exec.CommandContext(ctx, "ssh", "-o", "ConnectTimeout=30", host, "true")
+	cmd.Stderr = stderrW
+	if err := cmd.Run(); err != nil {
 		return err
-	}
-	if code != 0 {
-		return fmt.Errorf("ssh exit %d: %s", code, strings.TrimSpace(stderr))
 	}
 	return nil
 }

@@ -36,9 +36,12 @@ the headless launchd daemon can connect.`,
 				return usageErr{msg: fmt.Sprintf("no host given; run interactively or: %s install <ssh-host>", app.Tool)}
 			}
 
-			fmt.Printf("checking passwordless ssh to %s ... ", host)
+			fmt.Printf("checking ssh to %s ...\n", host)
 			ssh := sshctlSSH(a)
-			if err := ssh.Validate(cmd.Context(), host); err == nil {
+			// Pass os.Stderr directly so tools like Tailscale that print an
+			// auth URL while establishing the connection are visible to the
+			// user immediately (e.g. "To authenticate, visit: https://...").
+			if err := ssh.Validate(cmd.Context(), host, os.Stderr); err == nil {
 				fmt.Println("ok")
 				if !ssh.HasSS(cmd.Context(), host) {
 					fmt.Printf("WARNING: '%s' is reachable but has no 'ss' command — is it Linux? Port discovery may not work.\n", host)
