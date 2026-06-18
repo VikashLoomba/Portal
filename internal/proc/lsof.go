@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/vikashl/portal/internal/run"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
 )
 
 // PortLister is the dependency the reconcile engine consumes.

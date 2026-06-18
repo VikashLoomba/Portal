@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vikashl/portal/internal/clock"
-	"github.com/vikashl/portal/internal/config"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
 )
 
 // fakeTransport implements sshctl.Transport for the engine tests.

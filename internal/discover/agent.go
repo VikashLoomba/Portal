@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/vikashl/portal/internal/agentclient"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
 )
 
 // ErrAgentNotReady is returned by AgentDiscoverer.DesiredPorts before the

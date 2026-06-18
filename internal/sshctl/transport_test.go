@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/vikashl/portal/internal/run"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
 )
 
 // Real OpenSSH writes "Master running (pid=12345)\r\n" to STDERR. The

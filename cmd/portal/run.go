@@ -13,7 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/vikashl/portal/internal/app"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
 )
 
 func newRunCmd(a *app.App) *cobra.Command {

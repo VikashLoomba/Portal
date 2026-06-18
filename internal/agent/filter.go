@@ -5,7 +5,7 @@ package agent
 import (
 	"sync"
 
-	"github.com/vikashl/portal/internal/agent/watcher"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent/watcher"
 )
 
 // Filter applies the deny / ephemeral-range / allow-override pipeline to a

@@ -12,8 +12,8 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/vikashl/portal/internal/clock"
-	"github.com/vikashl/portal/internal/run"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
 )
 
 //go:embed plist.tmpl

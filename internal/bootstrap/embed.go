@@ -24,7 +24,7 @@ var agentBinary []byte
 //go:embed agent/sha.txt
 var agentSHARaw string
 
-// gitSHA is set via -ldflags "-X github.com/vikashl/portal/internal/bootstrap.gitSHA=..."
+// gitSHA is set via -ldflags "-X gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap.gitSHA=..."
 // by the Makefile. Should always equal strings.TrimSpace(agentSHARaw).
 var gitSHA = "dev"
 

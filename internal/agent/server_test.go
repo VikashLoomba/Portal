@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vikashl/portal/internal/agent/watcher"
-	"github.com/vikashl/portal/internal/protocol"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent/watcher"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
 )
 
 // connPair holds two unidirectional pipes: client→agent and agent→client.

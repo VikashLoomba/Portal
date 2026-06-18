@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vikashl/portal/internal/agent"
-	"github.com/vikashl/portal/internal/agent/watcher"
-	"github.com/vikashl/portal/internal/bootstrap"
-	"github.com/vikashl/portal/internal/protocol"
-	"github.com/vikashl/portal/internal/sshctl"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent/watcher"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
 
 // fakeStreamTransport implements sshctl.Transport for the client test. It

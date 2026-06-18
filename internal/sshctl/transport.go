@@ -26,7 +26,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vikashl/portal/internal/run"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
 )
 
 // Transport is the SSH surface consumed by the reconcile engine and the

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/vikashl/portal/internal/sshctl"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
 
 // agentDigest caches the sha256 of EmbeddedAgent() so the probe can

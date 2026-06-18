@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vikashl/portal/internal/clock"
-	"github.com/vikashl/portal/internal/config"
-	"github.com/vikashl/portal/internal/discover"
-	"github.com/vikashl/portal/internal/proc"
-	"github.com/vikashl/portal/internal/sshctl"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/discover"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/proc"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
 
 

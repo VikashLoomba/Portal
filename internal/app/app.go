@@ -7,16 +7,16 @@ import (
 	"os/user"
 	"strconv"
 
-	"github.com/vikashl/portal/internal/agentclient"
-	"github.com/vikashl/portal/internal/bootstrap"
-	"github.com/vikashl/portal/internal/clock"
-	"github.com/vikashl/portal/internal/config"
-	"github.com/vikashl/portal/internal/discover"
-	"github.com/vikashl/portal/internal/forward"
-	"github.com/vikashl/portal/internal/proc"
-	"github.com/vikashl/portal/internal/run"
-	"github.com/vikashl/portal/internal/service"
-	"github.com/vikashl/portal/internal/sshctl"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/discover"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/forward"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/proc"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/service"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
 
 // App is the dependency container. NewProd wires real adapters; tests build

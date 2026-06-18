@@ -12,9 +12,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vikashl/portal/internal/bootstrap"
-	"github.com/vikashl/portal/internal/protocol"
-	"github.com/vikashl/portal/internal/sshctl"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
 
 // ErrNoSnapshot is returned by Snapshot() before the first SubscribeAck has

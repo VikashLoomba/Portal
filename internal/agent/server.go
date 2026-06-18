@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vikashl/portal/internal/agent/watcher"
-	"github.com/vikashl/portal/internal/protocol"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent/watcher"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
 )
 
 // Config bundles the constructor inputs. Everything is injected so the

@@ -12,7 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/vikashl/portal/internal/app"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
 )
 
 // version is overridable via -ldflags "-X main.version=…" at build time.
