@@ -287,13 +287,13 @@ done`
 		_, _ = tr.Exec(ctx, "", "bash", "-c", shellQuoteRemote(symlinkScript))
 	}
 
-	// Warn if the remote's xdg-open doesn't resolve to our wrapper —
-	// if something earlier on PATH owns xdg-open, our wrapper is bypassed.
-	pathCheck := `command -v xdg-open 2>/dev/null`
-	out, _ := tr.Exec(ctx, "", "bash", "-c", shellQuoteRemote(pathCheck))
-	resolved := strings.TrimSpace(out)
-	if resolved != "" && !strings.HasSuffix(resolved, "/.local/bin/xdg-open") {
-		return fmt.Errorf("xdg-open on remote resolves to %q, not ~/.local/bin/xdg-open — ensure ~/.local/bin is first in PATH on %s", resolved, host)
+	// Verify our wrapper landed correctly — check the file we just wrote
+	// rather than resolving xdg-open through PATH (which is unreliable in
+	// non-interactive ssh sessions and varies by distro).
+	verifyScript := `grep -qF "Installed by portal" ~/.local/bin/xdg-open 2>/dev/null && echo ok || echo missing`
+	out, _ := tr.Exec(ctx, "", "bash", "-c", shellQuoteRemote(verifyScript))
+	if strings.TrimSpace(out) != "ok" {
+		return fmt.Errorf("wrapper not found at ~/.local/bin/xdg-open on %s — check that the upload succeeded", host)
 	}
 	return nil
 }
