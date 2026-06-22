@@ -15,3 +15,4 @@ func New() Clipboard { return Unsupported{} }
 
 func (Unsupported) HasImage() bool            { return false }
 func (Unsupported) ImagePNG() ([]byte, error) { return nil, ErrUnsupported }
+func (Unsupported) Describe() string          { return "clipboard access only supported on macOS" }

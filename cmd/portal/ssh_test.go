@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log"
 	"testing"
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
@@ -18,6 +19,10 @@ type fakeClip struct {
 
 func (f *fakeClip) HasImage() bool            { return f.has }
 func (f *fakeClip) ImagePNG() ([]byte, error) { return f.png, f.err }
+func (f *fakeClip) Describe() string          { return "fake" }
+
+// discardLog is a no-op logger for tests.
+var discardLog = log.New(io.Discard, "", 0)
 
 // fakeUploadTransport records ExecBytes and returns a canned remote path.
 type fakeUploadTransport struct {
@@ -52,7 +57,7 @@ func TestWriteWithPaste_NoImage(t *testing.T) {
 	var out bytes.Buffer
 	cb := &fakeClip{has: false}
 	tr := &fakeUploadTransport{}
-	writeWithPaste(context.Background(), []byte{'a', ctrlV, 'b'}, &out, cb, tr)
+	writeWithPaste(context.Background(), []byte{'a', ctrlV, 'b'}, &out, cb, tr, discardLog)
 	if !bytes.Equal(out.Bytes(), []byte{'a', ctrlV, 'b'}) {
 		t.Errorf("no-image passthrough: got %v, want [a 0x16 b]", out.Bytes())
 	}
@@ -67,7 +72,7 @@ func TestWriteWithPaste_WithImage(t *testing.T) {
 	var out bytes.Buffer
 	cb := &fakeClip{has: true, png: []byte("\x89PNG fake")}
 	tr := &fakeUploadTransport{remotePath: "/home/u/.cache/portal/clip/clip-abc123.png"}
-	writeWithPaste(context.Background(), []byte{'x', ctrlV, 'y'}, &out, cb, tr)
+	writeWithPaste(context.Background(), []byte{'x', ctrlV, 'y'}, &out, cb, tr, discardLog)
 
 	want := "x/home/u/.cache/portal/clip/clip-abc123.pngy"
 	if out.String() != want {
@@ -83,7 +88,7 @@ func TestWriteWithPaste_NoCtrlV(t *testing.T) {
 	var out bytes.Buffer
 	cb := &fakeClip{has: true} // even if clipboard has image, no Ctrl+V = no action
 	tr := &fakeUploadTransport{remotePath: "/should/not/appear"}
-	writeWithPaste(context.Background(), []byte("hello world"), &out, cb, tr)
+	writeWithPaste(context.Background(), []byte("hello world"), &out, cb, tr, discardLog)
 	if out.String() != "hello world" {
 		t.Errorf("got %q, want %q", out.String(), "hello world")
 	}
@@ -98,7 +103,7 @@ func TestWriteWithPaste_UploadError(t *testing.T) {
 	var out bytes.Buffer
 	cb := &fakeClip{has: true, err: context.DeadlineExceeded}
 	tr := &fakeUploadTransport{}
-	writeWithPaste(context.Background(), []byte{ctrlV}, &out, cb, tr)
+	writeWithPaste(context.Background(), []byte{ctrlV}, &out, cb, tr, discardLog)
 	if out.String() != "\x07" {
 		t.Errorf("expected bell on error, got %q", out.String())
 	}

@@ -56,6 +56,7 @@ func newRootCmd(a *app.App) *cobra.Command {
 	root.AddCommand(newUnallowCmd(a))
 	root.AddCommand(newAllowedCmd(a))
 	root.AddCommand(newSSHCmd(a))
+	root.AddCommand(newClipCheckCmd(a))
 	root.AddCommand(newAgentVersionCmd(a))
 	return root
 }

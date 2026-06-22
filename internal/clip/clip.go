@@ -16,4 +16,7 @@ type Clipboard interface {
 	// ImagePNG returns the clipboard image encoded as PNG bytes, or an
 	// error if there is no image or extraction failed.
 	ImagePNG() ([]byte, error)
+	// Describe returns a human-readable summary of the current clipboard
+	// flavors, for the `portal clip-check` diagnostic.
+	Describe() string
 }

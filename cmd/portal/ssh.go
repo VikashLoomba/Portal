@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -24,6 +25,21 @@ import (
 
 // ctrlV is the byte produced by Ctrl+V (ASCII SYN, 0x16).
 const ctrlV = 0x16
+
+// dbg logs to the file named by PORTAL_SSH_DEBUG (if set). We cannot log to
+// stdout/stderr during a session — those are the PTY surfaces and would
+// corrupt the remote TUI. Returns a no-op logger when unset.
+func newDebugLogger() *log.Logger {
+	path := os.Getenv("PORTAL_SSH_DEBUG")
+	if path == "" {
+		return log.New(io.Discard, "", 0)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return log.New(io.Discard, "", 0)
+	}
+	return log.New(f, "portal-ssh ", log.LstdFlags|log.Lmicroseconds)
+}
 
 func newSSHCmd(a *app.App) *cobra.Command {
 	return &cobra.Command{
@@ -52,7 +68,6 @@ commands, etc.).`,
 
 func runSSHProxy(ctx context.Context, a *app.App, args []string) error {
 	host := args[0]
-	rest := args[1:]
 
 	// Choose the ControlMaster socket. When the session targets the
 	// configured dev box, reuse the daemon's master socket so the session
@@ -116,6 +131,8 @@ func runSSHProxy(ctx context.Context, a *app.App, args []string) error {
 	// Upload transport multiplexes over the same master the session uses.
 	uploadT := sshctl.New(ctlSock, host, app.SSHOpts, a.Runner)
 	cb := clip.New()
+	dbg := newDebugLogger()
+	dbg.Printf("session start: host=%s ctlSock=%s", host, ctlSock)
 
 	// PTY → stdout (remote output to the screen).
 	var wg sync.WaitGroup
@@ -127,7 +144,7 @@ func runSSHProxy(ctx context.Context, a *app.App, args []string) error {
 
 	// stdin → PTY, intercepting Ctrl+V. Runs in its own goroutine; when ssh
 	// exits, ptmx closes and the io.Copy above returns, ending the session.
-	go proxyStdin(ctx, os.Stdin, ptmx, cb, uploadT, host, rest)
+	go proxyStdin(ctx, os.Stdin, ptmx, cb, uploadT, dbg)
 
 	// Wait for ssh to exit, then for the output pump to drain.
 	err = sshCmd.Wait()
@@ -146,12 +163,12 @@ func runSSHProxy(ctx context.Context, a *app.App, args []string) error {
 // writes the remote path into the PTY as if typed. Otherwise Ctrl+V passes
 // through. This goroutine is intentionally not awaited — os.Stdin.Read
 // can't be unblocked, so we let it die with the process.
-func proxyStdin(ctx context.Context, in io.Reader, ptmx io.Writer, cb clip.Clipboard, t sshctl.Transport, host string, _ []string) {
+func proxyStdin(ctx context.Context, in io.Reader, ptmx io.Writer, cb clip.Clipboard, t sshctl.Transport, dbg *log.Logger) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := in.Read(buf)
 		if n > 0 {
-			writeWithPaste(ctx, buf[:n], ptmx, cb, t)
+			writeWithPaste(ctx, buf[:n], ptmx, cb, t, dbg)
 		}
 		if err != nil {
 			return
@@ -162,12 +179,13 @@ func proxyStdin(ctx context.Context, in io.Reader, ptmx io.Writer, cb clip.Clipb
 // writeWithPaste forwards chunk to ptmx, but each Ctrl+V byte is handled
 // specially: if the clipboard holds an image, the byte is dropped and the
 // uploaded remote path is injected; otherwise the byte is forwarded.
-func writeWithPaste(ctx context.Context, chunk []byte, ptmx io.Writer, cb clip.Clipboard, t sshctl.Transport) {
+func writeWithPaste(ctx context.Context, chunk []byte, ptmx io.Writer, cb clip.Clipboard, t sshctl.Transport, dbg *log.Logger) {
 	start := 0
 	for i := 0; i < len(chunk); i++ {
 		if chunk[i] != ctrlV {
 			continue
 		}
+		dbg.Printf("Ctrl+V detected in input chunk (offset %d of %d bytes)", i, len(chunk))
 		// Forward everything before the Ctrl+V.
 		if i > start {
 			_, _ = ptmx.Write(chunk[start:i])
@@ -175,11 +193,13 @@ func writeWithPaste(ctx context.Context, chunk []byte, ptmx io.Writer, cb clip.C
 		start = i + 1
 
 		if !cb.HasImage() {
+			dbg.Printf("no image on clipboard; passing Ctrl+V through")
 			// No image — pass the Ctrl+V through unchanged.
 			_, _ = ptmx.Write([]byte{ctrlV})
 			continue
 		}
-		handlePaste(ctx, ptmx, cb, t)
+		dbg.Printf("image detected; handling paste")
+		handlePaste(ctx, ptmx, cb, t, dbg)
 	}
 	if start < len(chunk) {
 		_, _ = ptmx.Write(chunk[start:])
@@ -195,19 +215,23 @@ func writeWithPaste(ctx context.Context, chunk []byte, ptmx io.Writer, cb clip.C
 // stdout (which would corrupt a raw-mode TUI's screen). A screenshot uploads
 // in well under a second over a normal connection; the 30s context is only a
 // ceiling for a pathological link. The bell on failure is the one safe signal.
-func handlePaste(ctx context.Context, ptmx io.Writer, cb clip.Clipboard, t sshctl.Transport) {
+func handlePaste(ctx context.Context, ptmx io.Writer, cb clip.Clipboard, t sshctl.Transport, dbg *log.Logger) {
 	png, err := cb.ImagePNG()
 	if err != nil {
+		dbg.Printf("ImagePNG failed: %v", err)
 		bell(ptmx)
 		return
 	}
+	dbg.Printf("extracted %d-byte PNG; uploading", len(png))
 	upCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	remotePath, err := clipupload.Upload(upCtx, t, png)
 	if err != nil {
+		dbg.Printf("upload failed: %v", err)
 		bell(ptmx)
 		return
 	}
+	dbg.Printf("uploaded -> %s; injecting path", remotePath)
 	// Inject the bare path at the cursor, as if typed.
 	_, _ = ptmx.Write([]byte(remotePath))
 }
