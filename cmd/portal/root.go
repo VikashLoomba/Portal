@@ -55,6 +55,7 @@ func newRootCmd(a *app.App) *cobra.Command {
 	root.AddCommand(newAllowCmd(a))
 	root.AddCommand(newUnallowCmd(a))
 	root.AddCommand(newAllowedCmd(a))
+	root.AddCommand(newSSHCmd(a))
 	root.AddCommand(newAgentVersionCmd(a))
 	return root
 }
@@ -84,6 +85,11 @@ Usage: %[1]s <command>
     start           Start (load) the forwarding service.
     stop            Stop forwarding now (unload service + drop all forwards).
     restart         Force-restart the running service.
+
+  Sessions
+    ssh <host> ...  SSH to a host with clipboard-image paste: press Ctrl+V to
+                    upload a copied screenshot and insert its remote path.
+                    Forwards all extra args to ssh (drop-in replacement).
 
   Inspect
     status          Show box, service state, ssh master, active forwards. (default)
