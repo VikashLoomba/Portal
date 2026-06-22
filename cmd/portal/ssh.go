@@ -23,8 +23,46 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
 
-// ctrlV is the byte produced by Ctrl+V (ASCII SYN, 0x16).
+// ctrlV is the legacy byte produced by Ctrl+V (ASCII SYN, 0x16).
 const ctrlV = 0x16
+
+// ctrlVTokens are every byte sequence a terminal may send for Ctrl+V.
+// Most coding-agent TUIs enable an enhanced keyboard protocol (Kitty's, or
+// xterm's modifyOtherKeys), which changes Ctrl+V from the single byte 0x16
+// into a CSI escape sequence. We must match all of them or the keystroke
+// passes straight through to the remote app (which is exactly the "nothing
+// happens inside the agent, works at a bare shell" symptom).
+//
+//	0x16                — legacy control byte (bare shells)
+//	ESC [ 118 ; 5 u     — Kitty keyboard protocol ('v'=118, mod 5 = ctrl)
+//	ESC [ 27 ; 5 ; 118 ~ — xterm modifyOtherKeys form
+var ctrlVTokens = [][]byte{
+	{ctrlV},
+	[]byte("\x1b[118;5u"),
+	[]byte("\x1b[27;5;118~"),
+}
+
+// matchCtrlV reports the length of a Ctrl+V token at chunk[i], or 0 if none.
+func matchCtrlV(chunk []byte, i int) int {
+	for _, tok := range ctrlVTokens {
+		if i+len(tok) <= len(chunk) && bytesEqual(chunk[i:i+len(tok)], tok) {
+			return len(tok)
+		}
+	}
+	return 0
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
 
 // dbg logs to the file named by PORTAL_SSH_DEBUG (if set). We cannot log to
 // stdout/stderr during a session — those are the PTY surfaces and would
@@ -166,40 +204,81 @@ func runSSHProxy(ctx context.Context, a *app.App, args []string) error {
 func proxyStdin(ctx context.Context, in io.Reader, ptmx io.Writer, cb clip.Clipboard, t sshctl.Transport, dbg *log.Logger) {
 	trace := os.Getenv("PORTAL_SSH_TRACE") != ""
 	buf := make([]byte, 4096)
+	var carry []byte // bytes held back because they may be a partial Ctrl+V token
 	for {
 		n, err := in.Read(buf)
 		if n > 0 {
+			data := append(carry, buf[:n]...)
 			if trace {
-				dbg.Printf("stdin %d byte(s): % x", n, buf[:n])
+				dbg.Printf("stdin %d byte(s) (+%d carried): % x", n, len(carry), data)
 			}
-			writeWithPaste(ctx, buf[:n], ptmx, cb, t, dbg)
+			// If the data ends with a prefix of a Ctrl+V escape token, hold
+			// that tail back for the next read so a token split across two
+			// reads is still matched intact.
+			keep := len(data) - trailingCtrlVPrefixLen(data)
+			carry = append(carry[:0:0], data[keep:]...)
+			writeWithPaste(ctx, data[:keep], ptmx, cb, t, dbg)
 		}
 		if err != nil {
+			// Flush any held-back bytes before exiting.
+			if len(carry) > 0 {
+				_, _ = ptmx.Write(carry)
+			}
 			return
 		}
 	}
 }
 
-// writeWithPaste forwards chunk to ptmx, but each Ctrl+V byte is handled
-// specially: if the clipboard holds an image, the byte is dropped and the
-// uploaded remote path is injected; otherwise the byte is forwarded.
-func writeWithPaste(ctx context.Context, chunk []byte, ptmx io.Writer, cb clip.Clipboard, t sshctl.Transport, dbg *log.Logger) {
-	start := 0
-	for i := 0; i < len(chunk); i++ {
-		if chunk[i] != ctrlV {
+// trailingCtrlVPrefixLen returns the length of the longest suffix of data
+// that is a strict prefix of some Ctrl+V token — i.e. bytes that might be
+// the start of a token whose remainder arrives in the next read. Returns 0
+// when the tail can be processed immediately.
+func trailingCtrlVPrefixLen(data []byte) int {
+	for _, tok := range ctrlVTokens {
+		// Only escape sequences (len>1) can be split; the single 0x16 byte
+		// is always complete on its own.
+		if len(tok) <= 1 {
 			continue
 		}
-		dbg.Printf("Ctrl+V detected in input chunk (offset %d of %d bytes)", i, len(chunk))
-		// Forward everything before the Ctrl+V.
+		max := len(tok) - 1
+		if max > len(data) {
+			max = len(data)
+		}
+		for l := max; l >= 1; l-- {
+			if bytesEqual(data[len(data)-l:], tok[:l]) {
+				return l
+			}
+		}
+	}
+	return 0
+}
+
+// writeWithPaste forwards chunk to ptmx, but each Ctrl+V token (in any of
+// its terminal encodings) is handled specially: if the clipboard holds an
+// image, the token is dropped and the uploaded remote path is injected;
+// otherwise the original token is forwarded unchanged.
+func writeWithPaste(ctx context.Context, chunk []byte, ptmx io.Writer, cb clip.Clipboard, t sshctl.Transport, dbg *log.Logger) {
+	start := 0
+	for i := 0; i < len(chunk); {
+		tokLen := matchCtrlV(chunk, i)
+		if tokLen == 0 {
+			i++
+			continue
+		}
+		token := chunk[i : i+tokLen]
+		dbg.Printf("Ctrl+V detected (% x) at offset %d of %d bytes", token, i, len(chunk))
+		// Forward everything before the token.
 		if i > start {
 			_, _ = ptmx.Write(chunk[start:i])
 		}
-		start = i + 1
+		i += tokLen
+		start = i
 
 		if !cb.HasImage() {
 			dbg.Printf("no image on clipboard; passing Ctrl+V through")
-			// No image — pass the Ctrl+V through unchanged.
-			_, _ = ptmx.Write([]byte{ctrlV})
+			// No image — pass the ORIGINAL token through unchanged so the
+			// remote app still sees a real Ctrl+V.
+			_, _ = ptmx.Write(token)
 			continue
 		}
 		dbg.Printf("image detected; handling paste")
