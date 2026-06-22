@@ -93,7 +93,16 @@ If the clipboard has no image, Ctrl+V passes through unchanged.
 
 Everything after the host is forwarded to ssh verbatim, so this works as a
 drop-in replacement for ssh (aliases from ~/.ssh/config, -L forwards, remote
-commands, etc.).`,
+commands, etc.).
+
+By default portal strips remote OSC 52 clipboard-WRITE sequences from the
+session output. Multiplexers like zellij emit these to overwrite your local
+clipboard, which would clobber a copied image before you paste it. Set
+PORTAL_SSH_ALLOW_OSC52=1 to let remote apps write your clipboard instead.
+
+Env vars: PORTAL_SSH_DEBUG=<file> logs interception events; PORTAL_SSH_TRACE=1
+additionally logs every stdin byte; PORTAL_SSH_ALLOW_OSC52=1 disables the
+OSC 52 clipboard-write filter described above.`,
 		DisableFlagParsing: true, // pass all flags straight to ssh
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
@@ -172,12 +181,18 @@ func runSSHProxy(ctx context.Context, a *app.App, args []string) error {
 	dbg := newDebugLogger()
 	dbg.Printf("session start: host=%s ctlSock=%s", host, ctlSock)
 
-	// PTY → stdout (remote output to the screen).
+	// PTY → stdout (remote output to the screen). We pass it through an
+	// OSC 52 filter: remote apps (notably zellij's clipboard integration)
+	// emit OSC 52 to WRITE the local Mac clipboard, which clobbers a copied
+	// image with text and breaks Ctrl+V image paste. The filter logs and
+	// (by default) strips those clipboard-write sequences so the image the
+	// user copied survives until they paste it.
+	stripOSC52 := os.Getenv("PORTAL_SSH_ALLOW_OSC52") == "" // default: strip
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(os.Stdout, ptmx)
+		copyFilteringOSC52(os.Stdout, ptmx, stripOSC52, dbg)
 	}()
 
 	// stdin → PTY, intercepting Ctrl+V. Runs in its own goroutine; when ssh
@@ -320,3 +335,109 @@ func handlePaste(ctx context.Context, ptmx io.Writer, cb clip.Clipboard, t sshct
 }
 
 func bell(w io.Writer) { _, _ = w.Write([]byte{0x07}) }
+
+// osc52Prefix is the start of an OSC 52 clipboard sequence: ESC ] 52 ;
+var osc52Prefix = []byte("\x1b]52;")
+
+// copyFilteringOSC52 copies src→dst, optionally removing OSC 52
+// clipboard-write sequences (which remote apps like zellij use to overwrite
+// the LOCAL clipboard — clobbering a copied image and breaking Ctrl+V image
+// paste). When strip is false it only logs them. A sequence straddling two
+// reads is held in carry until complete.
+func copyFilteringOSC52(dst io.Writer, src io.Reader, strip bool, dbg *log.Logger) {
+	buf := make([]byte, 32*1024)
+	var carry []byte
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			data := append(carry, buf[:n]...)
+			out, held := filterOSC52(data, strip, dbg)
+			_, _ = dst.Write(out)
+			carry = append(carry[:0:0], held...)
+		}
+		if err != nil {
+			if len(carry) > 0 {
+				_, _ = dst.Write(carry)
+			}
+			return
+		}
+	}
+}
+
+// filterOSC52 returns the bytes to forward and any trailing bytes to hold
+// back (an OSC 52 sequence that hasn't terminated yet, or a prefix of the
+// ESC]52; marker). When strip is true, complete OSC 52 sequences are dropped
+// from the forwarded output; either way they are logged.
+func filterOSC52(data []byte, strip bool, dbg *log.Logger) (out, carry []byte) {
+	out = make([]byte, 0, len(data))
+	i := 0
+	for i < len(data) {
+		rest := data[i:]
+		idx := indexOf(rest, osc52Prefix)
+		if idx < 0 {
+			// No complete marker ahead. The tail might be a prefix of the
+			// marker spanning into the next read — hold that much back.
+			hold := trailingPrefixLen(rest, osc52Prefix)
+			out = append(out, rest[:len(rest)-hold]...)
+			return out, rest[len(rest)-hold:]
+		}
+		// Forward everything before the marker verbatim.
+		out = append(out, rest[:idx]...)
+		seqStart := i + idx
+		end, complete := osc52End(data[seqStart:])
+		if !complete {
+			// Sequence not finished in this chunk — hold it for next read.
+			return out, data[seqStart:]
+		}
+		seq := data[seqStart : seqStart+end]
+		dbg.Printf("OSC52 clipboard-write seen (%d bytes); strip=%v", len(seq), strip)
+		if !strip {
+			out = append(out, seq...)
+		}
+		i = seqStart + end
+	}
+	return out, nil
+}
+
+// osc52End returns the length of the OSC 52 sequence starting at data[0]
+// (including its terminator) and whether it is complete within data. The
+// sequence terminates with BEL (0x07) or ST (ESC \ = 0x1b 0x5c).
+func osc52End(data []byte) (int, bool) {
+	for j := len(osc52Prefix); j < len(data); j++ {
+		if data[j] == 0x07 {
+			return j + 1, true
+		}
+		if data[j] == 0x1b && j+1 < len(data) && data[j+1] == 0x5c {
+			return j + 2, true
+		}
+		if data[j] == 0x1b && j+1 >= len(data) {
+			return 0, false // ESC at the very end — need the next byte
+		}
+	}
+	return 0, false
+}
+
+// indexOf returns the index of sub in b, or -1.
+func indexOf(b, sub []byte) int {
+	for i := 0; i+len(sub) <= len(b); i++ {
+		if bytesEqual(b[i:i+len(sub)], sub) {
+			return i
+		}
+	}
+	return -1
+}
+
+// trailingPrefixLen returns the length of the longest suffix of b that is a
+// strict prefix of sub (so a marker split across reads is held back).
+func trailingPrefixLen(b, sub []byte) int {
+	max := len(sub) - 1
+	if max > len(b) {
+		max = len(b)
+	}
+	for l := max; l >= 1; l-- {
+		if bytesEqual(b[len(b)-l:], sub[:l]) {
+			return l
+		}
+	}
+	return 0
+}
