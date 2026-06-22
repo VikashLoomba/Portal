@@ -11,22 +11,27 @@ func L(port uint16, fam uint8, addr string) watcher.Listen {
 	return watcher.Listen{Port: port, Family: fam, Addr: addr}
 }
 
-func TestFilter_Loopback(t *testing.T) {
+func TestFilter_ForwardableAddrs(t *testing.T) {
 	f := NewFilter(32768, 60999)
 	f.SetAllowDeny(nil, nil, true)
 
 	in := []watcher.Listen{
-		L(8081, 4, "127.0.0.1"),
-		L(8082, 4, "0.0.0.0"),     // not loopback → drop
-		L(8083, 4, "192.168.1.5"), // not loopback → drop
-		L(8084, 6, "::1"),
-		L(8085, 6, "::"),         // not loopback → drop
-		L(8086, 6, "fe80::1"),    // not loopback → drop
+		L(8081, 4, "127.0.0.1"),   // loopback → keep
+		L(8082, 4, "0.0.0.0"),     // wildcard → keep
+		L(8083, 4, "192.168.1.5"), // specific iface → drop
+		L(8084, 6, "::1"),         // loopback → keep
+		L(8085, 6, "::"),          // wildcard → keep
+		L(8086, 6, "fe80::1"),     // specific iface → drop
 	}
 	got := f.Apply(in)
-	want := []watcher.Listen{L(8081, 4, "127.0.0.1"), L(8084, 6, "::1")}
+	want := []watcher.Listen{
+		L(8081, 4, "127.0.0.1"),
+		L(8082, 4, "0.0.0.0"),
+		L(8084, 6, "::1"),
+		L(8085, 6, "::"),
+	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("loopback: got %v, want %v", got, want)
+		t.Errorf("forwardable: got %v, want %v", got, want)
 	}
 }
 

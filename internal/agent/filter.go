@@ -14,7 +14,7 @@ import (
 // watcher-event goroutine.
 //
 // Decision order (allow always wins; matches the bash original):
-//  1. loopback predicate (caller-supplied — netlink filter does this)
+//  1. forwardable-address predicate (loopback or wildcard bind — see isForwardable)
 //  2. allow → KEEP
 //  3. deny  → DROP
 //  4. ExcludeEphemeral && port in [EphemMin,EphemMax] → DROP
@@ -59,7 +59,7 @@ func (f *Filter) SetAllowDeny(deny, allow []uint16, excludeEphemeral bool) {
 // Accept reports whether a single Listen passes the filter. Used in the
 // streaming-event hot path (no slice allocation).
 func (f *Filter) Accept(l watcher.Listen) bool {
-	if !isLoopback(l) {
+	if !isForwardable(l) {
 		return false
 	}
 	f.mu.RLock()
@@ -89,19 +89,25 @@ func (f *Filter) Apply(in []watcher.Listen) []watcher.Listen {
 	return out
 }
 
-// isLoopback returns true iff the listener is bound to 127.0.0.0/8 or ::1
-// (or the v4-mapped form ::ffff:127.0.0.0/8, which Go's net.IP.String()
-// normalizes to dotted-decimal even when Family==AF_INET6 — common for
-// JVM/Node servers that bind a v4 loopback on a v6 socket).
+// isForwardable returns true iff the listener's bind address is one we
+// forward. Two classes qualify:
 //
-// 0.0.0.0 / :: ARE loopback-reachable but match every interface; we choose
-// to forward only EXPLICIT loopback binds — the bash original made the same
-// choice (the `ss -Htln` filter row was checked against 127. or ::1).
-func isLoopback(l watcher.Listen) bool {
+//   - Explicit loopback: 127.0.0.0/8 or ::1 (or the v4-mapped form
+//     ::ffff:127.0.0.0/8, which Go's net.IP.String() normalizes to
+//     dotted-decimal even when Family==AF_INET6 — common for JVM/Node servers
+//     that bind a v4 loopback on a v6 socket).
+//   - Wildcard / all-interfaces: 0.0.0.0 or :: (the v4-mapped wildcard
+//     ::ffff:0.0.0.0 also normalizes to "0.0.0.0"). These are reachable on the
+//     remote via localhost, so the `ssh -L <p>:localhost:<p>` forward works.
+//
+// A bind to a SPECIFIC non-loopback interface (e.g. 192.168.1.5, fe80::1) is
+// still skipped: forwarding those is ambiguous and usually unintended.
+func isForwardable(l watcher.Listen) bool {
 	if len(l.Addr) >= 4 && l.Addr[:4] == "127." {
 		return true
 	}
-	if l.Addr == "::1" {
+	switch l.Addr {
+	case "::1", "0.0.0.0", "::":
 		return true
 	}
 	return false
