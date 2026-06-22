@@ -51,19 +51,38 @@ commands, etc.).`,
 }
 
 func runSSHProxy(ctx context.Context, a *app.App, args []string) error {
-	// Per-session ControlMaster socket. The interactive session becomes the
-	// master (ControlMaster=auto); the clipboard upload multiplexes over it
-	// via `ssh -S <sock>`. ControlPersist=no tears it down when we exit.
 	host := args[0]
 	rest := args[1:]
-	sessionSock := filepath.Join(os.TempDir(),
-		fmt.Sprintf("portal-ssh-%d.sock", os.Getpid()))
-	defer os.Remove(sessionSock)
+
+	// Choose the ControlMaster socket. When the session targets the
+	// configured dev box, reuse the daemon's master socket so the session
+	// and the clipboard upload share ONE connection to the box (and attach
+	// to the already-warm master if the daemon has one up). For any other
+	// host there is no daemon master to share, so use a session-local
+	// socket that is torn down on exit.
+	//
+	// ControlPath is keyed purely by file path, not by destination — so it
+	// is essential to only point at the daemon socket when the host
+	// actually matches, otherwise ssh would silently multiplex the session
+	// onto the wrong box.
+	configuredHost, _ := a.Cfg.ReadHost()
+	var ctlSock string
+	var persist string
+	if configuredHost != "" && host == configuredHost {
+		ctlSock = a.Paths.Sock
+		// Leave the master up for the daemon to keep using after we exit.
+		persist = "yes"
+	} else {
+		ctlSock = filepath.Join(os.TempDir(),
+			fmt.Sprintf("portal-ssh-%d.sock", os.Getpid()))
+		persist = "no"
+		defer os.Remove(ctlSock)
+	}
 
 	sshArgs := []string{
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=" + sessionSock,
-		"-o", "ControlPersist=no",
+		"-o", "ControlPath=" + ctlSock,
+		"-o", "ControlPersist=" + persist,
 	}
 	sshArgs = append(sshArgs, args...)
 
@@ -94,8 +113,8 @@ func runSSHProxy(ctx context.Context, a *app.App, args []string) error {
 		defer term.Restore(int(os.Stdin.Fd()), oldState)
 	}
 
-	// Upload transport multiplexes over the session master once it's up.
-	uploadT := sshctl.New(sessionSock, host, app.SSHOpts, a.Runner)
+	// Upload transport multiplexes over the same master the session uses.
+	uploadT := sshctl.New(ctlSock, host, app.SSHOpts, a.Runner)
 	cb := clip.New()
 
 	// PTY → stdout (remote output to the screen).
