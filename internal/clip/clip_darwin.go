@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -18,37 +18,76 @@ type Darwin struct{}
 
 func New() Clipboard { return Darwin{} }
 
-// hasImageScript checks for any of the common image flavors on the
-// pasteboard. `clipboard info` lists every available type; we look for the
-// PNG, TIFF, or generic picture class. Most apps (Preview, browsers,
-// Screenshot.app) put «class PNGf» and/or TIFF on the board for an image.
-const hasImageScript = `clipboard info`
-
-// HasImage reports whether the clipboard holds image data. It inspects the
-// type list from `clipboard info` for an image flavor — much cheaper than
-// actually pulling the (potentially large) image bytes on every Ctrl+V.
-func (Darwin) HasImage() bool {
+// Info returns the raw `clipboard info` flavor list — used by the
+// `portal clip-check` diagnostic so we can see exactly what macOS reports.
+func Info() (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "osascript", "-e", hasImageScript).Output()
+	out, err := exec.CommandContext(ctx, "osascript", "-e", "clipboard info").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// imageFlavors are the `clipboard info` substrings that indicate the
+// clipboard holds raster image data we can coerce to PNG. macOS renders
+// flavors in several forms depending on the source app, so we match
+// generously.
+var imageFlavors = []string{
+	"PNGf",        // «class PNGf» — screenshots, most apps
+	"TIFF",        // «class TIFF»/TIFF picture — Preview, generic
+	"PICT",        // legacy «class PICT»
+	"public.png",  // UTI form
+	"public.tiff",
+	"public.jpeg",
+	"JPEG",        // JPEG picture
+	"GIF",         // GIF picture
+	"public.heic",
+	"«class BMP",  // bitmaps
+}
+
+// HasImage reports whether the clipboard holds image data. It inspects the
+// type list from `clipboard info` for a known image flavor — much cheaper
+// than pulling the (potentially large) image bytes on every Ctrl+V.
+func (Darwin) HasImage() bool {
+	info, err := Info()
 	if err != nil {
 		return false
 	}
-	info := string(out)
-	// `clipboard info` renders flavors like: «class PNGf», 1234, «class TIFF», ...
-	for _, flavor := range []string{"PNGf", "TIFF", "«class PICT»", "public.png", "public.tiff"} {
-		if bytes.Contains([]byte(info), []byte(flavor)) {
+	for _, flavor := range imageFlavors {
+		if strings.Contains(info, flavor) {
 			return true
 		}
 	}
 	return false
 }
 
+// Describe reports the raw clipboard flavor list and whether HasImage
+// matched, for the `portal clip-check` diagnostic.
+func (d Darwin) Describe() string {
+	info, err := Info()
+	if err != nil {
+		return fmt.Sprintf("clipboard info failed: %v", err)
+	}
+	matched := ""
+	for _, flavor := range imageFlavors {
+		if strings.Contains(info, flavor) {
+			matched = flavor
+			break
+		}
+	}
+	verdict := "no image flavor detected"
+	if matched != "" {
+		verdict = "image detected (matched flavor: " + matched + ")"
+	}
+	return verdict + "\nraw flavors: " + info
+}
+
 // ImagePNG pulls the clipboard image as PNG bytes. It writes to a temp file
 // via osascript (AppleScript can't return raw binary on stdout cleanly),
-// reads it back, and removes it. If the clipboard has no PNG flavor but has
-// TIFF, it asks for PNG anyway — the AppleScript coercion «class PNGf»
-// converts most image flavors to PNG.
+// reads it back, and removes it. The «class PNGf» coercion converts most
+// image flavors (TIFF, JPEG, etc.) to PNG.
 func (Darwin) ImagePNG() ([]byte, error) {
 	tmp, err := os.CreateTemp("", "portal-clip-*.png")
 	if err != nil {
@@ -58,8 +97,6 @@ func (Darwin) ImagePNG() ([]byte, error) {
 	tmp.Close()
 	defer os.Remove(tmpPath)
 
-	// AppleScript: open the temp file, truncate, write the clipboard coerced
-	// to PNG, close. On failure (no image) it returns an error string.
 	script := fmt.Sprintf(`set f to (open for access (POSIX file %s) with write permission)
 try
 	set eof f to 0
@@ -80,7 +117,7 @@ end try`, strconv.Quote(tmpPath))
 		return nil, fmt.Errorf("osascript: %w", err)
 	}
 	if !bytes.HasPrefix(bytes.TrimSpace(out), []byte("OK")) {
-		return nil, fmt.Errorf("no image in clipboard: %s", bytes.TrimSpace(out))
+		return nil, fmt.Errorf("clipboard coercion failed: %s", bytes.TrimSpace(out))
 	}
 
 	data, err := os.ReadFile(tmpPath)
@@ -92,6 +129,3 @@ end try`, strconv.Quote(tmpPath))
 	}
 	return data, nil
 }
-
-// ensure filepath import is used (kept for future flavor-specific temp dirs).
-var _ = filepath.Join
