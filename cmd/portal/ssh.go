@@ -164,10 +164,14 @@ func runSSHProxy(ctx context.Context, a *app.App, args []string) error {
 // through. This goroutine is intentionally not awaited — os.Stdin.Read
 // can't be unblocked, so we let it die with the process.
 func proxyStdin(ctx context.Context, in io.Reader, ptmx io.Writer, cb clip.Clipboard, t sshctl.Transport, dbg *log.Logger) {
+	trace := os.Getenv("PORTAL_SSH_TRACE") != ""
 	buf := make([]byte, 4096)
 	for {
 		n, err := in.Read(buf)
 		if n > 0 {
+			if trace {
+				dbg.Printf("stdin %d byte(s): % x", n, buf[:n])
+			}
 			writeWithPaste(ctx, buf[:n], ptmx, cb, t, dbg)
 		}
 		if err != nil {
