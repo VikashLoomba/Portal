@@ -145,10 +145,10 @@ func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
 	return remotePath, nil
 }
 
-// PruneAll removes every agent-* file from the remote cache dir. Called
-// from `portal uninstall`.
+// PruneAll removes every agent-* file and the clipboard-image cache dir from
+// the remote cache dir. Called from `portal uninstall`.
 func (m *Manager) PruneAll(ctx context.Context) error {
-	cmd := fmt.Sprintf(`rm -rf %s/agent-* 2>/dev/null || true`, remoteDir)
+	cmd := fmt.Sprintf(`rm -rf %s/agent-* %s/clip 2>/dev/null || true`, remoteDir, remoteDir)
 	_, err := m.T.Exec(ctx, "", "bash", "-c", shellQuoted(cmd))
 	return err
 }
