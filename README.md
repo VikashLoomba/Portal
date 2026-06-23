@@ -40,13 +40,6 @@ background daemon connects headlessly, so **key-based passwordless SSH is
 required** (`ssh-copy-id <ssh-host>` if you haven't set it up). Run `./portal
 install` with no host to be prompted interactively.
 
-> **Downloading via a browser instead of `curl`?** macOS tags
-> browser-downloaded files with a quarantine attribute that Gatekeeper blocks
-> on first run. Either clear it with
-> `xattr -d com.apple.quarantine portal`, or right-click the binary in Finder
-> and choose **Open** once. Files fetched with `curl` (as above) are not
-> quarantined, so this isn't needed.
-
 ### Build from source
 
 Requires Go 1.25+. The build also cross-compiles the Linux dev-box agent
