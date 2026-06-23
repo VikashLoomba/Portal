@@ -123,6 +123,15 @@ func main() {
 	}
 	root := newRootCmd(a)
 	if err := root.Execute(); err != nil {
+		// exitCodeErr → propagate ssh's exit code. runSSHProxy returns this
+		// (instead of calling os.Exit itself) so its deferreds — term.Restore,
+		// session-socket removal, goroutine teardown — all run before we exit;
+		// os.Exit would skip them and strand the terminal in raw mode (F3).
+		// Print NOTHING: ssh already produced whatever output it did.
+		var ece exitCodeErr
+		if errors.As(err, &ece) {
+			os.Exit(ece.code)
+		}
 		// Detect Cobra's auto-generated "unknown command" error and treat
 		// it as a usage error (exit 2), matching bash's `*) ... exit 2`.
 		if strings.HasPrefix(err.Error(), "unknown command") {
