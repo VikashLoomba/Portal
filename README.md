@@ -8,37 +8,29 @@ upload a copied screenshot and insert its remote path).
 
 ### Recommended: download the latest release
 
-Pre-built Mac binaries are published on the
-[**Releases page**](https://gitlab.i.extrahop.com/vikashl/devportal/-/releases).
-Set `ARCH` to match your Mac (`arm64` for Apple Silicon — M1/M2/M3/M4; `amd64`
-for Intel — run `uname -m` if unsure), then download, mark executable, and run
-the installer:
+portal ships a pre-built **Apple Silicon** (arm64) Mac binary with every
+release. Download the latest one with the
+[`glab`](https://gitlab.com/gitlab-org/cli) CLI (it uses your existing GitLab
+login), make it executable, and run the installer:
 
 ```sh
-ARCH=arm64   # or amd64 on an Intel Mac
-
-# Download the latest released binary.
-VERSION=$(git ls-remote --tags --sort=-v:refname \
-  https://gitlab.i.extrahop.com/vikashl/devportal.git \
-  | sed -n 's#.*refs/tags/\(v[0-9.]*\)$#\1#p' | head -1)
-curl -fL -o portal \
-  "https://gitlab.i.extrahop.com/vikashl/devportal/-/jobs/artifacts/${VERSION}/raw/portal-darwin-${ARCH}?job=release-build"
-
-# A freshly downloaded file isn't executable; make it so, then install.
-chmod +x portal
-./portal install <ssh-host>
+glab release download \
+  -R https://gitlab.i.extrahop.com/vikashl/devportal \
+  --asset-name=portal-darwin-arm64
+chmod +x portal-darwin-arm64
+./portal-darwin-arm64 install <ssh-host>
 ```
 
 `portal install` copies the binary to `~/.local/bin/portal`, saves your dev-box
 config, and loads the background login agent — so after it runs you can invoke
 `portal` from anywhere (it prints a one-line `export PATH=...` to add if
-`~/.local/bin` isn't already on your PATH). The downloaded `./portal` in the
-current directory is just the bootstrap copy; you can delete it.
+`~/.local/bin` isn't already on your PATH). The downloaded file in the current
+directory is just the bootstrap copy; you can delete it.
 
 `<ssh-host>` may be an alias from `~/.ssh/config` or `user@hostname`. The
 background daemon connects headlessly, so **key-based passwordless SSH is
-required** (`ssh-copy-id <ssh-host>` if you haven't set it up). Run `./portal
-install` with no host to be prompted interactively.
+required** (`ssh-copy-id <ssh-host>` if you haven't set it up). Run `install`
+with no host to be prompted interactively.
 
 ### Build from source
 
@@ -52,8 +44,8 @@ make build              # produces ./portal for your host architecture
 ./portal install <ssh-host>
 ```
 
-`make portal-all` builds both Mac architectures (`portal-darwin-amd64` and
-`portal-darwin-arm64`) — this is what CI publishes as release artifacts.
+`make portal-all` cross-compiles the Apple Silicon binary (`portal-darwin-arm64`)
+— this is what CI publishes as the release artifact.
 
 ## Usage
 
@@ -100,5 +92,5 @@ test the full upload path to your configured dev box).
 
 ## Requirements
 
-- A **Mac** (Apple Silicon or Intel) for the client.
+- An **Apple Silicon Mac** (arm64) for the client.
 - A **Linux dev box** reachable over passwordless (key-based) SSH.
