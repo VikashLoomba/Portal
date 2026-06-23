@@ -2,8 +2,11 @@
 #
 # Jobs:
 #   test    — runs on every push/MR: build agent + run go test ./...
-#   release — runs only on version tags (v*): build both Mac architectures
-#             and publish them as a GitLab release with downloadable artifacts
+#   release — runs only on version tags (v*): build the Apple Silicon binary,
+#             publish it to the generic package registry, and create a GitLab
+#             release whose asset link points at the package (so a plain
+#             `glab release download` fetches the real binary — the job-artifacts
+#             web route sits behind SSO and returns a login page instead).
 
 default:
   image: golang:1.25
@@ -40,7 +43,6 @@ release-build:
   artifacts:
     name: "portal-${CI_COMMIT_TAG}"
     paths:
-      - portal-darwin-amd64
       - portal-darwin-arm64
     expire_in: 90 days
   rules:
@@ -60,15 +62,25 @@ release-publish:
       artifacts: true
   script:
     - |
-      ARTIFACT_BASE="${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_TAG}/raw"
-      DESCRIPTION="Download the binary for your Mac, mark it executable, and run portal install.
+      # 1. Upload the binary to the generic package registry. This route is
+      #    reachable with the job token / a user's glab login — unlike the
+      #    job-artifacts web route, which sits behind SSO and hands back an HTML
+      #    login page to non-browser clients. `glab release download` follows
+      #    the asset link, so it MUST point here to get the real binary.
+      PKG_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/portal/${CI_COMMIT_TAG}/portal-darwin-arm64"
+      curl --insecure --fail-with-body -sS \
+        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        --upload-file portal-darwin-arm64 \
+        "${PKG_URL}"
+      echo "Uploaded portal-darwin-arm64 to the package registry."
 
-      Apple Silicon (M1/M2/M3/M4): ${ARTIFACT_BASE}/portal-darwin-arm64?job=release-build
-      Intel Mac:                    ${ARTIFACT_BASE}/portal-darwin-amd64?job=release-build
+      # 2. Create the release with a single asset link -> the package above.
+      DESCRIPTION="Apple Silicon (arm64) Mac build. Download the latest with glab:
 
-      chmod +x portal && ./portal install"
+      glab release download -R ${CI_PROJECT_URL} --asset-name=portal-darwin-arm64
+      chmod +x portal-darwin-arm64
+      ./portal-darwin-arm64 install <ssh-host>"
 
-      # Create the release via the GitLab API.
       curl --insecure --fail-with-body -sS \
         --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
         --header "Content-Type: application/json" \
@@ -78,16 +90,14 @@ release-publish:
           "description": %s,
           "assets": {
             "links": [
-              {"name": "portal-darwin-arm64 (Apple Silicon)", "url": "%s/portal-darwin-arm64?job=release-build", "link_type": "package"},
-              {"name": "portal-darwin-amd64 (Intel Mac)",     "url": "%s/portal-darwin-amd64?job=release-build", "link_type": "package"}
+              {"name": "portal-darwin-arm64", "url": "%s", "link_type": "package"}
             ]
           }
         }' \
           "${CI_COMMIT_TAG}" \
           "${CI_COMMIT_TAG}" \
           "$(echo "$DESCRIPTION" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
-          "${ARTIFACT_BASE}" \
-          "${ARTIFACT_BASE}")" \
+          "${PKG_URL}")" \
         "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
       echo "Release ${CI_COMMIT_TAG} published."
   rules:

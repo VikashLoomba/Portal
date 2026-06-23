@@ -31,10 +31,11 @@ func embeddedSHA256() string {
 }
 
 // shellQuoted wraps a shell script in single quotes, escaping any embedded
-// single quotes via the standard `'\''` trick. Required because ssh joins
-// every argv argument after the host with spaces and runs the result on
-// the remote via `sh -c <joined>`. Without quoting, a multi-token script
-// gets re-tokenized and only the first word survives.
+// single quote with the standard close-escape-reopen sh idiom (the
+// ReplaceAll below). Required because ssh joins every argv argument after
+// the host with spaces and runs the result on the remote via sh -c. Without
+// quoting, a multi-token script gets re-tokenized and only the first word
+// survives.
 func shellQuoted(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
@@ -49,9 +50,9 @@ func (m *Manager) EmbeddedSHA() string { return EmbeddedSHA() }
 const remoteDir = "~/.cache/portal"
 
 // Manager handles the embedded-agent → remote-cache lifecycle:
-//   1. Probe for the right SHA already at ~/.cache/portal/agent-<sha>.
-//   2. If missing or wrong size, atomically upload via `cat > .tmp.$$ ; mv`.
-//   3. Best-effort prune older agent-* files.
+//  1. Probe for the right SHA already at ~/.cache/portal/agent-<sha>.
+//  2. If missing or wrong size, atomically upload via `cat > .tmp.$$ ; mv`.
+//  3. Best-effort prune older agent-* files.
 type Manager struct {
 	T   sshctl.Transport
 	Log *slog.Logger

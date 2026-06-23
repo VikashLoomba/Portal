@@ -1,3 +1,7 @@
 /portal
+/portal-darwin-arm64
+# CI sets GOPATH=$CI_PROJECT_DIR/.go-cache (inside the repo). Ignoring it keeps
+# the build tree clean so Go's buildvcs stamp isn't marked dirty (+dirty).
+/.go-cache/
 internal/bootstrap/agent/portald-linux-amd64
 internal/bootstrap/agent/sha.txt

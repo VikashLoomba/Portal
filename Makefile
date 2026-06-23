@@ -9,17 +9,23 @@
 # Mismatch is impossible because Make sets GIT_SHA once per invocation.
 
 GIT_SHA       := $(shell git rev-parse HEAD 2>/dev/null || echo dev-$(shell date +%s))
+# VERSION is the human-facing release string shown by `portal version` and
+# `portal --version`: the nearest git tag (e.g. v0.1.1), with -dirty/commit
+# suffixes for untagged or modified trees. Falls back to "dev" with no git.
+VERSION       := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 AGENT_DIR     := internal/bootstrap/agent
 AGENT_PATH    := $(AGENT_DIR)/portald-linux-amd64
 SHA_PATH      := $(AGENT_DIR)/sha.txt
 
+MODULE         := gitlab.i.extrahop.com/vikashl/devportal
 LDFLAGS_AGENT  := -s -w -X main.gitSHA=$(GIT_SHA)
-LDFLAGS_PORTAL := -X github.com/vikashl/portal/internal/bootstrap.gitSHA=$(GIT_SHA)
+# Stamp the portal CLI: main.version (release string) + bootstrap.gitSHA (the
+# linker-injected build SHA the drift check in bootstrap/embed.go validates).
+LDFLAGS_PORTAL := -X main.version=$(VERSION) -X $(MODULE)/internal/bootstrap.gitSHA=$(GIT_SHA)
 
-# Cross-compilation targets for the Mac client binary.
+# Cross-compilation target for the Mac client binary.
 # The agent is always linux-amd64 (it runs on the dev box).
-# The Mac client ships as darwin-amd64 and darwin-arm64 (Apple Silicon).
-PORTAL_DARWIN_AMD64  := portal-darwin-amd64
+# The Mac client ships as darwin-arm64 (Apple Silicon only).
 PORTAL_DARWIN_ARM64  := portal-darwin-arm64
 
 .PHONY: build agent portal portal-all test clean print-sha
@@ -38,15 +44,13 @@ portal: agent
 	go build -trimpath -ldflags "$(LDFLAGS_PORTAL)" -o portal ./cmd/portal
 	@echo "built portal (sha=$(GIT_SHA))"
 
-# portal-all builds both Mac architectures — used by CI to produce release artifacts.
+# portal-all builds the Apple Silicon Mac binary — used by CI to produce the
+# release artifact.
 portal-all: agent
-	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 \
-		go build -trimpath -ldflags "$(LDFLAGS_PORTAL)" \
-		-o $(PORTAL_DARWIN_AMD64) ./cmd/portal
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 \
 		go build -trimpath -ldflags "$(LDFLAGS_PORTAL)" \
 		-o $(PORTAL_DARWIN_ARM64) ./cmd/portal
-	@echo "built $(PORTAL_DARWIN_AMD64) and $(PORTAL_DARWIN_ARM64) (sha=$(GIT_SHA))"
+	@echo "built $(PORTAL_DARWIN_ARM64) (sha=$(GIT_SHA))"
 
 test: agent
 	go test ./...
