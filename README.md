@@ -10,54 +10,42 @@ upload a copied screenshot and insert its remote path).
 
 Pre-built Mac binaries are published on the
 [**Releases page**](https://gitlab.i.extrahop.com/vikashl/devportal/-/releases).
-Download the binary that matches your Mac, then install it.
-
-Pick the right build for your Mac (run `uname -m` if unsure):
-
-| Mac | `uname -m` | Asset |
-|-----|------------|-------|
-| Apple Silicon (M1/M2/M3/M4) | `arm64` | `portal-darwin-arm64` |
-| Intel | `x86_64` | `portal-darwin-amd64` |
-
-Then, from your Downloads folder:
+Set `ARCH` to match your Mac (`arm64` for Apple Silicon — M1/M2/M3/M4; `amd64`
+for Intel — run `uname -m` if unsure), then download, mark executable, and run
+the installer:
 
 ```sh
-# Rename to `portal`, make it executable, and put it on your PATH.
-mv portal-darwin-arm64 portal        # or portal-darwin-amd64 on an Intel Mac
-chmod +x portal
+ARCH=arm64   # or amd64 on an Intel Mac
 
-# macOS quarantines binaries downloaded from a browser; clear it so Gatekeeper
-# doesn't block the first run (otherwise: right-click → Open, once).
-xattr -d com.apple.quarantine portal 2>/dev/null || true
-
-# Move onto your PATH (or keep it wherever you like and call it by path).
-sudo mv portal /usr/local/bin/portal
-
-# Configure your dev box and install the background login agent.
-portal install <ssh-host>
-```
-
-Prefer the command line? Grab the latest tag's asset directly (set `ARCH` to
-`arm64` or `amd64`):
-
-```sh
-ARCH=arm64
+# Download the latest released binary.
 VERSION=$(git ls-remote --tags --sort=-v:refname \
   https://gitlab.i.extrahop.com/vikashl/devportal.git \
   | sed -n 's#.*refs/tags/\(v[0-9.]*\)$#\1#p' | head -1)
-
 curl -fL -o portal \
   "https://gitlab.i.extrahop.com/vikashl/devportal/-/jobs/artifacts/${VERSION}/raw/portal-darwin-${ARCH}?job=release-build"
+
+# A freshly downloaded file isn't executable; make it so, then install.
 chmod +x portal
-xattr -d com.apple.quarantine portal 2>/dev/null || true
-sudo mv portal /usr/local/bin/portal
-portal install <ssh-host>
+./portal install <ssh-host>
 ```
+
+`portal install` copies the binary to `~/.local/bin/portal`, saves your dev-box
+config, and loads the background login agent — so after it runs you can invoke
+`portal` from anywhere (it prints a one-line `export PATH=...` to add if
+`~/.local/bin` isn't already on your PATH). The downloaded `./portal` in the
+current directory is just the bootstrap copy; you can delete it.
 
 `<ssh-host>` may be an alias from `~/.ssh/config` or `user@hostname`. The
 background daemon connects headlessly, so **key-based passwordless SSH is
-required** (`ssh-copy-id <ssh-host>` if you haven't set it up). Run `portal
+required** (`ssh-copy-id <ssh-host>` if you haven't set it up). Run `./portal
 install` with no host to be prompted interactively.
+
+> **Downloading via a browser instead of `curl`?** macOS tags
+> browser-downloaded files with a quarantine attribute that Gatekeeper blocks
+> on first run. Either clear it with
+> `xattr -d com.apple.quarantine portal`, or right-click the binary in Finder
+> and choose **Open** once. Files fetched with `curl` (as above) are not
+> quarantined, so this isn't needed.
 
 ### Build from source
 
