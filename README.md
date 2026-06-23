@@ -71,6 +71,7 @@ portal <command>
     status          Show box, service state, ssh master, active forwards. (default)
     ports           List the loopback dev ports currently listening on the box.
     logs [-f|N]     Show recent log lines; -f to follow, N for last N lines.
+    version         Print the portal version and build commit (also -v/--version).
 
   Allowlist
     allow / unallow / allowed   Manage force-forwarded ports.

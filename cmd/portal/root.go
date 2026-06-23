@@ -37,7 +37,11 @@ func newRootCmd(a *app.App) *cobra.Command {
 		// Default behavior with no args = status (matches bash).
 		RunE: func(cmd *cobra.Command, args []string) error { return runStatus(cmd.Context(), a) },
 	}
+	// --version / -v are auto-provided by Cobra when Version is set; the
+	// template makes them print the same line as the `version` subcommand
+	// (version + build commit) instead of Cobra's default "tool version X".
 	root.Version = version
+	root.SetVersionTemplate(versionLine() + "\n")
 	root.SetHelpTemplate(helpText(a))
 
 	root.AddCommand(newRunCmd(a))
@@ -57,6 +61,7 @@ func newRootCmd(a *app.App) *cobra.Command {
 	root.AddCommand(newAllowedCmd(a))
 	root.AddCommand(newSSHCmd(a))
 	root.AddCommand(newClipCheckCmd(a))
+	root.AddCommand(newVersionCmd(a))
 	root.AddCommand(newAgentVersionCmd(a))
 	return root
 }
