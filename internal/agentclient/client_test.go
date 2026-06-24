@@ -23,13 +23,13 @@ type fakeStreamTransport struct {
 	w *watcher.Fake
 }
 
-func (f *fakeStreamTransport) Host() string                                  { return "fakehost" }
-func (f *fakeStreamTransport) Sock() string                                  { return "/tmp/fake-sock" }
-func (f *fakeStreamTransport) MasterPID(context.Context) (int, error)        { return 1, nil }
+func (f *fakeStreamTransport) Host() string                                    { return "fakehost" }
+func (f *fakeStreamTransport) Sock() string                                    { return "/tmp/fake-sock" }
+func (f *fakeStreamTransport) MasterPID(context.Context) (int, error)          { return 1, nil }
 func (f *fakeStreamTransport) EnsureMaster(context.Context) (int, bool, error) { return 1, false, nil }
-func (f *fakeStreamTransport) Forward(context.Context, int, int) error        { return nil }
-func (f *fakeStreamTransport) Cancel(context.Context, int, int) error         { return nil }
-func (f *fakeStreamTransport) Exit(context.Context) (bool, error)             { return false, nil }
+func (f *fakeStreamTransport) Forward(context.Context, int, int) error         { return nil }
+func (f *fakeStreamTransport) Cancel(context.Context, int, int) error          { return nil }
+func (f *fakeStreamTransport) Exit(context.Context) (bool, error)              { return false, nil }
 func (f *fakeStreamTransport) Exec(_ context.Context, _ string, _ ...string) (string, error) {
 	return "", nil
 }
@@ -158,13 +158,21 @@ type shaOverridingTransport struct {
 	sha  string
 }
 
-func (s *shaOverridingTransport) Host() string                                  { return s.base.Host() }
-func (s *shaOverridingTransport) Sock() string                                  { return s.base.Sock() }
-func (s *shaOverridingTransport) MasterPID(c context.Context) (int, error)     { return s.base.MasterPID(c) }
-func (s *shaOverridingTransport) EnsureMaster(c context.Context) (int, bool, error) { return s.base.EnsureMaster(c) }
-func (s *shaOverridingTransport) Forward(c context.Context, l, r int) error    { return s.base.Forward(c, l, r) }
-func (s *shaOverridingTransport) Cancel(c context.Context, l, r int) error     { return s.base.Cancel(c, l, r) }
-func (s *shaOverridingTransport) Exit(c context.Context) (bool, error)         { return s.base.Exit(c) }
+func (s *shaOverridingTransport) Host() string { return s.base.Host() }
+func (s *shaOverridingTransport) Sock() string { return s.base.Sock() }
+func (s *shaOverridingTransport) MasterPID(c context.Context) (int, error) {
+	return s.base.MasterPID(c)
+}
+func (s *shaOverridingTransport) EnsureMaster(c context.Context) (int, bool, error) {
+	return s.base.EnsureMaster(c)
+}
+func (s *shaOverridingTransport) Forward(c context.Context, l, r int) error {
+	return s.base.Forward(c, l, r)
+}
+func (s *shaOverridingTransport) Cancel(c context.Context, l, r int) error {
+	return s.base.Cancel(c, l, r)
+}
+func (s *shaOverridingTransport) Exit(c context.Context) (bool, error) { return s.base.Exit(c) }
 func (s *shaOverridingTransport) Exec(c context.Context, in string, av ...string) (string, error) {
 	return s.base.Exec(c, in, av...)
 }
@@ -212,13 +220,13 @@ func (r *realBootstrapShim) asManager() *bootstrap.Manager {
 // short-circuits on the probe.
 type probeOKTransport struct{ path string }
 
-func (p *probeOKTransport) Host() string                                  { return "p" }
-func (p *probeOKTransport) Sock() string                                  { return "/tmp/p" }
-func (p *probeOKTransport) MasterPID(context.Context) (int, error)        { return 1, nil }
+func (p *probeOKTransport) Host() string                                    { return "p" }
+func (p *probeOKTransport) Sock() string                                    { return "/tmp/p" }
+func (p *probeOKTransport) MasterPID(context.Context) (int, error)          { return 1, nil }
 func (p *probeOKTransport) EnsureMaster(context.Context) (int, bool, error) { return 1, false, nil }
-func (p *probeOKTransport) Forward(context.Context, int, int) error        { return nil }
-func (p *probeOKTransport) Cancel(context.Context, int, int) error         { return nil }
-func (p *probeOKTransport) Exit(context.Context) (bool, error)             { return false, nil }
+func (p *probeOKTransport) Forward(context.Context, int, int) error         { return nil }
+func (p *probeOKTransport) Cancel(context.Context, int, int) error          { return nil }
+func (p *probeOKTransport) Exit(context.Context) (bool, error)              { return false, nil }
 func (p *probeOKTransport) Exec(_ context.Context, _ string, _ ...string) (string, error) {
 	return fmt.Sprintf("%d\n", len(bootstrap.EmbeddedAgent())), nil
 }

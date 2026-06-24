@@ -10,10 +10,16 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/clip"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipupload"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
 )
 
 func newRunCmd(a *app.App) *cobra.Command {
@@ -36,11 +42,12 @@ func newRunCmd(a *app.App) *cobra.Command {
 
 			engine, openURLCh := a.NewEngineWithOpenURL()
 
-			// Run agent supervisor, reconcile engine, and URL opener in
-			// parallel; any returning ends the daemon (launchd will relaunch).
+			// Run agent supervisor, reconcile engine, URL opener, the
+			// clipboard-read handler, and the notification handler in parallel;
+			// any returning ends the daemon (launchd will relaunch).
 			var wg sync.WaitGroup
-			wg.Add(3)
-			errCh := make(chan error, 3)
+			wg.Add(5)
+			errCh := make(chan error, 5)
 
 			go func() {
 				defer wg.Done()
@@ -53,6 +60,14 @@ func newRunCmd(a *app.App) *cobra.Command {
 			go func() {
 				defer wg.Done()
 				runOpenURLHandler(ctx, openURLCh, a)
+			}()
+			go func() {
+				defer wg.Done()
+				runClipHandler(ctx, a.AgentClient.ClipEvents(), a)
+			}()
+			go func() {
+				defer wg.Done()
+				runNotifyHandler(ctx, a.AgentClient.NotifyEvents(), a)
 			}()
 
 			wg.Wait()
@@ -133,6 +148,7 @@ func runOpenURLHandler(ctx context.Context, ch <-chan string, a *app.App) {
 			}
 			ensureForwardedForURL(ctx, rawURL, a)
 			a.Log.Logf("opening URL from %s: %s", a.Transport.Host(), rawURL)
+			a.Audit.OpenURL(a.Transport.Host(), rawURL)
 			// Use "--" so a URL starting with "-" is never mistaken for
 			// a flag, and restrict to http/https schemes.
 			cmd := exec.CommandContext(ctx, "open", "--", rawURL)
@@ -143,6 +159,318 @@ func runOpenURLHandler(ctx context.Context, ch <-chan string, a *app.App) {
 			}
 		}
 	}
+}
+
+// clipProbeTTL is how long a `targets` probe's eager read+upload result stays
+// reusable for a follow-up `image`/`text` fetch (DESIGN §5). It collapses the
+// TARGETS→image TOCTOU window: the agent emits targets then image back-to-back,
+// and serving the second from cache avoids a second osascript coercion.
+const clipProbeTTL = 10 * time.Second
+
+// clipCoerceTimeout caps clip.ImagePNG/Text + clipupload.Upload on the paste
+// path. It must stay under the agent's clipTimeout (9s) so the Mac always
+// answers before the agent gives up (DESIGN §4.5) — no orphaned uploads for a
+// waiter that already timed out. clip.ImagePNG/Text honour this deadline and
+// additionally cap the osascript coercion at 5s, leaving ~3s for the upload
+// within this 8s slot.
+const clipCoerceTimeout = 8 * time.Second
+
+// clipEntry caches the result of an eager `targets` read so a back-to-back
+// `image`/`text` fetch reuses it instead of re-coercing the clipboard.
+type clipEntry struct {
+	sha      string
+	deadline time.Time
+}
+
+// runClipHandler services KindClipRequest events from the agent: a remote shim
+// asked the Mac to read its clipboard. It runs on its OWN goroutine fed by a
+// DEDICATED channel (not the shared, drop-on-full events channel) so a burst of
+// port events can't evict a pending paste (DESIGN §5). A worker semaphore of 1
+// serializes the actual clipboard reads so two rapid pastes can't fork two
+// osascript calls; while a read is in flight, additional requests answer
+// OK=false immediately (the agent maps that to "none" and the shim falls
+// through — better than queueing behind a slow coercion and blowing the budget).
+//
+// Ordering invariant (DESIGN §2): for image/text the bytes are uploaded over
+// the side channel and exit-0-confirmed BEFORE the OK=true ClipResponse is
+// sent, so by the time the agent answers the shim the file is guaranteed
+// present. Bytes NEVER touch the CBOR frame — the response carries only a SHA.
+func runClipHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a *app.App) {
+	cb := clip.New()
+	// probe caches the most recent eager `targets` read per kind so the
+	// follow-up `image`/`text` fetch can reuse it. Single-Mac-per-host, so a
+	// per-kind entry is sufficient; the worker semaphore serializes access.
+	probe := map[string]clipEntry{}
+	var probeMu sync.Mutex
+	// sem bounds in-flight reads to 1.
+	sem := make(chan struct{}, 1)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			if ev.Clip == nil {
+				continue
+			}
+			req := ev.Clip
+			select {
+			case sem <- struct{}{}:
+			default:
+				// A read is already in flight — don't queue (would blow the
+				// budget). Answer not-available so the shim falls through.
+				a.AgentClient.SendClipResponse(&protocol.ClipResponse{
+					Nonce: req.Nonce, Epoch: req.Epoch, OK: false,
+				})
+				continue
+			}
+			// Handle on a worker goroutine so the demux of the next event isn't
+			// blocked by the coercion+upload; the semaphore (cap 1) still
+			// serializes the reads themselves.
+			go func(req *agentclient.ClipEvent) {
+				defer func() { <-sem }()
+				resp := serveClipRequest(ctx, a, cb, probe, &probeMu, req)
+				if err := a.AgentClient.SendClipResponse(resp); err != nil {
+					a.Log.Logf("clip: send response failed (nonce=%d): %v", req.Nonce, err)
+				}
+			}(req)
+		}
+	}
+}
+
+// serveClipRequest reads/uploads the clipboard for a single ClipRequest and
+// returns the ClipResponse to send. It NEVER returns nil. On any error it
+// returns OK=false (which the agent maps to "none\n" → shim falls through).
+func serveClipRequest(ctx context.Context, a *app.App, cb clip.Clipboard,
+	probe map[string]clipEntry, probeMu *sync.Mutex, req *agentclient.ClipEvent) *protocol.ClipResponse {
+
+	resp := &protocol.ClipResponse{Nonce: req.Nonce, Epoch: req.Epoch}
+
+	cctx, cancel := context.WithTimeout(ctx, clipCoerceTimeout)
+	defer cancel()
+
+	switch req.Kind {
+	case "targets":
+		// Report what's available, and TELL the agent which kind so its grep
+		// sees the target lines actually on the clipboard. Image wins over text
+		// when both are present (HasImage first, else HasText) — matches what a
+		// Ctrl+V paste of a screenshot vs selected text expects. For image we
+		// eagerly read+upload NOW and cache the sha so the back-to-back `image`
+		// fetch is served from cache — collapsing the TARGETS→image TOCTOU
+		// window to a single read (§5).
+		if cb.HasImage() {
+			// Only short-circuit to "serve image" when the image feature is
+			// ENABLED and the upload succeeds. When the image feature is
+			// DISABLED we must NOT return here: an image being present must not
+			// hide text that the user has enabled (e.g. image feature off, text
+			// feature on, screenshot + selected text both on the clipboard).
+			// In that case we fall through to the text check below. Likewise an
+			// enabled-but-failed image coercion/upload falls through.
+			if clipFeatureAllowed(a, "image") {
+				if sha, err := uploadClipImage(cctx, a, cb); err == nil {
+					cacheClip(probe, probeMu, "image", sha)
+					a.Audit.ClipServed(a.Transport.Host(), "image", "sha="+sha)
+					resp.OK = true
+					resp.Has = true
+					resp.Kind = "image"
+					resp.SHA = sha
+					return resp
+				}
+				// Coerce/upload failed — fall through to checking text / no-content.
+			} else {
+				// Image present but feature disabled: audit the denial, then fall
+				// through to the text check rather than returning Has=false (which
+				// would hide servable text from the remote).
+				a.Audit.ClipDenied(a.Transport.Host(), "image", "disabled")
+			}
+		}
+		if cb.HasText() {
+			if !clipTextServeAllowed(a, cb) {
+				reason := "disabled"
+				if clipFeatureAllowed(a, "text") {
+					reason = "concealed"
+				}
+				a.Audit.ClipDenied(a.Transport.Host(), "text", reason)
+				resp.OK = true
+				resp.Has = false
+				return resp
+			}
+			// Eagerly read+upload the text too so the back-to-back `text` fetch
+			// is served from cache, applying the source-side length cap first.
+			if data, err := cb.Text(cctx); err == nil && len(data) <= clipupload.MaxUploadBytes {
+				if _, sha, uerr := clipupload.UploadText(cctx, a.Transport, data); uerr == nil {
+					cacheClip(probe, probeMu, "text", sha)
+					a.Audit.ClipServed(a.Transport.Host(), "text", fmt.Sprintf("len=%d", len(data)))
+					resp.OK = true
+					resp.Has = true
+					resp.Kind = "text"
+					resp.SHA = sha
+					return resp
+				}
+			}
+			// Coerce/upload failed or oversized — fall through to no-content.
+		}
+		// Nothing servable on the clipboard.
+		resp.OK = true
+		resp.Has = false
+		return resp
+
+	case "image":
+		if req.Format != "png" {
+			return resp // OK=false: portal only serves PNG
+		}
+		if !clipFeatureAllowed(a, "image") {
+			a.Audit.ClipDenied(a.Transport.Host(), "image", "disabled")
+			return resp
+		}
+		if sha, ok := lookupClip(probe, probeMu, "image"); ok {
+			// Served from the targets-probe cache (already audited there).
+			resp.OK = true
+			resp.SHA = sha
+			return resp
+		}
+		if !cb.HasImage() {
+			return resp
+		}
+		sha, err := uploadClipImage(cctx, a, cb)
+		if err != nil {
+			a.Log.Logf("clip: image read/upload failed: %v", err)
+			return resp
+		}
+		a.Audit.ClipServed(a.Transport.Host(), "image", "sha="+sha)
+		resp.OK = true
+		resp.SHA = sha
+		return resp
+
+	case "text":
+		// Gate text reads behind the capability + concealed-clipboard skip
+		// BEFORE the cache lookup — the gate is RE-READ EACH PASS (config.go:54)
+		// so a disable (echo off > feature.clip-text) or a freshly-concealed
+		// clipboard (password manager) must take effect immediately, even within
+		// the 10s probe-cache TTL. Gating after the cache hit would let a SHA
+		// cached by an earlier `clip targets` probe leak text after the user
+		// disabled the feature / copied a secret. When disabled/concealed the
+		// response is OK=false → "none" → the shim falls through to the real
+		// binary. (Mirrors the image path, which gates before its cache lookup.)
+		if !clipTextServeAllowed(a, cb) {
+			reason := "disabled"
+			if clipFeatureAllowed(a, "text") {
+				reason = "concealed"
+			}
+			a.Audit.ClipDenied(a.Transport.Host(), "text", reason)
+			return resp
+		}
+		if sha, ok := lookupClip(probe, probeMu, "text"); ok {
+			// Served from the targets-probe cache (already audited there).
+			resp.OK = true
+			resp.SHA = sha
+			return resp
+		}
+		if !cb.HasText() {
+			return resp
+		}
+		data, err := cb.Text(cctx)
+		if err != nil {
+			a.Log.Logf("clip: text read failed: %v", err)
+			return resp
+		}
+		// Source-side length cap (SPEC E): reuse the 8 MiB upload cap so an
+		// oversized paste fails fast here rather than stalling the upload.
+		if len(data) > clipupload.MaxUploadBytes {
+			a.Log.Logf("clip: text too large: %d bytes (max %d)", len(data), clipupload.MaxUploadBytes)
+			return resp
+		}
+		_, sha, err := clipupload.UploadText(cctx, a.Transport, data)
+		if err != nil {
+			a.Log.Logf("clip: text upload failed: %v", err)
+			return resp
+		}
+		cacheClip(probe, probeMu, "text", sha)
+		a.Audit.ClipServed(a.Transport.Host(), "text", fmt.Sprintf("len=%d", len(data)))
+		resp.OK = true
+		resp.SHA = sha
+		return resp
+
+	default:
+		return resp // unknown kind: OK=false
+	}
+}
+
+// clipFeatureAllowed reports whether serving the given clipboard feature
+// ("image" or "text") is enabled for this Mac. It is the capability-gate CHECK
+// SITE (SPEC C), backed by internal/config feature toggles — a user disables a
+// feature by writing "off" into ~/.config/portal/feature.clip-image /
+// feature.clip-text (re-read every serve, no daemon restart). The cc-clip
+// posture is the default: both image and text are ON when no toggle exists
+// (text additionally honours the concealed-clipboard skip in
+// clipTextServeAllowed). When this returns false serveClipRequest short-circuits
+// to OK=true/Has=false (targets) or OK=false (image/text) — the agent maps both
+// to "none" so the remote shim falls through to the real binary.
+func clipFeatureAllowed(a *app.App, feature string) bool {
+	switch feature {
+	case "image":
+		return a.Cfg.FeatureEnabled(config.FeatureClipImage)
+	case "text":
+		return a.Cfg.FeatureEnabled(config.FeatureClipText)
+	default:
+		// Unknown feature: default-deny (no known caller hits this, but a
+		// typo should fail closed rather than silently serve).
+		return false
+	}
+}
+
+// clipTextServeAllowed reports whether the current TEXT clipboard may be
+// served: it must be both capability-enabled AND not concealed/transient. It is
+// the combined CHECK SITE for the text capability gate + the concealed-clipboard
+// skip (SPEC C/E): a password manager that copied a credential marks the
+// pasteboard org.nspasteboard.ConcealedType, and the standing text-pull endpoint
+// must never auto-exfiltrate that. When it returns false the text serve replies
+// "none" and the shim falls through to the real binary.
+func clipTextServeAllowed(a *app.App, cb clip.Clipboard) bool {
+	if !clipFeatureAllowed(a, "text") {
+		return false
+	}
+	if cb.IsConcealed() {
+		// Secret/transient clipboard (password manager). Skip serving — the
+		// caller logs this as a "concealed" denial.
+		return false
+	}
+	return true
+}
+
+// uploadClipImage coerces the clipboard image to PNG and uploads it, returning
+// the short SHA. Only returns success after Upload confirms exit 0 with a
+// validated remote path (DESIGN §2 ordering invariant).
+func uploadClipImage(ctx context.Context, a *app.App, cb clip.Clipboard) (string, error) {
+	png, err := cb.ImagePNG(ctx)
+	if err != nil {
+		return "", err
+	}
+	_, sha, err := clipupload.UploadImage(ctx, a.Transport, png)
+	if err != nil {
+		return "", err
+	}
+	return sha, nil
+}
+
+func cacheClip(probe map[string]clipEntry, mu *sync.Mutex, kind, sha string) {
+	mu.Lock()
+	probe[kind] = clipEntry{sha: sha, deadline: time.Now().Add(clipProbeTTL)}
+	mu.Unlock()
+}
+
+func lookupClip(probe map[string]clipEntry, mu *sync.Mutex, kind string) (string, bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	e, ok := probe[kind]
+	if !ok || time.Now().After(e.deadline) {
+		delete(probe, kind)
+		return "", false
+	}
+	return e.sha, true
 }
 
 // ensureForwardedForURL ensures any localhost ports referenced in rawURL

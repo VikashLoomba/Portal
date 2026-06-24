@@ -16,6 +16,13 @@ import (
 // RemoteDir is where uploaded clipboard images land on the dev box.
 const RemoteDir = "~/.cache/portal/clip"
 
+// MaxUploadBytes caps the interactive-paste payload before it crosses the
+// ControlMaster (DESIGN §3). A multi-MB upload competes with the agent pipe
+// for bandwidth and can stall heartbeats; larger clipboards fail fast and the
+// shim falls through. Screenshots are well under this; 64 MiB pastes are not
+// worth stalling heartbeats for.
+const MaxUploadBytes = 8 << 20 // 8 MiB
+
 // Upload writes pngData to RemoteDir/clip-<hash>.png on the remote via the
 // transport's multiplexed ControlMaster and returns the remote path with
 // $HOME expanded (so it's usable as an absolute path by agent CLIs).
@@ -34,37 +41,86 @@ func Upload(ctx context.Context, t sshctl.Transport, pngData []byte) (string, er
 	if len(pngData) == 0 {
 		return "", fmt.Errorf("clipupload: empty image")
 	}
-	sum := sha256.Sum256(pngData)
-	name := "clip-" + hex.EncodeToString(sum[:])[:32] + ".png"
-	remotePath := RemoteDir + "/" + name
+	sha := ShortSHA(pngData)
+	abs, _, err := upload(ctx, t, pngData, "clip-"+sha+".png")
+	return abs, err
+}
 
-	// install -d for an atomic 0700 dir; write to a unique tmp then mv.
-	// Echo the $HOME-expanded absolute path back so the caller can inject it.
+// UploadText writes textData to RemoteDir/text-<sha>.txt the same atomic,
+// 0600, validated way as Upload and returns (absolute path, short sha). It is
+// the side channel for `clip text`: the ClipResponse carries only the sha and
+// the agent reconstructs ~/.cache/portal/clip/text-<sha>.txt from it. Text
+// bytes never cross the CBOR frame (DESIGN §4.1/§7), so the 1 MiB cap is safe.
+func UploadText(ctx context.Context, t sshctl.Transport, textData []byte) (path, sha string, err error) {
+	if len(textData) == 0 {
+		return "", "", fmt.Errorf("clipupload: empty text")
+	}
+	sha = ShortSHA(textData)
+	return upload(ctx, t, textData, "text-"+sha+".txt")
+}
+
+// UploadImage is Upload but also returns the short sha so the caller can put
+// it in a ClipResponse without recomputing it. The remote path is identical
+// to Upload's.
+func UploadImage(ctx context.Context, t sshctl.Transport, pngData []byte) (path, sha string, err error) {
+	if len(pngData) == 0 {
+		return "", "", fmt.Errorf("clipupload: empty image")
+	}
+	sha = ShortSHA(pngData)
+	path, _, err = upload(ctx, t, pngData, "clip-"+sha+".png")
+	return path, sha, err
+}
+
+// ShortSHA returns the content address used in clip filenames: the first 32
+// hex chars (128 bits) of the sha256. portald clip reconstructs the local
+// filename from exactly this string (matched against ^[0-9a-f]{32}$), so the
+// Mac and the agent MUST agree on this derivation.
+func ShortSHA(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])[:32]
+}
+
+// upload is the shared atomic write used by the image and text variants. name
+// is the content-addressed basename (clip-<sha>.png / text-<sha>.txt). It
+// enforces MaxUploadBytes before touching the wire, writes the file 0600
+// EXPLICITLY via chmod (not umask — DESIGN §7.1), and validates the returned
+// path against the basename it already knows so an injected stdout line can
+// never reach the caller. Returns (absolute path, short sha).
+func upload(ctx context.Context, t sshctl.Transport, data []byte, name string) (string, string, error) {
+	if len(data) > MaxUploadBytes {
+		return "", "", fmt.Errorf("clipupload: payload too large: %d bytes (max %d)", len(data), MaxUploadBytes)
+	}
+	// install -d for an atomic 0700 dir; write to a unique tmp, chmod 0600
+	// EXPLICITLY (defense-in-depth — do not trust the remote umask), then mv.
+	// Echo the $HOME-expanded absolute path back so the caller can verify it.
 	// Emit "$HOME/.cache/portal/clip/<name>" directly — a plain expansion that
 	// does NOT re-glob or re-split the way `eval echo` would.
+	remotePath := RemoteDir + "/" + name
 	script := fmt.Sprintf(
 		`set -e; install -d -m 0700 %s && tmp=$(mktemp %s/.clip.tmp.XXXXXX) && `+
-			`trap 'rm -f "$tmp"' EXIT && cat > "$tmp" && mv "$tmp" %s && trap - EXIT && `+
+			`trap 'rm -f "$tmp"' EXIT && cat > "$tmp" && chmod 0600 "$tmp" && mv "$tmp" %s && trap - EXIT && `+
 			`printf '%%s' "$HOME/.cache/portal/clip/%s"`,
 		RemoteDir, RemoteDir, remotePath, name,
 	)
 	// --noprofile --norc keeps rc noise off stdout so the path is the only
 	// thing we read back.
-	stdout, stderr, err := t.ExecBytes(ctx, pngData, "bash", "--noprofile", "--norc", "-c", shellQuote(script))
+	stdout, stderr, err := t.ExecBytes(ctx, data, "bash", "--noprofile", "--norc", "-c", shellQuote(script))
 	if err != nil {
 		if s := strings.TrimSpace(stderr); s != "" {
-			return "", fmt.Errorf("clipupload: %w: %s", err, s)
+			return "", "", fmt.Errorf("clipupload: %w: %s", err, s)
 		}
-		return "", fmt.Errorf("clipupload: %w", err)
+		return "", "", fmt.Errorf("clipupload: %w", err)
 	}
 	abs, err := validateRemotePath(stdout, name)
 	if err != nil {
 		if s := strings.TrimSpace(stderr); s != "" {
-			return "", fmt.Errorf("%w: %s", err, s)
+			return "", "", fmt.Errorf("%w: %s", err, s)
 		}
-		return "", err
+		return "", "", err
 	}
-	return abs, nil
+	// shortSHA is the substring between the "clip-"/"text-" prefix and the
+	// extension; recompute from data to avoid parsing the name back out.
+	return abs, ShortSHA(data), nil
 }
 
 // validateRemotePath turns adversary-influenceable remote stdout into a path

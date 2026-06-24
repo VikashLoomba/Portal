@@ -203,6 +203,94 @@ func TestContentAddressedName(t *testing.T) {
 	}
 }
 
+// TestUpload_ExplicitChmod0600: the upload script must chmod the temp file
+// 0600 EXPLICITLY (defense-in-depth, not umask — DESIGN §7.1) before mv.
+func TestUpload_ExplicitChmod0600(t *testing.T) {
+	png := []byte("\x89PNG fake")
+	name := expectedName(t, png)
+	tr := &fakeTransport{stdout: "/home/u/.cache/portal/clip/" + name}
+	if _, err := Upload(context.Background(), tr, png); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(tr.gotArgv[4], "chmod 0600") {
+		t.Errorf("script must chmod 0600 explicitly: %q", tr.gotArgv[4])
+	}
+}
+
+// TestUpload_SizeCap: a payload over MaxUploadBytes is rejected before any
+// remote call (DESIGN §3 — protect heartbeats from a multi-MB upload).
+func TestUpload_SizeCap(t *testing.T) {
+	tr := &fakeTransport{stdout: "/should/not/matter"}
+	big := make([]byte, MaxUploadBytes+1)
+	if _, err := Upload(context.Background(), tr, big); err == nil {
+		t.Fatalf("expected size-cap rejection")
+	}
+	if tr.gotStdin != nil {
+		t.Errorf("no remote call should happen for oversize input")
+	}
+}
+
+// TestShortSHA: stable 32-hex content address; differs for different bytes.
+func TestShortSHA(t *testing.T) {
+	a := ShortSHA([]byte("same"))
+	b := ShortSHA([]byte("same"))
+	c := ShortSHA([]byte("different"))
+	if a != b {
+		t.Errorf("same bytes must yield same sha")
+	}
+	if a == c {
+		t.Errorf("different bytes must yield different sha")
+	}
+	if len(a) != 32 {
+		t.Errorf("expected 32 hex chars, got %d: %q", len(a), a)
+	}
+}
+
+// TestUploadImage_ReturnsSHA: UploadImage returns the same short sha that names
+// the file, so the Mac can put it straight into a ClipResponse.
+func TestUploadImage_ReturnsSHA(t *testing.T) {
+	png := []byte("\x89PNG fake")
+	name := expectedName(t, png)
+	tr := &fakeTransport{stdout: "/home/u/.cache/portal/clip/" + name}
+	path, sha, err := UploadImage(context.Background(), tr, png)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sha != ShortSHA(png) {
+		t.Errorf("sha = %q, want %q", sha, ShortSHA(png))
+	}
+	if !strings.HasSuffix(path, "/"+name) {
+		t.Errorf("path %q does not end in /%s", path, name)
+	}
+}
+
+// TestUploadText: writes text-<sha>.txt, returns the sha, and the script's
+// basename matches the text- prefix.
+func TestUploadText(t *testing.T) {
+	body := []byte("hello text")
+	sha := ShortSHA(body)
+	name := "text-" + sha + ".txt"
+	tr := &fakeTransport{stdout: "/home/u/.cache/portal/clip/" + name}
+	path, gotSHA, err := UploadText(context.Background(), tr, body)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotSHA != sha {
+		t.Errorf("sha = %q, want %q", gotSHA, sha)
+	}
+	if !strings.HasSuffix(path, "/"+name) {
+		t.Errorf("path %q does not end in /%s", path, name)
+	}
+	if string(tr.gotStdin) != string(body) {
+		t.Errorf("stdin: got %q, want %q", tr.gotStdin, body)
+	}
+	// Empty text is rejected before any remote call.
+	tr2 := &fakeTransport{}
+	if _, _, err := UploadText(context.Background(), tr2, nil); err == nil {
+		t.Fatalf("expected empty-text rejection")
+	}
+}
+
 // TestShellQuote: single quotes are escaped so the script survives ssh's
 // sh -c re-parsing.
 func TestShellQuote(t *testing.T) {

@@ -9,7 +9,7 @@ import (
 // NetlinkConfig is referenced by cmd/portald/main.go on every OS so the
 // !linux build is still valid; it is otherwise unused outside Linux.
 type NetlinkConfig struct {
-	PollInterval        int    // ms
+	PollInterval        int // ms
 	UseDestroyMulticast bool
 }
 

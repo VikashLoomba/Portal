@@ -84,12 +84,13 @@ const (
 )
 
 // inet_diag_req_v2 (40 bytes):
-//   __u8 sdiag_family
-//   __u8 sdiag_protocol
-//   __u8 idiag_ext
-//   __u8 pad
-//   __u32 idiag_states
-//   inet_diag_sockid id (48 bytes — but we send zeros for dump)
+//
+//	__u8 sdiag_family
+//	__u8 sdiag_protocol
+//	__u8 idiag_ext
+//	__u8 pad
+//	__u32 idiag_states
+//	inet_diag_sockid id (48 bytes — but we send zeros for dump)
 type inetDiagReqV2 struct {
 	Family   uint8
 	Protocol uint8
@@ -123,16 +124,17 @@ func (r *inetDiagReqV2) marshal() []byte {
 }
 
 // inet_diag_msg layout (first bytes only — we read what we need):
-//   __u8 idiag_family
-//   __u8 idiag_state
-//   __u8 idiag_timer
-//   __u8 idiag_retrans
-//   inet_diag_sockid (48 bytes)
-//   __u32 idiag_expires
-//   __u32 idiag_rqueue
-//   __u32 idiag_wqueue
-//   __u32 idiag_uid
-//   __u32 idiag_inode
+//
+//	__u8 idiag_family
+//	__u8 idiag_state
+//	__u8 idiag_timer
+//	__u8 idiag_retrans
+//	inet_diag_sockid (48 bytes)
+//	__u32 idiag_expires
+//	__u32 idiag_rqueue
+//	__u32 idiag_wqueue
+//	__u32 idiag_uid
+//	__u32 idiag_inode
 type parsedRow struct {
 	Family uint8
 	State  uint8

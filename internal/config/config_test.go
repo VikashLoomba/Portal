@@ -7,6 +7,64 @@ import (
 	"testing"
 )
 
+func TestFeatureEnabled(t *testing.T) {
+	// Default-ON posture (cc-clip parity): a missing toggle file => enabled.
+	tests := []struct {
+		name     string
+		contents *string // nil => no file written
+		want     bool
+	}{
+		{"missing file defaults on", nil, true},
+		{"empty file is on", strptr(""), true},
+		{"whitespace is on", strptr("  \n\t"), true},
+		{"off disables", strptr("off"), false},
+		{"OFF case-insensitive", strptr("OFF\n"), false},
+		{"false disables", strptr("false"), false},
+		{"0 disables", strptr("0"), false},
+		{"no disables", strptr("no"), false},
+		{"disabled disables", strptr("disabled"), false},
+		{"on enables", strptr("on"), true},
+		{"garbage is on", strptr("yes please"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			s := New(dir)
+			if tt.contents != nil {
+				if err := os.WriteFile(filepath.Join(dir, "feature."+FeatureClipText), []byte(*tt.contents), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := s.FeatureEnabled(FeatureClipText); got != tt.want {
+				t.Errorf("FeatureEnabled = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSetFeature_RoundTrip(t *testing.T) {
+	s := New(t.TempDir())
+	for _, f := range []string{FeatureClipImage, FeatureClipText, FeatureNotify} {
+		if !s.FeatureEnabled(f) {
+			t.Errorf("%s should default ON", f)
+		}
+		if err := s.SetFeature(f, false); err != nil {
+			t.Fatal(err)
+		}
+		if s.FeatureEnabled(f) {
+			t.Errorf("%s should be OFF after SetFeature(false)", f)
+		}
+		if err := s.SetFeature(f, true); err != nil {
+			t.Fatal(err)
+		}
+		if !s.FeatureEnabled(f) {
+			t.Errorf("%s should be ON after SetFeature(true)", f)
+		}
+	}
+}
+
+func strptr(s string) *string { return &s }
+
 func TestReadHost_Whitespace(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "host"), []byte("  clementine \n\t"), 0o644); err != nil {

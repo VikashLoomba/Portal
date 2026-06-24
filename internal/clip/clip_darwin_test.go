@@ -57,3 +57,26 @@ func TestMatchImageFlavor(t *testing.T) {
 		})
 	}
 }
+
+func TestMatchConcealedType(t *testing.T) {
+	tests := []struct {
+		name  string
+		types string
+		want  bool
+	}{
+		{"empty", "", false},
+		{"plain text only", "public.utf8-plain-text\nNSStringPboardType", false},
+		{"concealed present", "public.utf8-plain-text\norg.nspasteboard.ConcealedType", true},
+		{"transient present", "org.nspasteboard.TransientType\npublic.utf8-plain-text", true},
+		{"concealed with whitespace", "  org.nspasteboard.ConcealedType  \n", true},
+		{"substring not a match", "com.example.org.nspasteboard.ConcealedTypeX", false},
+		{"blank lines tolerated", "\n\norg.nspasteboard.ConcealedType\n\n", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := matchConcealedType(tt.types); got != tt.want {
+				t.Errorf("matchConcealedType(%q) = %v, want %v", tt.types, got, tt.want)
+			}
+		})
+	}
+}

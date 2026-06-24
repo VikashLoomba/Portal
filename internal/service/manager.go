@@ -15,14 +15,14 @@ var ErrUnsupported = errors.New("service manager not supported on this OS")
 // Spec is everything the service manager needs to know to install and run
 // the daemon. Fields are populated from app.Paths.
 type Spec struct {
-	Label    string   // local.portal.autoforward
-	BinPath  string   // ~/.local/bin/portal
-	Args     []string // ["run"]
-	LogPath  string   // ~/Library/Logs/portal.log
-	Plist    string   // ~/Library/LaunchAgents/<label>.plist
-	Domain   string   // gui/<uid>
-	EnvPATH  string
-	Home     string
+	Label   string   // local.portal.autoforward
+	BinPath string   // ~/.local/bin/portal
+	Args    []string // ["run"]
+	LogPath string   // ~/Library/Logs/portal.log
+	Plist   string   // ~/Library/LaunchAgents/<label>.plist
+	Domain  string   // gui/<uid>
+	EnvPATH string
+	Home    string
 }
 
 // Status is a snapshot for the `status` command.

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
 
@@ -147,8 +148,14 @@ func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
 }
 
 // PruneAll removes every agent-* file and the clipboard-image cache dir from
-// the remote cache dir. Called from `portal uninstall`.
+// the remote cache dir, AND removes the clipboard read shims (xclip/wl-paste),
+// the xdg-open wrapper, the portald symlink, the env snippet, and the
+// PATH-prepend marker block — restoring any backed-up binaries (DESIGN §9.4).
+// Called from `portal uninstall`. clipshim.Remove is idempotent, so calling it
+// here in addition to removePortalWrappers (the CLI path) is harmless; this
+// makes PruneAll self-contained for any caller that only has a *Manager.
 func (m *Manager) PruneAll(ctx context.Context) error {
+	clipshim.Remove(ctx, m.T)
 	cmd := fmt.Sprintf(`rm -rf %s/agent-* %s/clip 2>/dev/null || true`, remoteDir, remoteDir)
 	_, err := m.T.Exec(ctx, "", "bash", "-c", shellQuoted(cmd))
 	return err

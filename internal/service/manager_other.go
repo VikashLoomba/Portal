@@ -13,14 +13,14 @@ import (
 // return ErrUnsupported. A future systemd backend lands here.
 type Stub struct{}
 
-func New(_ Spec, _ run.Runner, _ clock.Clock) *Stub                        { return &Stub{} }
-func (*Stub) Install(ctx context.Context) error                            { return ErrUnsupported }
-func (*Stub) Uninstall(ctx context.Context) error                          { return ErrUnsupported }
-func (*Stub) Reload(ctx context.Context) error                             { return ErrUnsupported }
-func (*Stub) Start(ctx context.Context) error                              { return ErrUnsupported }
-func (*Stub) Stop(ctx context.Context) error                               { return ErrUnsupported }
-func (*Stub) Restart(ctx context.Context) error                            { return ErrUnsupported }
-func (*Stub) IsLoaded(ctx context.Context) (bool, error)                   { return false, nil }
-func (*Stub) Status(ctx context.Context) (Status, error)                   { return Status{}, nil }
+func New(_ Spec, _ run.Runner, _ clock.Clock) *Stub      { return &Stub{} }
+func (*Stub) Install(ctx context.Context) error          { return ErrUnsupported }
+func (*Stub) Uninstall(ctx context.Context) error        { return ErrUnsupported }
+func (*Stub) Reload(ctx context.Context) error           { return ErrUnsupported }
+func (*Stub) Start(ctx context.Context) error            { return ErrUnsupported }
+func (*Stub) Stop(ctx context.Context) error             { return ErrUnsupported }
+func (*Stub) Restart(ctx context.Context) error          { return ErrUnsupported }
+func (*Stub) IsLoaded(ctx context.Context) (bool, error) { return false, nil }
+func (*Stub) Status(ctx context.Context) (Status, error) { return Status{}, nil }
 
 var _ Manager = (*Stub)(nil)

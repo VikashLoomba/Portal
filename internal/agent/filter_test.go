@@ -20,8 +20,8 @@ func TestFilter_Loopback(t *testing.T) {
 		L(8082, 4, "0.0.0.0"),     // not loopback → drop
 		L(8083, 4, "192.168.1.5"), // not loopback → drop
 		L(8084, 6, "::1"),
-		L(8085, 6, "::"),         // not loopback → drop
-		L(8086, 6, "fe80::1"),    // not loopback → drop
+		L(8085, 6, "::"),      // not loopback → drop
+		L(8086, 6, "fe80::1"), // not loopback → drop
 	}
 	got := f.Apply(in)
 	want := []watcher.Listen{L(8081, 4, "127.0.0.1"), L(8084, 6, "::1")}

@@ -30,7 +30,8 @@ const (
 )
 
 // DenyPorts are remote system services we never forward.
-//   22 ssh, 25 smtp, 53 dns, 631 cups, 139/445 smb/netbios.
+//
+//	22 ssh, 25 smtp, 53 dns, 631 cups, 139/445 smb/netbios.
 var DenyPorts = []int{22, 25, 53, 631, 139, 445}
 
 // SkipLocal lists extra LOCAL ports to never bind here (in case something

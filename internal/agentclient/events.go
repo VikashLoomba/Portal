@@ -25,6 +25,20 @@ const (
 	// KindOpenURL fires when the agent receives a request to open a URL
 	// on the client (e.g. via the xdg-open wrapper on the remote box).
 	KindOpenURL
+	// KindClipRequest fires when a remote shim asks the Mac to read its
+	// clipboard (via the cmd socket → ClipRequest frame). UNLIKE the other
+	// kinds this is NOT routed through the shared, drop-on-full events
+	// channel — runClipHandler reads it from a dedicated channel so a burst
+	// of port events can never evict a pending paste (DESIGN §5). It is
+	// declared here only so the kind value is reserved and the event shape is
+	// shared; the demuxer sends it on ClipEvents(), not Events().
+	KindClipRequest
+	// KindNotify fires when the agent relays a notification (a Claude Code hook
+	// or a generic `portald notify`) up the pipe. LIKE KindClipRequest it is
+	// routed on a DEDICATED channel (NotifyEvents()), not the shared drop-on-full
+	// events channel, so a port-event burst can't evict a pending notification.
+	// runNotifyHandler on the Mac drains it and raises a native notification.
+	KindNotify
 )
 
 // EngineEvent is the unit of communication from agentclient → engine.
@@ -34,4 +48,36 @@ type EngineEvent struct {
 	Added   []uint16 // populated on KindDelta
 	Removed []uint16 // populated on KindDelta
 	URL     string   // populated on KindOpenURL
+	// Clip carries the fields of a KindClipRequest event. nil otherwise. The
+	// handler answers by calling Client.SendClipResponse with the echoed
+	// Nonce/Epoch (DESIGN §4.4).
+	Clip *ClipEvent
+	// Notify carries the fields of a KindNotify event. nil otherwise. Notify is
+	// fire-and-forget (no response frame), so the handler just raises the
+	// native notification.
+	Notify *NotifyEvent
+}
+
+// NotifyEvent is the payload of a KindNotify. It mirrors protocol.Notify; the
+// Mac's runNotifyHandler raises a native notification from it, prefixing
+// "[unverified] " on the title when Verified is false.
+type NotifyEvent struct {
+	Title    string
+	Body     string
+	Subtitle string
+	Urgency  uint8
+	Verified bool
+	Source   string
+	Sound    string
+	Seq      uint64
+}
+
+// ClipEvent is the payload of a KindClipRequest. Nonce/Epoch are echoed back
+// verbatim in the ClipResponse so the agent can correlate it; Kind is one of
+// "targets"|"image"|"text" and Format is "png" for images, "" otherwise.
+type ClipEvent struct {
+	Nonce  uint64
+	Epoch  uint64
+	Kind   string
+	Format string
 }

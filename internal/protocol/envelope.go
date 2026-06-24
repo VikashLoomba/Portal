@@ -8,7 +8,18 @@ package protocol
 // ProtoVersion is bumped only on incompatible schema changes. Both binaries
 // ship from one tree, so a mismatch can only mean a stale agent upload — the
 // bootstrap layer detects this and re-uploads.
-const ProtoVersion uint32 = 1
+//
+// v2 added the clipboard-read request/response pair (ClipRequest /
+// ClipResponse). The fields are additive — an old decoder ignores the unknown
+// CBOR keys — so the bump is not for wire compatibility but for *honest*
+// version negotiation: if a re-upload were ever blocked (e.g. read-only
+// ~/.cache), a loud mismatch beats a silent clip-feature no-op.
+//
+// v3 added the notification relay (Notify, agent → client). Same honest-
+// negotiation rationale: a remote hook firing `portald notify` into a stale
+// agent that predates the Notify capability must surface as a loud version
+// mismatch (triggering re-upload) rather than a silently dropped notification.
+const ProtoVersion uint32 = 3
 
 // MaxFrameBytes is the hard cap on a single frame's payload size. Decoder
 // rejects oversized frames before allocating, so a hostile peer can't OOM us.
@@ -38,4 +49,13 @@ type Envelope struct {
 	AgentError   *AgentError   `cbor:"agent_error,omitempty"`
 	Bye          *Bye          `cbor:"bye,omitempty"`
 	OpenURL      *OpenURL      `cbor:"open_url,omitempty"`
+
+	// clipboard-read (v2): request flows agent → client, response client → agent.
+	ClipRequest  *ClipRequest  `cbor:"clip_req,omitempty"`  // agent → client
+	ClipResponse *ClipResponse `cbor:"clip_resp,omitempty"` // client → agent
+
+	// notification relay (v3): fire-and-forget agent → client. A remote event
+	// (a Claude Code hook, or a generic `portald notify`) is relayed up the pipe
+	// and raised as a native macOS notification on the Mac. No response frame.
+	Notify *Notify `cbor:"notify,omitempty"` // agent → client
 }

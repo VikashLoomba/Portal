@@ -136,3 +136,68 @@ func TestMultipleFramesInPipeline(t *testing.T) {
 		}
 	}
 }
+
+func TestRoundtripClipRequest(t *testing.T) {
+	in := &Envelope{ClipRequest: &ClipRequest{
+		Nonce: 7, Epoch: 0xdeadbeef, Kind: "image", Format: "png",
+	}}
+	var buf bytes.Buffer
+	if err := NewEncoder(&buf).Write(in); err != nil {
+		t.Fatal(err)
+	}
+	out, err := NewDecoder(&buf).Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.ClipRequest == nil {
+		t.Fatal("ClipRequest not present")
+	}
+	if !reflect.DeepEqual(in.ClipRequest, out.ClipRequest) {
+		t.Errorf("got %+v, want %+v", out.ClipRequest, in.ClipRequest)
+	}
+}
+
+func TestRoundtripClipResponse(t *testing.T) {
+	in := &Envelope{ClipResponse: &ClipResponse{
+		Nonce: 7, Epoch: 0xdeadbeef, OK: true, Has: true,
+		SHA: "0123456789abcdef0123456789abcdef",
+	}}
+	var buf bytes.Buffer
+	if err := NewEncoder(&buf).Write(in); err != nil {
+		t.Fatal(err)
+	}
+	out, err := NewDecoder(&buf).Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.ClipResponse == nil {
+		t.Fatal("ClipResponse not present")
+	}
+	if !reflect.DeepEqual(in.ClipResponse, out.ClipResponse) {
+		t.Errorf("got %+v, want %+v", out.ClipResponse, in.ClipResponse)
+	}
+}
+
+// TestClipFieldCountInvariant asserts the clip frames each carry exactly one
+// non-nil envelope field, so the tagged-union contract still holds with the
+// v2 additions, and that a clip field paired with another field is rejected.
+func TestClipFieldCountInvariant(t *testing.T) {
+	if n := countEnvelopeFields(&Envelope{ClipRequest: &ClipRequest{}}); n != 1 {
+		t.Errorf("ClipRequest alone: got %d fields, want 1", n)
+	}
+	if n := countEnvelopeFields(&Envelope{ClipResponse: &ClipResponse{}}); n != 1 {
+		t.Errorf("ClipResponse alone: got %d fields, want 1", n)
+	}
+	// A clip field paired with any other field must trip the multi-field guard.
+	in := &Envelope{
+		ClipRequest:  &ClipRequest{},
+		ClipResponse: &ClipResponse{},
+	}
+	var buf bytes.Buffer
+	if err := NewEncoder(&buf).Write(in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewDecoder(&buf).Read(); !errors.Is(err, ErrMultipleFields) {
+		t.Errorf("got %v, want ErrMultipleFields", err)
+	}
+}

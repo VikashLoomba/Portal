@@ -31,7 +31,7 @@ func newClipCheckCmd(a *app.App) *cobra.Command {
 				return nil
 			}
 
-			png, err := cb.ImagePNG()
+			png, err := cb.ImagePNG(cmd.Context())
 			if err != nil {
 				fmt.Printf("\nImagePNG() failed: %v\n", err)
 				return nil
