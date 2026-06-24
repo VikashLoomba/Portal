@@ -24,6 +24,63 @@ func New(dir string) *Store { return &Store{Dir: dir} }
 func (s *Store) hostFile() string  { return filepath.Join(s.Dir, "host") }
 func (s *Store) allowFile() string { return filepath.Join(s.Dir, "allow") }
 
+// featureFile is the per-feature on/off toggle path, e.g. ~/.config/portal/
+// feature.clip-text. One file per feature (mirroring the host/allow file-per-
+// setting convention) so a user can flip a capability with a plain `rm` /
+// `touch` and the running daemon picks it up on the next read with no restart.
+func (s *Store) featureFile(feature string) string {
+	return filepath.Join(s.Dir, "feature."+feature)
+}
+
+// Feature toggle names. These are the capability-gate keys (SPEC C): the Mac
+// side serves clip-read / notify only when the corresponding feature is enabled.
+const (
+	// FeatureClipImage gates serving the Mac clipboard IMAGE to a remote shim.
+	FeatureClipImage = "clip-image"
+	// FeatureClipText gates serving the Mac clipboard TEXT to a remote shim.
+	// Text is additionally subject to the concealed-clipboard skip (a password
+	// manager marking the pasteboard org.nspasteboard.ConcealedType is never
+	// served even when this is on) — that check is independent of this toggle.
+	FeatureClipText = "clip-text"
+	// FeatureNotify gates raising a native macOS notification from a relayed
+	// remote event (Claude Code hook / generic `portald notify`).
+	FeatureNotify = "notify"
+)
+
+// FeatureEnabled reports whether the named capability is enabled. The contract
+// matches cc-clip's default posture: every feature is ON by default (returns
+// true when no toggle file exists). A user disables a feature by writing the
+// word "off"/"false"/"0"/"no" (case-insensitive) into feature.<name>; any other
+// content (or an empty/missing file) is ON. RE-READ EACH PASS — like
+// AllowedPorts, an edit propagates to the running daemon with no restart.
+func (s *Store) FeatureEnabled(feature string) bool {
+	b, err := os.ReadFile(s.featureFile(feature))
+	if err != nil {
+		// Missing file (or unreadable) => default ON, matching cc-clip.
+		return true
+	}
+	switch strings.ToLower(stripAllWhitespace(string(b))) {
+	case "off", "false", "0", "no", "disabled":
+		return false
+	default:
+		return true
+	}
+}
+
+// SetFeature persists an explicit on/off toggle for the named capability,
+// creating Dir if needed. Writing "on"/"off" makes the state inspectable and
+// idempotent — `SetFeature(f,true)` then `FeatureEnabled(f)` round-trips.
+func (s *Store) SetFeature(feature string, on bool) error {
+	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
+		return err
+	}
+	val := "on\n"
+	if !on {
+		val = "off\n"
+	}
+	return os.WriteFile(s.featureFile(feature), []byte(val), 0o644)
+}
+
 // ReadHost returns the configured ssh host, or "" if no host file exists.
 // All whitespace is stripped to match the bash `tr -d '[:space:]'` behavior
 // (so a trailing newline or accidental spaces don't poison the alias).

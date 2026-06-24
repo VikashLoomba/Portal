@@ -41,8 +41,8 @@ type Fake struct {
 
 func NewFake(start time.Time) *Fake { return &Fake{now: start, ticker: make(chan time.Time, 1)} }
 
-func (f *Fake) Now() time.Time                              { return f.now }
-func (f *Fake) Sleep(_ context.Context, d time.Duration)    { f.now = f.now.Add(d) }
+func (f *Fake) Now() time.Time                           { return f.now }
+func (f *Fake) Sleep(_ context.Context, d time.Duration) { f.now = f.now.Add(d) }
 func (f *Fake) NewTicker(_ time.Duration) (<-chan time.Time, func()) {
 	return f.ticker, func() {}
 }

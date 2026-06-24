@@ -13,21 +13,31 @@ import (
 
 // fakeTransport implements sshctl.Transport for the engine tests.
 type fakeTransport struct {
-	host    string
-	pid     int
-	addCalls    [][2]int // (local, remote) for Forward
-	cancelCalls [][2]int // for Cancel
+	host        string
+	pid         int
+	addCalls    [][2]int       // (local, remote) for Forward
+	cancelCalls [][2]int       // for Cancel
 	failOn      map[int]string // port → error substring; *ForwardError surfaces upward
 	exitCalled  bool
 }
 
-func (f *fakeTransport) MasterPID(ctx context.Context) (int, error)                       { return f.pid, nil }
-func (f *fakeTransport) EnsureMaster(ctx context.Context) (int, bool, error)              { return f.pid, false, nil }
-func (f *fakeTransport) Cancel(ctx context.Context, l, r int) error                       { f.cancelCalls = append(f.cancelCalls, [2]int{l, r}); return nil }
-func (f *fakeTransport) Exit(ctx context.Context) (bool, error)                           { f.exitCalled = true; return true, nil }
-func (f *fakeTransport) Exec(ctx context.Context, stdin string, argv ...string) (string, error) { return "", nil }
-func (f *fakeTransport) Host() string                                                     { return f.host }
-func (f *fakeTransport) Sock() string                                                     { return "/tmp/sock-fake" }
+func (f *fakeTransport) MasterPID(ctx context.Context) (int, error) { return f.pid, nil }
+func (f *fakeTransport) EnsureMaster(ctx context.Context) (int, bool, error) {
+	return f.pid, false, nil
+}
+func (f *fakeTransport) Cancel(ctx context.Context, l, r int) error {
+	f.cancelCalls = append(f.cancelCalls, [2]int{l, r})
+	return nil
+}
+func (f *fakeTransport) Exit(ctx context.Context) (bool, error) {
+	f.exitCalled = true
+	return true, nil
+}
+func (f *fakeTransport) Exec(ctx context.Context, stdin string, argv ...string) (string, error) {
+	return "", nil
+}
+func (f *fakeTransport) Host() string { return f.host }
+func (f *fakeTransport) Sock() string { return "/tmp/sock-fake" }
 func (f *fakeTransport) ExecBytes(_ context.Context, _ []byte, _ ...string) (string, string, error) {
 	return "", "", nil
 }
@@ -87,8 +97,8 @@ func newTestEngine(t *fakeTransport, p *fakePortLister, d *fakeDiscoverer) (*Eng
 // behavior.
 func TestReconcile_Diff(t *testing.T) {
 	tr := &fakeTransport{
-		host: "clementine",
-		pid:  111,
+		host:   "clementine",
+		pid:    111,
 		failOn: map[int]string{8083: "request failed"},
 	}
 	pl := &fakePortLister{

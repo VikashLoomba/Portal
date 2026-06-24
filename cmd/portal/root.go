@@ -61,6 +61,7 @@ func newRootCmd(a *app.App) *cobra.Command {
 	root.AddCommand(newAllowedCmd(a))
 	root.AddCommand(newSSHCmd(a))
 	root.AddCommand(newClipCheckCmd(a))
+	root.AddCommand(newDoctorCmd(a))
 	root.AddCommand(newVersionCmd(a))
 	root.AddCommand(newAgentVersionCmd(a))
 	return root
@@ -93,14 +94,18 @@ Usage: %[1]s <command>
     restart         Force-restart the running service.
 
   Sessions
-    ssh <host> ...  SSH to a host with clipboard-image paste: press Ctrl+V to
-                    upload a copied screenshot and insert its remote path.
-                    Forwards all extra args to ssh (drop-in replacement).
+    ssh <host> ...  Deprecated alias for plain ssh (forwards all args verbatim).
+                    Clipboard-image paste now works over PLAIN ssh: the daemon
+                    deploys xclip/wl-paste read shims so a coding agent's own
+                    Ctrl+V serves your Mac clipboard — no special command needed.
 
   Inspect
     status          Show box, service state, ssh master, active forwards. (default)
     ports           List the loopback dev ports currently listening on the box.
     logs [-f|N]     Show recent log lines; -f to follow, N for last N lines.
+    doctor          Self-test the clipboard/notify path over ssh: verifies the
+                    xclip/wl-paste shims win PATH, the agent supports the verbs,
+                    and runs an end-to-end clip-targets smoke.
 
   Allowlist (forward ports the auto-filter would otherwise skip)
     allow <port>... Force-forward a port even if it's in the ephemeral range
@@ -128,11 +133,11 @@ func main() {
 	}
 	root := newRootCmd(a)
 	if err := root.Execute(); err != nil {
-		// exitCodeErr → propagate ssh's exit code. runSSHProxy returns this
-		// (instead of calling os.Exit itself) so its deferreds — term.Restore,
-		// session-socket removal, goroutine teardown — all run before we exit;
-		// os.Exit would skip them and strand the terminal in raw mode (F3).
-		// Print NOTHING: ssh already produced whatever output it did.
+		// exitCodeErr → propagate ssh's exit code. The `portal ssh` passthrough
+		// normally replaces this process via syscall.Exec (so ssh's exit code is
+		// the process's directly); exitCodeErr only arises on the rare
+		// child-process fallback, where we mirror ssh's code here. Print NOTHING:
+		// ssh already produced whatever output it did.
 		var ece exitCodeErr
 		if errors.As(err, &ece) {
 			os.Exit(ece.code)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
@@ -64,6 +65,19 @@ type Client struct {
 	// events is the demuxed stream the engine reads.
 	events chan EngineEvent
 
+	// clipEvents is a DEDICATED channel for KindClipRequest, separate from the
+	// shared (drop-on-full) events channel so a burst of port events can never
+	// evict a pending paste (DESIGN §5). runClipHandler on the Mac drains it.
+	// Buffered modestly: maxInflightClip on the agent already bounds how many
+	// requests can be outstanding, and runClipHandler's worker semaphore is 1.
+	clipEvents chan EngineEvent
+
+	// notifyEvents is a DEDICATED channel for KindNotify, separate from the
+	// shared events channel for the same reason as clipEvents: a port-event
+	// burst must not evict a pending notification. runNotifyHandler drains it.
+	// Never closed by Run (the handler exits on ctx, not channel close).
+	notifyEvents chan EngineEvent
+
 	// stream is the current send-side encoder; nil between connections.
 	streamMu sync.Mutex
 	enc      *protocol.Encoder
@@ -91,16 +105,47 @@ func New(cfg Config) *Client {
 		cfg.ReconnectMax = 10 * time.Second
 	}
 	return &Client{
-		cfg:    cfg,
-		events: make(chan EngineEvent, 64),
+		cfg:          cfg,
+		events:       make(chan EngineEvent, 64),
+		clipEvents:   make(chan EngineEvent, 8),
+		notifyEvents: make(chan EngineEvent, 16),
 	}
 }
 
 // Events returns the demuxed event channel.
 func (c *Client) Events() <-chan EngineEvent { return c.events }
 
+// ClipEvents returns the dedicated KindClipRequest channel. runClipHandler in
+// cmd/portal/run.go drains it on its own goroutine (DESIGN §5). It is NEVER
+// closed by Run (only Events() is) — the handler exits on ctx cancellation,
+// not on channel close — so a late ClipRequest racing shutdown cannot panic on
+// a send to a closed channel.
+func (c *Client) ClipEvents() <-chan EngineEvent { return c.clipEvents }
+
+// NotifyEvents returns the dedicated KindNotify channel. runNotifyHandler in
+// cmd/portal/run.go drains it on its own goroutine. Like ClipEvents() it is
+// NEVER closed by Run — the handler exits on ctx cancellation, not channel
+// close — so a late Notify racing shutdown cannot panic on a send to a closed
+// channel.
+func (c *Client) NotifyEvents() <-chan EngineEvent { return c.notifyEvents }
+
+// SendClipResponse writes a ClipResponse up the current pipe, correlating the
+// agent's outstanding waiter by (Nonce,Epoch). It is the Mac-side answer to a
+// KindClipRequest. Returns an error if no connection is up — the caller treats
+// that as "the paste is abandoned; the agent will time out and answer none".
+func (c *Client) SendClipResponse(resp *protocol.ClipResponse) error {
+	c.streamMu.Lock()
+	enc := c.enc
+	c.streamMu.Unlock()
+	if enc == nil {
+		return errors.New("agentclient: not connected")
+	}
+	return enc.Write(&protocol.Envelope{ClipResponse: resp})
+}
+
 // Snapshot returns the cached desired-set as the wire reports it.
-//   ok = false until the first SubscribeAck+Snapshot pair has landed.
+//
+//	ok = false until the first SubscribeAck+Snapshot pair has landed.
 func (c *Client) Snapshot() (seq uint64, ports []uint16, ok bool) {
 	c.snapMu.RLock()
 	defer c.snapMu.RUnlock()
@@ -240,6 +285,27 @@ func (c *Client) publish(ev EngineEvent) {
 	}
 }
 
+// publishClip sends to the dedicated clip channel. Non-blocking (so the demux
+// loop never stalls) but to its OWN channel so a port-event burst on c.events
+// can't drop the paste. clipEvents is never closed, so no recover is needed.
+func (c *Client) publishClip(ev EngineEvent) {
+	select {
+	case c.clipEvents <- ev:
+	default:
+	}
+}
+
+// publishNotify sends to the dedicated notify channel. Non-blocking (so the
+// demux loop never stalls) and to its OWN channel so a port-event burst on
+// c.events can't drop the notification. notifyEvents is never closed, so no
+// recover is needed.
+func (c *Client) publishNotify(ev EngineEvent) {
+	select {
+	case c.notifyEvents <- ev:
+	default:
+	}
+}
+
 // runOnce holds a single ssh-exec session. Returns when the stream errors,
 // EOFs, or ctx cancels.
 func (c *Client) runOnce(ctx context.Context) error {
@@ -251,7 +317,7 @@ func (c *Client) runOnce(ctx context.Context) error {
 
 	// 2. Spawn the long-lived exec.
 	stdin, stdout, stderr, wait, err := c.cfg.Transport.ExecStream(ctx,
-		remotePath, "--proto-version=1")
+		remotePath, fmt.Sprintf("--proto-version=%d", protocol.ProtoVersion))
 	if err != nil {
 		return fmt.Errorf("ExecStream: %w", err)
 	}
@@ -268,9 +334,9 @@ func (c *Client) runOnce(ctx context.Context) error {
 
 	// 4. Hello → HelloAck.
 	if err := enc.Write(&protocol.Envelope{Hello: &protocol.Hello{
-		ProtoVersion: protocol.ProtoVersion,
-		ClientGitSHA: bootstrap.EmbeddedSHA(),
-		ClientPID:    os.Getpid(),
+		ProtoVersion:  protocol.ProtoVersion,
+		ClientGitSHA:  bootstrap.EmbeddedSHA(),
+		ClientPID:     os.Getpid(),
 		WantDestroyMC: true,
 	}}); err != nil {
 		return fmt.Errorf("write Hello: %w", err)
@@ -301,6 +367,19 @@ func (c *Client) runOnce(ctx context.Context) error {
 	c.snapMu.Lock()
 	c.helloAck = first.HelloAck
 	c.snapMu.Unlock()
+
+	// 4b. Deploy/refresh the clipboard read shims now that the agent upload
+	// succeeded AND the HelloAck SHA matches (so the portald symlink points at
+	// THIS agent). This is what makes shim deploy DAEMON-DRIVEN (DESIGN §9.1):
+	// a Mac-binary upgrade that changes the embedded shim text re-converges on
+	// reconnect without a manual `portal install`. clipshim.Ensure is a cheap
+	// grep in the steady state (the content marker already matches). Failure is
+	// non-fatal to the session — port forwarding must not be held hostage to a
+	// shim write — but it is logged loudly so the headline feature's breakage
+	// is visible (DESIGN §9.6).
+	if err := clipshim.Ensure(ctx, c.cfg.Transport); err != nil {
+		c.cfg.Log.Error("clip shim deploy failed — clipboard paste will not work until this succeeds", "err", err)
+	}
 
 	// 5. Latch the encoder so external Subscribe/Shutdown calls go to it.
 	c.streamMu.Lock()
@@ -472,6 +551,29 @@ func (c *Client) demuxLoop(ctx context.Context, dec *protocol.Decoder) error {
 				resetTimer()
 			case env.OpenURL != nil:
 				c.publish(EngineEvent{Kind: KindOpenURL, URL: env.OpenURL.URL})
+			case env.ClipRequest != nil:
+				// Route to the DEDICATED clip channel, not the shared events
+				// channel — a port-event burst must not evict a pending paste
+				// (DESIGN §5). Non-blocking so the demux loop (which also runs
+				// the heartbeat watchdog) never stalls behind a slow handler;
+				// the channel is cap-8 > maxInflightClip(4) so a drop here means
+				// the handler is genuinely wedged, in which case the agent's
+				// clipTimeout answers "none" anyway.
+				cr := env.ClipRequest
+				c.publishClip(EngineEvent{Kind: KindClipRequest, Clip: &ClipEvent{
+					Nonce: cr.Nonce, Epoch: cr.Epoch, Kind: cr.Kind, Format: cr.Format,
+				}})
+			case env.Notify != nil:
+				// Route to the DEDICATED notify channel (same rationale as
+				// ClipRequest). Fire-and-forget: no response frame. Non-blocking
+				// so a slow notification handler never stalls the demux loop /
+				// heartbeat watchdog.
+				nf := env.Notify
+				c.publishNotify(EngineEvent{Kind: KindNotify, Notify: &NotifyEvent{
+					Title: nf.Title, Body: nf.Body, Subtitle: nf.Subtitle,
+					Urgency: nf.Urgency, Verified: nf.Verified, Source: nf.Source,
+					Sound: nf.Sound, Seq: nf.Seq,
+				}})
 			case env.Heartbeat != nil:
 				// Already bumped above.
 			case env.SubscribeAck != nil:

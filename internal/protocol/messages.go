@@ -16,7 +16,7 @@ type Hello struct {
 	ProtoVersion   uint32 `cbor:"pv"`
 	ClientGitSHA   string `cbor:"sha"`
 	ClientPID      int    `cbor:"pid"`
-	PollIntervalMs uint32 `cbor:"poll_ms"`   // 0 = agent default (75)
+	PollIntervalMs uint32 `cbor:"poll_ms"` // 0 = agent default (75)
 	WantDestroyMC  bool   `cbor:"destroy_mc"`
 }
 
@@ -130,4 +130,78 @@ const (
 type OpenURL struct {
 	URL string `cbor:"url"`
 	Seq uint64 `cbor:"seq"`
+}
+
+// ClipRequest — agent → client. A remote shim hit the cmd socket asking the
+// Mac to read its clipboard. Sent only while a client is subscribed; the
+// agent registers a waiter keyed by Nonce and the Serve loop writes this
+// frame interleaved with heartbeats. Nonce+Epoch correlate the response so a
+// stale ClipResponse arriving down a *new* pipe after reconnect (where the
+// agent's clipSeq reset to 0) is dropped on the epoch check, never
+// mis-delivered. These counters are SEPARATE from the port-event Seq — a
+// ClipRequest must never advance the agent's port-event staleness counter.
+//
+// Kind ∈ {"targets","image","text"}; Format is "png" for images, empty otherwise.
+type ClipRequest struct {
+	Nonce  uint64 `cbor:"n"`
+	Epoch  uint64 `cbor:"e"` // agent process identity; echoed back in ClipResponse
+	Kind   string `cbor:"kind"`
+	Format string `cbor:"fmt,omitempty"`
+}
+
+// ClipResponse — client → agent. Answers a ClipRequest by (Nonce,Epoch).
+// Image and text bytes are NEVER inline: the bytes cross out-of-band over the
+// ControlMaster (clipupload) to a content-addressed side-channel file, and
+// this frame carries only the SHA. The agent reconstructs the single legal
+// path from the SHA itself (closes the arbitrary-file-read vector), so this
+// frame is always a few hundred bytes — the 1 MiB MaxFrameBytes cap is never
+// at risk from clipboard content.
+//
+//	targets: Has indicates the requested content is available on the Mac, and
+//	         Kind ∈ {"image","text"} tells the agent WHICH target lines to
+//	         advertise. The Mac decides image-vs-text (HasImage first, else
+//	         HasText) so the shim greps see the kind actually on the clipboard.
+//	image:   OK=true with SHA only (NO path — agent reconstructs it).
+//	text:    OK=true with SHA of a side-channel text file (NOT inline).
+type ClipResponse struct {
+	Nonce uint64 `cbor:"n"`
+	Epoch uint64 `cbor:"e"`
+	OK    bool   `cbor:"ok"`
+	Has   bool   `cbor:"has,omitempty"`
+	// Kind is the clipboard content kind the Mac decided for a `targets`
+	// probe: "image" or "text" (empty for image/text fetches). The agent's
+	// writeClipReply maps it to the byte-exact target line(s) the shim's grep
+	// expects. Carrying the kind (not the literal target lines) keeps the
+	// tool-specific formatting (xclip's UTF8_STRING/TEXT/STRING vs wl-paste's
+	// text/plain) on the shim side where the tool identity is known.
+	Kind string `cbor:"k,omitempty"`
+	SHA  string `cbor:"sha,omitempty"`
+	Err  string `cbor:"err,omitempty"`
+}
+
+// Notify — agent → client (v3). A remote event (a Claude Code hook firing
+// `portald notify --hook`, or a generic `portald notify --title … --body …`)
+// is relayed up the pipe and raised as a native macOS notification on the Mac.
+// Fire-and-forget: there is NO response frame, mirroring OpenURL. Sent only
+// while a client is subscribed; silently dropped otherwise.
+//
+// Trust model (mirrors cc-clip): an event arriving via the STRUCTURED hook
+// entrypoint (a real Claude Code hook) is Verified=true; an event from an
+// arbitrary/generic `portald notify` invocation is Verified=false, which the
+// Mac renders with an "[unverified] " title prefix. The transport itself (the
+// authenticated ssh ControlMaster + the 0600 owner-only cmd socket) is the
+// trust boundary — there is no bearer token (DESIGN §7.2 token-equivalence).
+//
+// Urgency tiers (from the ported ClassifyHookPayload): 0 = completion/calm,
+// 1 = attention/idle, 2 = critical/tool-approval. The Mac maps these to an
+// optional notification sound when Sound is empty.
+type Notify struct {
+	Title    string `cbor:"title"`
+	Body     string `cbor:"body,omitempty"`
+	Subtitle string `cbor:"sub,omitempty"`
+	Urgency  uint8  `cbor:"urg,omitempty"`
+	Verified bool   `cbor:"verified,omitempty"`
+	Source   string `cbor:"src,omitempty"`   // e.g. "claude_hook" or "generic"
+	Sound    string `cbor:"sound,omitempty"` // macOS sound name; "" = urgency default
+	Seq      uint64 `cbor:"seq,omitempty"`
 }

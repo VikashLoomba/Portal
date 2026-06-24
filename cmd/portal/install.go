@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
 
@@ -109,11 +110,36 @@ the headless launchd daemon can connect.`,
 				fmt.Printf("installed xdg-open wrapper on %s\n", host)
 			}
 
+			// Deploy the clipboard read shims (xclip/wl-paste) + PATH-prepend.
+			// This is the headline clip feature; surface failure LOUDLY and
+			// name the remediation (DESIGN §9.6) rather than swallowing it.
+			if err := ensureClipShims(cmd.Context(), host, a); err != nil {
+				fmt.Printf("WARNING: could not install clipboard shims on %s: %v\n", host, err)
+				fmt.Printf("         clipboard paste into coding agents will NOT work until this succeeds.\n")
+				fmt.Printf("         fix the cause above and re-run: %s install %s\n", app.Tool, host)
+			} else {
+				fmt.Printf("installed clipboard shims (xclip/wl-paste) on %s\n", host)
+				fmt.Printf("NOTE: keep your terminal's OSC 52 clipboard-WRITE disabled — a remote\n")
+				fmt.Printf("      could otherwise write your Mac clipboard and read it back.\n")
+			}
+
 			if !pathContains(os.Getenv("PATH"), a.Paths.BinDir) {
 				fmt.Printf("NOTE: %s is not on your PATH. Add it to your shell profile:\n", a.Paths.BinDir)
 				fmt.Printf("      export PATH=\"$HOME/.local/bin:$PATH\"\n")
 			}
-			fmt.Printf("try:  %s status\n", app.Tool)
+
+			// Run the end-to-end self-test (SPEC D) so install surfaces a
+			// pass/fail verdict on the headline clip path LOUDLY, the same way
+			// cc-clip verifies its setup. A FAIL here is the single make-or-break
+			// (usually PATH ordering); we print the report but do NOT abort the
+			// install — the service is already loaded and the user can re-run
+			// `portal doctor` after fixing the cause.
+			fmt.Printf("\nrunning self-test (%s doctor) ...\n", app.Tool)
+			tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+			rep := runDoctor(cmd.Context(), host, tr)
+			rep.write(os.Stdout)
+
+			fmt.Printf("\ntry:  %s status\n", app.Tool)
 			return nil
 		},
 	}
@@ -244,6 +270,18 @@ const browserEnvSnippet = `
 export BROWSER="${BROWSER:-xdg-open}"
 `
 
+// ensureClipShims deploys the xclip + wl-paste clipboard read shims and the
+// PATH-prepend block to the dev box (DESIGN §6/§9). The deploy logic lives in
+// internal/clipshim so the agentclient daemon loop — which cannot import this
+// CLI main package — shares exactly one implementation. Here we just bind a
+// transport to the freshly-configured host (its HostID is empty on a fresh
+// install, so a direct ssh call with `host` is required, mirroring
+// installXdgOpenWrapper).
+func ensureClipShims(ctx context.Context, host string, a *app.App) error {
+	tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+	return clipshim.Ensure(ctx, tr)
+}
+
 // installXdgOpenWrapper writes the wrapper script to ~/.local/bin/xdg-open
 // on the dev box. Uses a direct (non-multiplexed) ssh call with the given
 // host so it works on a fresh install before the ControlMaster exists.
@@ -298,23 +336,14 @@ done`
 	return nil
 }
 
-// removeXdgOpenWrapper removes the wrapper, portald symlink, and env snippet
-// from the dev box, restoring any pre-existing xdg-open backed up at install.
-func removeXdgOpenWrapper(ctx context.Context, a *app.App) {
-	script := `
-if [ -f ~/.local/bin/xdg-open.portal-backup ]; then
-    mv ~/.local/bin/xdg-open.portal-backup ~/.local/bin/xdg-open
-else
-    rm -f ~/.local/bin/xdg-open
-fi
-rm -f ~/.cache/portal/portald
-rm -f ~/.config/portal/env.sh
-for rc in ~/.bashrc ~/.zshrc; do
-    [ -f "$rc" ] || continue
-    grep -qF "portal/env.sh" "$rc" || continue
-    tmp=$(mktemp); grep -vF "portal/env.sh" "$rc" > "$tmp" && mv "$tmp" "$rc"
-done`
-	_, _ = a.Transport.Exec(ctx, "", "bash", "-c", shellQuoteRemote(script))
+// removePortalWrappers removes everything portal deploys to the dev box's
+// ~/.local/bin and shell rc files: the xdg-open wrapper, the xclip/wl-paste
+// clipboard shims, the portald symlink, the env snippet, AND the PATH-prepend
+// marker block — restoring any pre-existing binaries backed up at install. The
+// removal logic lives in internal/clipshim so it shares exactly one
+// implementation with the deploy side. Never touches /usr/bin (DESIGN §9.3/§9.4).
+func removePortalWrappers(ctx context.Context, a *app.App) {
+	clipshim.Remove(ctx, a.Transport)
 }
 
 // shellQuoteRemote wraps a shell script in single quotes for safe remote

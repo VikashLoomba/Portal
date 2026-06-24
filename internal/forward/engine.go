@@ -19,8 +19,6 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
 
-
-
 // Engine wires the dependencies the reconcile loop needs. Build with New().
 type Engine struct {
 	T         sshctl.Transport

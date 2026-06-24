@@ -131,19 +131,56 @@ func (d *Decoder) Read() (*Envelope, error) {
 // Used to enforce the one-field-per-frame tagged-union contract.
 func countEnvelopeFields(e *Envelope) int {
 	n := 0
-	if e.Hello != nil { n++ }
-	if e.Subscribe != nil { n++ }
-	if e.Ping != nil { n++ }
-	if e.ReqSnap != nil { n++ }
-	if e.Shutdown != nil { n++ }
-	if e.HelloAck != nil { n++ }
-	if e.SubscribeAck != nil { n++ }
-	if e.Snapshot != nil { n++ }
-	if e.PortAdded != nil { n++ }
-	if e.PortRemoved != nil { n++ }
-	if e.Heartbeat != nil { n++ }
-	if e.AgentError != nil { n++ }
-	if e.Bye != nil { n++ }
-	if e.OpenURL != nil { n++ }
+	if e.Hello != nil {
+		n++
+	}
+	if e.Subscribe != nil {
+		n++
+	}
+	if e.Ping != nil {
+		n++
+	}
+	if e.ReqSnap != nil {
+		n++
+	}
+	if e.Shutdown != nil {
+		n++
+	}
+	if e.HelloAck != nil {
+		n++
+	}
+	if e.SubscribeAck != nil {
+		n++
+	}
+	if e.Snapshot != nil {
+		n++
+	}
+	if e.PortAdded != nil {
+		n++
+	}
+	if e.PortRemoved != nil {
+		n++
+	}
+	if e.Heartbeat != nil {
+		n++
+	}
+	if e.AgentError != nil {
+		n++
+	}
+	if e.Bye != nil {
+		n++
+	}
+	if e.OpenURL != nil {
+		n++
+	}
+	if e.ClipRequest != nil {
+		n++
+	}
+	if e.ClipResponse != nil {
+		n++
+	}
+	if e.Notify != nil {
+		n++
+	}
 	return n
 }

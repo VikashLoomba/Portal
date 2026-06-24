@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/audit"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
@@ -27,6 +28,7 @@ type App struct {
 	Runner    run.Runner
 	Clk       clock.Clock
 	Log       forward.Logger
+	Audit     *audit.Log
 	Transport sshctl.Transport
 	Ports     proc.PortLister
 	Discover  discover.RemoteDiscoverer
@@ -90,6 +92,7 @@ func NewProd() (*App, error) {
 
 	return &App{
 		Paths: paths, Cfg: cfg, Runner: runner, Clk: clk, Log: logf,
+		Audit:     audit.New(paths.ConfigDir),
 		Transport: transport, Ports: ports, Discover: rd, Service: svc,
 		Bootstrap: bs, AgentClient: ac,
 	}, nil
