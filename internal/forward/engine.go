@@ -49,6 +49,12 @@ type Engine struct {
 	// non-nil, Interval when nil.
 	SafetyInterval time.Duration
 
+	// kick is a buffered (cap 1) coalescing trigger for an out-of-band
+	// reconcile — POST /v1/reconcile's clean entry point. Kick() does a
+	// non-blocking send; runEventDriven selects on it and fires the same
+	// debounce path as EvConnected/EvDelta. Created by New().
+	kick chan struct{}
+
 	conflicts *conflictSet
 }
 
@@ -83,7 +89,23 @@ func New(t sshctl.Transport, pl proc.PortLister, rd discover.RemoteDiscoverer,
 	return &Engine{
 		T: t, PL: pl, RD: rd, Cfg: cfg, Clk: clk, Log: log,
 		Interval: interval, Deny: deny, SkipLocal: skipLocal,
+		kick:      make(chan struct{}, 1),
 		conflicts: newConflictSet(),
+	}
+}
+
+// Kick requests an out-of-band reconcile. The send is non-blocking and
+// coalescing (cap-1 buffer): concurrent kicks collapse into at most one
+// pending trigger, and Kick never blocks its caller (POST /v1/reconcile).
+// Nil-safe: an Engine built without New() has no kick channel, so this is a
+// no-op there — New() always sets it.
+func (e *Engine) Kick() {
+	if e.kick == nil {
+		return
+	}
+	select {
+	case e.kick <- struct{}{}:
+	default:
 	}
 }
 
@@ -193,6 +215,10 @@ func (e *Engine) runEventDriven(ctx context.Context) error {
 					e.Log.Logf("agent disconnected; preserving forwards")
 				}
 			}
+		case <-e.kick:
+			// Out-of-band reconcile trigger (POST /v1/reconcile). Same debounce
+			// path as EvConnected/EvDelta so bursts coalesce.
+			fireSoon()
 		case <-debounceC:
 			pending = false
 			_ = e.Reconcile(ctx)

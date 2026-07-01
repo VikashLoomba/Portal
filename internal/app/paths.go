@@ -59,6 +59,7 @@ type Paths struct {
 	Plist     string
 	Log       string
 	Sock      string // honors PORTAL_SOCK (test seam)
+	APISock   string // honors PORTAL_API_SOCK (test seam); default <ConfigDir>/api.sock
 	Domain    string // gui/<uid>
 }
 
@@ -75,6 +76,13 @@ func DerivePaths(home string, uid int) Paths {
 	if sock == "" {
 		sock = filepath.Join(home, ".ssh", "cm-"+Tool+".sock")
 	}
+	// APISock derives from the resolved ConfigDir (which already honors
+	// PORTAL_CONFIG_DIR), so the staging harness isolates it for free (D5).
+	// PORTAL_API_SOCK is the explicit override seam.
+	apiSock := os.Getenv("PORTAL_API_SOCK")
+	if apiSock == "" {
+		apiSock = filepath.Join(cfg, "api.sock")
+	}
 	binDir := filepath.Join(home, ".local", "bin")
 	label := "local." + Tool + ".autoforward"
 	return Paths{
@@ -89,6 +97,7 @@ func DerivePaths(home string, uid int) Paths {
 		Plist:     filepath.Join(home, "Library", "LaunchAgents", label+".plist"),
 		Log:       filepath.Join(home, "Library", "Logs", Tool+".log"),
 		Sock:      sock,
+		APISock:   apiSock,
 		Domain:    fmt.Sprintf("gui/%d", uid),
 	}
 }
