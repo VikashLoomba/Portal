@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
@@ -92,6 +93,32 @@ func TestHandleOpenAPI(t *testing.T) {
 	}
 }
 
+// TestHandleStatus_EmptyArraysNotNull pins §4.4: with no agent snapshot, no
+// master forwards, and an empty config, the ports/forwards/allowed fields must
+// serialize as [] (never null) so a polyglot client can iterate them in the
+// disconnected state — matching GET /v1/ports's always-array shape.
+func TestHandleStatus_EmptyArraysNotNull(t *testing.T) {
+	s := New(Deps{
+		Version: VersionInfo{Version: "9.9"},
+		Agent:   &fakeAgent{ok: false},
+		Config:  config.New(t.TempDir()),
+		Hub:     hub.New(),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	s.mux.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	for _, field := range []string{"ports", "forwards", "allowed"} {
+		if strings.Contains(body, `"`+field+`":null`) {
+			t.Errorf("status field %q serialized as null, want []: %s", field, body)
+		}
+		if !strings.Contains(body, `"`+field+`":[]`) {
+			t.Errorf("status field %q not an empty array: %s", field, body)
+		}
+	}
+}
+
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
@@ -137,6 +164,61 @@ func TestHandleStatus_AgentPresent(t *testing.T) {
 	}
 	if len(got.Forwards) != 1 || got.Forwards[0].Name != "127.0.0.1:8080->box:8080" {
 		t.Errorf("Forwards = %+v", got.Forwards)
+	}
+}
+
+// TestErrorEnvelope_FrameworkResponses pins D9: the ServeMux's own 404 (unknown
+// path) and 405 (wrong verb on a known path) must carry the {"error":{...}}
+// envelope with application/json, not Go's default text/plain body — otherwise a
+// typed client decoding non-2xx bodies fails. Our handlers' own 404s (which set
+// application/json first) must pass through untouched. These go through
+// middleware() because that is where the envelope is enforced.
+func TestErrorEnvelope_FrameworkResponses(t *testing.T) {
+	s := newTestServer(t, nil)
+	h := s.middleware(s.mux)
+
+	tests := []struct {
+		name     string
+		method   string
+		target   string
+		body     string
+		wantCode int
+		wantErr  string // "" => not an error envelope (handler-owned)
+	}{
+		{"unknown path is not_found", http.MethodGet, "/v1/nope", "", http.StatusNotFound, "not_found"},
+		{"wrong verb on known path is method_not_allowed", http.MethodPost, "/v1/status", "", http.StatusMethodNotAllowed, "method_not_allowed"},
+		{"unregistered verb on features is method_not_allowed", http.MethodDelete, "/v1/features/clip-text", "", http.StatusMethodNotAllowed, "method_not_allowed"},
+		// A handler-owned 404 (application/json already set) must survive verbatim.
+		{"handler 404 passes through", http.MethodPut, "/v1/features/bogus", `{"enabled":true}`, http.StatusNotFound, "feature_unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			var req *http.Request
+			if tt.body != "" {
+				req = httptest.NewRequest(tt.method, tt.target, strings.NewReader(tt.body))
+			} else {
+				req = httptest.NewRequest(tt.method, tt.target, nil)
+			}
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantCode {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.wantCode)
+			}
+			if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json", ct)
+			}
+			var eb errorBody
+			if err := json.Unmarshal(rec.Body.Bytes(), &eb); err != nil {
+				t.Fatalf("body %q is not the D9 error envelope: %v", rec.Body.String(), err)
+			}
+			if eb.Error.Code != tt.wantErr {
+				t.Errorf("error code = %q, want %q", eb.Error.Code, tt.wantErr)
+			}
+			if eb.Error.Message == "" {
+				t.Error("error message is empty")
+			}
+		})
 	}
 }
 

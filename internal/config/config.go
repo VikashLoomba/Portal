@@ -12,11 +12,20 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type Store struct {
 	// Dir is the config directory (e.g. ~/.config/portal).
 	Dir string
+
+	// mu serializes the allow/feature file read-modify-write mutations against
+	// each other. The allow file is edited via a non-atomic RMW (AllowedPorts →
+	// filter/append → rewrite), so two concurrent mutators — the daemon now
+	// serves allow/unallow from per-request HTTP goroutines (D7 single owner) —
+	// would otherwise interleave and silently drop one edit. A process mutex is
+	// sufficient because the daemon is the single-instance owner of the socket.
+	mu sync.Mutex
 }
 
 func New(dir string) *Store { return &Store{Dir: dir} }
@@ -71,6 +80,8 @@ func (s *Store) FeatureEnabled(feature string) bool {
 // creating Dir if needed. Writing "on"/"off" makes the state inspectable and
 // idempotent — `SetFeature(f,true)` then `FeatureEnabled(f)` round-trips.
 func (s *Store) SetFeature(feature string, on bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
 		return err
 	}
@@ -110,6 +121,14 @@ func (s *Store) WriteHost(host string) error {
 // ints. RE-READ EACH PASS — `allow`/`unallow` edits propagate to the running
 // daemon within the reconcile interval with no restart needed.
 func (s *Store) AllowedPorts() ([]int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.allowedPortsLocked()
+}
+
+// allowedPortsLocked is AllowedPorts without acquiring mu — the shared read used
+// by Allow/Unallow, which already hold mu for the whole RMW.
+func (s *Store) allowedPortsLocked() ([]int, error) {
 	f, err := os.Open(s.allowFile())
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -149,7 +168,9 @@ func (s *Store) AllowedPorts() ([]int, error) {
 // Allow appends ports to the allowlist, returning the ports actually added
 // (skipping duplicates). Numeric validation is the caller's job.
 func (s *Store) Allow(ports []int) ([]int, error) {
-	current, err := s.AllowedPorts()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, err := s.allowedPortsLocked()
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +203,9 @@ func (s *Store) Allow(ports []int) ([]int, error) {
 // Unallow rewrites the allowlist minus the given ports. Missing ports are
 // no-ops (matches the bash command which prints "unallowed: P" regardless).
 func (s *Store) Unallow(ports []int) error {
-	current, err := s.AllowedPorts()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, err := s.allowedPortsLocked()
 	if err != nil {
 		return err
 	}

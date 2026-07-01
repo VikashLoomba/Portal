@@ -2,6 +2,7 @@ package localapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -114,7 +115,7 @@ func Listen(path string) (net.Listener, error) {
 		ln.Close()
 		return nil, fmt.Errorf("localapi: expected *net.UnixListener, got %T", ln)
 	}
-	return &peerCredListener{UnixListener: ul, selfUID: os.Getuid()}, nil
+	return &peerCredListener{UnixListener: ul, selfUID: os.Getuid(), uidOf: peerUID}, nil
 }
 
 // probeAlive reports whether something answers HTTP on the unix socket at path
@@ -144,17 +145,26 @@ func probeAlive(path string) bool {
 type peerCredListener struct {
 	*net.UnixListener
 	selfUID int
+	// uidOf resolves an accepted conn's peer uid; it defaults to peerUID and is a
+	// field only so a test can drive Accept with a faked mismatched/erroring peer
+	// (the real peerUID needs a genuine same-uid socket, which can't exercise the
+	// close-and-skip branches — the actual §4.7 trust boundary).
+	uidOf func(*net.UnixConn) (int, error)
 }
 
 // Accept returns the next connection from a same-uid peer, transparently
 // closing and skipping mismatched or unreadable peers.
 func (l *peerCredListener) Accept() (net.Conn, error) {
+	uidOf := l.uidOf
+	if uidOf == nil {
+		uidOf = peerUID
+	}
 	for {
 		c, err := l.UnixListener.AcceptUnix()
 		if err != nil {
 			return nil, err
 		}
-		uid, err := peerUID(c)
+		uid, err := uidOf(c)
 		if err != nil {
 			c.Close()
 			continue
@@ -197,25 +207,74 @@ func socketPath(ln net.Listener) string {
 	return ""
 }
 
-// middleware wraps the mux with panic recovery (recover → 500 error JSON) and a
-// debug request log. Peer-cred is enforced at the listener, not here.
+// middleware wraps the mux with panic recovery (recover → 500 error JSON), a
+// debug request log, and D9 envelope enforcement for the framework's own 404/405
+// responses. Peer-cred is enforced at the listener, not here.
 func (s *Server) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ew := &envelopeWriter{ResponseWriter: w}
 		defer func() {
 			if rec := recover(); rec != nil {
 				s.log.Error("localapi handler panic", "err", rec, "method", r.Method, "path", r.URL.Path)
-				writeError(w, http.StatusInternalServerError, "internal", "internal server error")
+				writeError(ew, http.StatusInternalServerError, "internal", "internal server error")
 			}
 		}()
 		s.log.Debug("localapi request", "method", r.Method, "path", r.URL.Path)
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(ew, r)
 	})
+}
+
+// envelopeWriter rewrites the ServeMux's default plain-text 404/405 bodies into
+// the D9 error envelope. Go 1.22 method patterns answer an unknown path with 404
+// and a wrong verb on a known path with 405, both as text/plain; a typed client
+// decoding non-2xx bodies as {"error":{...}} would otherwise fail (§ D9). Our own
+// handlers already set Content-Type application/json before WriteHeader, so those
+// (e.g. 404 feature_unknown) pass through untouched. Unwrap keeps
+// http.ResponseController (events streaming's Flush/SetWriteDeadline) working.
+type envelopeWriter struct {
+	http.ResponseWriter
+	swallow bool // true once we've substituted our own JSON body for the default
+}
+
+func (w *envelopeWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *envelopeWriter) WriteHeader(code int) {
+	if (code == http.StatusNotFound || code == http.StatusMethodNotAllowed) &&
+		w.Header().Get("Content-Type") != "application/json" {
+		machineCode, msg := "not_found", "no such endpoint"
+		if code == http.StatusMethodNotAllowed {
+			machineCode, msg = "method_not_allowed", "method not allowed for this endpoint"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.ResponseWriter.WriteHeader(code)
+		_ = json.NewEncoder(w.ResponseWriter).Encode(errorBody{Error: errorDetail{Code: machineCode, Message: msg}})
+		w.swallow = true
+		return
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *envelopeWriter) Write(b []byte) (int, error) {
+	if w.swallow {
+		// Discard the framework's plain-text body; we already wrote the envelope.
+		return len(b), nil
+	}
+	return w.ResponseWriter.Write(b)
 }
 
 // buildStatus assembles the Status aggregate from deps. Missing/erroring
 // sources degrade to zero values rather than failing the whole status.
 func (s *Server) buildStatus(ctx context.Context) Status {
-	st := Status{Version: s.deps.Version, Features: map[string]bool{}}
+	// Ports/Forwards/Allowed are initialized to empty non-nil slices so the JSON
+	// fields are ALWAYS arrays, never null — matching GET /v1/ports and letting a
+	// polyglot client iterate them safely even in the disconnected state (§4.4).
+	st := Status{
+		Version:  s.deps.Version,
+		Features: map[string]bool{},
+		Ports:    []PortStatus{},
+		Forwards: []ForwardStatus{},
+		Allowed:  []int{},
+	}
 
 	if s.deps.Host != nil {
 		if h, err := s.deps.Host(); err == nil {
@@ -261,7 +320,9 @@ func (s *Server) buildStatus(ctx context.Context) Status {
 	}
 
 	if s.deps.Config != nil {
-		if allowed, err := s.deps.Config.AllowedPorts(); err == nil {
+		// AllowedPorts returns nil for a missing file; keep the initialized empty
+		// slice in that case so Allowed never marshals to null.
+		if allowed, err := s.deps.Config.AllowedPorts(); err == nil && allowed != nil {
 			st.Allowed = allowed
 		}
 		for _, name := range s.deps.FeatureNames {
