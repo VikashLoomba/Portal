@@ -23,6 +23,9 @@ paths:
   /v1/status:
     get:
       summary: The full Status aggregate.
+  /v1/events:
+    get:
+      summary: ndjson event stream (snapshot-first, coalesced state, notify, tick).
   /v1/ports:
     get:
       summary: Remote loopback listeners from the cached Snapshot (503 before the first).

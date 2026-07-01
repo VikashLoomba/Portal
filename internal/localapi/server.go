@@ -62,6 +62,7 @@ func (s *Server) registerRoutes() []route {
 		{http.MethodGet, "/v1/version", s.handleVersion},
 		{http.MethodGet, "/v1/openapi.yaml", s.handleOpenAPI},
 		{http.MethodGet, "/v1/status", s.handleStatus},
+		{http.MethodGet, "/v1/events", s.handleEvents},
 		{http.MethodGet, "/v1/ports", s.handlePorts},
 		{http.MethodPut, "/v1/allow/{port}", s.handleAllowPut},
 		{http.MethodDelete, "/v1/allow/{port}", s.handleAllowDelete},
