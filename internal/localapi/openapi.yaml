@@ -23,3 +23,23 @@ paths:
   /v1/status:
     get:
       summary: The full Status aggregate.
+  /v1/ports:
+    get:
+      summary: Remote loopback listeners from the cached Snapshot (503 before the first).
+  /v1/allow/{port}:
+    put:
+      summary: Add a port to the allowlist and push it; returns the new allowlist.
+    delete:
+      summary: Remove a port from the allowlist and push it; returns the new allowlist.
+  /v1/features:
+    get:
+      summary: The capability gates as a name to enabled map.
+  /v1/features/{name}:
+    put:
+      summary: Toggle one capability gate; unknown name is 404.
+  /v1/reconcile:
+    post:
+      summary: Kick the forward engine reconcile; returns 202.
+  /v1/doctor:
+    post:
+      summary: Run the doctor self-test; returns the structured report.
