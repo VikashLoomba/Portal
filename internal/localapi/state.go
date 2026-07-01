@@ -1,0 +1,129 @@
+// Package localapi is the local control-plane HTTP server: HTTP/1.1 + JSON over
+// a Unix socket, mirroring the remote cmd socket's trust model (dir 0700, socket
+// 0600, peer-uid check). It is the single implementation of portal's status
+// aggregate and mutation endpoints; every frontend (the CLI today, desktop
+// shells later) is a thin client of it. See DESIGN-local-core-api.md §4.
+package localapi
+
+import (
+	"context"
+
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/service"
+)
+
+// VersionInfo is the payload of GET /v1/version: portal version, embedded git
+// SHA, and the wire ProtoVersion (D6).
+type VersionInfo struct {
+	Version      string `json:"version"`
+	GitSHA       string `json:"gitSha"`
+	ProtoVersion uint32 `json:"protoVersion"`
+}
+
+// AgentStatus is the connected agent's handshake identity, sourced from
+// protocol.HelloAck. ConnectedFor is deferred (§4.4 is shape-not-final).
+type AgentStatus struct {
+	Pid    int    `json:"pid"`
+	SHA    string `json:"sha"`
+	Kernel string `json:"kernel"`
+	BootID string `json:"bootId"`
+}
+
+// PortStatus is one remote loopback listener from the cached wire Snapshot.
+type PortStatus struct {
+	Port int `json:"port"`
+}
+
+// ForwardStatus is one active local forward — the verbatim lsof NAME line
+// (ground truth; renderers parse it, this layer does not).
+type ForwardStatus struct {
+	Name string `json:"name"`
+}
+
+// ServiceStatus mirrors service.Status: launchd loaded flag + raw state lines.
+type ServiceStatus struct {
+	Loaded     bool     `json:"loaded"`
+	StateLines []string `json:"stateLines"`
+}
+
+// MasterStatus reports the ssh ControlMaster: Up iff a live pid was found.
+type MasterStatus struct {
+	Up  bool `json:"up"`
+	Pid int  `json:"pid"`
+}
+
+// Health carries daemon-internal liveness/QoS counters (§4.4).
+type Health struct {
+	LastDisconnectErr  string `json:"lastDisconnectErr,omitempty"`
+	DroppedNotifyCount uint64 `json:"droppedNotifyCount"`
+	EventsSubscribers  int    `json:"eventsSubscribers"`
+}
+
+// Status is the full aggregate returned by GET /v1/status (and the first line
+// of the events stream). Everything runStatus prints today is derivable from it.
+type Status struct {
+	Version  VersionInfo     `json:"version"`
+	Host     string          `json:"host"`
+	Service  ServiceStatus   `json:"service"`
+	Master   MasterStatus    `json:"master"`
+	Agent    *AgentStatus    `json:"agent"`
+	Ports    []PortStatus    `json:"ports"`
+	Forwards []ForwardStatus `json:"forwards"`
+	Allowed  []int           `json:"allowed"`
+	Features map[string]bool `json:"features"`
+	Health   Health          `json:"health"`
+}
+
+// AgentSource is the narrow read view of the in-process agentclient.Client the
+// status aggregate needs. Satisfied by *agentclient.Client; faked in tests.
+type AgentSource interface {
+	HelloAck() *protocol.HelloAck
+	Snapshot() (seq uint64, ports []uint16, ok bool)
+	LastDisconnectErr() string
+}
+
+// MasterProber probes the ssh ControlMaster pid (subset of sshctl.Transport).
+type MasterProber interface {
+	MasterPID(ctx context.Context) (int, error)
+}
+
+// ForwardLister lists active local forwards (subset of proc.PortLister).
+type ForwardLister interface {
+	MasterForwardLines(ctx context.Context, masterPID int) ([]string, error)
+}
+
+// ServiceStater reports launchd service state (subset of service.Manager).
+type ServiceStater interface {
+	Status(ctx context.Context) (service.Status, error)
+}
+
+// ConfigStore is the file-backed allowlist + feature gates (subset of
+// *config.Store; a real *config.Store over t.TempDir is fine in tests).
+type ConfigStore interface {
+	AllowedPorts() ([]int, error)
+	Allow(ports []int) ([]int, error)
+	Unallow(ports []int) error
+	FeatureEnabled(feature string) bool
+	SetFeature(feature string, on bool) error
+}
+
+// Deps is the dependency set for a Server. The interface fields are narrow so
+// tests fake them without constructing an App; Doctor/PushAllow/Kick are
+// closures wired by run.go so localapi never imports package app. FeatureNames
+// defaults to [clip-image, clip-text, notify] when empty.
+type Deps struct {
+	Version      VersionInfo
+	Host         func() (string, error)
+	Agent        AgentSource
+	Master       MasterProber
+	Ports        ForwardLister
+	Service      ServiceStater
+	Config       ConfigStore
+	Hub          *hub.Hub
+	PushAllow    func([]int) error
+	Kick         func()
+	Doctor       func(context.Context) *doctor.Report
+	FeatureNames []string
+}

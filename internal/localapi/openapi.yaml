@@ -1,0 +1,25 @@
+# openapi.yaml — hand-written, go:embed-ed (handlers.go), served at
+# GET /v1/openapi.yaml. This is the D2 spec-first source of truth.
+#
+# FORMATTING CONTRACT (the spec_test.go mini-parser depends on this EXACTLY):
+#   - 2-space indentation throughout.
+#   - path keys are indented 2 spaces and look like `  /v1/foo:`.
+#   - method keys are indented 4 spaces and look like `    get:`.
+# The conformance test extracts (METHOD, path) pairs from these keys and asserts
+# set equality with the mux route table in BOTH directions. Later units append
+# paths/methods here IN LOCKSTEP with server.go's registerRoutes so the test
+# stays green.
+openapi: 3.0.3
+info:
+  title: Portal Local Core API
+  version: "1"
+paths:
+  /v1/version:
+    get:
+      summary: Portal version, embedded git SHA, and wire ProtoVersion.
+  /v1/openapi.yaml:
+    get:
+      summary: This embedded OpenAPI spec.
+  /v1/status:
+    get:
+      summary: The full Status aggregate.
