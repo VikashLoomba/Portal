@@ -1,11 +1,37 @@
 package hub
 
 import (
+	"encoding/json"
 	"runtime"
 	"sync"
 	"testing"
 	"time"
 )
+
+// TestNotifyJSONContract pins the on-the-wire key names of a Notify: it is
+// serialized directly as the /v1/events `notify` object, whose keys DESIGN §4.6
+// fixes as camelCase. This guards the source of truth so field-name drift is
+// caught here, not by a polyglot client rendering empty notifications.
+func TestNotifyJSONContract(t *testing.T) {
+	n := Notify{Title: "t", Body: "b", Subtitle: "s", Urgency: 2, Verified: true, Source: "src", Sound: "snd", Seq: 9}
+	b, err := json.Marshal(n)
+	if err != nil {
+		t.Fatalf("marshal Notify: %v", err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal Notify: %v", err)
+	}
+	want := []string{"title", "body", "subtitle", "urgency", "verified", "source", "sound", "seq"}
+	if len(got) != len(want) {
+		t.Fatalf("Notify JSON has %d keys, want %d (json=%s)", len(got), len(want), b)
+	}
+	for _, k := range want {
+		if _, ok := got[k]; !ok {
+			t.Errorf("Notify JSON missing camelCase key %q (json=%s)", k, b)
+		}
+	}
+}
 
 // stateEvent is a Coalesced signal; Notify is nil by design.
 func stateEvent() Event { return Event{Class: Coalesced} }

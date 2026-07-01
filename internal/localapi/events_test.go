@@ -58,25 +58,35 @@ func streamingClient(path string) *http.Client {
 	}
 }
 
+// streamLine is one ndjson line: the raw wire bytes plus its decoded envelope.
+// Retaining raw lets tests assert on the on-the-wire JSON keys directly instead
+// of round-tripping through the same structs the server marshals with, which
+// would mask field-name drift (e.g. PascalCase vs. the camelCase §4.6 contract).
+type streamLine struct {
+	raw []byte
+	el  eventLine
+}
+
 // lineReader decodes ndjson eventLines off a stream body on a goroutine so tests
 // can bound each read with a timeout instead of blocking on Scanner.Scan.
 type lineReader struct {
-	lines chan eventLine
+	lines chan streamLine
 	errc  chan error
 }
 
 func readLines(body io.Reader) *lineReader {
-	lr := &lineReader{lines: make(chan eventLine, 64), errc: make(chan error, 1)}
+	lr := &lineReader{lines: make(chan streamLine, 64), errc: make(chan error, 1)}
 	go func() {
 		sc := bufio.NewScanner(body)
 		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 		for sc.Scan() {
+			raw := append([]byte(nil), sc.Bytes()...)
 			var el eventLine
-			if err := json.Unmarshal(sc.Bytes(), &el); err != nil {
+			if err := json.Unmarshal(raw, &el); err != nil {
 				lr.errc <- err
 				return
 			}
-			lr.lines <- el
+			lr.lines <- streamLine{raw: raw, el: el}
 		}
 		lr.errc <- sc.Err()
 	}()
@@ -86,27 +96,40 @@ func readLines(body io.Reader) *lineReader {
 // next returns the next decoded line or fails on timeout.
 func (lr *lineReader) next(t *testing.T, timeout time.Duration) eventLine {
 	t.Helper()
+	return lr.nextLine(t, timeout).el
+}
+
+// nextLine returns the next raw+decoded line or fails on timeout.
+func (lr *lineReader) nextLine(t *testing.T, timeout time.Duration) streamLine {
+	t.Helper()
 	select {
-	case el := <-lr.lines:
-		return el
+	case sl := <-lr.lines:
+		return sl
 	case err := <-lr.errc:
 		t.Fatalf("stream ended before a line arrived: %v", err)
 	case <-time.After(timeout):
 		t.Fatal("timed out waiting for an event line")
 	}
-	return eventLine{}
+	return streamLine{}
 }
 
 // waitType returns the next line whose Type == typ, skipping other lines (e.g.
 // interleaved ticks), or fails on timeout.
 func (lr *lineReader) waitType(t *testing.T, typ string, timeout time.Duration) eventLine {
 	t.Helper()
+	return lr.waitTypeLine(t, typ, timeout).el
+}
+
+// waitTypeLine returns the next raw+decoded line whose Type == typ, skipping
+// other lines, or fails on timeout.
+func (lr *lineReader) waitTypeLine(t *testing.T, typ string, timeout time.Duration) streamLine {
+	t.Helper()
 	deadline := time.After(timeout)
 	for {
 		select {
-		case el := <-lr.lines:
-			if el.Type == typ {
-				return el
+		case sl := <-lr.lines:
+			if sl.el.Type == typ {
+				return sl
 			}
 		case err := <-lr.errc:
 			t.Fatalf("stream ended before a %q line: %v", typ, err)
@@ -205,13 +228,38 @@ func TestEventsNotifyTeed(t *testing.T) {
 	want := &hub.Notify{Title: "deploy done", Body: "build 42", Subtitle: "ci", Urgency: 1, Verified: true, Source: "hook", Sound: "ping", Seq: 7}
 	h.Publish(hub.Event{Class: hub.Queued, Notify: want})
 
-	notify := lr.waitType(t, "notify", 2*time.Second)
-	if notify.Notify == nil {
+	line := lr.waitTypeLine(t, "notify", 2*time.Second)
+	if line.el.Notify == nil {
 		t.Fatal("notify line has nil notify")
 	}
-	if *notify.Notify != *want {
-		t.Errorf("notify = %+v, want %+v", *notify.Notify, *want)
+	if *line.el.Notify != *want {
+		t.Errorf("notify = %+v, want %+v", *line.el.Notify, *want)
 	}
+
+	// Assert the on-the-wire keys are the camelCase DESIGN §4.6 contract, not
+	// the PascalCase Go field names. Decoding through the same struct the server
+	// marshals with (as *line.el above) round-trips either casing cleanly and so
+	// cannot catch this drift — the raw bytes must be inspected directly.
+	var raw struct {
+		Notify map[string]json.RawMessage `json:"notify"`
+	}
+	if err := json.Unmarshal(line.raw, &raw); err != nil {
+		t.Fatalf("unmarshal raw notify line: %v", err)
+	}
+	for _, key := range []string{"title", "body", "subtitle", "urgency", "verified", "source", "sound", "seq"} {
+		if _, ok := raw.Notify[key]; !ok {
+			t.Errorf("notify object missing camelCase key %q; got keys %v (raw: %s)", key, mapKeys(raw.Notify), line.raw)
+		}
+	}
+}
+
+// mapKeys returns the keys of m (for test failure messages).
+func mapKeys(m map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 // TestEventsTick (EC3.4): with a short TickInterval, at least one "tick" line
@@ -229,23 +277,62 @@ func TestEventsTick(t *testing.T) {
 }
 
 // TestEventsDisconnect (EC3.5): closing the client mid-stream makes the handler
-// return and subCount fall back to 0 — proving no leak/backpressure.
+// return, releasing BOTH its hub subscriptions (Coalesced + Queued) as well as
+// decrementing subCount — proving no leak/backpressure. Asserting on the hub's
+// own subscriber count (not just the handler-local subCount atomic) is what
+// actually catches a missing cancel: a leaked subscription stays in h.subs and
+// keeps receiving every Publish forever while subCount can still reach 0.
 func TestEventsDisconnect(t *testing.T) {
-	s, _, path := newEventsServer(t, time.Hour)
+	s, h, path := newEventsServer(t, time.Hour)
+
+	base := h.SubscriberCount()
+
 	resp, lr, cancel := openStream(t, path)
 
 	if first := lr.next(t, 2*time.Second); first.Type != "snapshot" {
 		t.Fatalf("first line type = %q, want snapshot", first.Type)
 	}
-	// The handler incremented subCount on entry.
+	// The handler incremented subCount and registered both hub subscriptions.
 	waitSubCount(t, s, 1)
+	waitHubSubs(t, h, base+2)
 
 	// Disconnect: cancel the request context and close the body.
 	cancel()
 	resp.Body.Close()
 
-	// The handler's r.Context() is now Done; it returns and decrements.
+	// The handler's r.Context() is now Done; it returns, decrements subCount,
+	// and its two cancel funcs remove both subscribers from the hub.
 	waitSubCount(t, s, 0)
+	waitHubSubs(t, h, base)
+
+	// A Publish after disconnect must reach no leaked subscriber. If either
+	// subscription leaked it would still be in h.subs; the drop counter proves
+	// nothing is being delivered to a dead, un-drained Queued channel.
+	before := h.DroppedNotify()
+	for i := 0; i < queuedStress; i++ {
+		h.Publish(hub.Event{Class: hub.Queued, Notify: &hub.Notify{Seq: uint64(i)}})
+		h.Publish(hub.Event{Class: hub.Coalesced})
+	}
+	if got := h.DroppedNotify(); got != before {
+		t.Fatalf("DroppedNotify advanced by %d after disconnect; a subscription leaked", got-before)
+	}
+}
+
+// queuedStress overflows a Queued subscriber's cap-16 buffer many times over, so
+// a leaked (un-drained) subscription would register drops.
+const queuedStress = 128
+
+// waitHubSubs polls the hub's own subscriber count until it equals want or fails.
+func waitHubSubs(t *testing.T, h *hub.Hub, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.SubscriberCount() == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("hub SubscriberCount = %d, want %d", h.SubscriberCount(), want)
 }
 
 // waitSubCount polls s.subCount until it equals want or fails.

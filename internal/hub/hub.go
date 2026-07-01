@@ -42,15 +42,21 @@ const (
 // Notify mirrors agentclient.NotifyEvent field-for-field. It is duplicated
 // rather than imported so the hub imports nothing from agentclient (the tee
 // dependency points one way only: agentclient → hub).
+//
+// The json tags are load-bearing: this struct is serialized directly as the
+// `notify` object of the /v1/events ndjson stream, and DESIGN §4.6 fixes that
+// object's keys as camelCase (title/verified/seq/…). Without the tags Go would
+// emit the exported field names verbatim, breaking any client keyed on the
+// documented contract.
 type Notify struct {
-	Title    string
-	Body     string
-	Subtitle string
-	Urgency  uint8
-	Verified bool
-	Source   string
-	Sound    string
-	Seq      uint64
+	Title    string `json:"title"`
+	Body     string `json:"body"`
+	Subtitle string `json:"subtitle"`
+	Urgency  uint8  `json:"urgency"`
+	Verified bool   `json:"verified"`
+	Source   string `json:"source"`
+	Sound    string `json:"sound"`
+	Seq      uint64 `json:"seq"`
 }
 
 // Event is the tagged-union unit of fan-out. For Coalesced, Notify is nil (a
@@ -142,6 +148,16 @@ func (h *Hub) Publish(ev Event) {
 // drop-oldest policy (for Status.Health).
 func (h *Hub) DroppedNotify() uint64 {
 	return atomic.LoadUint64(&h.dropped)
+}
+
+// SubscriberCount returns the number of currently registered subscribers. It
+// exists so tests can assert that cancel actually removes subscribers from the
+// hub (not merely that some independent handler counter fell to zero): a leaked
+// subscription stays in h.subs and would keep receiving Publish forever.
+func (h *Hub) SubscriberCount() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.subs)
 }
 
 // sendCoalesced delivers ev with latest-wins semantics on a cap-1 buffer: if
