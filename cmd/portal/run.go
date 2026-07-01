@@ -16,10 +16,14 @@ import (
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clip"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipupload"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/localapi"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
 
 func newRunCmd(a *app.App) *cobra.Command {
@@ -33,6 +37,12 @@ func newRunCmd(a *app.App) *cobra.Command {
 			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
+			// A cancelable child of the signal ctx so a FATAL API bind/serve
+			// failure (D10) can bring the other goroutines down: cancelling it
+			// makes wg.Wait return so the daemon exits non-zero and launchd
+			// relaunches loudly.
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
 
 			// Push the initial Subscribe so the agent has the latest filter
 			// even before its first connect — Subscribe is buffered until
@@ -43,11 +53,12 @@ func newRunCmd(a *app.App) *cobra.Command {
 			engine, openURLCh := a.NewEngineWithOpenURL()
 
 			// Run agent supervisor, reconcile engine, URL opener, the
-			// clipboard-read handler, and the notification handler in parallel;
-			// any returning ends the daemon (launchd will relaunch).
+			// clipboard-read handler, the notification handler, and the local
+			// API server in parallel; any returning ends the daemon (launchd
+			// will relaunch).
 			var wg sync.WaitGroup
-			wg.Add(5)
-			errCh := make(chan error, 5)
+			wg.Add(6)
+			errCh := make(chan error, 6)
 
 			go func() {
 				defer wg.Done()
@@ -68,6 +79,47 @@ func newRunCmd(a *app.App) *cobra.Command {
 			go func() {
 				defer wg.Done()
 				runNotifyHandler(ctx, a.AgentClient.NotifyEvents(), a)
+			}()
+			go func() {
+				defer wg.Done()
+				// D10: API bind failure is FATAL. On a bind failure we cancel
+				// the shared ctx so the other five goroutines return, wg.Wait
+				// unblocks, and the daemon exits non-zero for launchd to relaunch
+				// loudly. A serve failure (Serve returns non-nil) is fatal for
+				// the same reason; a clean ctx-cancel shutdown returns nil.
+				ln, err := localapi.Listen(a.Paths.APISock)
+				if err != nil {
+					errCh <- err
+					cancel()
+					return
+				}
+				deps := localapi.Deps{
+					Version: localapi.VersionInfo{
+						Version:      version,
+						GitSHA:       bootstrap.EmbeddedSHA(),
+						ProtoVersion: protocol.ProtoVersion,
+					},
+					Host:    a.Cfg.ReadHost,
+					Agent:   a.AgentClient,
+					Master:  a.Transport,
+					Ports:   a.Ports,
+					Service: a.Service,
+					Config:  a.Cfg,
+					Hub:     a.Hub,
+					PushAllow: func(allow []int) error {
+						return a.AgentClient.Subscribe(toU16(app.DenyPorts), toU16(allow), true)
+					},
+					Kick: engine.Kick,
+					Doctor: func(c context.Context) *doctor.Report {
+						tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+						return runDoctor(c, host, tr)
+					},
+				}
+				srv := localapi.New(deps)
+				if err := srv.Serve(ctx, ln); err != nil {
+					errCh <- err
+					cancel()
+				}
 			}()
 
 			wg.Wait()
