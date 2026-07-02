@@ -5,7 +5,7 @@ import (
 	"io"
 	"testing"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // nativeHealthTransport is a transport.Transport whose Health is fully
@@ -34,6 +34,18 @@ func (t nativeHealthTransport) Describe() transport.Desc {
 }
 
 var _ transport.Transport = nativeHealthTransport{}
+
+// systemDownTransport is a DOWN default (system-ssh) transport: it reuses
+// nativeHealthTransport's plumbing (zero value ⇒ Health{Up:false}) but reports
+// Impl "system-ssh", so status/doctor byte-compat for the default path can be
+// asserted against a DOWN connection.
+type systemDownTransport struct{ nativeHealthTransport }
+
+func (systemDownTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: "fakehost", Endpoint: "/tmp/cm-fake.sock"}
+}
+
+var _ transport.Transport = systemDownTransport{}
 
 // recordingForwarder is a transport.PortForwarder that records Forward calls and
 // returns a canned current-forward set from ListForwards. Used to prove the run

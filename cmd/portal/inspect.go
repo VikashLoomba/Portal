@@ -11,10 +11,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localapi"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/logfile"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/localapi"
+	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/internal/logfile"
 )
 
 func newStatusCmd(a *app.App) *cobra.Command {
@@ -152,7 +152,17 @@ func renderStatus(w io.Writer, v statusView) {
 		return
 	}
 	if !v.masterUp {
-		fmt.Fprintf(w, "ssh master: DOWN (host=%s sock=%s)\n", v.host, v.sock)
+		// A native (non-system) transport never creates the ControlMaster
+		// socket, so printing sock= there would name a fictional path implying
+		// system ssh. Omit it and surface the active transport unconditionally
+		// (mirroring runDoctor), so a DOWN native connection still says which
+		// transport is failing (T8). System-ssh stays byte-identical (T8/T9).
+		if v.impl != "" && v.impl != "system-ssh" {
+			fmt.Fprintf(w, "ssh master: DOWN (host=%s)\n", v.host)
+			fmt.Fprintf(w, "transport: %s\n", v.impl)
+		} else {
+			fmt.Fprintf(w, "ssh master: DOWN (host=%s sock=%s)\n", v.host, v.sock)
+		}
 		return
 	}
 	fmt.Fprintf(w, "ssh master: UP (pid=%d) host=%s\n", v.masterPID, v.host)

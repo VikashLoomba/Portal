@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/service"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/service"
 )
 
 // EC1: status sourced over the socket includes the agent line plus the master/
@@ -346,6 +346,67 @@ func TestStatus_Native_TransportLine(t *testing.T) {
 		"  127.0.0.1:5173\n"
 	if got := buf.String(); got != want {
 		t.Errorf("native status mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+// T8: with the native transport selected but DOWN (box unreachable), the status
+// DOWN branch must still surface `transport: native-ssh` AND must NOT print a
+// `sock=` path — native never creates the ControlMaster socket, so naming one
+// falsely implies system ssh, exactly when the user needs to know which
+// transport is failing. Mirrors runDoctor's unconditional transport surfacing.
+func TestStatus_Native_Down_TransportLineNoSock(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	a := &app.App{
+		Cfg:       cfg,
+		Paths:     app.Paths{Label: "com.test.portal", Sock: "/tmp/cm-fake.sock"},
+		Transport: nativeHealthTransport{up: false, pid: 0},
+		PF:        &recordingForwarder{},
+		Service:   &appFakeService{st: service.Status{Loaded: true, StateLines: []string{"state = running"}}},
+	}
+
+	var buf bytes.Buffer
+	renderStatus(&buf, viewFromLocal(context.Background(), a))
+	want := "dev box: devbox\n" +
+		"service (com.test.portal):\n" +
+		"state = running\n" +
+		"\n" +
+		"ssh master: DOWN (host=devbox)\n" +
+		"transport: native-ssh\n"
+	if got := buf.String(); got != want {
+		t.Errorf("native DOWN status mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+	if strings.Contains(buf.String(), "sock=") {
+		t.Errorf("native DOWN status must not print a ControlMaster sock= path, got:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "/tmp/cm-fake.sock") {
+		t.Errorf("native DOWN status leaked the fictional ControlMaster path, got:\n%s", buf.String())
+	}
+}
+
+// T8/T9: with the SYSTEM transport DOWN the DOWN branch stays byte-identical to
+// today — the `sock=` path is present and NO `transport:` line appears.
+func TestStatus_System_Down_ByteCompat(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	a := &app.App{
+		Cfg:       cfg,
+		Paths:     app.Paths{Label: "com.test.portal", Sock: "/tmp/cm-sys.sock"},
+		Transport: systemDownTransport{},
+		PF:        &recordingForwarder{},
+		Service:   &appFakeService{st: service.Status{Loaded: true, StateLines: []string{"state = running"}}},
+	}
+
+	var buf bytes.Buffer
+	renderStatus(&buf, viewFromLocal(context.Background(), a))
+	want := "dev box: devbox\n" +
+		"service (com.test.portal):\n" +
+		"state = running\n" +
+		"\n" +
+		"ssh master: DOWN (host=devbox sock=/tmp/cm-sys.sock)\n"
+	if got := buf.String(); got != want {
+		t.Errorf("system DOWN status not byte-identical:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+	if strings.Contains(buf.String(), "transport:") {
+		t.Errorf("system DOWN status must not show a transport line, got:\n%s", buf.String())
 	}
 }
 
