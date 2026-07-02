@@ -57,10 +57,8 @@ type Envelope struct {
 	AgentError   *AgentError   `cbor:"agent_error,omitempty"`
 	Bye          *Bye          `cbor:"bye,omitempty"`
 
-	// clipboard-read (v2): request flows agent → client, response client → agent.
-	ClipRequest  *ClipRequest  `cbor:"clip_req,omitempty"`  // agent → client
-	ClipResponse *ClipResponse `cbor:"clip_resp,omitempty"` // client → agent
-
-	// services (v4): the ONLY feature frame, either direction.
+	// services (v4): the ONLY feature frame, either direction. The clip
+	// request/response pair (like OpenURL/Notify before it) no longer has
+	// dedicated Envelope fields — ClipRequest/ClipResponse ride Msg.Payload.
 	Msg *Msg `cbor:"msg,omitempty"`
 }

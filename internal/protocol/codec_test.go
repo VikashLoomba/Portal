@@ -139,10 +139,18 @@ func TestMultipleFramesInPipeline(t *testing.T) {
 	}
 }
 
+// TestRoundtripClipRequest (migrated to v4): the ClipRequest struct no longer
+// has a dedicated Envelope field — it rides Msg.Payload. Encode it via
+// MarshalPayload inside a Msg{svc:clip,kind:req}, round-trip the Envelope, and
+// assert UnmarshalPayload reconstructs the struct deep-equal (EC5: the legacy
+// per-field roundtrip migrates to Msg).
 func TestRoundtripClipRequest(t *testing.T) {
-	in := &Envelope{ClipRequest: &ClipRequest{
-		Nonce: 7, Epoch: 0xdeadbeef, Kind: "image", Format: "png",
-	}}
+	orig := ClipRequest{Nonce: 7, Epoch: 0xdeadbeef, Kind: "image", Format: "png"}
+	payload, err := MarshalPayload(orig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := &Envelope{Msg: &Msg{Service: "clip", Kind: "req", Payload: payload}}
 	var buf bytes.Buffer
 	if err := NewEncoder(&buf).Write(in); err != nil {
 		t.Fatal(err)
@@ -151,19 +159,30 @@ func TestRoundtripClipRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.ClipRequest == nil {
-		t.Fatal("ClipRequest not present")
+	if out.Msg == nil {
+		t.Fatal("Msg not present")
 	}
-	if !reflect.DeepEqual(in.ClipRequest, out.ClipRequest) {
-		t.Errorf("got %+v, want %+v", out.ClipRequest, in.ClipRequest)
+	got, err := UnmarshalPayload[ClipRequest](out.Msg.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, orig) {
+		t.Errorf("got %+v, want %+v", got, orig)
 	}
 }
 
+// TestRoundtripClipResponse (migrated to v4): same as above for ClipResponse,
+// which rides Msg.Payload in a Msg{svc:clip,kind:resp}.
 func TestRoundtripClipResponse(t *testing.T) {
-	in := &Envelope{ClipResponse: &ClipResponse{
+	orig := ClipResponse{
 		Nonce: 7, Epoch: 0xdeadbeef, OK: true, Has: true,
 		SHA: "0123456789abcdef0123456789abcdef",
-	}}
+	}
+	payload, err := MarshalPayload(orig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := &Envelope{Msg: &Msg{Service: "clip", Kind: "resp", Payload: payload}}
 	var buf bytes.Buffer
 	if err := NewEncoder(&buf).Write(in); err != nil {
 		t.Fatal(err)
@@ -172,28 +191,41 @@ func TestRoundtripClipResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.ClipResponse == nil {
-		t.Fatal("ClipResponse not present")
+	if out.Msg == nil {
+		t.Fatal("Msg not present")
 	}
-	if !reflect.DeepEqual(in.ClipResponse, out.ClipResponse) {
-		t.Errorf("got %+v, want %+v", out.ClipResponse, in.ClipResponse)
+	got, err := UnmarshalPayload[ClipResponse](out.Msg.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, orig) {
+		t.Errorf("got %+v, want %+v", got, orig)
 	}
 }
 
-// TestClipFieldCountInvariant asserts the clip frames each carry exactly one
-// non-nil envelope field, so the tagged-union contract still holds with the
-// v2 additions, and that a clip field paired with another field is rejected.
+// TestClipFieldCountInvariant (migrated to v4): the clip request/response now
+// travel as Msg frames, so the one-field-per-frame tagged-union contract is
+// asserted over Msg — a clip-carrying Msg counts as exactly one field, and
+// pairing it with any other field trips the multi-field guard on decode.
 func TestClipFieldCountInvariant(t *testing.T) {
-	if n := countEnvelopeFields(&Envelope{ClipRequest: &ClipRequest{}}); n != 1 {
-		t.Errorf("ClipRequest alone: got %d fields, want 1", n)
+	reqPayload, err := MarshalPayload(ClipRequest{Nonce: 1, Kind: "image"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if n := countEnvelopeFields(&Envelope{ClipResponse: &ClipResponse{}}); n != 1 {
-		t.Errorf("ClipResponse alone: got %d fields, want 1", n)
+	if n := countEnvelopeFields(&Envelope{Msg: &Msg{Service: "clip", Kind: "req", Payload: reqPayload}}); n != 1 {
+		t.Errorf("clip req Msg alone: got %d fields, want 1", n)
 	}
-	// A clip field paired with any other field must trip the multi-field guard.
+	respPayload, err := MarshalPayload(ClipResponse{Nonce: 1, OK: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := countEnvelopeFields(&Envelope{Msg: &Msg{Service: "clip", Kind: "resp", Payload: respPayload}}); n != 1 {
+		t.Errorf("clip resp Msg alone: got %d fields, want 1", n)
+	}
+	// A clip Msg paired with any other field must trip the multi-field guard.
 	in := &Envelope{
-		ClipRequest:  &ClipRequest{},
-		ClipResponse: &ClipResponse{},
+		Msg:   &Msg{Service: "clip", Kind: "req", Payload: reqPayload},
+		Hello: &Hello{ProtoVersion: ProtoVersion},
 	}
 	var buf bytes.Buffer
 	if err := NewEncoder(&buf).Write(in); err != nil {

@@ -171,6 +171,25 @@ func New(cfg Config) *Client {
 		},
 		Deliver: c.publishNotify,
 	})
+	// Auto-register the clip handler: it decodes the ClipRequest payload into a
+	// KindClipRequest EngineEvent and delivers via publishClip (the DEDICATED
+	// cap-8 clip channel, DESIGN S10 QoS) exactly as the old `case env.ClipRequest`
+	// arm did. The Mac answers via SendClipResponse (still a thin facade, S11).
+	c.registry.register(HandlerSpec{
+		Service:    "clip",
+		Version:    1,
+		MaxPayload: 4096,
+		Decode: func(payload cbor.RawMessage) (EngineEvent, error) {
+			cr, err := protocol.UnmarshalPayload[protocol.ClipRequest](payload)
+			if err != nil {
+				return EngineEvent{}, err
+			}
+			return EngineEvent{Kind: KindClipRequest, Clip: &ClipEvent{
+				Nonce: cr.Nonce, Epoch: cr.Epoch, Kind: cr.Kind, Format: cr.Format,
+			}}, nil
+		},
+		Deliver: c.publishClip,
+	})
 	return c
 }
 
@@ -199,10 +218,14 @@ func (c *Client) SendClipResponse(resp *protocol.ClipResponse) error {
 	c.streamMu.Lock()
 	enc := c.enc
 	c.streamMu.Unlock()
-	if enc == nil {
-		return errors.New("agentclient: not connected")
+	// The ClipResponse now rides Msg.Payload (v4): marshal it and send via the
+	// registry's client→agent send path, which returns ErrNotConnected when enc
+	// is nil — the same "not connected" contract as before.
+	payload, err := protocol.MarshalPayload(*resp)
+	if err != nil {
+		return err
 	}
-	return enc.Write(&protocol.Envelope{ClipResponse: resp})
+	return c.registry.send(enc, "clip", "resp", payload)
 }
 
 // Snapshot returns the cached desired-set as the wire reports it.
@@ -662,21 +685,11 @@ func (c *Client) demuxLoop(ctx context.Context, dec *protocol.Decoder) error {
 			case env.Msg != nil:
 				// Inbound service frame (v4): route to the registry, which decodes
 				// per-service and delivers on the handler's declared sink (openurl
-				// → publish; notify/clip after u4/u5). Unknown/dormant services and
+				// → publish; notify → publishNotify; clip → publishClip, the
+				// DEDICATED cap-8 channel so a port-event burst can't evict a
+				// pending paste, DESIGN §5/S10). Unknown/dormant services and
 				// decode failures are logged drops — the session lives.
 				c.registry.dispatch(env.Msg)
-			case env.ClipRequest != nil:
-				// Route to the DEDICATED clip channel, not the shared events
-				// channel — a port-event burst must not evict a pending paste
-				// (DESIGN §5). Non-blocking so the demux loop (which also runs
-				// the heartbeat watchdog) never stalls behind a slow handler;
-				// the channel is cap-8 > maxInflightClip(4) so a drop here means
-				// the handler is genuinely wedged, in which case the agent's
-				// clipTimeout answers "none" anyway.
-				cr := env.ClipRequest
-				c.publishClip(EngineEvent{Kind: KindClipRequest, Clip: &ClipEvent{
-					Nonce: cr.Nonce, Epoch: cr.Epoch, Kind: cr.Kind, Format: cr.Format,
-				}})
 			case env.Heartbeat != nil:
 				// Already bumped above.
 			case env.SubscribeAck != nil:

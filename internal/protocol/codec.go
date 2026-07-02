@@ -170,12 +170,6 @@ func countEnvelopeFields(e *Envelope) int {
 	if e.Bye != nil {
 		n++
 	}
-	if e.ClipRequest != nil {
-		n++
-	}
-	if e.ClipResponse != nil {
-		n++
-	}
 	if e.Msg != nil {
 		n++
 	}
