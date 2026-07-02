@@ -233,6 +233,11 @@ func (s *SSH) Exec(ctx context.Context, stdin []byte, argv ...string) (string, s
 // responsible for closing stdin (or just exiting) to terminate. wait() returns
 // the ssh exit error AFTER all three streams have been drained or closed by the
 // caller. Used by the agentclient to spawn the long-lived portald RPC pipe.
+//
+// argv follows the SAME shell-join contract as Exec: it is APPENDED VERBATIM as
+// trailing args and the ssh binary performs the space-join + remote re-shell —
+// no sh -c wrapping. Callers needing shell metacharacters pre-quote them into a
+// single argv element.
 func (s *SSH) Stream(ctx context.Context, argv ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	args := []string{"-S", s.SockPath}
 	args = append(args, s.Opts...)
