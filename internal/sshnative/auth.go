@@ -18,10 +18,13 @@ import (
 //  2. unencrypted keys from the resolved identity-file list, via
 //     ssh.ParsePrivateKey.
 //
-// An ENCRYPTED key yields a CLEAR error naming the workaround (decrypt or add
-// to ssh-agent) rather than prompting. When no usable credential is found at
-// all, it returns an actionable error naming the exact agent-socket and
-// identity-file paths that were tried.
+// An ENCRYPTED key is treated as an UNUSABLE candidate, not a fatal error: it
+// is skipped so any other method (agent or an unencrypted key) can still
+// authenticate. Only when NO usable credential is found at all does the failure
+// surface, and then the error names the exact agent-socket and identity-file
+// paths that were tried plus the workaround (decrypt or add to ssh-agent) for
+// any key that was skipped solely because it is passphrase-encrypted. This
+// never prompts for passphrases.
 //
 // The returned agentConn (nil unless the agent method was added) is held open
 // for the client's lifetime by the caller — the agent signer callback dials it
@@ -43,6 +46,7 @@ func (c *Client) authMethods() ([]ssh.AuthMethod, net.Conn, error) {
 	}
 
 	var signers []ssh.Signer
+	var encrypted []string // identity files skipped solely because they are passphrase-encrypted
 	for _, path := range c.identityFiles {
 		tried = append(tried, "identity file "+path)
 		data, err := os.ReadFile(path)
@@ -53,12 +57,13 @@ func (c *Client) authMethods() ([]ssh.AuthMethod, net.Conn, error) {
 		if err != nil {
 			var pmErr *ssh.PassphraseMissingError
 			if errors.As(err, &pmErr) {
-				if agentConn != nil {
-					agentConn.Close()
-				}
-				return nil, nil, fmt.Errorf("sshnative: identity file %s is passphrase-encrypted; decrypt it or add it to ssh-agent (ssh-add %s) — sshnative does not prompt for passphrases", path, path)
+				// An encrypted key is an unusable candidate, not a fatal
+				// error: record it and keep going so the agent (or an
+				// unencrypted key) can still authenticate. The guidance is
+				// surfaced below only if nothing else works.
+				encrypted = append(encrypted, path)
 			}
-			continue // some other parse failure: skip this candidate
+			continue // encrypted or otherwise unparseable: skip this candidate
 		}
 		signers = append(signers, signer)
 	}
@@ -67,6 +72,14 @@ func (c *Client) authMethods() ([]ssh.AuthMethod, net.Conn, error) {
 	}
 
 	if len(methods) == 0 {
+		if agentConn != nil {
+			agentConn.Close()
+		}
+		if len(encrypted) > 0 {
+			// No agent and no unencrypted key: the encrypted key(s) are the
+			// only credentials present, so name the workaround.
+			return nil, nil, fmt.Errorf("sshnative: no usable ssh credentials for %s@%s; identity file %s is passphrase-encrypted; decrypt it or add it to ssh-agent (ssh-add %s) — sshnative does not prompt for passphrases", c.user, c.host, strings.Join(encrypted, ", "), strings.Join(encrypted, ", "))
+		}
 		return nil, nil, fmt.Errorf("sshnative: no usable ssh credentials for %s@%s; tried %s", c.user, c.host, strings.Join(tried, ", "))
 	}
 	return methods, agentConn, nil
