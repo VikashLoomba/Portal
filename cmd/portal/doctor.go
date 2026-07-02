@@ -11,6 +11,7 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
 
@@ -28,19 +29,43 @@ func newDoctorCmd(a *app.App) *cobra.Command {
 		Use:   "doctor",
 		Short: "Self-test the clipboard + notification path over ssh (PATH winner, shim version, agent verbs, smoke)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			host, _ := a.Cfg.ReadHost()
-			if host == "" {
-				return fmt.Errorf("no dev box configured — run: %s install <ssh-host>", app.Tool)
-			}
-			tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
-			rep := runDoctor(cmd.Context(), host, tr)
-			renderDoctor(cmd.OutOrStdout(), rep)
-			if !rep.OK() {
-				return errSilent
-			}
-			return nil
+			return runDoctorCmd(cmd.Context(), cmd.OutOrStdout(), a)
 		},
 	}
+}
+
+// runDoctorCmd is newDoctorCmd.RunE's body, extracted so tests can drive it with
+// a buffer and an App. Production output is byte-identical (cmd.OutOrStdout()
+// defaults to os.Stdout). When the daemon is up it POSTs /v1/doctor so the
+// self-test runs against the daemon's LIVE ControlMaster (better ground truth
+// than a fresh CLI-side probe); when the daemon is down (or the socket errors)
+// it silently falls back to today's in-process run. Both paths need a host.
+func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App) error {
+	host, _ := a.Cfg.ReadHost()
+	if host == "" {
+		return fmt.Errorf("no dev box configured — run: %s install <ssh-host>", app.Tool)
+	}
+	// Prefer the daemon: it renders from its live transport. The decode only
+	// works because internal/doctor adds Status.UnmarshalJSON; any localclient
+	// error (down/dead/hung) silently drops to the local run below.
+	lc := localclient.New(a.Paths.APISock)
+	if rep, err := lc.Doctor(ctx); err == nil {
+		renderDoctor(w, rep)
+		if !rep.OK() {
+			return errSilent
+		}
+		return nil
+	}
+	// Fallback: the in-process run over a FRESH sshctl transport (never
+	// a.Transport — routing doctor probes through it would leak ssh stderr into
+	// the report). The only test seam that intercepts this path is a.Runner.
+	tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+	rep := runDoctor(ctx, host, tr)
+	renderDoctor(w, rep)
+	if !rep.OK() {
+		return errSilent
+	}
+	return nil
 }
 
 // renderDoctor writes the human-readable report to w. It is a free function in
