@@ -15,17 +15,19 @@ import (
 // to today's SendClipResponse "not connected" contract.
 var ErrNotConnected = errors.New("agentclient: not connected")
 
-// HandlerSpec declares a client-side service handler. Decode turns the raw
+// HandlerSpec declares a client-side service handler. Decode turns the
+// registry-stamped Msg.Seq (DESIGN S3 — the per-service monotonic correlation
+// counter, which the agent NEVER duplicates into the payload) plus the raw
 // payload into a typed EngineEvent; Deliver is the NON-BLOCKING sink (clip ⇒
 // publishClip cap-8, notify ⇒ publishNotify cap-16 preserving DESIGN S10 QoS;
 // openurl ⇒ publish shared events). Channel capacity + drop policy are thus
 // DECLARED per handler via its Deliver target (the dedicated channels created in
-// Client.New).
+// Client.New). Handlers that do not correlate on seq (openurl/clip) ignore it.
 type HandlerSpec struct {
 	Service    string
 	Version    uint32
 	MaxPayload int
-	Decode     func(payload cbor.RawMessage) (EngineEvent, error)
+	Decode     func(seq uint64, payload cbor.RawMessage) (EngineEvent, error)
 	Deliver    func(EngineEvent)
 }
 
@@ -114,7 +116,7 @@ func (r *registry) dispatch(m *protocol.Msg) {
 				"service", m.Service, "kind", m.Kind, "panic", rec)
 		}
 	}()
-	ev, err := h.spec.Decode(m.Payload)
+	ev, err := h.spec.Decode(m.Seq, m.Payload)
 	if err != nil {
 		r.log.Warn("dropping Msg: payload decode failed; session lives",
 			"service", m.Service, "kind", m.Kind, "err", err)

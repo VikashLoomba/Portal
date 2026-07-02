@@ -47,7 +47,7 @@ func TestClientRegistry_Routing(t *testing.T) {
 	var got EngineEvent
 	r.register(HandlerSpec{
 		Service: "notify", Version: 1, MaxPayload: 1024,
-		Decode:  func(cbor.RawMessage) (EngineEvent, error) { return EngineEvent{Kind: KindNotify}, nil },
+		Decode:  func(uint64, cbor.RawMessage) (EngineEvent, error) { return EngineEvent{Kind: KindNotify}, nil },
 		Deliver: func(ev EngineEvent) { got = ev },
 	})
 	r.dispatch(&protocol.Msg{Service: "notify", Kind: "event", Payload: raw1()})
@@ -61,13 +61,13 @@ func TestClientRegistry_DecodeFailureDrops(t *testing.T) {
 	delivered := false
 	r.register(HandlerSpec{
 		Service: "bad", Version: 1, MaxPayload: 1024,
-		Decode:  func(cbor.RawMessage) (EngineEvent, error) { return EngineEvent{}, errors.New("boom") },
+		Decode:  func(uint64, cbor.RawMessage) (EngineEvent, error) { return EngineEvent{}, errors.New("boom") },
 		Deliver: func(EngineEvent) { delivered = true },
 	})
 	goodDelivered := false
 	r.register(HandlerSpec{
 		Service: "good", Version: 1, MaxPayload: 1024,
-		Decode:  func(cbor.RawMessage) (EngineEvent, error) { return EngineEvent{Kind: KindNotify}, nil },
+		Decode:  func(uint64, cbor.RawMessage) (EngineEvent, error) { return EngineEvent{Kind: KindNotify}, nil },
 		Deliver: func(EngineEvent) { goodDelivered = true },
 	})
 	r.dispatch(&protocol.Msg{Service: "bad", Kind: "x", Payload: raw1()})
@@ -86,7 +86,7 @@ func TestClientRegistry_UnknownAndDormantDrop(t *testing.T) {
 	delivered := false
 	r.register(HandlerSpec{
 		Service: "clip", Version: 1, MaxPayload: 1024,
-		Decode:  func(cbor.RawMessage) (EngineEvent, error) { return EngineEvent{Kind: KindClipRequest}, nil },
+		Decode:  func(uint64, cbor.RawMessage) (EngineEvent, error) { return EngineEvent{Kind: KindClipRequest}, nil },
 		Deliver: func(EngineEvent) { delivered = true },
 	})
 	// Unknown service: dropped, no panic.
@@ -107,7 +107,7 @@ func TestClientRegistry_MaxPayloadDrop(t *testing.T) {
 	delivered := 0
 	r.register(HandlerSpec{
 		Service: "svc", Version: 1, MaxPayload: 4,
-		Decode:  func(cbor.RawMessage) (EngineEvent, error) { return EngineEvent{Kind: KindNotify}, nil },
+		Decode:  func(uint64, cbor.RawMessage) (EngineEvent, error) { return EngineEvent{Kind: KindNotify}, nil },
 		Deliver: func(EngineEvent) { delivered++ },
 	})
 	r.dispatch(&protocol.Msg{Service: "svc", Kind: "big", Payload: cbor.RawMessage(make([]byte, 8))})
@@ -124,7 +124,7 @@ func TestClientRegistry_PanicIsolation(t *testing.T) {
 	delivered := 0
 	r.register(HandlerSpec{
 		Service: "svc", Version: 1, MaxPayload: 64,
-		Decode: func(cbor.RawMessage) (EngineEvent, error) { return EngineEvent{Kind: KindNotify}, nil },
+		Decode: func(uint64, cbor.RawMessage) (EngineEvent, error) { return EngineEvent{Kind: KindNotify}, nil },
 		Deliver: func(EngineEvent) {
 			if shouldPanic {
 				panic("deliberate Deliver panic")
@@ -151,7 +151,7 @@ func TestClientRegistry_QoSNonEviction(t *testing.T) {
 	r := newRegistry(nil)
 	r.register(HandlerSpec{
 		Service: "clip", Version: 1, MaxPayload: 1024,
-		Decode: func(cbor.RawMessage) (EngineEvent, error) {
+		Decode: func(uint64, cbor.RawMessage) (EngineEvent, error) {
 			return EngineEvent{Kind: KindClipRequest, Clip: &ClipEvent{Nonce: 7}}, nil
 		},
 		Deliver: c.publishClip,

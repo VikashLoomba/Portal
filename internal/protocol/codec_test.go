@@ -344,7 +344,7 @@ func TestMarshalUnmarshalPayloadRoundtrip(t *testing.T) {
 	t.Run("Notify", func(t *testing.T) {
 		orig := Notify{
 			Title: "done", Body: "build ok", Subtitle: "ci",
-			Urgency: 2, Verified: true, Source: "claude_hook", Sound: "Glass", Seq: 9,
+			Urgency: 2, Verified: true, Source: "claude_hook", Sound: "Glass",
 		}
 		raw, err := MarshalPayload(orig)
 		if err != nil {

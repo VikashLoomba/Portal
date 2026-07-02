@@ -779,34 +779,89 @@ func TestServer_OutboxBudgetRecycleAllServices(t *testing.T) {
 }
 
 // TestServer_PayloadCapDropSessionLives (EC5) delivers an inbound Msg whose
-// Payload exceeds the clip service's MaxPayload: it is dropped + logged and the
-// session stays alive (a subsequent port event still flows).
+// Payload exceeds a service's MaxPayload and proves the registry's SIZE CHECK
+// (service.go dispatch) — not a downstream decode failure — dropped it.
+//
+// The old version of this test sent a byte-string payload to the real clip
+// service; that payload ALSO fails to UnmarshalPayload into ClipResponse, so
+// deleting the cap check would have produced the identical observable (one warn
+// + session alive) via the decode-drop path — a tautology. This version uses the
+// in-package fakeService seam: its HandleMsg records EVERY kind regardless of
+// payload content (no decode), so asserting handledKinds() stays empty proves the
+// cap path — and ONLY the cap path — dropped the frame.
 func TestServer_PayloadCapDropSessionLives(t *testing.T) {
+	w := watcher.NewFake()
+	w.SetSnapshot(nil)
+	conn := newConnPair()
 	wc := &warnCounter{}
-	h := newU6Harness(t, map[string]uint32{"openurl": 1, "notify": 1, "clip": 1}, slog.New(wc))
-	defer h.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := New(Config{
+		In: conn.c2aR, Out: conn.a2cW, Watcher: w, AgentSHA: "testsha",
+		HeartbeatInterval: time.Hour, Log: slog.New(wc),
+	})
+	// In-package seam: a fake inbound service with a small MaxPayload. HandleMsg
+	// records any kind it is handed, WITHOUT decoding — so if the cap check were
+	// removed the oversized (but well-formed) payload would reach HandleMsg and be
+	// recorded. Registered before Serve so the merged outbox is sized correctly.
+	capSvc := &fakeService{name: "cap", version: 1, maxPayload: 64, outboxCap: 2, verbName: "capverb"}
+	srv.reg.register(capSvc)
 
-	// A single valid CBOR item larger than clip's MaxPayload (4096): the size
-	// check drops it before decode, so its contents are irrelevant.
-	big, err := protocol.MarshalPayload(make([]byte, 5000))
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); _ = srv.Serve(ctx); conn.a2cW.Close() }()
+
+	enc := protocol.NewEncoder(conn.c2aW)
+	dec := protocol.NewDecoder(conn.a2cR)
+	enc.Write(&protocol.Envelope{Hello: &protocol.Hello{ProtoVersion: protocol.ProtoVersion}})
+	if _, err := dec.Read(); err != nil { // HelloAck
+		t.Fatal(err)
+	}
+	enc.Write(&protocol.Envelope{Subscribe: &protocol.Subscribe{ResubscribeID: 1}})
+	if _, err := dec.Read(); err != nil { // SubscribeAck
+		t.Fatal(err)
+	}
+	if _, err := dec.Read(); err != nil { // Snapshot
+		t.Fatal(err)
+	}
+
+	frames := make(chan *protocol.Envelope, 8)
+	var cwg sync.WaitGroup
+	cwg.Add(1)
+	go func() {
+		defer cwg.Done()
+		for {
+			env, err := dec.Read()
+			if err != nil {
+				return
+			}
+			if env.PortAdded != nil {
+				frames <- env
+			}
+		}
+	}()
+	defer func() { cancel(); conn.c2aW.Close(); wg.Wait(); cwg.Wait(); conn.close() }()
+
+	// A single well-formed CBOR item larger than the fake's MaxPayload (64). It
+	// would decode-and-record in HandleMsg if the size check were gone.
+	big, err := protocol.MarshalPayload(make([]byte, 200))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(big) <= 4096 {
+	if len(big) <= 64 {
 		t.Fatalf("test payload %d bytes is not oversized", len(big))
 	}
-	if err := h.enc.Write(&protocol.Envelope{Msg: &protocol.Msg{
-		Service: "clip", Kind: "resp", Payload: big,
-	}}); err != nil {
-		t.Fatal(err)
-	}
+	enc.Write(&protocol.Envelope{Msg: &protocol.Msg{Service: "cap", Kind: "resp", Payload: big}})
 
 	// Session lives: a genuine port event still round-trips after the drop.
-	h.w.Emit(watcher.Event{Kind: watcher.KindAdd, At: time.Now(),
+	w.Emit(watcher.Event{Kind: watcher.KindAdd, At: time.Now(),
 		Listen: watcher.Listen{Port: 8082, Family: 4, Addr: "127.0.0.1"}})
-	got := h.nextPort(t)
-	if got.PortAdded == nil || got.PortAdded.Port.Port != 8082 {
-		t.Fatalf("expected PortAdded(8082) after oversized drop, got %+v", got)
+	select {
+	case got := <-frames:
+		if got.PortAdded == nil || got.PortAdded.Port.Port != 8082 {
+			t.Fatalf("expected PortAdded(8082) after oversized drop, got %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no PortAdded after oversized drop (session died)")
 	}
 
 	// The oversized payload was logged as a drop.
@@ -816,6 +871,12 @@ func TestServer_PayloadCapDropSessionLives(t *testing.T) {
 			t.Fatal("oversized payload drop was not logged")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The CAP path dropped it: HandleMsg was never invoked. This is the assertion
+	// the old test lacked — it fails if service.go's size check is removed.
+	if kinds := capSvc.handledKinds(); len(kinds) != 0 {
+		t.Fatalf("capped handler recorded %v; the oversized frame must be dropped by the size check, not reach HandleMsg", kinds)
 	}
 }
 

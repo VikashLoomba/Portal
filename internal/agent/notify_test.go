@@ -23,7 +23,18 @@ type notifyHarness struct {
 	conn     *connPair
 
 	mu       sync.Mutex
-	notifies []*protocol.Notify
+	notifies []relayedNotify
+}
+
+// relayedNotify mirrors exactly what the production client surfaces: the payload
+// decoded on its own (payload-only, as agentclient/registry.dispatch does) PLUS
+// the registry-stamped Msg.Seq handed to the handler out-of-band (DESIGN S3).
+// Keeping seq SEPARATE from the payload is what makes the Seq assertion catch a
+// regression — threading Msg.Seq back into the payload struct (as the old
+// harness did) masked that svc_notify never sets a payload Seq.
+type relayedNotify struct {
+	n   protocol.Notify
+	seq uint64
 }
 
 func newNotifyHarness(t *testing.T, subscribe bool) *notifyHarness {
@@ -81,18 +92,18 @@ func newNotifyHarness(t *testing.T, subscribe bool) *notifyHarness {
 				return
 			}
 			// Notify now rides a Msg{svc:notify,kind:event} frame (v4). Decode the
-			// payload back into a protocol.Notify — the same shape the client
-			// registry's notify handler decodes. The per-service correlation Seq
-			// now lives on Msg.Seq (registry-stamped, DESIGN S3), not the payload
-			// field, so thread it in for the relay test's Seq!=0 assertion.
+			// payload back into a protocol.Notify EXACTLY as the production client
+			// does — payload-only (agentclient/registry.dispatch), which never sees
+			// a payload Seq because svc_notify does not set one. The correlation Seq
+			// is the registry-stamped Msg.Seq (DESIGN S3), captured SEPARATELY so
+			// the Seq assertion exercises the real production surface.
 			if env.Msg != nil && env.Msg.Service == "notify" && env.Msg.Kind == "event" {
 				n, err := protocol.UnmarshalPayload[protocol.Notify](env.Msg.Payload)
 				if err != nil {
 					continue
 				}
-				n.Seq = env.Msg.Seq
 				h.mu.Lock()
-				h.notifies = append(h.notifies, &n)
+				h.notifies = append(h.notifies, relayedNotify{n: n, seq: env.Msg.Seq})
 				h.mu.Unlock()
 			}
 		}
@@ -138,13 +149,32 @@ func (h *notifyHarness) ask(t *testing.T, line string) string {
 	return string(buf[:n])
 }
 
-func (h *notifyHarness) lastNotify() *protocol.Notify {
+func (h *notifyHarness) lastNotify() *relayedNotify {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if len(h.notifies) == 0 {
 		return nil
 	}
-	return h.notifies[len(h.notifies)-1]
+	rn := h.notifies[len(h.notifies)-1]
+	return &rn
+}
+
+// notifyCount returns how many notify frames have been relayed so far.
+func (h *notifyHarness) notifyCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.notifies)
+}
+
+// seqs returns the registry-stamped Msg.Seq of every relayed notify, in order.
+func (h *notifyHarness) seqs() []uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]uint64, len(h.notifies))
+	for i, rn := range h.notifies {
+		out[i] = rn.seq
+	}
+	return out
 }
 
 // TestNotify_Relay drives a verified hook notification end to end: the agent
@@ -163,15 +193,49 @@ func TestNotify_Relay(t *testing.T) {
 	for h.lastNotify() == nil && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	n := h.lastNotify()
-	if n == nil {
+	rn := h.lastNotify()
+	if rn == nil {
 		t.Fatal("no Notify frame relayed")
 	}
-	if n.Title != "Claude finished" || n.Body != "done" || !n.Verified || n.Source != "claude_hook" {
-		t.Fatalf("relayed Notify = %+v, want verified hook fields", n)
+	if rn.n.Title != "Claude finished" || rn.n.Body != "done" || !rn.n.Verified || rn.n.Source != "claude_hook" {
+		t.Fatalf("relayed Notify = %+v, want verified hook fields", rn.n)
 	}
-	if n.Seq == 0 {
-		t.Errorf("Notify.Seq should be non-zero (stamped by the agent)")
+	// The correlation Seq the production client surfaces (NotifyEvent.Seq) is the
+	// registry-stamped Msg.Seq, not a payload field. It must be non-zero.
+	if rn.seq == 0 {
+		t.Errorf("relayed Msg.Seq should be non-zero (stamped by the registry)")
+	}
+	// The payload itself must NOT carry a duplicate seq — svc_notify never sets
+	// one, and the payload struct no longer has the field.
+}
+
+// TestNotify_SeqMonotonic fires several notifications and asserts the
+// registry-stamped Msg.Seq (the value the production client surfaces as
+// NotifyEvent.Seq → /v1/events "seq") increments 1,2,3,... — the per-
+// notification correlation the field exists for. This is the end-to-end guard
+// for the v4 regression where the payload Seq was always 0.
+func TestNotify_SeqMonotonic(t *testing.T) {
+	h := newNotifyHarness(t, true)
+	defer h.close()
+
+	const n = 5
+	for i := 0; i < n; i++ {
+		if got := h.ask(t, "notify\t{\"title\":\"n\"}\n"); got != "ok\n" {
+			t.Fatalf("notify #%d = %q, want ok\\n", i, got)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for h.notifyCount() < n && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	got := h.seqs()
+	if len(got) != n {
+		t.Fatalf("relayed %d notifies, want %d", len(got), n)
+	}
+	for i, s := range got {
+		if s != uint64(i+1) {
+			t.Fatalf("relayed seqs = %v, want 1..%d (monotonic per-notification)", got, n)
+		}
 	}
 }
 

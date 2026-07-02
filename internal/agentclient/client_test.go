@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -460,8 +461,8 @@ func containsPort(ps []uint16, p uint16) bool {
 // version-mismatched handler while keeping the real Decode.
 func openurlHandler(version uint32, deliver func(EngineEvent)) HandlerSpec {
 	return HandlerSpec{
-		Service: "openurl", Version: version, MaxPayload: 4096,
-		Decode: func(payload cbor.RawMessage) (EngineEvent, error) {
+		Service: "openurl", Version: version, MaxPayload: 8192,
+		Decode: func(_ uint64, payload cbor.RawMessage) (EngineEvent, error) {
 			ou, err := protocol.UnmarshalPayload[protocol.OpenURL](payload)
 			if err != nil {
 				return EngineEvent{}, err
@@ -636,5 +637,59 @@ func TestServiceVersionMismatchDisable(t *testing.T) {
 	}
 	if got := clientLog.count(); got != 1 {
 		t.Fatalf("client warnings = %d, want exactly 1", got)
+	}
+}
+
+// TestClientNotify_SurfacesMsgSeq exercises the REAL client notify handler
+// (registered in New) through registry.dispatch and asserts NotifyEvent.Seq is
+// the registry-stamped Msg.Seq — NOT the payload field, which svc_notify never
+// sets. This guards the v4 regression where the client read the always-0 payload
+// Seq, collapsing every /v1/events notify line to seq:0.
+func TestClientNotify_SurfacesMsgSeq(t *testing.T) {
+	c := New(Config{})
+	// Payload carries NO seq (mirrors svc_notify, which stamps only Msg.Seq).
+	payload, err := protocol.MarshalPayload(protocol.Notify{Title: "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []uint64{7, 8} {
+		c.registry.dispatch(&protocol.Msg{Service: "notify", Kind: "event", Seq: want, Payload: payload})
+		select {
+		case ev := <-c.NotifyEvents():
+			if ev.Notify == nil {
+				t.Fatalf("notify not delivered for seq %d", want)
+			}
+			if ev.Notify.Seq != want {
+				t.Fatalf("NotifyEvent.Seq = %d, want %d (registry-stamped Msg.Seq)", ev.Notify.Seq, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("no notify event delivered for seq %d", want)
+		}
+	}
+}
+
+// TestClientOpenURL_LongURLSurvivesPayloadCap delivers a URL near the agent's
+// 4096-byte cmd-socket line, whose CBOR-framed payload exceeds 4096, and asserts
+// the client openurl handler still admits it. Guards the regression where the
+// client cap was pinned at the raw socket-read size (4096) and silently dropped
+// any URL a caller could actually pass to `portald open`.
+func TestClientOpenURL_LongURLSurvivesPayloadCap(t *testing.T) {
+	c := New(Config{})
+	url := "http://host/?q=" + strings.Repeat("a", 4070)
+	payload, err := protocol.MarshalPayload(protocol.OpenURL{URL: url})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) <= 4096 {
+		t.Fatalf("payload %d bytes is not over the old 4096 cap; test would not guard the regression", len(payload))
+	}
+	c.registry.dispatch(&protocol.Msg{Service: "openurl", Kind: "open", Payload: payload})
+	select {
+	case ev := <-c.Events():
+		if ev.Kind != KindOpenURL || ev.URL != url {
+			t.Fatalf("delivered %+v, want KindOpenURL carrying the long URL", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("long URL was dropped by the client payload cap")
 	}
 }

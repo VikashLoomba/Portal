@@ -136,10 +136,15 @@ func New(cfg Config) *Client {
 	// events channel (publish) exactly as the old `case env.OpenURL` arm did.
 	c.registry = newRegistry(cfg.Log)
 	c.registry.register(HandlerSpec{
-		Service:    "openurl",
-		Version:    1,
-		MaxPayload: 4096,
-		Decode: func(payload cbor.RawMessage) (EngineEvent, error) {
+		Service: "openurl",
+		Version: 1,
+		// The agent reads a whole `open\t<url>\n` line in one 4096-byte socket Read
+		// (server.go handleCmdConn), so a relayed URL can be ~4090 bytes; CBOR
+		// framing of OpenURL then pushes the payload just over 4096. Cap well above
+		// the socket line so any URL the agent can emit survives the client cap —
+		// a URL that fit the agent's Read must not be silently dropped here.
+		MaxPayload: 8192,
+		Decode: func(_ uint64, payload cbor.RawMessage) (EngineEvent, error) {
 			ou, err := protocol.UnmarshalPayload[protocol.OpenURL](payload)
 			if err != nil {
 				return EngineEvent{}, err
@@ -152,13 +157,15 @@ func New(cfg Config) *Client {
 	// delivers via publishNotify exactly as the old `case env.Notify` arm did —
 	// publishNotify still sends on notifyEvents AND fires the hub Queued tee, so
 	// the tee now relocates to this registry-driven dispatch site (S11) with
-	// byte-identical behavior. All eight Notify fields carry through verbatim
-	// (Verified passthrough preserves the upstream classify/[unverified] split).
+	// byte-identical behavior. The seven notify payload fields carry through
+	// verbatim (Verified passthrough preserves the upstream classify/[unverified]
+	// split); the per-notification correlation Seq comes from the registry-stamped
+	// Msg.Seq (DESIGN S3), NOT the payload — the agent never duplicates it there.
 	c.registry.register(HandlerSpec{
 		Service:    "notify",
 		Version:    1,
 		MaxPayload: 4096,
-		Decode: func(payload cbor.RawMessage) (EngineEvent, error) {
+		Decode: func(seq uint64, payload cbor.RawMessage) (EngineEvent, error) {
 			nf, err := protocol.UnmarshalPayload[protocol.Notify](payload)
 			if err != nil {
 				return EngineEvent{}, err
@@ -166,7 +173,7 @@ func New(cfg Config) *Client {
 			return EngineEvent{Kind: KindNotify, Notify: &NotifyEvent{
 				Title: nf.Title, Body: nf.Body, Subtitle: nf.Subtitle,
 				Urgency: nf.Urgency, Verified: nf.Verified, Source: nf.Source,
-				Sound: nf.Sound, Seq: nf.Seq,
+				Sound: nf.Sound, Seq: seq,
 			}}, nil
 		},
 		Deliver: c.publishNotify,
@@ -179,7 +186,7 @@ func New(cfg Config) *Client {
 		Service:    "clip",
 		Version:    1,
 		MaxPayload: 4096,
-		Decode: func(payload cbor.RawMessage) (EngineEvent, error) {
+		Decode: func(_ uint64, payload cbor.RawMessage) (EngineEvent, error) {
 			cr, err := protocol.UnmarshalPayload[protocol.ClipRequest](payload)
 			if err != nil {
 				return EngineEvent{}, err

@@ -231,5 +231,6 @@ type Notify struct {
 	Verified bool   `cbor:"verified,omitempty"`
 	Source   string `cbor:"src,omitempty"`   // e.g. "claude_hook" or "generic"
 	Sound    string `cbor:"sound,omitempty"` // macOS sound name; "" = urgency default
-	Seq      uint64 `cbor:"seq,omitempty"`
+	// No Seq field: the per-notification correlation counter is the
+	// registry-stamped Msg.Seq (DESIGN S3), never duplicated into the payload.
 }
