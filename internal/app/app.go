@@ -91,11 +91,7 @@ func NewProd() (*App, error) {
 	// Instead we install errTransport, which surfaces the error LOUDLY (never a
 	// silent fallback to system) on the transport-touching commands while leaving
 	// config-only commands (transport/host/help/allow…) fully usable.
-	tr, pf, err := NewTransport(paths, host, runner, cfg, os.Stderr)
-	if err != nil {
-		et := errTransport{err: err}
-		tr, pf = et, et
-	}
+	tr, pf := transportOrErr(NewTransport(paths, host, runner, cfg, os.Stderr))
 	svc := service.New(service.Spec{
 		Label:   paths.Label,
 		BinPath: paths.BinPath,
@@ -176,6 +172,22 @@ func NewTransport(paths Paths, host string, runner run.Runner, cfg *config.Store
 		s.StderrSink = sshStderr // nil-safe: sshctl guards a nil sink.
 		return s, s, nil
 	}
+}
+
+// transportOrErr is the graceful-degradation wiring joining the selection-aware
+// factory to errTransport. It takes NewTransport's exact (transport, forwarder,
+// error) tuple: on a nil error it passes the real pair straight through; on any
+// construction error it discards the (nil) pair and returns a single errTransport
+// value as BOTH transport and forwarder, so NewProd never aborts App construction
+// on a bad selection (which would brick the CLI's own recovery commands). This is
+// a pure function precisely so the wiring — not just errTransport's behavior — is
+// unit-tested: a regression to `return nil, err` in NewProd fails its test.
+func transportOrErr(tr transport.Transport, pf transport.PortForwarder, err error) (transport.Transport, transport.PortForwarder) {
+	if err != nil {
+		et := errTransport{err: err}
+		return et, et
+	}
+	return tr, pf
 }
 
 // errTransport is the graceful-degradation placeholder NewProd installs when the

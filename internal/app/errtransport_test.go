@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"io"
 	"testing"
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
@@ -75,3 +76,78 @@ func TestErrTransport_SatisfiesBothInterfaces(t *testing.T) {
 	var _ transport.Transport = errTransport{err: errors.New("x")}
 	var _ transport.PortForwarder = errTransport{err: errors.New("x")}
 }
+
+// transportOrErr is the exact wiring NewProd uses to join the selection-aware
+// factory to errTransport. This locks that wiring in place: a regression to
+// `return nil, err` (or dropping the errTransport install) in NewProd would
+// remove this helper's error branch and fail here — closing the gap where
+// errTransport's behavior and the factory's error production were each tested
+// but never the join that keeps config-only recovery commands usable.
+func TestTransportOrErr_Wiring(t *testing.T) {
+	t.Run("factory error yields an errTransport pair", func(t *testing.T) {
+		sentinel := errors.New("sshnative: target \"mybox\" missing user")
+		tr, pf := transportOrErr(nil, nil, sentinel)
+		if tr == nil || pf == nil {
+			t.Fatal("a factory error must still yield a non-nil transport/forwarder pair")
+		}
+		// Same errTransport value backs both — Describe reports the degraded impl.
+		if got := tr.Describe().Impl; got != "unavailable" {
+			t.Errorf("Describe().Impl = %q, want unavailable", got)
+		}
+		ctx := context.Background()
+		if _, _, err := tr.Exec(ctx, nil, "echo", "hi"); !errors.Is(err, sentinel) {
+			t.Errorf("Exec err = %v, want the construction error surfaced", err)
+		}
+		if _, err := tr.Ensure(ctx); !errors.Is(err, sentinel) {
+			t.Errorf("Ensure err = %v, want the construction error surfaced", err)
+		}
+		if err := pf.Forward(ctx, 1, 2); !errors.Is(err, sentinel) {
+			t.Errorf("Forward err = %v, want the construction error surfaced", err)
+		}
+		// Health stays a clean DOWN so status/doctor render rather than crash.
+		h, err := tr.Health(ctx)
+		if err != nil {
+			t.Errorf("Health err = %v, want nil", err)
+		}
+		if h.Up {
+			t.Error("Health.Up = true, want false for an unavailable transport")
+		}
+	})
+
+	t.Run("nil error passes the real pair through untouched", func(t *testing.T) {
+		realTr := okTransport{}
+		tr, pf := transportOrErr(realTr, realTr, nil)
+		if got := tr.Describe().Impl; got != "ok-fake" {
+			t.Errorf("Describe().Impl = %q, want the passed-through transport (ok-fake)", got)
+		}
+		if pf == nil {
+			t.Fatal("nil error must pass the forwarder through, got nil")
+		}
+	})
+}
+
+// okTransport is a healthy no-op transport/forwarder used to prove transportOrErr
+// passes a successfully-built pair through unchanged on a nil error.
+type okTransport struct{}
+
+var (
+	_ transport.Transport     = okTransport{}
+	_ transport.PortForwarder = okTransport{}
+)
+
+func (okTransport) Ensure(context.Context) (bool, error) { return true, nil }
+func (okTransport) Health(context.Context) (transport.Health, error) {
+	return transport.Health{Up: true}, nil
+}
+func (okTransport) Exec(context.Context, []byte, ...string) (string, string, error) {
+	return "", "", nil
+}
+func (okTransport) Stream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+	return nil, nil, nil, nil, nil
+}
+func (okTransport) Close(context.Context) (bool, error)            { return false, nil }
+func (okTransport) Describe() transport.Desc                       { return transport.Desc{Impl: "ok-fake"} }
+func (okTransport) Forward(context.Context, int, int) error        { return nil }
+func (okTransport) Cancel(context.Context, int, int) error         { return nil }
+func (okTransport) ListForwards(context.Context) ([]int, error)    { return nil, nil }
+func (okTransport) ForwardLines(context.Context) ([]string, error) { return nil, nil }
