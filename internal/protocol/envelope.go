@@ -58,4 +58,7 @@ type Envelope struct {
 	// (a Claude Code hook, or a generic `portald notify`) is relayed up the pipe
 	// and raised as a native macOS notification on the Mac. No response frame.
 	Notify *Notify `cbor:"notify,omitempty"` // agent → client
+
+	// services (v4): the ONLY feature frame, either direction.
+	Msg *Msg `cbor:"msg,omitempty"`
 }

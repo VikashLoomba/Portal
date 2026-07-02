@@ -1,5 +1,20 @@
 package protocol
 
+import "github.com/fxamacker/cbor/v2"
+
+// Msg is the generic service frame (v4). Payload is the service's own CBOR
+// struct — the v3 payload types (OpenURL/ClipRequest/ClipResponse/Notify),
+// their tags unchanged — marshalled via MarshalPayload and carried opaquely.
+// Seq is per-(service, direction) monotonic within one agent process, stamped
+// by the registry for LOG CORRELATION ONLY; it is never the port-event
+// staleness Seq (that counter is s.seq and Msg must never advance it).
+type Msg struct {
+	Service string          `cbor:"svc"`
+	Kind    string          `cbor:"k"`
+	Seq     uint64          `cbor:"seq,omitempty"`
+	Payload cbor.RawMessage `cbor:"p,omitempty"`
+}
+
 // Port describes a remote loopback listener. Family is 4 or 6; Addr is
 // "127.0.0.1" or "::1" in our use (the agent filters out non-loopback
 // listeners before they reach the wire). InodeNS is the kernel socket
@@ -18,6 +33,10 @@ type Hello struct {
 	ClientPID      int    `cbor:"pid"`
 	PollIntervalMs uint32 `cbor:"poll_ms"` // 0 = agent default (75)
 	WantDestroyMC  bool   `cbor:"destroy_mc"`
+	// Services advertises the client's registered handlers as service→version
+	// (DESIGN S4 symmetric advertisement). A handler whose service the agent
+	// lacks — or whose version differs — stays dormant with one warning.
+	Services map[string]uint32 `cbor:"services,omitempty"`
 }
 
 // HelloAck — agent → client. Sent after validating Hello.
@@ -30,6 +49,9 @@ type HelloAck struct {
 	EphemMin     uint16 `cbor:"emin"`
 	EphemMax     uint16 `cbor:"emax"`
 	NowUnixNano  int64  `cbor:"now"`
+	// Services advertises the agent's registered services as service→version
+	// (DESIGN S4 symmetric advertisement). Symmetric with Hello.Services.
+	Services map[string]uint32 `cbor:"services,omitempty"`
 }
 
 // Subscribe — client → agent. Allow/deny lists. Sent after HelloAck and on
@@ -127,6 +149,7 @@ const (
 // `portald open <url>` (typically via the ~/.local/bin/xdg-open wrapper).
 // The Mac client calls `open <url>` to open it in the default browser.
 // Only sent while a client is subscribed; silently dropped otherwise.
+// As of v4 this travels inside Msg.Payload rather than as an Envelope field.
 type OpenURL struct {
 	URL string `cbor:"url"`
 	Seq uint64 `cbor:"seq"`
@@ -142,6 +165,7 @@ type OpenURL struct {
 // ClipRequest must never advance the agent's port-event staleness counter.
 //
 // Kind ∈ {"targets","image","text"}; Format is "png" for images, empty otherwise.
+// As of v4 this travels inside Msg.Payload rather than as an Envelope field.
 type ClipRequest struct {
 	Nonce  uint64 `cbor:"n"`
 	Epoch  uint64 `cbor:"e"` // agent process identity; echoed back in ClipResponse
@@ -163,6 +187,8 @@ type ClipRequest struct {
 //	         HasText) so the shim greps see the kind actually on the clipboard.
 //	image:   OK=true with SHA only (NO path — agent reconstructs it).
 //	text:    OK=true with SHA of a side-channel text file (NOT inline).
+//
+// As of v4 this travels inside Msg.Payload rather than as an Envelope field.
 type ClipResponse struct {
 	Nonce uint64 `cbor:"n"`
 	Epoch uint64 `cbor:"e"`
@@ -195,6 +221,8 @@ type ClipResponse struct {
 // Urgency tiers (from the ported ClassifyHookPayload): 0 = completion/calm,
 // 1 = attention/idle, 2 = critical/tool-approval. The Mac maps these to an
 // optional notification sound when Sound is empty.
+//
+// As of v4 this travels inside Msg.Payload rather than as an Envelope field.
 type Notify struct {
 	Title    string `cbor:"title"`
 	Body     string `cbor:"body,omitempty"`

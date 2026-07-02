@@ -7,6 +7,8 @@ import (
 	"io"
 	"reflect"
 	"testing"
+
+	"github.com/fxamacker/cbor/v2"
 )
 
 // ensure errors import is used
@@ -200,4 +202,128 @@ func TestClipFieldCountInvariant(t *testing.T) {
 	if _, err := NewDecoder(&buf).Read(); !errors.Is(err, ErrMultipleFields) {
 		t.Errorf("got %v, want ErrMultipleFields", err)
 	}
+}
+
+// TestRoundtripMsg encodes a Msg carrying a MarshalPayload'd ClipRequest,
+// round-trips the Envelope, and proves the RawMessage passthrough is
+// byte-preserving: Service/Kind/Seq survive and UnmarshalPayload of the
+// round-tripped Payload deep-equals the original struct.
+func TestRoundtripMsg(t *testing.T) {
+	orig := ClipRequest{Nonce: 7, Epoch: 0xdeadbeef, Kind: "image", Format: "png"}
+	payload, err := MarshalPayload(orig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := &Envelope{Msg: &Msg{Service: "clip", Kind: "req", Seq: 5, Payload: payload}}
+	var buf bytes.Buffer
+	if err := NewEncoder(&buf).Write(in); err != nil {
+		t.Fatal(err)
+	}
+	out, err := NewDecoder(&buf).Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Msg == nil {
+		t.Fatal("Msg not present")
+	}
+	if out.Msg.Service != "clip" || out.Msg.Kind != "req" || out.Msg.Seq != 5 {
+		t.Errorf("header mismatch: got %+v", out.Msg)
+	}
+	got, err := UnmarshalPayload[ClipRequest](out.Msg.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, orig) {
+		t.Errorf("payload roundtrip: got %+v, want %+v", got, orig)
+	}
+}
+
+// TestRoundtripMsgEmptyPayload proves an omitted Msg.Payload round-trips as a
+// nil/empty RawMessage and an all-zero Seq omits the seq key (omitempty).
+func TestRoundtripMsgEmptyPayload(t *testing.T) {
+	in := &Envelope{Msg: &Msg{Service: "clip", Kind: "req"}}
+	var buf bytes.Buffer
+	if err := NewEncoder(&buf).Write(in); err != nil {
+		t.Fatal(err)
+	}
+	out, err := NewDecoder(&buf).Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Msg == nil {
+		t.Fatal("Msg not present")
+	}
+	if len(out.Msg.Payload) != 0 {
+		t.Errorf("empty payload round-tripped as %v, want empty", out.Msg.Payload)
+	}
+	if out.Msg.Seq != 0 {
+		t.Errorf("zero Seq round-tripped as %d", out.Msg.Seq)
+	}
+}
+
+// TestMsgFieldCountInvariant proves Msg participates in the one-field-per-frame
+// tagged-union invariant: it counts as one field, and pairing it with any other
+// field trips the multi-field guard on decode.
+func TestMsgFieldCountInvariant(t *testing.T) {
+	if n := countEnvelopeFields(&Envelope{Msg: &Msg{}}); n != 1 {
+		t.Errorf("Msg alone: got %d fields, want 1", n)
+	}
+	in := &Envelope{
+		Msg:   &Msg{Service: "clip", Kind: "req"},
+		Hello: &Hello{ProtoVersion: 1},
+	}
+	var buf bytes.Buffer
+	if err := NewEncoder(&buf).Write(in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewDecoder(&buf).Read(); !errors.Is(err, ErrMultipleFields) {
+		t.Errorf("got %v, want ErrMultipleFields", err)
+	}
+}
+
+// TestMsgDupKeyFailClosed proves a hand-built payload with a duplicated map key
+// still fails closed via decMode (DupMapKeyEnforcedAPF protects nested payload
+// maps just as it does the top-level Envelope).
+func TestMsgDupKeyFailClosed(t *testing.T) {
+	// CBOR: map(2) { "a": 1, "a": 2 } — a duplicated key.
+	dup := cbor.RawMessage{0xA2, 0x61, 'a', 0x01, 0x61, 'a', 0x02}
+	if _, err := UnmarshalPayload[map[string]uint64](dup); err == nil {
+		t.Fatal("dup-key payload decoded without error, want fail-closed")
+	}
+}
+
+// TestMarshalUnmarshalPayloadRoundtrip proves the typed payload helpers
+// round-trip the fire-and-forget payload structs byte-for-byte.
+func TestMarshalUnmarshalPayloadRoundtrip(t *testing.T) {
+	t.Run("OpenURL", func(t *testing.T) {
+		orig := OpenURL{URL: "https://example.com/path?q=1", Seq: 42}
+		raw, err := MarshalPayload(orig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := UnmarshalPayload[OpenURL](raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, orig) {
+			t.Errorf("got %+v, want %+v", got, orig)
+		}
+	})
+	t.Run("Notify", func(t *testing.T) {
+		orig := Notify{
+			Title: "done", Body: "build ok", Subtitle: "ci",
+			Urgency: 2, Verified: true, Source: "claude_hook", Sound: "Glass", Seq: 9,
+		}
+		raw, err := MarshalPayload(orig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := UnmarshalPayload[Notify](raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, orig) {
+			t.Errorf("got %+v, want %+v", got, orig)
+		}
+	})
 }
