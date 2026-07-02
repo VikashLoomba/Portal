@@ -82,11 +82,38 @@ func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App, nativeOpts ...ss
 		return err
 	}
 	rep := runDoctor(ctx, host, tr)
+	// This branch is only reached with the daemon confirmed DOWN
+	// (lc.Available==false above). Force the daemon-down verdict to be honest
+	// under a non-system transport — see markDaemonDown.
+	markDaemonDown(rep, tr.Describe().Impl)
 	renderDoctor(w, rep)
 	if !rep.OK() {
 		return errSilent
 	}
 	return nil
+}
+
+// markDaemonDown makes the daemon-down fallback report honest under a NON-system
+// transport. The fallback in runDoctorCmd is only reached with the relay daemon
+// confirmed down, and for native runDoctor built a FRESH client and actively
+// Ensure'd it (a native dial is a cheap in-process connect that the install/
+// self-test path legitimately needs) — a throwaway connection that shares nothing
+// with the dead daemon. That dial succeeds against a reachable box, so the master
+// check renders "ssh master: UP (pid=0)" and every downstream probe passes, which
+// would render a FALSE "RESULT: PASS": the relay daemon is down, so
+// clip/notify/forwards are dead (native forwards have no ControlPersist analogue,
+// per T10). Seed a FAIL so the verdict matches reality.
+//
+// SYSTEM is a deliberate no-op (byte-identical per T9): its fresh transport shares
+// the persistent ControlMaster and doctor probes it PASSIVELY (never Ensures), so
+// a daemon-down system run already FAILs the master check on its own — adding a
+// line here would break the goldens.
+func markDaemonDown(rep *doctor.Report, impl string) {
+	if impl == "system-ssh" {
+		return
+	}
+	rep.Add("daemon", doctor.Fail,
+		"daemon not running — clip/notify/forwards are down; start it: "+app.Tool+" start")
 }
 
 // doctorTransport picks the transport the daemon-up /v1/doctor probe runs over.

@@ -474,6 +474,61 @@ func TestRunDoctorCmd_FallbackNativeSelection(t *testing.T) {
 	}
 }
 
+// TestMarkDaemonDown_NativeForcesFail pins the principal-reviewer finding: with
+// the relay daemon DOWN and a NATIVE transport, runDoctorCmd's fallback builds a
+// FRESH native client and runDoctor actively Ensure's it — a throwaway dial that
+// shares nothing with the dead daemon. Against a reachable box that dial succeeds,
+// so the master line reads "UP (pid=0)" and every downstream probe passes, which
+// WITHOUT the fix renders a false "RESULT: PASS" even though clip/notify/forwards
+// are dead. markDaemonDown (called from the daemon-down fallback) must flip that
+// verdict to FAIL. We build the exact all-green native report the bug produces
+// (forceUp native fake, matching the doctorTransport live-transport shape), then
+// apply the fallback's markDaemonDown and assert the render is FAIL, never PASS.
+func TestMarkDaemonDown_NativeForcesFail(t *testing.T) {
+	order, reply := greenReplies()
+	tr := &doctorFakeTransport{forceUp: true, pid: 0, impl: "native-ssh", matchOrder: order, execReply: reply}
+	rep := runDoctor(context.Background(), "user@devbox", tr)
+	// Precondition (the bug): without the fix this native report is all-green.
+	if !rep.OK() {
+		t.Fatalf("precondition: forceUp native report should be all-green before the fix, got:\n%s", reportString(rep))
+	}
+	if strings.Contains(reportString(rep), "RESULT: FAIL") {
+		t.Fatalf("precondition: unfixed native report should render RESULT: PASS, got:\n%s", reportString(rep))
+	}
+
+	// The daemon-down fallback is definitionally daemon-down; apply the fix.
+	markDaemonDown(rep, tr.Describe().Impl)
+
+	if rep.OK() {
+		t.Fatal("native + daemon-down must NOT be OK: the relay daemon is down so clip/notify/forwards are dead")
+	}
+	rendered := reportString(rep)
+	if strings.Contains(rendered, "RESULT: PASS") {
+		t.Errorf("native + daemon-down must NEVER render RESULT: PASS, got:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "RESULT: FAIL") {
+		t.Errorf("native + daemon-down must render RESULT: FAIL, got:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "daemon not running") {
+		t.Errorf("report should name the daemon-down root cause, got:\n%s", rendered)
+	}
+}
+
+// TestMarkDaemonDown_SystemUnchanged: the SYSTEM daemon-down fallback stays
+// byte-identical (T9). A daemon-down system run already FAILs on its own via the
+// passive master check (doctor never Ensures a system transport), so markDaemonDown
+// must be a no-op for system-ssh — seeding a daemon line would break the goldens.
+func TestMarkDaemonDown_SystemUnchanged(t *testing.T) {
+	order, reply := greenReplies()
+	tr := &doctorFakeTransport{pid: 4242, matchOrder: order, execReply: reply} // impl defaults to system-ssh
+	rep := runDoctor(context.Background(), "user@devbox", tr)
+	before := reportString(rep)
+	markDaemonDown(rep, tr.Describe().Impl)
+	if after := reportString(rep); after != before {
+		t.Errorf("system path must stay byte-identical (T9); markDaemonDown mutated it:\n--- before ---\n%s\n--- after ---\n%s", before, after)
+	}
+}
+
 // TestDoctorTransport_NativeUsesLiveTransport (findings 1 & 3): on a healthy
 // native daemon, the daemon-up /v1/doctor probe must run over the daemon's LIVE
 // transport (a.Transport), NOT a fresh factory client — a fresh native client
