@@ -110,7 +110,8 @@ func newRunCmd(a *app.App) *cobra.Command {
 					PushAllow: func(allow []int) error {
 						return a.AgentClient.Subscribe(toU16(app.DenyPorts), toU16(allow), true)
 					},
-					Kick: engine.Kick,
+					Kick:         engine.Kick,
+					ReconcileGen: engine.Reconciles,
 					Doctor: func(c context.Context) *doctor.Report {
 						tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
 						return runDoctor(c, host, tr)
@@ -153,8 +154,12 @@ func newOnceCmd(a *app.App) *cobra.Command {
 			// invoked on this branch.
 			lc := localclient.New(a.Paths.APISock)
 			if lc.Available(cmd.Context()) {
+				// Snapshot the reconcile counter BEFORE the kick so the poll below
+				// waits for a pass that ran AFTER our request, not one already in
+				// flight (POST /v1/reconcile is async+debounced).
+				gen0 := reconcileGen(cmd.Context(), lc)
 				if err := lc.Reconcile(cmd.Context()); err == nil {
-					pollOnceStatus(cmd.Context(), lc)
+					pollOnceReconciled(cmd.Context(), lc, gen0, onceConvergeBudget)
 					return runStatusTo(cmd.Context(), cmd.OutOrStdout(), a)
 				}
 			}
@@ -193,15 +198,35 @@ func newOnceCmd(a *app.App) *cobra.Command {
 	}
 }
 
-// pollOnceStatus is a bounded, best-effort poll that gives the daemon's async
-// Kick time to converge before `once` renders status. It calls lc.Status up to
-// ~1s in 50ms steps, returning as soon as Master.Up is true (or the deadline/ctx
-// elapses). It never errors — it is purely cosmetic, so `once` still returns
-// promptly even if the daemon never reports the master up.
-func pollOnceStatus(ctx context.Context, lc *localclient.Client) {
-	deadline := time.Now().Add(1 * time.Second)
+// onceConvergeBudget bounds how long `once` waits for the daemon's async,
+// debounced reconcile to complete before it renders status.
+const onceConvergeBudget = 1 * time.Second
+
+// reconcileGen reads the daemon's completed-reconcile-pass counter, or 0 if the
+// status probe fails. A missed baseline only makes pollOnceReconciled wait for
+// the first pass it observes — still correct, and still bounded by the budget.
+func reconcileGen(ctx context.Context, lc *localclient.Client) uint64 {
+	if st, err := lc.Status(ctx); err == nil {
+		return st.Health.ReconcileCount
+	}
+	return 0
+}
+
+// pollOnceReconciled is a bounded, best-effort poll that gives the daemon's
+// async, debounced Kick time to run a full reconcile pass before `once` renders
+// status. POST /v1/reconcile only SCHEDULES a pass (202, ~50ms debounce), so
+// keying off Master.Up is useless on the daemon-up branch — the running daemon
+// already owns the ControlMaster, so Master.Up is true on the first poll and the
+// render races ahead of the reconcile, printing the OLD forward set. Instead we
+// poll Status.Health.ReconcileCount and return once it advances past the pre-kick
+// baseline gen0, i.e. at least one full pass has completed since the kick was
+// queued (every pass re-derives ground truth, so any pass after gen0 reflects the
+// new listener/allow). It calls lc.Status up to `budget` in 50ms steps and never
+// errors — `once` still returns promptly if the daemon never reports progress.
+func pollOnceReconciled(ctx context.Context, lc *localclient.Client, gen0 uint64, budget time.Duration) {
+	deadline := time.Now().Add(budget)
 	for {
-		if st, err := lc.Status(ctx); err == nil && st.Master.Up {
+		if st, err := lc.Status(ctx); err == nil && st.Health.ReconcileCount > gen0 {
 			return
 		}
 		if time.Now().After(deadline) {

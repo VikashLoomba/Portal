@@ -12,6 +12,7 @@ import (
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/service"
 )
 
 // EC1: status sourced over the socket includes the agent line plus the master/
@@ -43,6 +44,45 @@ func TestRunStatusTo_DaemonUp_AgentLine(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("status output missing %q\n--- got ---\n%s", want, got)
 		}
+	}
+}
+
+// EC4 (§5.3.4): the daemon-up `portal status` render must be byte-identical to
+// today's layout apart from the agent line. Unlike TestRunStatusTo_DaemonUp_AgentLine
+// (Contains-only, never inspects the service block) and TestRenderStatus_Golden
+// (drives renderStatus with hand-built statusView, never viewFromStatus), this
+// test drives the FULL socket seam end-to-end — GET /v1/status ->
+// viewFromStatus -> renderStatus — and compares the entire buffer, so a
+// viewFromStatus refactor that drops StateLines or inverts Loaded fails here.
+func TestRunStatusTo_DaemonUp_ByteIdentical(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	d := startFakeDaemon(t, cfg,
+		withService(service.Status{Loaded: true, StateLines: []string{"state = running"}}),
+		withHelloAck(&protocol.HelloAck{
+			AgentPID:    1234,
+			AgentGitSHA: "abcdef123456789", // > 12 runes: truncation asserted below
+			Kernel:      "Linux",
+		}),
+		withMasterPID(4242),
+		withForwardLines([]string{"127.0.0.1:8080", "[::1]:8080"}),
+	)
+	a := newDaemonTestApp(t, d.path, cfg)
+
+	var buf bytes.Buffer
+	if err := runStatusTo(context.Background(), &buf, a); err != nil {
+		t.Fatalf("runStatusTo: %v", err)
+	}
+	want := "dev box: devbox\n" +
+		"service (com.test.portal):\n" +
+		"state = running\n" +
+		"\n" +
+		"ssh master: UP (pid=4242) host=devbox\n" +
+		"agent: pid=1234 sha=abcdef123456 kernel=Linux\n" +
+		"active forwards (local listeners owned by master):\n" +
+		"  127.0.0.1:8080\n" +
+		"  [::1]:8080\n"
+	if got := buf.String(); got != want {
+		t.Errorf("daemon-up status not byte-identical:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 }
 

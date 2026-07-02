@@ -10,6 +10,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
@@ -54,6 +55,15 @@ type Engine struct {
 	// non-blocking send; runEventDriven selects on it and fires the same
 	// debounce path as EvConnected/EvDelta. Created by New().
 	kick chan struct{}
+
+	// reconciles is a monotonic count of completed Reconcile passes (every
+	// return of Reconcile bumps it, success or failure). It is the ONLY signal
+	// a client can use to know an out-of-band Kick has actually run to
+	// completion: Kick/POST /v1/reconcile is async+debounced, so Master.Up (the
+	// master is already owned by the daemon) tells a caller nothing about
+	// convergence. `once` reads Reconciles() before its Kick and polls until it
+	// advances (see cmd/portal/run.go).
+	reconciles atomic.Uint64
 
 	conflicts *conflictSet
 }
@@ -108,6 +118,12 @@ func (e *Engine) Kick() {
 	default:
 	}
 }
+
+// Reconciles reports the number of Reconcile passes that have completed. It is
+// monotonic and safe to call from any goroutine. A caller that Kick()s an
+// out-of-band reconcile can read this first, then wait for it to advance past
+// that baseline to know a full pass has run since (§5 `once` convergence).
+func (e *Engine) Reconciles() uint64 { return e.reconciles.Load() }
 
 // Run is event-driven when AgentEvents is non-nil: it reconciles whenever
 // an agent event lands (debounced 50ms to coalesce bursts) and on a 60s
@@ -238,6 +254,10 @@ func (e *Engine) runEventDriven(ctx context.Context) error {
 //     This is the source of truth — never an in-memory cache.
 //  5. Add desired − current; cancel current − desired.
 func (e *Engine) Reconcile(ctx context.Context) error {
+	// Count every completed pass (including the early error returns below) so a
+	// waiter observing the counter advance knows the engine has re-derived
+	// ground truth once more, even when the master is momentarily unreachable.
+	defer e.reconciles.Add(1)
 	pid, rebuilt, err := e.T.EnsureMaster(ctx)
 	if err != nil {
 		e.Log.Logf("WARN: ssh master unreachable: %v", err)

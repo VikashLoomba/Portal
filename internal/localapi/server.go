@@ -348,6 +348,9 @@ func (s *Server) buildStatus(ctx context.Context) Status {
 		st.Health.DroppedNotifyCount = s.deps.Hub.DroppedNotify()
 	}
 	st.Health.EventsSubscribers = int(s.subCount.Load())
+	if s.deps.ReconcileGen != nil {
+		st.Health.ReconcileCount = s.deps.ReconcileGen()
+	}
 
 	return st
 }

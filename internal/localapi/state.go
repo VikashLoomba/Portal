@@ -59,6 +59,12 @@ type Health struct {
 	LastDisconnectErr  string `json:"lastDisconnectErr,omitempty"`
 	DroppedNotifyCount uint64 `json:"droppedNotifyCount"`
 	EventsSubscribers  int    `json:"eventsSubscribers"`
+	// ReconcileCount is the engine's monotonic completed-pass counter. A client
+	// (e.g. `once`) reads it before POST /v1/reconcile, then polls until it
+	// advances to know the async, debounced Kick has actually run a pass —
+	// Master.Up is already true on the daemon-up branch and says nothing about
+	// convergence (§5).
+	ReconcileCount uint64 `json:"reconcileCount"`
 }
 
 // Status is the full aggregate returned by GET /v1/status (and the first line
@@ -124,6 +130,7 @@ type Deps struct {
 	Hub          *hub.Hub
 	PushAllow    func([]int) error
 	Kick         func()
+	ReconcileGen func() uint64
 	Doctor       func(context.Context) *doctor.Report
 	FeatureNames []string
 }

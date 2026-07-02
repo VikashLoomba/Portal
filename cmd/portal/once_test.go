@@ -18,6 +18,7 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/forward"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
@@ -163,6 +164,52 @@ func TestOnce_DaemonUp_KicksAndRendersFromSocket(t *testing.T) {
 	}
 	if errw.Len() != 0 {
 		t.Errorf("unexpected stderr: %q", errw.String())
+	}
+}
+
+// Regression (finding: `once` poll waited on Master.Up, not reconcile
+// convergence): with the master UP but NO reconcile pass completing, the poll
+// must spend the whole budget waiting — the OLD Master.Up poll returned on the
+// first iteration (Master.Up is trivially true on the daemon-up branch) and
+// rendered the stale forward set. Keying off Health.ReconcileCount fixes that.
+func TestPollOnceReconciled_WaitsWhenNoReconcileProgress(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	// Master up so the old Master.Up predicate would fire immediately; the
+	// reconcile counter stays at its baseline (no Kick issued in this test).
+	d := startFakeDaemon(t, cfg, withMasterPID(4242))
+	lc := localclient.New(d.path)
+
+	gen0 := reconcileGen(context.Background(), lc)
+	const budget = 250 * time.Millisecond
+	start := time.Now()
+	pollOnceReconciled(context.Background(), lc, gen0, budget)
+	if elapsed := time.Since(start); elapsed < budget-50*time.Millisecond {
+		t.Errorf("poll returned after %v with no reconcile progress; expected to wait the full %v budget "+
+			"(regression: keyed off Master.Up instead of ReconcileCount)", elapsed, budget)
+	}
+}
+
+// EC (once convergence): once the reconcile counter advances past the pre-kick
+// baseline, the poll returns promptly (well inside the budget).
+func TestPollOnceReconciled_ReturnsWhenCounterAdvances(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	d := startFakeDaemon(t, cfg, withMasterPID(4242))
+	lc := localclient.New(d.path)
+
+	gen0 := reconcileGen(context.Background(), lc)
+	// Model the debounced reconcile completing shortly after the (implicit) kick.
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		d.reconciles.Add(1)
+	}()
+	start := time.Now()
+	pollOnceReconciled(context.Background(), lc, gen0, 3*time.Second)
+	elapsed := time.Since(start)
+	if elapsed > 1*time.Second {
+		t.Errorf("poll took %v; expected to return soon after the counter advanced (~60ms)", elapsed)
+	}
+	if got := reconcileGen(context.Background(), lc); got <= gen0 {
+		t.Errorf("reconcile counter did not advance: got %d, baseline %d", got, gen0)
 	}
 }
 

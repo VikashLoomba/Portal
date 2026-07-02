@@ -127,6 +127,12 @@ type fakeDaemon struct {
 	svc    *fakeServiceStater
 	cfg    *countingConfig
 	kicks  atomic.Int64
+	// reconciles stands in for the real engine's completed-pass counter that
+	// ReconcileGen exposes over GET /v1/status. Kick advances it, modelling the
+	// production engine running a pass in response to POST /v1/reconcile, so the
+	// daemon-up `once` poll (pollOnceReconciled) can observe convergence. Tests
+	// may also bump it directly to drive the poll.
+	reconciles atomic.Int64
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -194,7 +200,8 @@ func startFakeDaemon(t *testing.T, cfg *config.Store, opts ...fakeOpt) *fakeDaem
 		PushAllow: func(allow []int) error {
 			return d.agent.Subscribe(toU16(app.DenyPorts), toU16(allow), true)
 		},
-		Kick: func() { d.kicks.Add(1) },
+		Kick:         func() { d.kicks.Add(1); d.reconciles.Add(1) },
+		ReconcileGen: func() uint64 { return uint64(d.reconciles.Load()) },
 		Doctor: func(context.Context) *doctor.Report {
 			return &doctor.Report{Host: "fakehost"}
 		},
