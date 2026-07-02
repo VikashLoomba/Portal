@@ -8,10 +8,12 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
@@ -22,8 +24,10 @@ import (
 // testServer is an in-process x/crypto/ssh SERVER on a random loopback port. It
 // accepts publickey auth for a single test-generated key and runs each exec
 // request LOCALLY via `sh -c` — matching the shell-join model the native client
-// emits — piping stdout/stderr/exit-status back. It is _test-only (this file is
-// never shipped). The direct-tcpip handler for port forwarding arrives in u4.
+// emits — piping stdout/stderr/exit-status back. Its direct-tcpip handler dials
+// the requested host:port LOCALLY and copies bytes, so the native forward
+// round-trip works fully in-process. It is _test-only (this file is never
+// shipped).
 type testServer struct {
 	ln      net.Listener
 	hostKey ssh.Signer
@@ -77,12 +81,50 @@ func (s *testServer) handleConn(nConn net.Conn, cfg *ssh.ServerConfig) {
 	// false (no error), which the client counts as a successful keepalive.
 	go ssh.DiscardRequests(reqs)
 	for newChan := range chans {
-		if newChan.ChannelType() != "session" {
-			newChan.Reject(ssh.UnknownChannelType, "only session channels are supported")
-			continue
+		switch newChan.ChannelType() {
+		case "session":
+			go s.handleSession(newChan)
+		case "direct-tcpip":
+			go s.handleDirectTCPIP(newChan)
+		default:
+			newChan.Reject(ssh.UnknownChannelType, "only session and direct-tcpip channels are supported")
 		}
-		go s.handleSession(newChan)
 	}
+}
+
+// directTCPIPPayload is the RFC 4254 §7.2 direct-tcpip channel-open request:
+// the host:port the client wants proxied plus its originator address.
+type directTCPIPPayload struct {
+	HostToConnect  string
+	PortToConnect  uint32
+	OriginatorHost string
+	OriginatorPort uint32
+}
+
+// handleDirectTCPIP dials the requested host:port on THIS machine and copies
+// bytes bidirectionally between the ssh channel and the local connection,
+// closing both on either side's EOF. This makes the native client's
+// direct-tcpip forwards round-trip fully in-process.
+func (s *testServer) handleDirectTCPIP(newChan ssh.NewChannel) {
+	var p directTCPIPPayload
+	if err := ssh.Unmarshal(newChan.ExtraData(), &p); err != nil {
+		newChan.Reject(ssh.ConnectionFailed, "bad direct-tcpip payload")
+		return
+	}
+	dest := net.JoinHostPort(p.HostToConnect, strconv.Itoa(int(p.PortToConnect)))
+	remote, err := net.Dial("tcp", dest)
+	if err != nil {
+		newChan.Reject(ssh.ConnectionFailed, err.Error())
+		return
+	}
+	ch, reqs, err := newChan.Accept()
+	if err != nil {
+		remote.Close()
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	go func() { io.Copy(ch, remote); ch.Close() }()
+	go func() { io.Copy(remote, ch); remote.Close() }()
 }
 
 func (s *testServer) handleSession(newChan ssh.NewChannel) {

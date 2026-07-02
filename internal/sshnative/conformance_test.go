@@ -12,9 +12,10 @@ import (
 // TestConformance runs the shared T7 suite against the in-process T6 server via
 // the injection-seam Options (temp known_hosts + temp key + WithAgentSocket("")),
 // so nothing touches the runner's real ~/.ssh. Describe().Impl == "native-ssh"
-// (!= system-ssh), so the suite treats forwards as loopback-reachable — but the
-// Client does not yet assert PortForwarder (forward.go is u4), so the whole
-// PortForwarder section is skipped here; it lights up in u4.
+// (!= system-ssh), so the suite treats forwards as loopback-reachable. The
+// Client now asserts PortForwarder (forward.go), so the PortForwarder section
+// runs fully: the always-on lifecycle steps AND the loopback-guarded echo +
+// ForwardLines round-trip (direct-tcpip through the T6 server's handler).
 func TestConformance(t *testing.T) {
 	clientPriv, clientSigner := generateKeyPair(t)
 	srv := newTestServer(t, clientSigner.PublicKey())

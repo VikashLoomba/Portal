@@ -100,6 +100,14 @@ type Client struct {
 	dead          bool
 	agentConn     net.Conn      // held open for the client's lifetime; closed on redial/Close
 	keepaliveStop chan struct{} // closed to stop the current keepalive goroutine
+
+	// fwdMu guards forwards, the in-process port-forward registry (keyed by
+	// local port). This registry is the GROUND TRUTH for ListForwards/
+	// ForwardLines (see forward.go) — more truthful than lsof. Native forwards
+	// die with this process: there is no ControlPersist analogue, so Close (or
+	// daemon exit) drops every forward. See forward.go.
+	fwdMu    sync.Mutex
+	forwards map[int]net.Listener
 }
 
 var _ transport.Transport = (*Client)(nil)
@@ -417,6 +425,9 @@ func (nopReadCloser) Close() error { return nil }
 
 // Close closes the client. stopped is true iff there was a live client to stop.
 func (c *Client) Close(ctx context.Context) (bool, error) {
+	// Native forwards die with the daemon (no ControlPersist analogue), so a
+	// graceful Close drops every live forward before tearing down the client.
+	c.closeAllForwards()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	had := c.client != nil
