@@ -4,6 +4,11 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -440,6 +445,84 @@ func TestRegistry_RouteVerbLiveDeadline(t *testing.T) {
 
 	if r.routeVerb(ctx, conn, "unknown", "") {
 		t.Fatal("routeVerb should return false for an unknown verb (default-deny)")
+	}
+}
+
+// (l) An inbound Msg for a service the registry doesn't know is dropped with no
+// panic; a subsequent Msg for a known service still dispatches (session lives).
+func TestRegistry_UnknownServiceDrop(t *testing.T) {
+	r := newRegistry(nil)
+	s := &fakeService{name: "svc", version: 1, maxPayload: 64, outboxCap: 2, verbName: "v"}
+	r.register(s)
+	r.dispatch(&protocol.Msg{Service: "nope", Kind: "x", Payload: rawN(1)})
+	r.dispatch(&protocol.Msg{Service: "svc", Kind: "ok", Payload: rawN(1)})
+	if kinds := s.handledKinds(); len(kinds) != 1 || kinds[0] != "ok" {
+		t.Fatalf("want only [ok] handled (unknown-service dropped), got %v", kinds)
+	}
+}
+
+// TestDeletionInvariant_NoLegacyEnvelopeFields is the DESIGN §8 deletion grep as
+// a test: the v4 hard cut removed Envelope.OpenURL/ClipRequest/ClipResponse/
+// Notify, so NO Go source may reference them. The compiler enforces real
+// references; this scan is belt-and-suspenders. It is scoped to .go source with
+// line comments stripped — historical references survive verbatim in comments
+// (e.g. client.go's "the old case env.OpenURL arm") and in the DESIGN docs, so a
+// literal tree-wide grep is intentionally NOT empty; only actual code must be.
+func TestDeletionInvariant_NoLegacyEnvelopeFields(t *testing.T) {
+	root := repoRoot(t)
+	// Pattern assembled from fragments so this file's own source can never carry a
+	// literal deleted-field reference that self-trips the scan.
+	pat := regexp.MustCompile(`env\.(` + "OpenURL|ClipRequest|ClipResponse|Notify" + `)\b`)
+	_, self, _, _ := runtime.Caller(0)
+
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if info.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || path == self {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for i, line := range strings.Split(string(b), "\n") {
+			code := line
+			if idx := strings.Index(code, "//"); idx >= 0 {
+				code = code[:idx]
+			}
+			if pat.MatchString(code) {
+				t.Errorf("%s:%d references a deleted Envelope field: %q", path, i+1, strings.TrimSpace(line))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("go.mod not found walking up from cwd")
+		}
+		dir = parent
 	}
 }
 
