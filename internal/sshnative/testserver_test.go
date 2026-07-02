@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
@@ -32,6 +33,9 @@ type testServer struct {
 	ln      net.Listener
 	hostKey ssh.Signer
 	addr    string // "127.0.0.1:<port>"
+
+	mu    sync.Mutex
+	conns []net.Conn // every accepted TCP conn, so dropConns can sever them
 }
 
 // newTestServer starts a server whose publickey callback accepts exactly
@@ -70,7 +74,23 @@ func (s *testServer) serve(cfg *ssh.ServerConfig) {
 	}
 }
 
+// dropConns severs every accepted TCP connection, simulating a silent network
+// death / server reboot so a client's in-flight keepalive@openssh.com SendRequest
+// fails. The listener stays open so a subsequent Ensure can re-dial.
+func (s *testServer) dropConns() {
+	s.mu.Lock()
+	conns := s.conns
+	s.conns = nil
+	s.mu.Unlock()
+	for _, c := range conns {
+		c.Close()
+	}
+}
+
 func (s *testServer) handleConn(nConn net.Conn, cfg *ssh.ServerConfig) {
+	s.mu.Lock()
+	s.conns = append(s.conns, nConn)
+	s.mu.Unlock()
 	sconn, chans, reqs, err := ssh.NewServerConn(nConn, cfg)
 	if err != nil {
 		nConn.Close()

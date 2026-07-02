@@ -39,10 +39,10 @@ import (
 )
 
 const (
-	defaultPort      = 22
-	dialTimeout      = 15 * time.Second
-	keepalivePeriod  = 15 * time.Second
-	keepaliveStrikes = 3
+	defaultPort             = 22
+	dialTimeout             = 15 * time.Second
+	defaultKeepalivePeriod  = 15 * time.Second
+	defaultKeepaliveStrikes = 3
 )
 
 // Option mutates a Client's resolved configuration before Ensure dials. New
@@ -77,6 +77,22 @@ func WithHostKeyCallback(cb ssh.HostKeyCallback) Option {
 	return func(c *Client) { c.hostKeyOverride = cb }
 }
 
+// WithKeepalive overrides the keepalive cadence (default 15s period, 3 strikes).
+// It is a test seam: the 15s/3-strike production timing would make dead-connection
+// detection take ~45s to observe, so tests shrink the period to drive the real
+// startKeepaliveLocked detection loop deterministically. A non-positive period or
+// strike count is ignored (the default stands).
+func WithKeepalive(period time.Duration, strikes int) Option {
+	return func(c *Client) {
+		if period > 0 {
+			c.keepalivePeriod = period
+		}
+		if strikes > 0 {
+			c.keepaliveStrikes = strikes
+		}
+	}
+}
+
 // Client is one native ssh transport bound to a single target. The embedded
 // *ssh.Client is guarded by mu; a nil or dead client makes the next Ensure
 // re-dial.
@@ -90,6 +106,11 @@ type Client struct {
 	identityFiles   []string
 	agentSocket     string
 	hostKeyOverride ssh.HostKeyCallback
+
+	// Keepalive cadence: defaults from New (15s/3), overridable by WithKeepalive.
+	// Read once when startKeepaliveLocked launches; never mutated after New.
+	keepalivePeriod  time.Duration
+	keepaliveStrikes int
 
 	// hostKeyCB is the built STRICT callback (from knownHostsPath, or the
 	// override). Populated by New so Ensure never touches ~/.ssh again.
@@ -135,6 +156,8 @@ func New(target string, opts ...Option) (*Client, error) {
 		filepath.Join(home, ".ssh", "id_rsa"),
 	}
 	c.agentSocket = os.Getenv("SSH_AUTH_SOCK")
+	c.keepalivePeriod = defaultKeepalivePeriod
+	c.keepaliveStrikes = defaultKeepaliveStrikes
 
 	for _, o := range opts {
 		o(c)
@@ -275,8 +298,13 @@ func (c *Client) teardownLocked() {
 func (c *Client) startKeepaliveLocked(client *ssh.Client) {
 	stop := make(chan struct{})
 	c.keepaliveStop = stop
+	// Snapshot cadence under mu so the goroutine never races a later Option
+	// mutation (there is none today, but the capture keeps the goroutine
+	// self-contained and -race clean).
+	period := c.keepalivePeriod
+	strikeLimit := c.keepaliveStrikes
 	go func() {
-		ticker := time.NewTicker(keepalivePeriod)
+		ticker := time.NewTicker(period)
 		defer ticker.Stop()
 		strikes := 0
 		for {
@@ -287,7 +315,7 @@ func (c *Client) startKeepaliveLocked(client *ssh.Client) {
 				_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
 				if err != nil {
 					strikes++
-					if strikes >= keepaliveStrikes {
+					if strikes >= strikeLimit {
 						c.markDead(client)
 						return
 					}

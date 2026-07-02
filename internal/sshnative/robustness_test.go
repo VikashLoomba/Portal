@@ -187,3 +187,66 @@ func TestEnsureRedialsDeadClient(t *testing.T) {
 		t.Errorf("post-redial Exec: out=%q err=%v", out, err)
 	}
 }
+
+// TestKeepaliveMarksDeadOnConnectionDrop (finding 6 / T5): drives the REAL
+// startKeepaliveLocked detection loop end-to-end — no markDead seam. With a fast
+// keepalive cadence, severing the server's TCP connection makes the in-flight
+// keepalive@openssh.com SendRequest fail; after keepaliveStrikes consecutive
+// failures the goroutine must mark the client dead so Health.Up flips false and
+// the next Ensure self-heals by re-dialing. A regression that never trips the
+// strike threshold (e.g. `strikes >= limit` weakened, the markDead call dropped,
+// or the goroutine panics/early-returns) leaves Health.Up=true forever and fails
+// here — the exact silent-death hole T5 exists to close.
+func TestKeepaliveMarksDeadOnConnectionDrop(t *testing.T) {
+	clientPriv, clientSigner := generateKeyPair(t)
+	srv := newTestServer(t, clientSigner.PublicKey())
+	kh := writeKnownHosts(t, srv.knownHostsLine())
+	keyFile := writeIdentityFile(t, clientPriv)
+
+	// 10ms period / 3 strikes: real detection fires in ~30ms yet the loop is the
+	// same code the 15s/3 production path runs.
+	c, err := New(srv.target("testuser"),
+		WithKnownHostsPath(kh),
+		WithIdentityFiles(keyFile),
+		WithAgentSocket(""),
+		WithKeepalive(10*time.Millisecond, 3))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { c.Close(context.Background()) })
+	if _, err := c.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if h, _ := c.Health(context.Background()); !h.Up {
+		t.Fatal("Health.Up = false right after dial, want true")
+	}
+
+	// Silent network death: the client is not told; only its keepalive can notice.
+	srv.dropConns()
+
+	// The detection loop must flip Health.Up to false within a bounded window
+	// (period*strikes plus generous slack), with NO markDead call from the test.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if h, _ := c.Health(context.Background()); !h.Up {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Health.Up stayed true after the connection dropped: keepalive never detected the dead connection (T5 self-heal broken)")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Self-heal: the next Ensure re-dials a fresh, working client.
+	rebuilt, err := c.Ensure(context.Background())
+	if err != nil {
+		t.Fatalf("Ensure after keepalive death: %v", err)
+	}
+	if !rebuilt {
+		t.Fatal("Ensure must re-dial after keepalive marked the client dead (rebuilt=true)")
+	}
+	out, _, err := c.Exec(context.Background(), nil, "echo", "healed")
+	if err != nil || !strings.Contains(out, "healed") {
+		t.Errorf("post-heal Exec: out=%q err=%v", out, err)
+	}
+}
