@@ -388,7 +388,7 @@ func TestDaemonDown(t *testing.T) {
 	t.Run("no socket", func(t *testing.T) {
 		dir := shortTempDir(t)
 		c := New(filepath.Join(dir, "nonexistent.sock"))
-		assertAllMethodsError(t, c, context.Background())
+		assertAllMethodsError(t, c, context.Background(), 2*time.Second)
 	})
 
 	t.Run("dead socket (plain file at the path)", func(t *testing.T) {
@@ -398,42 +398,71 @@ func TestDaemonDown(t *testing.T) {
 			t.Fatalf("write dead socket file: %v", err)
 		}
 		c := New(path)
-		assertAllMethodsError(t, c, context.Background())
+		assertAllMethodsError(t, c, context.Background(), 2*time.Second)
 	})
 
 	t.Run("hung server times out", func(t *testing.T) {
-		dir := shortTempDir(t)
-		path := filepath.Join(dir, "api.sock")
-		ln, err := net.Listen("unix", path)
-		if err != nil {
-			t.Fatalf("listen: %v", err)
-		}
-		defer ln.Close()
-		// Accept connections but never write a response, so every request blocks
-		// until its ctx deadline.
-		go func() {
-			for {
-				conn, err := ln.Accept()
-				if err != nil {
-					return
-				}
-				// Hold the conn open without responding.
-				t.Cleanup(func() { conn.Close() })
-			}
-		}()
-
-		// Shrink timeouts so the hung-server assertions finish fast.
-		restore := shrinkTimeouts(200 * time.Millisecond)
-		defer restore()
-
-		c := New(path)
-		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-		defer cancel()
-		assertAllMethodsError(t, c, ctx)
-		if c.Available(ctx) {
-			t.Error("Available = true against a hung server, want false")
-		}
+		c := newHungServer(t)
+		// A genuinely unbounded base ctx: assertAllMethodsError gives each method
+		// its own 200ms budget, so each dials the hung listener and times out on
+		// its OWN deadline (proving no method ignores its context) rather than
+		// riding a single pre-expired context that only the first call spends.
+		assertAllMethodsError(t, c, context.Background(), 200*time.Millisecond)
 	})
+}
+
+// newHungServer returns a Client dialing a listener that accepts connections but
+// never writes a response, so every request blocks until its ctx deadline.
+func newHungServer(t *testing.T) *Client {
+	t.Helper()
+	dir := shortTempDir(t)
+	path := filepath.Join(dir, "api.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { conn.Close() })
+		}
+	}()
+	return New(path)
+}
+
+// TestHungServerPerCallTimeout proves the per-call StatusTimeout/DoctorTimeout/
+// ProbeTimeout in newReq are the ONLY thing that ends a request against a wedged
+// daemon when the caller passes an UNBOUNDED context — which is exactly what the
+// CLI does (cobra's root.Execute runs on context.Background()). Every request
+// here rides context.Background(); only shrinkTimeouts lowers the package
+// defaults. Dropping newReq's context.WithTimeout would make these calls hang
+// forever, so this test would hang and fail — the regression the other cases
+// (which inject their own bounded context) cannot catch.
+func TestHungServerPerCallTimeout(t *testing.T) {
+	c := newHungServer(t)
+	restore := shrinkTimeouts(200 * time.Millisecond)
+	defer restore()
+
+	ctx := context.Background()
+	if c.Available(ctx) {
+		t.Error("Available = true against a hung server, want false")
+	}
+	if _, err := c.Status(ctx); err == nil {
+		t.Error("Status err = nil, want a per-call StatusTimeout error")
+	}
+	if _, err := c.Ports(ctx); err == nil {
+		t.Error("Ports err = nil, want a per-call StatusTimeout error")
+	}
+	if _, err := c.Allow(ctx, 40085); err == nil {
+		t.Error("Allow err = nil, want a per-call StatusTimeout error")
+	}
+	if _, err := c.Doctor(ctx); err == nil {
+		t.Error("Doctor err = nil, want a per-call DoctorTimeout error")
+	}
 }
 
 // shrinkTimeouts lowers the package default timeouts (for the hung-server case)
@@ -446,39 +475,44 @@ func shrinkTimeouts(d time.Duration) func() {
 }
 
 // assertAllMethodsError calls every non-streaming method and Available and
-// requires each to fail (no partial success) against a down/hung daemon.
-func assertAllMethodsError(t *testing.T, c *Client, ctx context.Context) {
+// requires each to fail (no partial success) against a down/hung daemon. Each
+// method gets its OWN fresh WithTimeout(base, per) context rather than a single
+// shared one: against a hung listener a shared context is consumed by the first
+// call, so later calls would return on the already-cancelled context WITHOUT
+// ever dialing — falsely "passing" a method that ignored its context. A fresh
+// per-method budget makes every method genuinely exercise the hung path. `per`
+// only bites the hung case; for a down socket the dial fails immediately.
+func assertAllMethodsError(t *testing.T, c *Client, base context.Context, per time.Duration) {
 	t.Helper()
-	if c.Available(ctx) {
-		t.Error("Available = true against a down daemon, want false")
+	fresh := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(base, per)
 	}
-	if _, err := c.Status(ctx); err == nil {
-		t.Error("Status err = nil, want an error against a down daemon")
+	{
+		ctx, cancel := fresh()
+		if c.Available(ctx) {
+			t.Error("Available = true against a down daemon, want false")
+		}
+		cancel()
 	}
-	if _, err := c.Ports(ctx); err == nil {
-		t.Error("Ports err = nil, want an error")
+	call := func(name string, fn func(ctx context.Context) error) {
+		ctx, cancel := fresh()
+		defer cancel()
+		if err := fn(ctx); err == nil {
+			t.Errorf("%s err = nil, want an error against a down daemon", name)
+		}
 	}
-	if _, err := c.Allow(ctx, 40085); err == nil {
-		t.Error("Allow err = nil, want an error")
-	}
-	if _, err := c.Unallow(ctx, 40085); err == nil {
-		t.Error("Unallow err = nil, want an error")
-	}
-	if _, err := c.Features(ctx); err == nil {
-		t.Error("Features err = nil, want an error")
-	}
-	if _, err := c.SetFeature(ctx, config.FeatureNotify, true); err == nil {
-		t.Error("SetFeature err = nil, want an error")
-	}
-	if err := c.Reconcile(ctx); err == nil {
-		t.Error("Reconcile err = nil, want an error")
-	}
-	if _, err := c.Doctor(ctx); err == nil {
-		t.Error("Doctor err = nil, want an error")
-	}
-	if _, _, err := c.Events(ctx); err == nil {
-		t.Error("Events err = nil, want an error against a down daemon")
-	}
+	call("Status", func(ctx context.Context) error { _, err := c.Status(ctx); return err })
+	call("Ports", func(ctx context.Context) error { _, err := c.Ports(ctx); return err })
+	call("Allow", func(ctx context.Context) error { _, err := c.Allow(ctx, 40085); return err })
+	call("Unallow", func(ctx context.Context) error { _, err := c.Unallow(ctx, 40085); return err })
+	call("Features", func(ctx context.Context) error { _, err := c.Features(ctx); return err })
+	call("SetFeature", func(ctx context.Context) error {
+		_, err := c.SetFeature(ctx, config.FeatureNotify, true)
+		return err
+	})
+	call("Reconcile", func(ctx context.Context) error { return c.Reconcile(ctx) })
+	call("Doctor", func(ctx context.Context) error { _, err := c.Doctor(ctx); return err })
+	call("Events", func(ctx context.Context) error { _, _, err := c.Events(ctx); return err })
 }
 
 // containsInt reports whether s contains v.

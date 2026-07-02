@@ -154,10 +154,14 @@ func newAllowedCmd(a *app.App) *cobra.Command {
 	}
 }
 
+// parsePorts splits args into valid TCP ports and rejects. The valid range is
+// 1..65535 — identical to localapi.parsePort (§4.5), so a port the daemon would
+// reject with 400 invalid_port never gets written to the allow file nor PUT to
+// the daemon (which would misreport an up daemon as "reconciles" / down).
 func parsePorts(args []string) (ports []int, bad []string) {
 	for _, a := range args {
 		n, err := strconv.Atoi(a)
-		if err != nil || n <= 0 {
+		if err != nil || n < 1 || n > 65535 {
 			bad = append(bad, a)
 			continue
 		}

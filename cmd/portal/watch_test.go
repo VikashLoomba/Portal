@@ -14,6 +14,8 @@ import (
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/localapi"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
 )
 
 // syncBuffer is a mutex-guarded bytes.Buffer so the test goroutine polling the
@@ -73,6 +75,36 @@ func TestRunStatusWatch_RerenderThenShutdown(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("runStatusWatch did not exit after daemon shutdown")
+	}
+}
+
+// TestWatchLoop_DrainsFinalStateOnStreamEnd proves the errc case renders any
+// state event still buffered on `events` before returning. The client enqueues
+// every decoded line onto `events` and only THEN sends the terminal to `errc`,
+// so at stream end BOTH a final state event and the terminal can be ready; a
+// bare `return nil` on `errc` would let select drop that last render ~50% of the
+// time. We reproduce that exact simultaneity (a state event pre-buffered on
+// `events`, a terminal on `errc`) many times: with the drain, every iteration
+// renders exactly once regardless of which ready case select picks; without it,
+// some iteration renders zero times and the test fails.
+func TestWatchLoop_DrainsFinalStateOnStreamEnd(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	a := newDaemonTestApp(t, filepath.Join(t.TempDir(), "unused.sock"), cfg)
+	st := localapi.Status{Host: "devbox"}
+
+	for i := 0; i < 200; i++ {
+		events := make(chan localclient.Event, 16)
+		events <- localclient.Event{Type: "state", Status: &st}
+		errc := make(chan error, 1)
+		errc <- nil // clean EOF terminal, ready simultaneously with the buffered state
+
+		var out bytes.Buffer
+		if err := watchLoop(context.Background(), &out, a, events, errc); err != nil {
+			t.Fatalf("iter %d: watchLoop = %v, want nil", i, err)
+		}
+		if got := strings.Count(out.String(), "dev box:"); got != 1 {
+			t.Fatalf("iter %d: rendered %d times, want exactly 1 — a final buffered state was dropped at stream end", i, got)
+		}
 	}
 }
 

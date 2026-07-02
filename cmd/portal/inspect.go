@@ -50,6 +50,28 @@ func runStatusWatch(ctx context.Context, w, errw io.Writer, a *app.App) error {
 		fmt.Fprintf(errw, "%s status --watch needs the running daemon; run `%s status` instead\n", app.Tool, app.Tool)
 		return errSilent
 	}
+	return watchLoop(ctx, w, a, events, errc)
+}
+
+// renderEvent renders a snapshot/state event's Status; notify/tick carry no
+// Status and are ignored.
+func renderEvent(w io.Writer, a *app.App, ev localclient.Event) {
+	if ev.Type == "snapshot" || ev.Type == "state" {
+		if ev.Status != nil {
+			renderStatus(w, viewFromStatus(a, *ev.Status))
+		}
+	}
+}
+
+// watchLoop renders each snapshot/state event and returns nil when the stream
+// ends. The `errc` case must drain any still-buffered events before returning:
+// the client's Events goroutine enqueues every decoded line onto the buffered
+// `events` chan (cap 16) and only THEN sends the terminal to `errc` (cap 1)
+// before its deferred close(events). So a final Coalesced state event and the
+// terminal can be ready simultaneously; a bare `return nil` on `errc` would let
+// select drop that last state render (daemon publishes a final state, then
+// shuts down immediately). Draining guarantees the last truth is rendered.
+func watchLoop(ctx context.Context, w io.Writer, a *app.App, events <-chan localclient.Event, errc <-chan error) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -58,14 +80,19 @@ func runStatusWatch(ctx context.Context, w, errw io.Writer, a *app.App) error {
 			if !ok {
 				return nil
 			}
-			// snapshot/state carry a full Status; notify/tick are ignored.
-			if ev.Type == "snapshot" || ev.Type == "state" {
-				if ev.Status != nil {
-					renderStatus(w, viewFromStatus(a, *ev.Status))
+			renderEvent(w, a, ev)
+		case <-errc:
+			for {
+				select {
+				case ev, ok := <-events:
+					if !ok {
+						return nil
+					}
+					renderEvent(w, a, ev)
+				default:
+					return nil
 				}
 			}
-		case <-errc:
-			return nil
 		}
 	}
 }
