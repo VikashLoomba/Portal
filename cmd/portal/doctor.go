@@ -12,6 +12,7 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshnative"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
 )
 
@@ -40,7 +41,12 @@ func newDoctorCmd(a *app.App) *cobra.Command {
 // self-test runs against the daemon's LIVE ControlMaster (better ground truth
 // than a fresh CLI-side probe); when the daemon is down it falls back to today's
 // in-process run. Both paths need a host.
-func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App) error {
+//
+// nativeOpts is a T5 hermeticity seam: production passes NONE (native resolves
+// the real ~/.ssh defaults), while the daemon-down fallback test injects temp-dir
+// known_hosts/identity fixtures so the native construction never touches the
+// runner's real ~/.ssh. It applies only to the native branch of the factory.
+func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App, nativeOpts ...sshnative.Option) error {
 	host, _ := a.Cfg.ReadHost()
 	if host == "" {
 		return fmt.Errorf("no dev box configured — run: %s install <ssh-host>", app.Tool)
@@ -71,7 +77,7 @@ func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App) error {
 	// no-leak behavior (routing doctor probes through a.Transport, or a sink-wired
 	// transport, would tee ssh stderr into the report). The only test seam that
 	// intercepts this path is a.Runner.
-	tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
+	tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil, nativeOpts...)
 	if err != nil {
 		return err
 	}
@@ -81,6 +87,39 @@ func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App) error {
 		return errSilent
 	}
 	return nil
+}
+
+// doctorTransport picks the transport the daemon-up /v1/doctor probe runs over.
+//
+// For NATIVE it returns the daemon's LIVE transport (a.Transport). A native
+// connection is in-process state: a freshly-constructed client shares nothing
+// with the daemon's live connection, so its Health reports DOWN without dialing
+// (New never dials) — the false "ssh master DOWN" a fresh factory client would
+// yield on a healthy native daemon. Ensure is idempotent: a no-op when the live
+// client is up, a same-client re-dial (no leaked connection) if the keepalive
+// marked it dead. Unlike system-ssh — whose fresh transport shares the persistent
+// ControlMaster socket and can probe it via `ssh -O check` — native must be
+// observed on the very connection the daemon holds.
+//
+// For SYSTEM it returns a FRESH nil-sink transport: routing doctor probes through
+// a.Transport (StderrSink=os.Stderr) would tee ssh stderr into the launchd log,
+// so the fresh transport keeps the report clean while still probing the shared
+// ControlMaster socket.
+func doctorTransport(ctx context.Context, a *app.App, host string) (transport.Transport, error) {
+	sel, err := a.Cfg.Transport()
+	if err != nil {
+		return nil, err
+	}
+	if sel == "native" && a.Transport != nil {
+		// Idempotent: no-op if already up, same-client re-dial if keepalive-dead.
+		_, _ = a.Transport.Ensure(ctx)
+		return a.Transport, nil
+	}
+	tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
+	if err != nil {
+		return nil, err
+	}
+	return tr, nil
 }
 
 // renderDoctor writes the human-readable report to w. It is a free function in

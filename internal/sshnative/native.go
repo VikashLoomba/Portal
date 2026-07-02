@@ -365,10 +365,21 @@ func (c *Client) Exec(ctx context.Context, stdin []byte, argv ...string) (string
 	sess.Stdout = &outBuf
 	sess.Stderr = &errBuf
 
+	// Per-call ctx must interrupt a started session (the sole cancellation seam
+	// x/crypto/ssh exposes is closing the session), mirroring the exec.CommandContext
+	// semantics sshctl/localexec give the SAME interface.
+	stop := watchSessionCtx(ctx, sess)
+	defer stop()
+
 	runErr := sess.Run(strings.Join(argv, " "))
 	stdout, stderr := outBuf.String(), errBuf.String()
 	if runErr == nil {
 		return stdout, stderr, nil
+	}
+	// A ctx deadline/cancel that tore the session down surfaces as the ctx error,
+	// not the opaque channel-closed error the interrupted Run returns.
+	if ctx != nil && ctx.Err() != nil {
+		return stdout, stderr, fmt.Errorf("sshnative: exec: %w", ctx.Err())
 	}
 	var ee *ssh.ExitError
 	if errors.As(runErr, &ee) {
@@ -408,14 +419,43 @@ func (c *Client) Stream(ctx context.Context, argv ...string) (io.WriteCloser, io
 		sess.Close()
 		return nil, nil, nil, nil, fmt.Errorf("sshnative: start: %w", err)
 	}
+	// A ctx deadline/cancel closes the session so a hung Stream consumer unblocks
+	// (exec.CommandContext parity — see watchSessionCtx). The watcher lives until
+	// wait observes the session end.
+	stop := watchSessionCtx(ctx, sess)
 	wait := func() error {
 		werr := sess.Wait()
+		stop()
 		sess.Close()
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return werr
 	}
 	// ssh.Session pipes are io.Reader; adapt to io.ReadCloser (session Close, in
 	// wait, tears the underlying channel down — the reader Close is a no-op).
 	return stdin, nopReadCloser{stdout}, nopReadCloser{stderr}, wait, nil
+}
+
+// watchSessionCtx closes sess when ctx is done, giving Exec/Stream the per-call
+// cancellation the other Transport impls get from exec.CommandContext: after the
+// session starts, ctx's deadline/cancel is otherwise ignored because x/crypto/ssh
+// only watches ctx during the dial. Closing the session unblocks Run/Wait. The
+// returned stop func ends the watcher once the session finishes on its own. A nil
+// or never-cancelable ctx (e.g. context.Background) installs no goroutine.
+func watchSessionCtx(ctx context.Context, sess *ssh.Session) func() {
+	if ctx == nil || ctx.Done() == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			sess.Close()
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
 }
 
 // nopReadCloser adapts the ssh.Session pipe io.Readers to io.ReadCloser.

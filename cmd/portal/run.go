@@ -112,11 +112,18 @@ func newRunCmd(a *app.App) *cobra.Command {
 					Kick:         engine.Kick,
 					ReconcileGen: engine.Reconciles,
 					Doctor: func(c context.Context) *doctor.Report {
-						// nil ssh-stderr sink: routing doctor probes through a
-						// sink-wired transport would leak ssh stderr into the
-						// launchd log on the daemon-up path. Config was validated at
-						// startup (NewProd), so ignoring the factory error is safe.
-						tr, _, _ := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
+						// doctorTransport probes the daemon's LIVE native connection
+						// (a.Transport) — a fresh native client would report "ssh
+						// master DOWN" without dialing — while system uses a fresh
+						// nil-sink transport so ssh stderr is never tee'd into the
+						// launchd log. Config was validated at startup (NewProd), so
+						// an error here is unexpected; surface it, never panic.
+						tr, err := doctorTransport(c, a, host)
+						if err != nil {
+							rep := &doctor.Report{Host: host}
+							rep.Add("transport", doctor.Fail, "transport unavailable: "+err.Error())
+							return rep
+						}
 						return runDoctor(c, host, tr)
 					},
 				}

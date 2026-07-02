@@ -13,6 +13,7 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshnative"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
 )
 
@@ -388,12 +389,70 @@ func TestRunDoctorCmd_FallbackNativeSelection(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	_ = runDoctorCmd(context.Background(), &out, a) // FAIL expected (native undialed)
+	// T5 hermeticity: inject a temp-dir known_hosts path so the native client the
+	// fallback constructs never reads the runner's real ~/.ssh/known_hosts.
+	hermetic := sshnative.WithKnownHostsPath(filepath.Join(t.TempDir(), "known_hosts"))
+	_ = runDoctorCmd(context.Background(), &out, a, hermetic) // FAIL expected (native undialed)
 	if !strings.Contains(out.String(), "[PASS] transport: native-ssh") {
 		t.Errorf("daemon-down fallback must honor the native selection, got:\n%s", out.String())
 	}
 	if !strings.Contains(out.String(), "forward lifetime") {
 		t.Errorf("native fallback should include the T10 forward-lifetime note, got:\n%s", out.String())
+	}
+}
+
+// TestDoctorTransport_NativeUsesLiveTransport (findings 1 & 3): on a healthy
+// native daemon, the daemon-up /v1/doctor probe must run over the daemon's LIVE
+// transport (a.Transport), NOT a fresh factory client — a fresh native client
+// reports Health.Up=false without dialing, yielding a flatly-wrong "ssh master
+// DOWN" on a supported path. doctorTransport returning a.Transport is the fix.
+func TestDoctorTransport_NativeUsesLiveTransport(t *testing.T) {
+	cfg := newTestConfig(t, "user@devbox")
+	if err := cfg.SetTransport("native"); err != nil {
+		t.Fatal(err)
+	}
+	live := &doctorFakeTransport{forceUp: true, pid: 0, impl: "native-ssh"}
+	a := &app.App{Cfg: cfg, Transport: live, Runner: &run.Fake{}}
+
+	tr, err := doctorTransport(context.Background(), a, "user@devbox")
+	if err != nil {
+		t.Fatalf("doctorTransport: %v", err)
+	}
+	if tr != live {
+		t.Fatal("native doctor must run over the daemon's LIVE a.Transport, not a fresh factory client")
+	}
+
+	// End to end: the report over the live transport shows the master UP — the
+	// exact line a fresh, undialed native client would have (wrongly) failed.
+	order, reply := greenReplies()
+	live.matchOrder, live.execReply = order, reply
+	rep := runDoctor(context.Background(), "user@devbox", tr)
+	assertCheck(t, rep, "ssh master", doctor.Pass)
+	assertCheck(t, rep, "transport", doctor.Pass)
+}
+
+// TestDoctorTransport_SystemUsesFreshTransport: the system daemon-up probe must
+// use a FRESH nil-sink transport (not a.Transport, whose StderrSink=os.Stderr
+// would tee ssh stderr into the launchd log), while still selecting system-ssh.
+func TestDoctorTransport_SystemUsesFreshTransport(t *testing.T) {
+	cfg := newTestConfig(t, "user@devbox") // transport file absent -> system
+	live := &doctorFakeTransport{forceUp: true, pid: 4242}
+	a := &app.App{
+		Cfg:       cfg,
+		Transport: live,
+		Runner:    &run.Fake{},
+		Paths:     app.Paths{Sock: "/tmp/cm.sock"},
+	}
+
+	tr, err := doctorTransport(context.Background(), a, "user@devbox")
+	if err != nil {
+		t.Fatalf("doctorTransport: %v", err)
+	}
+	if tr == live {
+		t.Fatal("system doctor must use a FRESH nil-sink transport, not a.Transport (avoids teeing ssh stderr)")
+	}
+	if got := tr.Describe().Impl; got != "system-ssh" {
+		t.Errorf("system doctor transport Impl = %q, want system-ssh", got)
 	}
 }
 

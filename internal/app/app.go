@@ -143,14 +143,19 @@ func NewProd() (*App, error) {
 // The concrete *sshctl.SSH and *sshnative.Client each satisfy BOTH
 // transport.Transport and transport.PortForwarder at compile time, so the
 // returned pair needs no runtime assertion.
-func NewTransport(paths Paths, host string, runner run.Runner, cfg *config.Store, sshStderr io.Writer) (transport.Transport, transport.PortForwarder, error) {
+// nativeOpts is the native-client injection seam (T5): production passes NONE
+// so sshnative.New resolves the real ~/.ssh defaults, while the selection tests
+// pass temp-dir known_hosts/identity fixtures so native construction stays
+// hermetic (never reads the runner's real ~/.ssh). It applies ONLY to the native
+// branch; the system branch ignores it.
+func NewTransport(paths Paths, host string, runner run.Runner, cfg *config.Store, sshStderr io.Writer, nativeOpts ...sshnative.Option) (transport.Transport, transport.PortForwarder, error) {
 	sel, err := cfg.Transport()
 	if err != nil {
 		return nil, nil, err
 	}
 	switch sel {
 	case "native":
-		c, err := sshnative.New(host)
+		c, err := sshnative.New(host, nativeOpts...)
 		if err != nil {
 			return nil, nil, err
 		}

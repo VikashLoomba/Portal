@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshnative"
 )
 
 // stderrRunner is a run.Runner that returns a fixed stderr on a code-0 Exec, so
@@ -44,7 +45,11 @@ func TestNewTransport_SelectionMatrix(t *testing.T) {
 		if err := cfg.SetTransport("native"); err != nil {
 			t.Fatal(err)
 		}
-		tr, pf, err := NewTransport(Paths{}, "user@host", runner, cfg, nil)
+		// T5 hermeticity: inject a temp-dir known_hosts path via the native-options
+		// seam so New does not read the runner's real ~/.ssh/known_hosts (an
+		// unparseable line there would fail this selection-only assertion).
+		hermetic := sshnative.WithKnownHostsPath(filepath.Join(t.TempDir(), "known_hosts"))
+		tr, pf, err := NewTransport(Paths{}, "user@host", runner, cfg, nil, hermetic)
 		if err != nil {
 			t.Fatal(err)
 		}
