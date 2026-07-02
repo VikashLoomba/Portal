@@ -5,13 +5,16 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 // fakeResolver maps a target/hop token to a ResolvedHost. It is the hermetic
@@ -289,6 +292,120 @@ func TestProxyJumpWrongHopKey(t *testing.T) {
 	}
 	if _, _, err := c.Exec(ctx, nil, "echo", "hi"); err == nil {
 		t.Error("Exec after failed hop key: want error, got nil")
+	}
+}
+
+// TestProxyJumpPerHopIdentity proves each hop authenticates with ITS OWN
+// resolved IdentityFile, not the target's. Hop A accepts ONLY a bastion key
+// (never in any agent — the client disables the agent); the target accepts the
+// shared client key. With per-hop auth the bastion key is offered to A and the
+// chain reaches the target; offering the target's key to A (the bug) is rejected
+// by A and aborts the whole dial.
+func TestProxyJumpPerHopIdentity(t *testing.T) {
+	ctx := context.Background()
+	clientPriv, clientSigner := generateKeyPair(t)   // target credential
+	bastionPriv, bastionSigner := generateKeyPair(t) // hop-only credential
+	a := newTestServer(t, bastionSigner.PublicKey()) // jump: accepts ONLY the bastion key
+	b := newTestServer(t, clientSigner.PublicKey())  // target: accepts the shared key
+	aHost, aPort := serverEndpoint(t, a)
+	bHost, bPort := serverEndpoint(t, b)
+	bastionKeyFile := writeIdentityFile(t, bastionPriv)
+	fake := fakeResolver{
+		"target": {User: "testuser", HostName: bHost, Port: bPort, ProxyJump: "hopa"},
+		"hopa":   {User: "testuser", HostName: aHost, Port: aPort, IdentityFiles: []string{bastionKeyFile}},
+	}
+	kh := writeKnownHostsLines(t, a, b)
+	keyFile := writeIdentityFile(t, clientPriv)
+	c := newProxyClient(t, fake, keyFile, kh)
+
+	if _, err := c.Ensure(ctx); err != nil {
+		t.Fatalf("Ensure with per-hop identity: %v", err)
+	}
+	stdout, _, err := c.Exec(ctx, nil, "echo", "hi")
+	if err != nil {
+		t.Fatalf("Exec via per-hop identity: %v", err)
+	}
+	if strings.TrimSpace(stdout) != "hi" {
+		t.Errorf("Exec stdout = %q, want %q", stdout, "hi")
+	}
+}
+
+// TestHopHostKeyCallbackPortlessHop proves a hop resolved with an unspecified
+// port (Port==0) queries known_hosts at host:22 — the address portOr22 forms for
+// the dial — not host:0 (which knownhosts.check rejects), matching the target
+// path that defaults the port to 22 before building its callback.
+func TestHopHostKeyCallbackPortlessHop(t *testing.T) {
+	hostKey := generateSSHKey(t)
+	// A real :22 server records the bare-host entry (Normalize drops the default
+	// port), so key known_hosts by that canonical form.
+	entry := knownhosts.Line([]string{knownhosts.Normalize("127.0.0.1:22")}, hostKey.PublicKey())
+	kh := writeKnownHosts(t, entry)
+	c := &Client{knownHostsPath: kh}
+
+	cb, err := c.hopHostKeyCallback(ResolvedHost{HostName: "127.0.0.1", Port: 0})
+	if err != nil {
+		t.Fatalf("hopHostKeyCallback: %v", err)
+	}
+	addr := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 22}
+	if err := cb("127.0.0.1:22", addr, hostKey.PublicKey()); err != nil {
+		t.Errorf("port-less hop rejected a matching host key: %v", err)
+	}
+	// Guard: the raw-port construction (the bug) queries host:0 and fails to match
+	// the bare-host entry, proving portOr22 is load-bearing.
+	bad, err := newStrictHostKeyCallback(kh, nil, "", "127.0.0.1", 0)
+	if err != nil {
+		t.Fatalf("newStrictHostKeyCallback raw port 0: %v", err)
+	}
+	if err := bad("127.0.0.1:0", addr, hostKey.PublicKey()); err == nil {
+		t.Error("raw port-0 host-key query unexpectedly matched; the portOr22 fix would be untested")
+	}
+}
+
+// TestProxyJumpHopCapPositiveBoundary proves a chain of EXACTLY maxProxyHops hops
+// is ACCEPTED and reaches the target — the positive boundary the over-cap
+// rejection test (TestProxyJumpHopCap) leaves untested, so an over-strict
+// off-by-one (or a lowered cap constant) that rejects a legitimate deep chain is
+// caught here.
+func TestProxyJumpHopCapPositiveBoundary(t *testing.T) {
+	ctx := context.Background()
+	clientPriv, clientSigner := generateKeyPair(t)
+	target := newTestServer(t, clientSigner.PublicKey())
+	tHost, tPort := serverEndpoint(t, target)
+
+	fake := fakeResolver{}
+	allServers := []*testServer{}
+	var tokens []string
+	for i := 1; i <= maxProxyHops; i++ {
+		hop := newTestServer(t, clientSigner.PublicKey())
+		hHost, hPort := serverEndpoint(t, hop)
+		tok := fmt.Sprintf("h%d", i)
+		tokens = append(tokens, tok)
+		fake[tok] = ResolvedHost{User: "testuser", HostName: hHost, Port: hPort}
+		allServers = append(allServers, hop)
+	}
+	allServers = append(allServers, target)
+	fake["target"] = ResolvedHost{User: "testuser", HostName: tHost, Port: tPort, ProxyJump: strings.Join(tokens, ",")}
+
+	kh := writeKnownHostsLines(t, allServers...)
+	keyFile := writeIdentityFile(t, clientPriv)
+	c := newProxyClient(t, fake, keyFile, kh)
+
+	chain, err := c.expandJumpChain(ctx)
+	if err != nil {
+		t.Fatalf("expandJumpChain of maxProxyHops: %v", err)
+	}
+	if len(chain) != maxProxyHops {
+		t.Fatalf("chain length = %d, want maxProxyHops=%d", len(chain), maxProxyHops)
+	}
+	if _, err := c.Ensure(ctx); err != nil {
+		t.Fatalf("Ensure with %d-hop chain: %v", maxProxyHops, err)
+	}
+	stdout, _, err := c.Exec(ctx, nil, "echo", "hi")
+	if err != nil {
+		t.Fatalf("Exec via %d-hop chain: %v", maxProxyHops, err)
+	}
+	if strings.TrimSpace(stdout) != "hi" {
+		t.Errorf("Exec stdout = %q, want %q", stdout, "hi")
 	}
 }
 
@@ -602,6 +719,93 @@ func TestChainTeardownProxyCommand(t *testing.T) {
 	if calls, _, _ := rec.snapshot(); calls != 2 {
 		t.Errorf("seam calls after redial = %d, want 2", calls)
 	}
+}
+
+// TestDefaultProxyCommandDialerReapsProcess (EC15) drives the REAL
+// defaultProxyCommandDialer against a long-lived process and proves
+// proxyProcessCloser.Close KILLS and reaps it. The hermetic
+// TestChainTeardownProxyCommand only exercises a fake closer, so dropping the
+// Kill — leaving Close to Wait on a hung ProxyCommand forever — would pass it.
+// This test catches that regression two ways: Close must return promptly (a
+// Wait-only Close would block ~30s on the live process) and the pid must be gone
+// afterward.
+func TestDefaultProxyCommandDialerReapsProcess(t *testing.T) {
+	// `exec sleep` so sh replaces itself with sleep — cmd.Process IS the sleep
+	// process, so Kill reaps it directly with no orphan. sleep never writes, so a
+	// Wait-only (Kill-less) Close would block until the 30s natural exit.
+	conn, closer, err := defaultProxyCommandDialer(context.Background(), "exec sleep 30")
+	if err != nil {
+		t.Fatalf("defaultProxyCommandDialer: %v", err)
+	}
+	pc, ok := closer.(proxyProcessCloser)
+	if !ok {
+		t.Fatalf("closer type = %T, want proxyProcessCloser", closer)
+	}
+	pid := pc.cmd.Process.Pid
+	if err := pc.cmd.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("proxycommand process (pid %d) not alive before Close: %v", pid, err)
+	}
+
+	conn.Close()
+	// Close must return promptly: a Kill unblocks Wait at once, whereas a Wait-only
+	// Close blocks on the live sleep past this deadline.
+	done := make(chan error, 1)
+	go func() { done <- closer.Close() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Close did not return within 5s; the ProxyCommand process (pid %d) was not killed", pid)
+	}
+
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatalf("FindProcess(%d): %v", pid, err)
+	}
+	if err := proc.Signal(syscall.Signal(0)); err == nil {
+		t.Errorf("proxycommand subprocess (pid %d) still alive after Close; Kill/Wait did not reap it", pid)
+	}
+}
+
+// TestDefaultProxyCommandDialerSurvivesDialCtxCancel proves the ProxyCommand
+// subprocess OUTLIVES the dial ctx: the ssh master built on its stdio persists
+// across calls and must die only at teardownLocked (Close/redial), never when the
+// short-lived caller ctx that first triggered the dial is cancelled. Binding the
+// process to that ctx via exec.CommandContext(ctx, ...) (the bug) has a watchdog
+// SIGKILL it the instant ctx is Done, silently tearing the still-live master
+// down. With the WithoutCancel decoupling the process survives cancellation.
+func TestDefaultProxyCommandDialerSurvivesDialCtxCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	conn, closer, err := defaultProxyCommandDialer(ctx, "exec sleep 30")
+	if err != nil {
+		cancel()
+		t.Fatalf("defaultProxyCommandDialer: %v", err)
+	}
+	pc, ok := closer.(proxyProcessCloser)
+	if !ok {
+		cancel()
+		t.Fatalf("closer type = %T, want proxyProcessCloser", closer)
+	}
+
+	// Own Wait here so the process is reaped whether it dies (bug) or we kill it
+	// (cleanup); the watchdog-killed process would otherwise linger as a zombie
+	// that still answers signal 0, defeating a liveness probe.
+	waited := make(chan error, 1)
+	go func() { waited <- pc.cmd.Wait() }()
+
+	cancel() // dial ctx done: the buggy ctx-bound watchdog SIGKILLs the process here.
+
+	select {
+	case <-waited:
+		t.Error("ProxyCommand process exited after the dial ctx was cancelled; its lifetime is wrongly bound to the dial ctx")
+	case <-time.After(2 * time.Second):
+		// Survived cancellation -> lifetime correctly decoupled from the dial ctx.
+	}
+
+	// Cleanup: Kill unblocks the Wait goroutine (a no-op if the bug already killed
+	// it). waited is buffered, so the goroutine exits without a second receive here
+	// (which would deadlock in the failure branch that already drained it).
+	conn.Close()
+	pc.cmd.Process.Kill()
 }
 
 // --- helpers ---

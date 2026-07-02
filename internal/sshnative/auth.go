@@ -30,13 +30,49 @@ import (
 // for the client's lifetime by the caller — the agent signer callback dials it
 // lazily during the handshake — and closed on redial/Close.
 func (c *Client) authMethods() ([]ssh.AuthMethod, net.Conn, error) {
+	return buildAuthMethods(c.agentSocket, c.identityFiles, c.user, c.host)
+}
+
+// hopAuthMethods builds a ProxyJump hop's auth from ITS OWN resolved
+// IdentityFiles (stat-filtered, mirroring New's target logic) so per-hop
+// `IdentityFile` ssh_config fidelity is honored: a hop that resolves usable
+// identity files offers exactly those, matching OpenSSH; a hop that resolves
+// none falls back to the client's identity files (the target's resolved list or
+// the ~/.ssh defaults). The agent socket is shared across the chain. The "no
+// usable credentials" error names the HOP (rh.User@rh.HostName), not the target,
+// so a failure identifies which hop lacked a key.
+func (c *Client) hopAuthMethods(rh ResolvedHost) ([]ssh.AuthMethod, net.Conn, error) {
+	ids := statFilterIdentityFiles(rh.IdentityFiles)
+	if len(ids) == 0 {
+		ids = c.identityFiles
+	}
+	return buildAuthMethods(c.agentSocket, ids, rh.User, rh.HostName)
+}
+
+// statFilterIdentityFiles returns, in order, the paths that exist on disk. New
+// and hopAuthMethods both use it so a resolved IdentityFile that is not present
+// is dropped rather than offered.
+func statFilterIdentityFiles(paths []string) []string {
+	var out []string
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// buildAuthMethods builds the ssh auth methods for a specific agent socket and
+// identity-file list; user/host label the "no usable credentials" error only.
+// See authMethods for the ordering and encrypted-key contract.
+func buildAuthMethods(agentSocket string, identityFiles []string, user, host string) ([]ssh.AuthMethod, net.Conn, error) {
 	var methods []ssh.AuthMethod
 	var agentConn net.Conn
 	var tried []string
 
-	if c.agentSocket != "" {
-		tried = append(tried, "agent socket "+c.agentSocket)
-		conn, err := net.Dial("unix", c.agentSocket)
+	if agentSocket != "" {
+		tried = append(tried, "agent socket "+agentSocket)
+		conn, err := net.Dial("unix", agentSocket)
 		if err == nil {
 			agentConn = conn
 			ag := agent.NewClient(conn)
@@ -47,7 +83,7 @@ func (c *Client) authMethods() ([]ssh.AuthMethod, net.Conn, error) {
 
 	var signers []ssh.Signer
 	var encrypted []string // identity files skipped solely because they are passphrase-encrypted
-	for _, path := range c.identityFiles {
+	for _, path := range identityFiles {
 		tried = append(tried, "identity file "+path)
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -78,9 +114,9 @@ func (c *Client) authMethods() ([]ssh.AuthMethod, net.Conn, error) {
 		if len(encrypted) > 0 {
 			// No agent and no unencrypted key: the encrypted key(s) are the
 			// only credentials present, so name the workaround.
-			return nil, nil, fmt.Errorf("sshnative: no usable ssh credentials for %s@%s; identity file %s is passphrase-encrypted; decrypt it or add it to ssh-agent (ssh-add %s) — sshnative does not prompt for passphrases", c.user, c.host, strings.Join(encrypted, ", "), strings.Join(encrypted, ", "))
+			return nil, nil, fmt.Errorf("sshnative: no usable ssh credentials for %s@%s; identity file %s is passphrase-encrypted; decrypt it or add it to ssh-agent (ssh-add %s) — sshnative does not prompt for passphrases", user, host, strings.Join(encrypted, ", "), strings.Join(encrypted, ", "))
 		}
-		return nil, nil, fmt.Errorf("sshnative: no usable ssh credentials for %s@%s; tried %s", c.user, c.host, strings.Join(tried, ", "))
+		return nil, nil, fmt.Errorf("sshnative: no usable ssh credentials for %s@%s; tried %s", user, host, strings.Join(tried, ", "))
 	}
 	return methods, agentConn, nil
 }

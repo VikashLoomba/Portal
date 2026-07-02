@@ -218,13 +218,7 @@ func New(target string, opts ...Option) (*Client, error) {
 	// Resolved IdentityFiles (existing files only) REPLACE the id_ed25519/id_rsa
 	// defaults; an explicit WithIdentityFiles still wins.
 	if !c.identityFilesExplicit {
-		var filtered []string
-		for _, path := range rh.IdentityFiles {
-			if _, err := os.Stat(path); err == nil {
-				filtered = append(filtered, path)
-			}
-		}
-		if len(filtered) > 0 {
+		if filtered := statFilterIdentityFiles(rh.IdentityFiles); len(filtered) > 0 {
 			c.identityFiles = filtered
 		}
 	}

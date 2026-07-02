@@ -112,6 +112,17 @@ func (c *Client) expandJumpChain(ctx context.Context) ([]ResolvedHost, error) {
 	return chain, nil
 }
 
+// hopHostKeyCallback builds the STRICT per-hop host-key verifier keyed by the
+// hop's HostKeyAlias:22 or HostName:port, defaulting an unspecified hop port to
+// 22 via portOr22 so the known_hosts query address matches the dial address
+// dialViaProxyJump forms on the very next lines — a port-less hop must query
+// host:22 (which collapses to the bare-host entry a real :22 server records),
+// never host:0 (which knownhosts.check rejects). Mirrors New's target path,
+// which defaults c.port to 22 before building its callback.
+func (c *Client) hopHostKeyCallback(rh ResolvedHost) (ssh.HostKeyCallback, error) {
+	return newStrictHostKeyCallback(c.knownHostsPath, c.hostKeyOverride, rh.HostKeyAlias, rh.HostName, portOr22(rh.Port))
+}
+
 // dialViaProxyJump dials the target through the resolved hop chain via chained
 // direct-tcpip channels. It returns the target client, the ordered jump clients,
 // and any agent connections opened for hop auth. On ANY error mid-chain it closes
@@ -143,11 +154,11 @@ func (c *Client) dialViaProxyJump(ctx context.Context, targetCfg *ssh.ClientConf
 		// address (u7 mechanic): each hop is verified by its own HostKeyAlias:22
 		// or HostName:port, never a Normalize'd value, so a wrong hop key aborts
 		// the WHOLE dial.
-		hopCB, err := newStrictHostKeyCallback(c.knownHostsPath, c.hostKeyOverride, rh.HostKeyAlias, rh.HostName, rh.Port)
+		hopCB, err := c.hopHostKeyCallback(rh)
 		if err != nil {
 			return fail(err)
 		}
-		auths, agentConn, err := c.authMethods()
+		auths, agentConn, err := c.hopAuthMethods(rh)
 		if err != nil {
 			return fail(err)
 		}
@@ -259,7 +270,17 @@ func expandProxyCommand(tmpl, host string, port int, user string) (string, error
 // process and Waits it (process-exit teardown). os/exec is stdlib — no new
 // dependency.
 func defaultProxyCommandDialer(ctx context.Context, command string) (net.Conn, io.Closer, error) {
-	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	// The subprocess must OUTLIVE the dial ctx: the ssh.Client built on its stdio
+	// is stored in c.client and PERSISTS across calls (guarded by mu, kept alive by
+	// the keepalive goroutine), reaped only by proxyProcessCloser.Close at
+	// teardownLocked on Close/redial. exec.CommandContext installs a watchdog that
+	// SIGKILLs the process the instant its context is Done, so binding it to the
+	// per-call dial ctx would asynchronously tear down the still-live master the
+	// moment the triggering caller's ctx is cancelled/deadlined. WithoutCancel
+	// decouples the process lifetime from ctx (ctx still bounds only this dial via
+	// the caller), matching the direct-dial and ProxyJump paths, neither of which
+	// ties the persistent connection to ctx.
+	cmd := exec.CommandContext(context.WithoutCancel(ctx), "sh", "-c", command)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, nil, fmt.Errorf("sshnative: proxycommand stdin pipe: %w", err)
