@@ -27,7 +27,16 @@ import (
 	"time"
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
 )
+
+// MasterForwardSource enumerates the local LISTEN ports/lines a given master
+// pid owns. It is structurally satisfied by *proc.Lsof; sshctl does NOT import
+// proc — the composition root injects the concrete lister via SSH.Forwards.
+type MasterForwardSource interface {
+	MasterForwards(ctx context.Context, pid int) ([]int, error)
+	MasterForwardLines(ctx context.Context, pid int) ([]string, error)
+}
 
 // Transport is the SSH surface consumed by the reconcile engine and the
 // remote port discoverer.
@@ -89,6 +98,10 @@ type SSH struct {
 	// log, matching the bash daemon where ssh's stderr inherits the
 	// daemon's stderr by default.
 	StderrSink io.Writer
+	// Forwards backs the PortForwarder List/Lines methods via lsof against the
+	// live master pid. Injected by the composition root (structurally
+	// *proc.Lsof) so sshctl need not import proc.
+	Forwards MasterForwardSource
 }
 
 func New(sock, host string, opts []string, r run.Runner) *SSH {
@@ -328,3 +341,67 @@ func atoi(s string) (int, error) {
 }
 
 var _ Transport = (*SSH)(nil)
+
+// --- transport.Transport / transport.PortForwarder dual-stack (u1) ---
+//
+// These methods are added ALONGSIDE the legacy interface, which is still
+// consumed everywhere until u2. Each is a byte-compat wrapper over the
+// existing private logic. Exec (signature clash) and ExecStream->Stream
+// (rename) are the two methods that cannot be dual-stacked; they migrate in
+// u2. No `var _ transport.Transport`/`var _ transport.PortForwarder` assertion
+// is added yet because Exec/Stream have not migrated.
+
+// Ensure wraps EnsureMaster, discarding the pid and reporting only whether
+// this call rebuilt the master.
+func (s *SSH) Ensure(ctx context.Context) (bool, error) {
+	_, rebuilt, err := s.EnsureMaster(ctx)
+	return rebuilt, err
+}
+
+// Health reports liveness from the `ssh -O check` pid. Detail is EXACT
+// ("pid=N") so status/log output renders byte-identically.
+func (s *SSH) Health(ctx context.Context) (transport.Health, error) {
+	pid, err := s.MasterPID(ctx)
+	if err != nil {
+		return transport.Health{}, err
+	}
+	if pid <= 0 {
+		return transport.Health{Up: false, Pid: 0, Detail: ""}, nil
+	}
+	return transport.Health{Up: true, Pid: pid, Detail: fmt.Sprintf("pid=%d", pid)}, nil
+}
+
+// Close wraps Exit.
+func (s *SSH) Close(ctx context.Context) (bool, error) {
+	return s.Exit(ctx)
+}
+
+// Describe identifies the system ssh transport.
+func (s *SSH) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: s.HostID, Endpoint: s.SockPath}
+}
+
+// ListForwards reads the live master pid and returns the ports it forwards via
+// the injected MasterForwardSource. Returns nil when the master is down.
+func (s *SSH) ListForwards(ctx context.Context) ([]int, error) {
+	pid, err := s.MasterPID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if pid == 0 {
+		return nil, nil
+	}
+	return s.Forwards.MasterForwards(ctx, pid)
+}
+
+// ForwardLines is the verbatim-lines analogue of ListForwards.
+func (s *SSH) ForwardLines(ctx context.Context) ([]string, error) {
+	pid, err := s.MasterPID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if pid == 0 {
+		return nil, nil
+	}
+	return s.Forwards.MasterForwardLines(ctx, pid)
+}
