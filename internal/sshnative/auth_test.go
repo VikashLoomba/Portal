@@ -73,6 +73,41 @@ func TestAuthIdentityFilePath(t *testing.T) {
 	}
 }
 
+// TestAuthDeadAgentFallsThroughToKey (EC9): a non-empty but UNREACHABLE agent
+// socket (stale SSH_AUTH_SOCK after an ssh-agent restart or tmux re-attach) must
+// NOT be fatal — the dead net.Dial must fall through to the identity-file loop
+// and authenticate via a working unencrypted key on disk. Guards against a
+// regression that makes a failed agent dial abort auth (return nil,nil,err).
+func TestAuthDeadAgentFallsThroughToKey(t *testing.T) {
+	clientPriv, clientSigner := generateKeyPair(t)
+	srv := newTestServer(t, clientSigner.PublicKey())
+	kh := writeKnownHosts(t, srv.knownHostsLine())
+	keyFile := writeIdentityFile(t, clientPriv)
+	// A non-empty path with no listener: net.Dial("unix", …) fails, but auth
+	// must continue to the key rather than abort.
+	deadSock := filepath.Join(t.TempDir(), "dead-agent.sock")
+
+	c, err := New(srv.target("testuser"),
+		WithKnownHostsPath(kh),
+		WithAgentSocket(deadSock),
+		WithIdentityFiles(keyFile))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close(context.Background())
+
+	if _, err := c.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure with dead agent + valid key: %v", err)
+	}
+	stdout, _, err := c.Exec(context.Background(), []byte("key-ok\n"), "cat")
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if stdout != "key-ok\n" {
+		t.Errorf("stdout = %q, want %q", stdout, "key-ok\n")
+	}
+}
+
 // TestAuthEncryptedKey (EC9): an encrypted identity file yields a CLEAR error
 // naming the workaround (decrypt / add to ssh-agent) rather than prompting.
 func TestAuthEncryptedKey(t *testing.T) {
