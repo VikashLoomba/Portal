@@ -167,15 +167,28 @@ func runDoctor(ctx context.Context, host string, tr transport.Transport) *doctor
 	// 1. Master connectivity. Without the ControlMaster the daemon can't relay a
 	// clip request at all; everything downstream is moot.
 	//
-	// Ensure BEFORE the Health gate: the two direct callers (install self-test,
-	// daemon-down fallback) build a FRESH transport that has never been brought
-	// up. For native that transport has not dialed, so Health reports DOWN until
-	// Ensure connects — without this a healthy native box would wrongly fail the
-	// master check. Ensure is idempotent for system (a no-op when the shared
-	// ControlMaster is already up, which is the install case running right after
-	// `portal start`). A dial error is not fatal here; the Health gate below
-	// still renders the DOWN line.
-	_, _ = tr.Ensure(ctx)
+	// Ensure BEFORE the Health gate, but ONLY for native. The two direct callers
+	// (install self-test, daemon-down fallback) build a FRESH transport that has
+	// never been brought up. For native that transport has not dialed, so Health
+	// reports DOWN until Ensure connects — without this a healthy native box
+	// would wrongly fail the master check, and a native dial is a cheap
+	// in-process connect.
+	//
+	// For SYSTEM we must NOT Ensure here: sshctl.Ensure is not a passive
+	// dial-check — it removes the stale socket and spawns a persistent
+	// `ssh -fN -M -o ControlPersist=yes` ControlMaster whenever one isn't
+	// running. Calling it from `portal doctor` when the daemon is down (fresh
+	// boot, or right after `portal stop`) would flip the master check false-green,
+	// hide that the relay daemon is not running, and leave an orphaned master the
+	// user never asked for. The system path stays check-only so a daemon-down
+	// doctor run still reports `DOWN — start the daemon`, preserving the
+	// byte-compat diagnostic. When the daemon IS up the shared ControlMaster is
+	// already running, so Health sees it without any build.
+	if tr.Describe().Impl == "native-ssh" {
+		// A dial error is not fatal here; the Health gate below still renders
+		// the DOWN line.
+		_, _ = tr.Ensure(ctx)
+	}
 	if h, err := tr.Health(ctx); err != nil || !h.Up {
 		rep.Add("ssh master", doctor.Fail, "DOWN — start the daemon: "+app.Tool+" start")
 		// Without a master we cannot run any remote probe; bail with what we have.

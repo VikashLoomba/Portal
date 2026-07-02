@@ -159,6 +159,39 @@ func TestRunDoctor_MasterDown(t *testing.T) {
 	}
 }
 
+// TestRunDoctor_SystemNeverEnsures pins the finding: for the REAL system
+// transport, sshctl.Ensure is not a passive dial-check — it removes the stale
+// socket and SPAWNS a persistent ControlMaster. runDoctor must therefore NEVER
+// call Ensure on a system transport, or a daemon-down `portal doctor` (fresh
+// boot / post-`portal stop`) would spawn an orphan master, flip the master check
+// false-green, and hide that the relay daemon is not running.
+//
+// This fake models that spawn: needsEnsure makes Health report DOWN until Ensure
+// is called, exactly as a would-be-spawned master would flip it UP. With the fix
+// runDoctor leaves the system transport untouched, so Health stays DOWN, the
+// master check is FAIL, and Ensure was never invoked. The pre-fix code called
+// Ensure unconditionally, which would have flipped this report to false-green.
+func TestRunDoctor_SystemNeverEnsures(t *testing.T) {
+	tr := &doctorFakeTransport{
+		needsEnsure: true, // Health is DOWN unless Ensure spawns a master
+		forceUp:     true, // if Ensure WERE (wrongly) called, Health would go UP
+		pid:         0,
+		// impl defaults to system-ssh
+	}
+	rep := runDoctor(context.Background(), "fakehost", tr)
+	if tr.ensured {
+		t.Fatal("runDoctor must NOT call Ensure on a system transport (would spawn an orphan ControlMaster)")
+	}
+	if rep.OK() {
+		t.Fatal("expected FAIL: a daemon-down system doctor must report the master DOWN, not spawn one")
+	}
+	assertCheck(t, rep, "ssh master", doctor.Fail)
+	c := findCheck(rep, "ssh master")
+	if c == nil || !strings.Contains(c.Detail, "start the daemon") {
+		t.Errorf("system master-down detail must keep the byte-compat `start the daemon` diagnostic, got %q", detailOf(c))
+	}
+}
+
 // TestRunDoctor_RealBinaryWinsPATH is the single make-or-break regression: a
 // real /usr/bin/xclip resolves ahead of the shim, so the feature is silently
 // dead. The doctor MUST flag this as FAIL, not pass it off.
