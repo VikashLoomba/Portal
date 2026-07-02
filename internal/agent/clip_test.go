@@ -75,8 +75,13 @@ func newClipHarness(t *testing.T, respond func(req *protocol.ClipRequest) *proto
 	enc := protocol.NewEncoder(conn.c2aW)
 	dec := protocol.NewDecoder(conn.a2cR)
 
-	// Handshake.
-	if err := enc.Write(&protocol.Envelope{Hello: &protocol.Hello{ProtoVersion: protocol.ProtoVersion}}); err != nil {
+	// Handshake. Advertise openurl@1 so TestClip_OpenStillWorks's "open" verb
+	// passes the agent's hasClient()&&clientHas("openurl") gate (clip itself
+	// stays on the legacy ClipRequest/ClipResponse path this unit).
+	if err := enc.Write(&protocol.Envelope{Hello: &protocol.Hello{
+		ProtoVersion: protocol.ProtoVersion,
+		Services:     map[string]uint32{"openurl": 1},
+	}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := dec.Read(); err != nil { // HelloAck

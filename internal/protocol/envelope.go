@@ -19,7 +19,15 @@ package protocol
 // negotiation rationale: a remote hook firing `portald notify` into a stale
 // agent that predates the Notify capability must surface as a loud version
 // mismatch (triggering re-upload) rather than a silently dropped notification.
-const ProtoVersion uint32 = 3
+//
+// v4 replaces the per-feature Envelope frames (OpenURL, ClipRequest,
+// ClipResponse, Notify) with the single generic Msg frame plus symmetric
+// capability negotiation in the handshake (Hello/HelloAck Services). Same
+// honest-negotiation doctrine as v2/v3: a stale agent that predates v4 speaks
+// the old field-per-feature schema, so it surfaces as a loud CodeProtocolMismatch
+// fatal on the very first frame — the SHA-keyed bootstrap re-upload heals it —
+// rather than silently no-op'ing every migrated feature.
+const ProtoVersion uint32 = 4
 
 // MaxFrameBytes is the hard cap on a single frame's payload size. Decoder
 // rejects oversized frames before allocating, so a hostile peer can't OOM us.
@@ -48,7 +56,6 @@ type Envelope struct {
 	Heartbeat    *Heartbeat    `cbor:"heartbeat,omitempty"`
 	AgentError   *AgentError   `cbor:"agent_error,omitempty"`
 	Bye          *Bye          `cbor:"bye,omitempty"`
-	OpenURL      *OpenURL      `cbor:"open_url,omitempty"`
 
 	// clipboard-read (v2): request flows agent → client, response client → agent.
 	ClipRequest  *ClipRequest  `cbor:"clip_req,omitempty"`  // agent → client

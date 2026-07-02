@@ -77,6 +77,12 @@ type Server struct {
 	enc    *protocol.Encoder
 	dec    *protocol.Decoder
 
+	// reg is the service registry. It auto-registers the compiled-in openurl
+	// service in New and owns the per-service outbox the Serve loop drains, the
+	// inbound Msg dispatch, and (from u4/u5) the notify/clip services. It never
+	// holds an *Encoder — the Serve loop stays the sole agent→client writer.
+	reg *registry
+
 	mu          sync.Mutex
 	seq         uint64
 	lastRSID    uint64
@@ -149,7 +155,7 @@ func New(cfg Config) *Server {
 	if cfg.EphemMax == 0 {
 		cfg.EphemMax = 60999
 	}
-	return &Server{
+	s := &Server{
 		cfg:         cfg,
 		filter:      NewFilter(cfg.EphemMin, cfg.EphemMax),
 		enc:         protocol.NewEncoder(cfg.Out),
@@ -161,6 +167,14 @@ func New(cfg Config) *Server {
 		epoch:       randEpoch(),
 		bpKillCh:    make(chan struct{}),
 	}
+	// Build the registry and bind the Server's guarded subscription reader so
+	// services can gate on `hasClient() && clientHas(svc)` without ever touching
+	// s.mu directly. Then auto-register the compiled-in services (openurl only
+	// this unit; notify/clip stay legacy until u4/u5).
+	s.reg = newRegistry(cfg.Log)
+	s.reg.bindHasClient(func() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.hasClient })
+	s.reg.register(newOpenURLService(s.reg, cfg.Log))
+	return s
 }
 
 // randEpoch returns a non-zero random clip epoch. A zero epoch would be
@@ -198,8 +212,13 @@ func (s *Server) Serve(ctx context.Context) error {
 		}})
 		return fmt.Errorf("proto version mismatch: %d vs %d", hello.ProtoVersion, protocol.ProtoVersion)
 	}
+	// Record the client's advertised services (DESIGN S4). A registered service
+	// the client advertises at a mismatched version is treated as absent (one
+	// warning logged here); a service the client omits gates its cmd-verb callers
+	// to "no-client\n" exactly as an unsubscribed client would.
+	s.reg.setClientServices(hello.Services)
 
-	// 2. HelloAck.
+	// 2. HelloAck — advertises the agent's registered services symmetrically.
 	if err := s.enc.Write(&protocol.Envelope{HelloAck: &protocol.HelloAck{
 		ProtoVersion: protocol.ProtoVersion,
 		AgentGitSHA:  s.cfg.AgentSHA,
@@ -209,6 +228,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		EphemMin:     s.cfg.EphemMin,
 		EphemMax:     s.cfg.EphemMax,
 		NowUnixNano:  s.cfg.Now().UnixNano(),
+		Services:     s.reg.services(),
 	}}); err != nil {
 		return err
 	}
@@ -229,13 +249,12 @@ func (s *Server) Serve(ctx context.Context) error {
 	readErrCh := make(chan error, 1)
 	go s.readLoop(ctx, cmdCh, readErrCh)
 
-	// 5. Start cmd Unix socket if configured. The socket relays OpenURL
-	// requests from `portald open <url>` (typically via the xdg-open
-	// wrapper). It is only live while a client is actively subscribed;
-	// startCmdSock gates on hasClient, which is set in handleSubscribe.
-	openURLCh := make(chan string, 8) // urls from cmd socket → main loop
+	// 5. Start cmd Unix socket if configured. The socket relays cmd-verb
+	// requests (open/clip/notify) from `portald <verb>` on the box. It is only
+	// live while a client is actively subscribed; the service handlers gate on
+	// hasClient, which is set in handleSubscribe.
 	if s.cfg.CmdSockPath != "" {
-		go s.serveCmdSock(ctx, openURLCh)
+		go s.serveCmdSock(ctx)
 	}
 
 	hb := time.NewTicker(s.cfg.HeartbeatInterval)
@@ -282,19 +301,22 @@ func (s *Server) Serve(ctx context.Context) error {
 			}
 			s.handleEvent(ev)
 
-		case url := <-openURLCh:
+		case env := <-s.reg.outbox():
+			// The RELEASED drain arm: the Serve loop is the SOLE writer of
+			// agent→client frames, so every registered service's outbox is drained
+			// here. Re-check hasClient to drop a frame that raced a disconnect. The
+			// per-service admission budget consumed at emit() is returned via
+			// reg.release — UNCONDITIONALLY, whether or not the frame was written —
+			// so the per-service DropNewest budget recycles across the whole
+			// session rather than after the first cap emits. Does NOT touch s.seq:
+			// Msg.Seq is registry-stamped, separate from the port-event counter.
 			s.mu.Lock()
 			active := s.hasClient
-			if active {
-				s.seq++
-			}
-			seq := s.seq
 			s.mu.Unlock()
 			if active {
-				_ = s.enc.Write(&protocol.Envelope{OpenURL: &protocol.OpenURL{
-					URL: url, Seq: seq,
-				}})
+				_ = s.enc.Write(env)
 			}
+			s.reg.release(env.Msg.Service)
 
 		case req := <-s.clipReqCh:
 			// The Serve loop is the SOLE writer of agent→client frames, so the
@@ -388,6 +410,13 @@ func (s *Server) handleCommand(ctx context.Context, env *protocol.Envelope) erro
 		}})
 	case env.ClipResponse != nil:
 		s.handleClipResponse(env.ClipResponse)
+		return nil
+	case env.Msg != nil:
+		// Inbound client→agent service frame (DESIGN §4). Only clip "resp" uses
+		// this after u5; harmless now (openurl is agent→client only). Dispatch
+		// runs under the registry's payload-cap/recover guards — an unknown
+		// service or panicking handler drops the frame, the session lives.
+		s.reg.dispatch(env.Msg)
 		return nil
 	case env.Shutdown != nil:
 		_ = s.enc.Write(&protocol.Envelope{Bye: &protocol.Bye{Reason: env.Shutdown.Reason}})
@@ -506,7 +535,7 @@ func (s *Server) handleEvent(ev watcher.Event) {
 // Each connection sends one URL line and reads back "ok" or "no-client".
 // The socket is removed on context cancellation so stale socks don't block
 // the next session startup.
-func (s *Server) serveCmdSock(ctx context.Context, out chan<- string) {
+func (s *Server) serveCmdSock(ctx context.Context) {
 	path := s.cfg.CmdSockPath
 	_ = os.Remove(path) // clean up any previous session's socket
 	l, err := net.Listen("unix", path)
@@ -542,7 +571,7 @@ func (s *Server) serveCmdSock(ctx context.Context, out chan<- string) {
 		if err != nil {
 			return // ctx cancelled or listener closed
 		}
-		go s.handleCmdConn(ctx, conn, out)
+		go s.handleCmdConn(ctx, conn)
 	}
 }
 
@@ -551,17 +580,18 @@ func (s *Server) serveCmdSock(ctx context.Context, out chan<- string) {
 // shape replies "rejected\n". Image/text bytes NEVER traverse this socket
 // inbound — only tiny control lines — so a single bounded read is sufficient.
 //
-//	open\t<url>\n        → relay URL to the Mac (existing behavior, 5s deadline)
+//	open\t<url>\n        → relay URL to the Mac (openurl service, 5s deadline)
 //	clip\ttargets\n      → "ok\timage/png\n" | "none\n"
 //	clip\timage\tpng\n   → "ok\t<sha>\n" | "none\n"
 //	clip\ttext\n         → "ok\t<sha>\n" | "none\n"
 //	notify\t<json>\n     → relay a notification to the Mac; "ok\n"|"no-client\n"|"dropped\n"
 //	<anything else>      → "rejected\n"
-func (s *Server) handleCmdConn(ctx context.Context, conn net.Conn, out chan<- string) {
+func (s *Server) handleCmdConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	// Tight default deadline for the read + the open path. Clip extends it
 	// below (see clipSockDeadline) because the round trip to the Mac is slower
-	// than a local URL hand-off.
+	// than a local URL hand-off. routeVerb re-applies each claimed verb's live
+	// per-verb deadline before dispatching.
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
@@ -573,50 +603,21 @@ func (s *Server) handleCmdConn(ctx context.Context, conn net.Conn, out chan<- st
 		return
 	}
 	verb, rest, _ := strings.Cut(line, "\t")
+	// Claimed verbs route to their registered service first ("open" → openurl,
+	// which applies its own 5s deadline). clip/notify are still served by the
+	// legacy handlers this unit (dual-stack until u4/u5); an unknown verb
+	// default-denies.
+	if s.reg.routeVerb(ctx, conn, verb, rest) {
+		return
+	}
 	switch verb {
-	case "open":
-		s.handleOpenReq(conn, rest, out)
 	case "clip":
 		s.handleClipReq(ctx, conn, rest)
 	case "notify":
 		s.handleNotifyReq(conn, rest)
 	default:
-		// Default-deny: unknown verb (including an old shim's bare URL with no
-		// "open\t" prefix would already have been "open"; a truly unknown token
-		// lands here).
+		// Default-deny: a truly unknown token lands here.
 		_, _ = conn.Write([]byte("rejected\n"))
-	}
-}
-
-// handleOpenReq preserves the original open-URL behavior exactly: only
-// http/https URLs are relayed; the channel-full case reports "dropped" rather
-// than falsely claiming success.
-func (s *Server) handleOpenReq(conn net.Conn, rawURL string, out chan<- string) {
-	rawURL = strings.TrimSpace(rawURL)
-	if rawURL == "" {
-		return
-	}
-	// Only relay http/https URLs. This is defense-in-depth: the Mac client
-	// validates too, but rejecting here prevents non-http URLs from ever
-	// reaching the wire.
-	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
-		_, _ = conn.Write([]byte("rejected\n"))
-		return
-	}
-	s.mu.Lock()
-	active := s.hasClient
-	s.mu.Unlock()
-	if !active {
-		_, _ = conn.Write([]byte("no-client\n"))
-		return
-	}
-	select {
-	case out <- rawURL:
-		_, _ = conn.Write([]byte("ok\n"))
-	default:
-		// Channel full — tell the caller the URL was dropped rather
-		// than falsely claiming success.
-		_, _ = conn.Write([]byte("dropped\n"))
 	}
 }
 

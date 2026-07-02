@@ -170,9 +170,6 @@ func countEnvelopeFields(e *Envelope) int {
 	if e.Bye != nil {
 		n++
 	}
-	if e.OpenURL != nil {
-		n++
-	}
 	if e.ClipRequest != nil {
 		n++
 	}

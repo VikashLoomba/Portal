@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fxamacker/cbor/v2"
+
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
@@ -85,6 +87,12 @@ type Client struct {
 	// Never closed by Run (the handler exits on ctx, not channel close).
 	notifyEvents chan EngineEvent
 
+	// registry is the client-side service registry: it demuxes inbound Msg
+	// frames to per-service handlers (openurl this unit; notify/clip after
+	// u4/u5) and advertises the client's handlers in Hello. Auto-populated in
+	// New; the handlers deliver through the existing publish* sinks (S11 facades).
+	registry *registry
+
 	// stream is the current send-side encoder; nil between connections.
 	streamMu sync.Mutex
 	enc      *protocol.Encoder
@@ -117,12 +125,30 @@ func New(cfg Config) *Client {
 	if cfg.ReconnectMax == 0 {
 		cfg.ReconnectMax = 10 * time.Second
 	}
-	return &Client{
+	c := &Client{
 		cfg:          cfg,
 		events:       make(chan EngineEvent, 64),
 		clipEvents:   make(chan EngineEvent, 8),
 		notifyEvents: make(chan EngineEvent, 16),
 	}
+	// Auto-register the compiled-in openurl handler so cmd/portal/run.go stays
+	// unchanged: it decodes the OpenURL payload and delivers via the shared
+	// events channel (publish) exactly as the old `case env.OpenURL` arm did.
+	c.registry = newRegistry(cfg.Log)
+	c.registry.register(HandlerSpec{
+		Service:    "openurl",
+		Version:    1,
+		MaxPayload: 4096,
+		Decode: func(payload cbor.RawMessage) (EngineEvent, error) {
+			ou, err := protocol.UnmarshalPayload[protocol.OpenURL](payload)
+			if err != nil {
+				return EngineEvent{}, err
+			}
+			return EngineEvent{Kind: KindOpenURL, URL: ou.URL}, nil
+		},
+		Deliver: c.publish,
+	})
+	return c
 }
 
 // Events returns the demuxed event channel.
@@ -393,6 +419,7 @@ func (c *Client) runOnce(ctx context.Context) error {
 		ClientGitSHA:  bootstrap.EmbeddedSHA(),
 		ClientPID:     os.Getpid(),
 		WantDestroyMC: true,
+		Services:      c.registry.services(),
 	}}); err != nil {
 		return fmt.Errorf("write Hello: %w", err)
 	}
@@ -422,6 +449,11 @@ func (c *Client) runOnce(ctx context.Context) error {
 	c.snapMu.Lock()
 	c.helloAck = first.HelloAck
 	c.snapMu.Unlock()
+
+	// Record the agent's advertised services (DESIGN S4). A registered handler
+	// the agent lacks — or advertises at a mismatched version — goes dormant
+	// with one warning and drops inbound frames for that service.
+	c.registry.setAgentServices(first.HelloAck.Services)
 
 	// 4b. Deploy/refresh the clipboard read shims now that the agent upload
 	// succeeded AND the HelloAck SHA matches (so the portald symlink points at
@@ -604,8 +636,12 @@ func (c *Client) demuxLoop(ctx context.Context, dec *protocol.Decoder) error {
 				c.snapMu.Unlock()
 				pendRemoved = append(pendRemoved, port)
 				resetTimer()
-			case env.OpenURL != nil:
-				c.publish(EngineEvent{Kind: KindOpenURL, URL: env.OpenURL.URL})
+			case env.Msg != nil:
+				// Inbound service frame (v4): route to the registry, which decodes
+				// per-service and delivers on the handler's declared sink (openurl
+				// → publish; notify/clip after u4/u5). Unknown/dormant services and
+				// decode failures are logged drops — the session lives.
+				c.registry.dispatch(env.Msg)
 			case env.ClipRequest != nil:
 				// Route to the DEDICATED clip channel, not the shared events
 				// channel — a port-event burst must not evict a pending paste
