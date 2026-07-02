@@ -13,6 +13,7 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
 )
 
 // newDoctorCmd self-tests the clipboard + notification path end to end over ssh
@@ -102,17 +103,17 @@ func renderDoctor(w io.Writer, rep *doctor.Report) {
 // runDoctor performs every probe over tr and returns the assembled report. It
 // is split out (taking a Transport) so a test can drive it with a fake
 // transport that scripts canned ssh-exec replies — no live dev box needed.
-func runDoctor(ctx context.Context, host string, tr sshctl.Transport) *doctor.Report {
+func runDoctor(ctx context.Context, host string, tr transport.Transport) *doctor.Report {
 	rep := &doctor.Report{Host: host}
 
 	// 1. Master connectivity. Without the ControlMaster the daemon can't relay a
 	// clip request at all; everything downstream is moot.
-	if pid, err := tr.MasterPID(ctx); err != nil || pid == 0 {
+	if h, err := tr.Health(ctx); err != nil || !h.Up {
 		rep.Add("ssh master", doctor.Fail, "DOWN — start the daemon: "+app.Tool+" start")
 		// Without a master we cannot run any remote probe; bail with what we have.
 		return rep
 	} else {
-		rep.Add("ssh master", doctor.Pass, fmt.Sprintf("UP (pid=%d)", pid))
+		rep.Add("ssh master", doctor.Pass, fmt.Sprintf("UP (pid=%d)", h.Pid))
 	}
 
 	// 2. PATH-winner check — THE make-or-break. For each shim, resolve the tool
@@ -204,7 +205,7 @@ func runDoctor(ctx context.Context, host string, tr sshctl.Transport) *doctor.Re
 // ~/.bashrc / ~/.zshenv / ~/.profile by clipshim.ensurePathPrepend) is in
 // effect — matching the environment a coding agent inherits — rather than the
 // bare non-interactive ssh PATH which would not source those files.
-func resolveShimWinner(ctx context.Context, tr sshctl.Transport, tool string) (path string, isShim bool) {
+func resolveShimWinner(ctx context.Context, tr transport.Transport, tool string) (path string, isShim bool) {
 	// `bash -lic` = login + interactive so rc files (and the PATH block) load.
 	// command -v prints the resolved path; we then grep the file for the Marker.
 	script := fmt.Sprintf(
@@ -213,7 +214,7 @@ func resolveShimWinner(ctx context.Context, tr sshctl.Transport, tool string) (p
 			`if grep -qF %q "$p" 2>/dev/null; then echo "SHIM $p"; else echo "REAL $p"; fi`,
 		tool, clipshim.Marker,
 	)
-	out, err := tr.Exec(ctx, "", "bash", "-c", doctorShellQuote(script))
+	out, _, err := tr.Exec(ctx, nil, "bash", "-c", doctorShellQuote(script))
 	if err != nil {
 		return "", false
 	}
@@ -233,7 +234,7 @@ func resolveShimWinner(ctx context.Context, tr sshctl.Transport, tool string) (p
 // deployedShimVersion extracts the version number from the Marker line in the
 // deployed ~/.local/bin/xclip shim. Returns ok=false if the shim is absent or
 // carries no recognizable marker.
-func deployedShimVersion(ctx context.Context, tr sshctl.Transport) (version string, ok bool) {
+func deployedShimVersion(ctx context.Context, tr transport.Transport) (version string, ok bool) {
 	// The Marker is "Installed by portal clip-shim v<N>"; grep it out of the
 	// shim and print the trailing version token.
 	const prefix = "Installed by portal clip-shim v"
@@ -246,7 +247,7 @@ func deployedShimVersion(ctx context.Context, tr sshctl.Transport) (version stri
 			`echo "${line##*%s}"`,
 		prefix, prefix,
 	)
-	out, err := tr.Exec(ctx, "", "bash", "-c", doctorShellQuote(script))
+	out, _, err := tr.Exec(ctx, nil, "bash", "-c", doctorShellQuote(script))
 	if err != nil {
 		return "", false
 	}
@@ -275,7 +276,7 @@ type agentVerbs struct {
 // prints (a present subcommand prints its own usage to stderr; an absent one
 // falls through to the agent's flag parser). This avoids actually triggering a
 // clip/notify relay.
-func probePortaldVerbs(ctx context.Context, tr sshctl.Transport) (present bool, verbs agentVerbs) {
+func probePortaldVerbs(ctx context.Context, tr transport.Transport) (present bool, verbs agentVerbs) {
 	script := `
 pd="$HOME/.cache/portal/portald"
 [ -x "$pd" ] || { echo "NO_PORTALD"; exit 0; }
@@ -286,7 +287,7 @@ case "$cu" in *"usage: portald clip"*) echo "CLIP_OK";; esac
 nu=$("$pd" notify 2>&1 1>/dev/null; true)
 case "$nu" in *"usage: portald notify"*) echo "NOTIFY_OK";; esac
 `
-	out, err := tr.Exec(ctx, "", "bash", "-c", doctorShellQuote(script))
+	out, _, err := tr.Exec(ctx, nil, "bash", "-c", doctorShellQuote(script))
 	if err != nil {
 		return false, verbs
 	}
@@ -303,9 +304,9 @@ case "$nu" in *"usage: portald notify"*) echo "NOTIFY_OK";; esac
 // exit 1 == nothing servable (the expected/clean fall-through). We run it via a
 // wrapper that echoes the exit code so a non-zero exit (which Exec surfaces as
 // an error) is captured as data rather than swallowed.
-func smokeClipTargets(ctx context.Context, tr sshctl.Transport) (out string, code int) {
+func smokeClipTargets(ctx context.Context, tr transport.Transport) (out string, code int) {
 	script := `"$HOME/.cache/portal/portald" clip targets xclip; echo "EXIT=$?"`
-	raw, _ := tr.Exec(ctx, "", "bash", "-c", doctorShellQuote(script))
+	raw, _, _ := tr.Exec(ctx, nil, "bash", "-c", doctorShellQuote(script))
 	// Split the captured EXIT marker off the tail.
 	idx := strings.LastIndex(raw, "EXIT=")
 	if idx < 0 {

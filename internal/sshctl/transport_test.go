@@ -20,12 +20,12 @@ func TestMasterPID_StderrSource(t *testing.T) {
 		Stderr: "Master running (pid=12345)\r\n",
 	})
 	s := New("/tmp/sock", "clementine", nil, fake)
-	pid, err := s.MasterPID(context.Background())
+	pid, err := s.masterPID(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if pid != 12345 {
-		t.Errorf("MasterPID = %d, want 12345", pid)
+		t.Errorf("masterPID = %d, want 12345", pid)
 	}
 }
 
@@ -37,9 +37,9 @@ func TestMasterPID_NoMaster(t *testing.T) {
 		ExitCode: 255,
 	})
 	s := New("/tmp/sock", "clementine", nil, fake)
-	pid, _ := s.MasterPID(context.Background())
+	pid, _ := s.masterPID(context.Background())
 	if pid != 0 {
-		t.Errorf("MasterPID = %d, want 0", pid)
+		t.Errorf("masterPID = %d, want 0", pid)
 	}
 }
 
@@ -72,9 +72,9 @@ func TestForward_Failure_StderrSubstring(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected ForwardError")
 	}
-	var fe *ForwardError
+	var fe *transport.ForwardError
 	if !errors.As(err, &fe) {
-		t.Errorf("got %T, want *ForwardError", err)
+		t.Errorf("got %T, want *transport.ForwardError", err)
 	}
 	if fe.Port != 8081 {
 		t.Errorf("ForwardError.Port = %d, want 8081", fe.Port)
@@ -102,6 +102,34 @@ func TestForward_LocalhostSpec(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("-L spec not found in args %v", args)
+	}
+}
+
+// TestExec_ArgvByteCompat locks T9 for the Exec argv path: Exec appends argv
+// VERBATIM as trailing args to the ssh invocation (the ssh binary performs the
+// space-join + remote re-shell). It MUST NOT adopt localexec's `sh -c <joined>`
+// wrapping. A nil-stdin Exec routes through the injected Runner, so the fake
+// observes the exact arg list ending in `... <host> a b c`.
+func TestExec_ArgvByteCompat(t *testing.T) {
+	fake := &run.Fake{}
+	fake.Default = run.FakeReply{}
+	s := New("/tmp/sock", "clementine", nil, fake)
+	if _, _, err := s.Exec(context.Background(), nil, "a", "b", "c"); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.Calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(fake.Calls))
+	}
+	args := fake.Calls[0].Args
+	want := []string{"-S", "/tmp/sock", "clementine", "a", "b", "c"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("Exec args = %v, want %v (argv appended verbatim, no sh -c)", args, want)
+	}
+	// Guard against any sh -c drift.
+	for _, a := range args {
+		if a == "sh" || a == "-c" {
+			t.Errorf("Exec argv must not wrap in sh -c; args = %v", args)
+		}
 	}
 }
 

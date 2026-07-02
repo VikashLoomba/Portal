@@ -25,7 +25,7 @@ func newUninstallCmd(a *app.App) *cobra.Command {
 				if a.Bootstrap != nil {
 					_ = a.Bootstrap.PruneAll(cmd.Context())
 				}
-				_, _ = a.Transport.Exit(cmd.Context())
+				_, _ = a.Transport.Close(cmd.Context())
 			}
 			_ = os.Remove(a.Paths.Sock)
 			// Best-effort: a stale api.sock must never block a fresh daemon.
@@ -76,7 +76,7 @@ func newStopCmd(a *app.App) *cobra.Command {
 			}
 			host, _ := a.Cfg.ReadHost()
 			if host != "" {
-				stopped, _ := a.Transport.Exit(cmd.Context())
+				stopped, _ := a.Transport.Close(cmd.Context())
 				if stopped {
 					// Mirror bash: only print this line when the master responded.
 					fmt.Println("master stopped")
@@ -126,7 +126,7 @@ func newHostCmd(a *app.App) *cobra.Command {
 			}
 			// Tear down the old master before switching, ignoring errors.
 			if cur != "" {
-				_, _ = a.Transport.Exit(cmd.Context())
+				_, _ = a.Transport.Close(cmd.Context())
 			}
 			_ = os.Remove(a.Paths.Sock)
 			if err := a.Cfg.WriteHost(newHost); err != nil {

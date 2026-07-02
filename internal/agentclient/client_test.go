@@ -19,34 +19,32 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent/watcher"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
 )
 
-// fakeStreamTransport implements sshctl.Transport for the client test. It
-// pairs the client's ExecStream call with an in-process agent.Server using
+// fakeStreamTransport implements transport.Transport for the client test. It
+// pairs the client's Stream call with an in-process agent.Server using
 // io.Pipe rather than launching a real ssh process.
 type fakeStreamTransport struct {
 	w *watcher.Fake
 }
 
-func (f *fakeStreamTransport) Host() string                                    { return "fakehost" }
-func (f *fakeStreamTransport) Sock() string                                    { return "/tmp/fake-sock" }
-func (f *fakeStreamTransport) MasterPID(context.Context) (int, error)          { return 1, nil }
-func (f *fakeStreamTransport) EnsureMaster(context.Context) (int, bool, error) { return 1, false, nil }
-func (f *fakeStreamTransport) Forward(context.Context, int, int) error         { return nil }
-func (f *fakeStreamTransport) Cancel(context.Context, int, int) error          { return nil }
-func (f *fakeStreamTransport) Exit(context.Context) (bool, error)              { return false, nil }
-func (f *fakeStreamTransport) Exec(_ context.Context, _ string, _ ...string) (string, error) {
-	return "", nil
+func (f *fakeStreamTransport) Ensure(context.Context) (bool, error) { return false, nil }
+func (f *fakeStreamTransport) Health(context.Context) (transport.Health, error) {
+	return transport.Health{Up: true, Pid: 1, Detail: "pid=1"}, nil
 }
-func (f *fakeStreamTransport) ExecBytes(_ context.Context, _ []byte, _ ...string) (string, string, error) {
+func (f *fakeStreamTransport) Exec(_ context.Context, _ []byte, _ ...string) (string, string, error) {
 	return "", "", nil
 }
+func (f *fakeStreamTransport) Close(context.Context) (bool, error) { return false, nil }
+func (f *fakeStreamTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: "fakehost", Endpoint: "/tmp/fake-sock"}
+}
 
-// ExecStream wires the agent.Server to the returned (stdin, stdout)
+// Stream wires the agent.Server to the returned (stdin, stdout)
 // pipes via io.Pipe pairs. The agent runs in a goroutine and exits when
 // stdin closes.
-func (f *fakeStreamTransport) ExecStream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+func (f *fakeStreamTransport) Stream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	c2aR, c2aW := io.Pipe()
 	a2cR, a2cW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
@@ -164,28 +162,16 @@ type shaOverridingTransport struct {
 	sha  string
 }
 
-func (s *shaOverridingTransport) Host() string { return s.base.Host() }
-func (s *shaOverridingTransport) Sock() string { return s.base.Sock() }
-func (s *shaOverridingTransport) MasterPID(c context.Context) (int, error) {
-	return s.base.MasterPID(c)
+func (s *shaOverridingTransport) Ensure(c context.Context) (bool, error) { return s.base.Ensure(c) }
+func (s *shaOverridingTransport) Health(c context.Context) (transport.Health, error) {
+	return s.base.Health(c)
 }
-func (s *shaOverridingTransport) EnsureMaster(c context.Context) (int, bool, error) {
-	return s.base.EnsureMaster(c)
-}
-func (s *shaOverridingTransport) Forward(c context.Context, l, r int) error {
-	return s.base.Forward(c, l, r)
-}
-func (s *shaOverridingTransport) Cancel(c context.Context, l, r int) error {
-	return s.base.Cancel(c, l, r)
-}
-func (s *shaOverridingTransport) Exit(c context.Context) (bool, error) { return s.base.Exit(c) }
-func (s *shaOverridingTransport) Exec(c context.Context, in string, av ...string) (string, error) {
+func (s *shaOverridingTransport) Exec(c context.Context, in []byte, av ...string) (string, string, error) {
 	return s.base.Exec(c, in, av...)
 }
-func (s *shaOverridingTransport) ExecBytes(c context.Context, b []byte, av ...string) (string, string, error) {
-	return s.base.ExecBytes(c, b, av...)
-}
-func (s *shaOverridingTransport) ExecStream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+func (s *shaOverridingTransport) Close(c context.Context) (bool, error) { return s.base.Close(c) }
+func (s *shaOverridingTransport) Describe() transport.Desc              { return s.base.Describe() }
+func (s *shaOverridingTransport) Stream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	c2aR, c2aW := io.Pipe()
 	a2cR, a2cW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
@@ -226,27 +212,25 @@ func (r *realBootstrapShim) asManager() *bootstrap.Manager {
 // short-circuits on the probe.
 type probeOKTransport struct{ path string }
 
-func (p *probeOKTransport) Host() string                                    { return "p" }
-func (p *probeOKTransport) Sock() string                                    { return "/tmp/p" }
-func (p *probeOKTransport) MasterPID(context.Context) (int, error)          { return 1, nil }
-func (p *probeOKTransport) EnsureMaster(context.Context) (int, bool, error) { return 1, false, nil }
-func (p *probeOKTransport) Forward(context.Context, int, int) error         { return nil }
-func (p *probeOKTransport) Cancel(context.Context, int, int) error          { return nil }
-func (p *probeOKTransport) Exit(context.Context) (bool, error)              { return false, nil }
-func (p *probeOKTransport) Exec(_ context.Context, _ string, _ ...string) (string, error) {
-	return fmt.Sprintf("%d\n", len(bootstrap.EmbeddedAgent())), nil
+func (p *probeOKTransport) Ensure(context.Context) (bool, error) { return false, nil }
+func (p *probeOKTransport) Health(context.Context) (transport.Health, error) {
+	return transport.Health{Up: true, Pid: 1, Detail: "pid=1"}, nil
 }
-func (p *probeOKTransport) ExecBytes(context.Context, []byte, ...string) (string, string, error) {
-	return "", "", nil
+func (p *probeOKTransport) Exec(_ context.Context, _ []byte, _ ...string) (string, string, error) {
+	return fmt.Sprintf("%d\n", len(bootstrap.EmbeddedAgent())), "", nil
 }
-func (p *probeOKTransport) ExecStream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+func (p *probeOKTransport) Close(context.Context) (bool, error) { return false, nil }
+func (p *probeOKTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: "p", Endpoint: "/tmp/p"}
+}
+func (p *probeOKTransport) Stream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	return nil, nil, nil, func() error { return nil }, nil
 }
 
 // silence unused import.
 var _ = os.Getpid
 var _ = protocol.ProtoVersion
-var _ sshctl.Transport = (*shaOverridingTransport)(nil)
+var _ transport.Transport = (*shaOverridingTransport)(nil)
 
 // ---------------------------------------------------------------------------
 // u6: full-stack v4 exit-criteria suite (real agent.Server + real Client over
@@ -269,7 +253,7 @@ func shortSockPath(t *testing.T) string {
 // e2eTransport wires the Client to a REAL agent.Server over io.Pipe, giving the
 // agent a live cmd socket so the test can drive open/notify/clip verbs, plus a
 // configurable SHA, heartbeat interval, and slog sink. It embeds
-// fakeStreamTransport for the trivial Transport methods and overrides ExecStream.
+// fakeStreamTransport for the trivial Transport methods and overrides Stream.
 type e2eTransport struct {
 	*fakeStreamTransport
 	sha      string
@@ -278,7 +262,11 @@ type e2eTransport struct {
 	hb       time.Duration
 }
 
-func (e *e2eTransport) ExecStream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+// Stream OVERRIDES the embedded fakeStreamTransport.Stream with the live
+// agent.Server wiring. It MUST stay named Stream (not ExecStream) — an
+// ExecStream method here would be an orphan that no longer overrides the
+// embedded Stream, silently reverting the e2e tests to the canned fake pipe.
+func (e *e2eTransport) Stream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	c2aR, c2aW := io.Pipe()
 	a2cR, a2cW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
@@ -292,7 +280,7 @@ func (e *e2eTransport) ExecStream(ctx context.Context, _ ...string) (io.WriteClo
 	return c2aW, a2cR, stderrR, wait, nil
 }
 
-var _ sshctl.Transport = (*e2eTransport)(nil)
+var _ transport.Transport = (*e2eTransport)(nil)
 
 // e2eSession bundles a running Client bound to a real agent over the e2e
 // transport, plus the agent's cmd-socket path and the shared fake watcher.

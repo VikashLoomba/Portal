@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"strings"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
 )
 
 // Version is the content-version marker embedded in every shim. Ensure
@@ -195,14 +195,14 @@ var rcFiles = []string{"~/.bashrc", "~/.zshrc", "~/.zshenv", "~/.profile"}
 // For each rc file it appends the PATH-prepend marker block exactly once.
 // Returns an error describing the FIRST failure so the caller can surface it
 // loudly (DESIGN §9.6).
-func Ensure(ctx context.Context, tr sshctl.Transport) error {
+func Ensure(ctx context.Context, tr transport.Transport) error {
 	// Fast path: if BOTH shims already carry the current marker, only ensure
 	// the PATH block (cheap, idempotent). Steady state on every reconnect.
 	check := fmt.Sprintf(
 		`grep -qF %q ~/.local/bin/xclip 2>/dev/null && grep -qF %q ~/.local/bin/wl-paste 2>/dev/null && echo current || echo stale`,
 		Marker, Marker,
 	)
-	out, _ := tr.Exec(ctx, "", "bash", "-c", shellQuote(check))
+	out, _, _ := tr.Exec(ctx, nil, "bash", "-c", shellQuote(check))
 	if strings.TrimSpace(out) != "current" {
 		for _, sh := range shims {
 			if err := deployShim(ctx, tr, sh.name, sh.script); err != nil {
@@ -235,14 +235,14 @@ func Ensure(ctx context.Context, tr sshctl.Transport) error {
 // carries NotifyHookMarker (ours, from a prior deploy) before re-adding exactly
 // one entry per event, preserving any user-authored hooks (which lack the
 // marker). This mirrors cc-clip's CC_CLIP_MANAGED ownership tracking.
-func ensureNotifyHook(ctx context.Context, tr sshctl.Transport) error {
+func ensureNotifyHook(ctx context.Context, tr transport.Transport) error {
 	// 1. Write the hook script atomically (same pattern as deployShim).
 	bin := "~/.local/bin/portal-notify-hook"
 	writeScript := fmt.Sprintf(
 		`mkdir -p ~/.local/bin && cat > %s.portal.tmp && chmod 0755 %s.portal.tmp && mv %s.portal.tmp %s`,
 		bin, bin, bin, bin,
 	)
-	if _, _, err := tr.ExecBytes(ctx, []byte(notifyHookScript), "bash", "-c", shellQuote(writeScript)); err != nil {
+	if _, _, err := tr.Exec(ctx, []byte(notifyHookScript), "bash", "-c", shellQuote(writeScript)); err != nil {
 		return fmt.Errorf("write notify hook script: %w", err)
 	}
 
@@ -252,7 +252,7 @@ func ensureNotifyHook(ctx context.Context, tr sshctl.Transport) error {
 	// atomically. The command line carries NotifyHookMarker so the strip step
 	// recognizes our own entries; the actual command runs the script above.
 	merge := mergeClaudeSettingsProgram()
-	if _, err := tr.Exec(ctx, "", "bash", "-c", shellQuote(merge)); err != nil {
+	if _, _, err := tr.Exec(ctx, nil, "bash", "-c", shellQuote(merge)); err != nil {
 		return fmt.Errorf("merge claude settings: %w", err)
 	}
 	return nil
@@ -308,7 +308,7 @@ os.replace(tmp,p)
 // deployShim backs up a pre-existing non-shim binary at ~/.local/bin/<name>
 // (preserving type via cp -P so a symlink stays a symlink — DESIGN §9.3), writes
 // our shim atomically at 0755, and verifies the marker landed.
-func deployShim(ctx context.Context, tr sshctl.Transport, name, script string) error {
+func deployShim(ctx context.Context, tr transport.Transport, name, script string) error {
 	bin := "~/.local/bin/" + name
 	backup := bin + ".portal-backup"
 	// Back up only a pre-existing file that is NOT already our shim, and only
@@ -318,19 +318,19 @@ func deployShim(ctx context.Context, tr sshctl.Transport, name, script string) e
 		`if [ -e %s ] && ! grep -qF %q %s 2>/dev/null && [ ! -e %s ]; then cp -P %s %s; fi`,
 		bin, Marker, bin, backup, bin, backup,
 	)
-	_, _ = tr.Exec(ctx, "", "bash", "-c", shellQuote(backupScript))
+	_, _, _ = tr.Exec(ctx, nil, "bash", "-c", shellQuote(backupScript))
 
 	// Atomic write: cat to a unique .tmp, chmod 0755, mv into place.
 	writeScript := fmt.Sprintf(
 		`mkdir -p ~/.local/bin && cat > %s.portal.tmp && chmod 0755 %s.portal.tmp && mv %s.portal.tmp %s`,
 		bin, bin, bin, bin,
 	)
-	if _, _, err := tr.ExecBytes(ctx, []byte(script), "bash", "-c", shellQuote(writeScript)); err != nil {
+	if _, _, err := tr.Exec(ctx, []byte(script), "bash", "-c", shellQuote(writeScript)); err != nil {
 		return fmt.Errorf("write %s shim: %w", name, err)
 	}
 
 	verifyScript := fmt.Sprintf(`grep -qF %q %s 2>/dev/null && echo ok || echo missing`, Marker, bin)
-	out, _ := tr.Exec(ctx, "", "bash", "-c", shellQuote(verifyScript))
+	out, _, _ := tr.Exec(ctx, nil, "bash", "-c", shellQuote(verifyScript))
 	if strings.TrimSpace(out) != "ok" {
 		return fmt.Errorf("%s shim not found at %s after write — check the upload", name, bin)
 	}
@@ -341,7 +341,7 @@ func deployShim(ctx context.Context, tr sshctl.Transport, name, script string) e
 // exactly once (idempotent via a grep on the start marker). We create the rc
 // file if it does not exist so a non-login/non-interactive agent shell still
 // resolves the shim first (DESIGN §9.2).
-func ensurePathPrepend(ctx context.Context, tr sshctl.Transport) error {
+func ensurePathPrepend(ctx context.Context, tr transport.Transport) error {
 	// The block text is passed on stdin so its characters need no further shell
 	// quoting; the loop appends it to any rc file missing the start marker.
 	rcList := strings.Join(rcFiles, " ")
@@ -349,7 +349,7 @@ func ensurePathPrepend(ctx context.Context, tr sshctl.Transport) error {
     if [ -f "$rc" ] && grep -qF %q "$rc"; then continue; fi
     printf '\n%%s\n' "$block" >> "$rc"
 done`, rcList, PathMarkerStart)
-	if _, _, err := tr.ExecBytes(ctx, []byte(pathPrependSnippet), "bash", "-c", shellQuote(script)); err != nil {
+	if _, _, err := tr.Exec(ctx, []byte(pathPrependSnippet), "bash", "-c", shellQuote(script)); err != nil {
 		return fmt.Errorf("write PATH-prepend block: %w", err)
 	}
 	return nil
@@ -364,7 +364,7 @@ done`, rcList, PathMarkerStart)
 // Each rc-file edit strips the env.sh source line and the PATH-prepend marker
 // block (start..end inclusive) with an awk range delete keyed on the stable
 // markers. Best-effort: errors are ignored (uninstall continues regardless).
-func Remove(ctx context.Context, tr sshctl.Transport) {
+func Remove(ctx context.Context, tr transport.Transport) {
 	script := fmt.Sprintf(`
 # Restore or remove each ~/.local/bin entry, preserving symlink type via mv.
 for bin in xdg-open xclip wl-paste; do
@@ -421,7 +421,7 @@ for rc in ~/.bashrc ~/.zshrc ~/.zshenv ~/.profile; do
         { print }
     ' "$rc" > "$tmp" && mv "$tmp" "$rc"
 done`, PathMarkerStart, PathMarkerEnd)
-	_, _ = tr.Exec(ctx, "", "bash", "-c", shellQuote(script))
+	_, _, _ = tr.Exec(ctx, nil, "bash", "-c", shellQuote(script))
 }
 
 // shellQuote wraps a shell script in single quotes for safe remote execution

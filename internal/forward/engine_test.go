@@ -3,6 +3,7 @@ package forward
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -10,41 +11,60 @@ import (
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
 )
 
-// fakeTransport implements sshctl.Transport for the engine tests.
+// fakeTransport implements BOTH transport.Transport and transport.PortForwarder
+// for the engine tests: the engine takes the two capabilities as separate
+// constructor args, but one struct satisfying both lets a test observe
+// Forward/Cancel and the master pid on a single value. ListForwards is the
+// engine's current-truth source and is keyed by the LIVE master pid so the
+// stateless-rebuild test can flip pid and see the fresh master's empty set.
 type fakeTransport struct {
 	host        string
 	pid         int
+	rebuilt     bool           // returned by Ensure
 	addCalls    [][2]int       // (local, remote) for Forward
 	cancelCalls [][2]int       // for Cancel
-	failOn      map[int]string // port → error substring; *ForwardError surfaces upward
+	failOn      map[int]string // port → error substring; surfaces upward from Forward
 	exitCalled  bool
+	// forwardsByPID is the ground-truth forwarded set per master pid, returned
+	// by ListForwards for the live pid.
+	forwardsByPID map[int][]int
+	// reconciled is a SYNCHRONIZED reconcile signal: ListForwards runs exactly
+	// once per Reconcile pass, so a non-blocking notify here emits one value per
+	// pass. Tests that want to observe reconciles set it to a buffered channel; a
+	// nil channel is never ready, so tests that leave it nil see no behavior
+	// change. Reading the plain slices/maps while Run is live would be a data
+	// race — use this.
+	reconciled chan struct{}
 }
 
-func (f *fakeTransport) MasterPID(ctx context.Context) (int, error) { return f.pid, nil }
-func (f *fakeTransport) EnsureMaster(ctx context.Context) (int, bool, error) {
-	return f.pid, false, nil
+// --- transport.Transport ---
+
+func (f *fakeTransport) Ensure(context.Context) (bool, error) { return f.rebuilt, nil }
+func (f *fakeTransport) Health(context.Context) (transport.Health, error) {
+	if f.pid <= 0 {
+		return transport.Health{Up: false}, nil
+	}
+	return transport.Health{Up: true, Pid: f.pid, Detail: fmt.Sprintf("pid=%d", f.pid)}, nil
 }
-func (f *fakeTransport) Cancel(ctx context.Context, l, r int) error {
-	f.cancelCalls = append(f.cancelCalls, [2]int{l, r})
-	return nil
+func (f *fakeTransport) Exec(context.Context, []byte, ...string) (string, string, error) {
+	return "", "", nil
 }
-func (f *fakeTransport) Exit(ctx context.Context) (bool, error) {
+func (f *fakeTransport) Stream(_ context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+	return nil, nil, nil, func() error { return nil }, nil
+}
+func (f *fakeTransport) Close(context.Context) (bool, error) {
 	f.exitCalled = true
 	return true, nil
 }
-func (f *fakeTransport) Exec(ctx context.Context, stdin string, argv ...string) (string, error) {
-	return "", nil
+func (f *fakeTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: f.host, Endpoint: "/tmp/sock-fake"}
 }
-func (f *fakeTransport) Host() string { return f.host }
-func (f *fakeTransport) Sock() string { return "/tmp/sock-fake" }
-func (f *fakeTransport) ExecBytes(_ context.Context, _ []byte, _ ...string) (string, string, error) {
-	return "", "", nil
-}
-func (f *fakeTransport) ExecStream(_ context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
-	return nil, nil, nil, func() error { return nil }, nil
-}
+
+// --- transport.PortForwarder ---
+
 func (f *fakeTransport) Forward(ctx context.Context, l, r int) error {
 	f.addCalls = append(f.addCalls, [2]int{l, r})
 	if f.failOn != nil {
@@ -54,32 +74,30 @@ func (f *fakeTransport) Forward(ctx context.Context, l, r int) error {
 	}
 	return nil
 }
-
-// fakePortLister implements proc.PortLister.
-type fakePortLister struct {
-	masterForwardsByPID map[int][]int
-	holders             map[int]int
-	processNames        map[int]string
-
-	// reconciled is a SYNCHRONIZED reconcile signal: MasterForwards runs
-	// exactly once per Reconcile pass, so a non-blocking notify here emits one
-	// value per pass. Tests that want to observe reconciles set it to a
-	// buffered channel; a nil channel is never ready, so the three tests that
-	// leave it nil see no race and no behavior change. Reading the plain
-	// slices/maps above while Run is live would be a data race — use this.
-	reconciled chan struct{}
+func (f *fakeTransport) Cancel(ctx context.Context, l, r int) error {
+	f.cancelCalls = append(f.cancelCalls, [2]int{l, r})
+	return nil
 }
-
-func (f *fakePortLister) MasterForwards(_ context.Context, pid int) ([]int, error) {
+func (f *fakeTransport) ListForwards(context.Context) ([]int, error) {
 	select {
 	case f.reconciled <- struct{}{}:
 	default:
 	}
-	return f.masterForwardsByPID[pid], nil
+	return f.forwardsByPID[f.pid], nil
 }
-func (f *fakePortLister) MasterForwardLines(_ context.Context, pid int) ([]string, error) {
-	return nil, nil
+func (f *fakeTransport) ForwardLines(context.Context) ([]string, error) { return nil, nil }
+
+var (
+	_ transport.Transport     = (*fakeTransport)(nil)
+	_ transport.PortForwarder = (*fakeTransport)(nil)
+)
+
+// fakePortLister implements the engine's narrow LocalPorts surface.
+type fakePortLister struct {
+	holders      map[int]int
+	processNames map[int]string
 }
+
 func (f *fakePortLister) LocalHolder(_ context.Context, port int) (int, error) {
 	return f.holders[port], nil
 }
@@ -101,7 +119,8 @@ func newTestEngine(t *fakeTransport, p *fakePortLister, d *fakeDiscoverer) (*Eng
 	log := &MemLogger{}
 	cfg := config.New("/tmp/never-touched-by-test")
 	clk := clock.Real{}
-	return New(t, p, d, cfg, clk, log, time.Second, []int{22, 25}, []int{}), log
+	// t satisfies both transport.Transport and transport.PortForwarder.
+	return New(t, t, p, d, cfg, clk, log, time.Second, []int{22, 25}, []int{}), log
 }
 
 // TestReconcile_Diff is the keystone test: given desired = {8081, 8082, 8083, 8084},
@@ -110,14 +129,14 @@ func newTestEngine(t *fakeTransport, p *fakePortLister, d *fakeDiscoverer) (*Eng
 // behavior.
 func TestReconcile_Diff(t *testing.T) {
 	tr := &fakeTransport{
-		host:   "clementine",
-		pid:    111,
-		failOn: map[int]string{8083: "request failed"},
+		host:          "clementine",
+		pid:           111,
+		failOn:        map[int]string{8083: "request failed"},
+		forwardsByPID: map[int][]int{111: {8081, 9111}},
 	}
 	pl := &fakePortLister{
-		masterForwardsByPID: map[int][]int{111: {8081, 9111}},
-		holders:             map[int]int{8082: 222}, // foreign holder
-		processNames:        map[int]string{222: "node"},
+		holders:      map[int]int{8082: 222}, // foreign holder
+		processNames: map[int]string{222: "node"},
 	}
 	d := &fakeDiscoverer{desired: []int{8081, 8082, 8083, 8084}}
 
@@ -179,13 +198,15 @@ func TestReconcile_Diff(t *testing.T) {
 // cache the old set. After the rebuild, all desired ports are missing on the
 // fresh master and must be re-forwarded.
 func TestReconcile_StatelessAfterMasterRebuild(t *testing.T) {
-	tr := &fakeTransport{host: "clementine", pid: 111}
-	pl := &fakePortLister{
-		masterForwardsByPID: map[int][]int{
+	tr := &fakeTransport{
+		host: "clementine",
+		pid:  111,
+		forwardsByPID: map[int][]int{
 			111: {8081}, // old master had 8081 forwarded
 			222: {},     // fresh master has nothing
 		},
 	}
+	pl := &fakePortLister{}
 	d := &fakeDiscoverer{desired: []int{8081}}
 
 	e, _ := newTestEngine(tr, pl, d)
@@ -207,8 +228,8 @@ func TestReconcile_StatelessAfterMasterRebuild(t *testing.T) {
 // TestReconcile_DiscoveryFailureKeepsForwards — if DesiredPorts errors, no
 // Cancel calls are issued (transient blip must NOT drop everything).
 func TestReconcile_DiscoveryFailureKeepsForwards(t *testing.T) {
-	tr := &fakeTransport{host: "clementine", pid: 111}
-	pl := &fakePortLister{masterForwardsByPID: map[int][]int{111: {8081, 9111}}}
+	tr := &fakeTransport{host: "clementine", pid: 111, forwardsByPID: map[int][]int{111: {8081, 9111}}}
+	pl := &fakePortLister{}
 	d := &fakeDiscoverer{err: errors.New("transient")}
 
 	e, log := newTestEngine(tr, pl, d)
@@ -248,8 +269,8 @@ func TestReconcile_MasterDownReturnsError(t *testing.T) {
 // TestRun_ContextCancelLeavesMasterAlone — Run must return on ctx.Done()
 // without calling Transport.Exit, matching the bash trap behavior.
 func TestRun_ContextCancelLeavesMasterAlone(t *testing.T) {
-	tr := &fakeTransport{host: "clementine", pid: 111}
-	pl := &fakePortLister{masterForwardsByPID: map[int][]int{111: {}}}
+	tr := &fakeTransport{host: "clementine", pid: 111, forwardsByPID: map[int][]int{111: {}}}
+	pl := &fakePortLister{}
 	d := &fakeDiscoverer{desired: []int{}}
 
 	e, _ := newTestEngine(tr, pl, d)
@@ -270,11 +291,13 @@ func TestRun_ContextCancelLeavesMasterAlone(t *testing.T) {
 // the event-driven loop; the default 60s SafetyInterval is far past the 1s
 // window, so the second signal is unambiguously the Kick's, not the backstop.
 func TestRun_KickTriggersReconcile(t *testing.T) {
-	tr := &fakeTransport{host: "clementine", pid: 111}
-	pl := &fakePortLister{
-		masterForwardsByPID: map[int][]int{111: {}},
-		reconciled:          make(chan struct{}, 8),
+	tr := &fakeTransport{
+		host:          "clementine",
+		pid:           111,
+		forwardsByPID: map[int][]int{111: {}},
+		reconciled:    make(chan struct{}, 8),
 	}
+	pl := &fakePortLister{}
 	d := &fakeDiscoverer{desired: []int{8081}}
 
 	e, _ := newTestEngine(tr, pl, d)
@@ -291,7 +314,7 @@ func TestRun_KickTriggersReconcile(t *testing.T) {
 
 	// The immediate startup reconcile.
 	select {
-	case <-pl.reconciled:
+	case <-tr.reconciled:
 	case <-time.After(1 * time.Second):
 		cancel()
 		wg.Wait()
@@ -303,7 +326,7 @@ func TestRun_KickTriggersReconcile(t *testing.T) {
 	// The kicked reconcile — comfortably past the 50ms debounce and far under
 	// the 60s safety ticker, so this signal is the Kick's.
 	select {
-	case <-pl.reconciled:
+	case <-tr.reconciled:
 	case <-time.After(1 * time.Second):
 		cancel()
 		wg.Wait()
@@ -323,5 +346,29 @@ func TestRun_KickTriggersReconcile(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected Forward(8081,8081) across reconcile passes; addCalls=%v", tr.addCalls)
+	}
+}
+
+// TestReconcile_MasterEstablishedLog pins the byte-exact "master established
+// (pid=N)" log line (T9): when Ensure reports a fresh (re)build and Health
+// reports the master up, the engine renders the line from Health.Pid. No prior
+// test asserted this line — it is the machine-verifiable guard that the system
+// transport keeps carrying the pid into the daemon log after the migration.
+func TestReconcile_MasterEstablishedLog(t *testing.T) {
+	tr := &fakeTransport{
+		host:          "clementine",
+		pid:           4242,
+		rebuilt:       true, // Ensure reports THIS call performed the rebuild
+		forwardsByPID: map[int][]int{4242: {}},
+	}
+	pl := &fakePortLister{}
+	d := &fakeDiscoverer{desired: []int{}}
+
+	e, log := newTestEngine(tr, pl, d)
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !log.Has("master established (pid=4242)") {
+		t.Errorf("expected 'master established (pid=4242)' log; got:\n%v", log.Lines)
 	}
 }

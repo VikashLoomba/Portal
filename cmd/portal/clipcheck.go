@@ -10,7 +10,18 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clip"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipupload"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
 )
+
+// clipUploadReachable gates the live clip upload on transport liveness: Ensure
+// brings the master/connection up, then liveness gates on Health.Up (per T2 —
+// NOT on Pid, which is 0 for the native transport). Extracted from the RunE
+// closure so the gate is unit-testable without a live upload.
+func clipUploadReachable(ctx context.Context, tr transport.Transport) bool {
+	_, _ = tr.Ensure(ctx)
+	h, _ := tr.Health(ctx)
+	return h.Up
+}
 
 // newClipCheckCmd diagnoses the clipboard-paste pipeline: what's on the
 // clipboard, whether portal detects an image, and (optionally) whether it
@@ -48,7 +59,7 @@ func newClipCheckCmd(a *app.App) *cobra.Command {
 				fmt.Println("\nNo dev box configured; cannot test upload.")
 				return nil
 			}
-			if pid, _, _ := a.Transport.EnsureMaster(cmd.Context()); pid == 0 {
+			if !clipUploadReachable(cmd.Context(), a.Transport) {
 				fmt.Printf("\nCould not reach %s to test upload.\n", host)
 				return nil
 			}

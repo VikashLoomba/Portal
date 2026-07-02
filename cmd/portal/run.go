@@ -103,7 +103,7 @@ func newRunCmd(a *app.App) *cobra.Command {
 					Host:    a.Cfg.ReadHost,
 					Agent:   a.AgentClient,
 					Master:  a.Transport,
-					Ports:   a.Ports,
+					Ports:   a.PF,
 					Service: a.Service,
 					Config:  a.Cfg,
 					Hub:     a.Hub,
@@ -268,8 +268,8 @@ func runOpenURLHandler(ctx context.Context, ch <-chan string, a *app.App) {
 				continue
 			}
 			ensureForwardedForURL(ctx, rawURL, a)
-			a.Log.Logf("opening URL from %s: %s", a.Transport.Host(), rawURL)
-			a.Audit.OpenURL(a.Transport.Host(), rawURL)
+			a.Log.Logf("opening URL from %s: %s", a.Transport.Describe().Host, rawURL)
+			a.Audit.OpenURL(a.Transport.Describe().Host, rawURL)
 			// Use "--" so a URL starting with "-" is never mistaken for
 			// a flag, and restrict to http/https schemes.
 			cmd := exec.CommandContext(ctx, "open", "--", rawURL)
@@ -393,7 +393,7 @@ func serveClipRequest(ctx context.Context, a *app.App, cb clip.Clipboard,
 			if clipFeatureAllowed(a, "image") {
 				if sha, err := uploadClipImage(cctx, a, cb); err == nil {
 					cacheClip(probe, probeMu, "image", sha)
-					a.Audit.ClipServed(a.Transport.Host(), "image", "sha="+sha)
+					a.Audit.ClipServed(a.Transport.Describe().Host, "image", "sha="+sha)
 					resp.OK = true
 					resp.Has = true
 					resp.Kind = "image"
@@ -405,7 +405,7 @@ func serveClipRequest(ctx context.Context, a *app.App, cb clip.Clipboard,
 				// Image present but feature disabled: audit the denial, then fall
 				// through to the text check rather than returning Has=false (which
 				// would hide servable text from the remote).
-				a.Audit.ClipDenied(a.Transport.Host(), "image", "disabled")
+				a.Audit.ClipDenied(a.Transport.Describe().Host, "image", "disabled")
 			}
 		}
 		if cb.HasText() {
@@ -414,7 +414,7 @@ func serveClipRequest(ctx context.Context, a *app.App, cb clip.Clipboard,
 				if clipFeatureAllowed(a, "text") {
 					reason = "concealed"
 				}
-				a.Audit.ClipDenied(a.Transport.Host(), "text", reason)
+				a.Audit.ClipDenied(a.Transport.Describe().Host, "text", reason)
 				resp.OK = true
 				resp.Has = false
 				return resp
@@ -424,7 +424,7 @@ func serveClipRequest(ctx context.Context, a *app.App, cb clip.Clipboard,
 			if data, err := cb.Text(cctx); err == nil && len(data) <= clipupload.MaxUploadBytes {
 				if _, sha, uerr := clipupload.UploadText(cctx, a.Transport, data); uerr == nil {
 					cacheClip(probe, probeMu, "text", sha)
-					a.Audit.ClipServed(a.Transport.Host(), "text", fmt.Sprintf("len=%d", len(data)))
+					a.Audit.ClipServed(a.Transport.Describe().Host, "text", fmt.Sprintf("len=%d", len(data)))
 					resp.OK = true
 					resp.Has = true
 					resp.Kind = "text"
@@ -444,7 +444,7 @@ func serveClipRequest(ctx context.Context, a *app.App, cb clip.Clipboard,
 			return resp // OK=false: portal only serves PNG
 		}
 		if !clipFeatureAllowed(a, "image") {
-			a.Audit.ClipDenied(a.Transport.Host(), "image", "disabled")
+			a.Audit.ClipDenied(a.Transport.Describe().Host, "image", "disabled")
 			return resp
 		}
 		if sha, ok := lookupClip(probe, probeMu, "image"); ok {
@@ -461,7 +461,7 @@ func serveClipRequest(ctx context.Context, a *app.App, cb clip.Clipboard,
 			a.Log.Logf("clip: image read/upload failed: %v", err)
 			return resp
 		}
-		a.Audit.ClipServed(a.Transport.Host(), "image", "sha="+sha)
+		a.Audit.ClipServed(a.Transport.Describe().Host, "image", "sha="+sha)
 		resp.OK = true
 		resp.SHA = sha
 		return resp
@@ -481,7 +481,7 @@ func serveClipRequest(ctx context.Context, a *app.App, cb clip.Clipboard,
 			if clipFeatureAllowed(a, "text") {
 				reason = "concealed"
 			}
-			a.Audit.ClipDenied(a.Transport.Host(), "text", reason)
+			a.Audit.ClipDenied(a.Transport.Describe().Host, "text", reason)
 			return resp
 		}
 		if sha, ok := lookupClip(probe, probeMu, "text"); ok {
@@ -510,7 +510,7 @@ func serveClipRequest(ctx context.Context, a *app.App, cb clip.Clipboard,
 			return resp
 		}
 		cacheClip(probe, probeMu, "text", sha)
-		a.Audit.ClipServed(a.Transport.Host(), "text", fmt.Sprintf("len=%d", len(data)))
+		a.Audit.ClipServed(a.Transport.Describe().Host, "text", fmt.Sprintf("len=%d", len(data)))
 		resp.OK = true
 		resp.SHA = sha
 		return resp
@@ -611,11 +611,11 @@ func ensureForwardedForURL(ctx context.Context, rawURL string, a *app.App) {
 		return
 	}
 
-	masterPID, _ := a.Transport.MasterPID(ctx)
-	if masterPID == 0 {
+	h, _ := a.Transport.Health(ctx)
+	if !h.Up {
 		return
 	}
-	current, _ := a.Ports.MasterForwards(ctx, masterPID)
+	current, _ := a.PF.ListForwards(ctx)
 	forwarded := make(map[int]bool, len(current))
 	for _, p := range current {
 		forwarded[p] = true
@@ -625,11 +625,11 @@ func ensureForwardedForURL(ctx context.Context, rawURL string, a *app.App) {
 		if forwarded[port] {
 			continue
 		}
-		if err := a.Transport.Forward(ctx, port, port); err != nil {
+		if err := a.PF.Forward(ctx, port, port); err != nil {
 			a.Log.Logf("auto-forward port %d: %v", port, err)
 			continue
 		}
-		a.Log.Logf("auto-forwarded localhost:%d -> %s:%d", port, a.Transport.Host(), port)
+		a.Log.Logf("auto-forwarded localhost:%d -> %s:%d", port, a.Transport.Describe().Host, port)
 	}
 }
 

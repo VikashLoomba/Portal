@@ -277,6 +277,32 @@ func TestRunPorts_DaemonUp_NotConnected(t *testing.T) {
 	}
 }
 
+// EC10c: viewFromLocal must set masterUp from Health.Up, NOT from Pid>0. Under a
+// native-shaped Health ({Up:true, Pid:0}) the fallback view must still report the
+// master up and fetch forwards via App.PF.ForwardLines.
+func TestViewFromLocal_NativeHealthPidZero(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	pf := &recordingForwarder{lines: []string{"127.0.0.1:5173"}}
+	a := &app.App{
+		Cfg:       cfg,
+		Paths:     app.Paths{Label: "com.test.portal", Sock: "/tmp/cm-fake.sock"},
+		Transport: nativeHealthTransport{up: true, pid: 0},
+		PF:        pf,
+		Service:   &appFakeService{st: service.Status{Loaded: true, StateLines: []string{"state = running"}}},
+	}
+
+	v := viewFromLocal(context.Background(), a)
+	if !v.masterUp {
+		t.Errorf("masterUp = false, want true (gated on Health.Up, not Pid>0)")
+	}
+	if v.masterPID != 0 {
+		t.Errorf("masterPID = %d, want 0 (native transport carries no pid)", v.masterPID)
+	}
+	if len(v.forwards) != 1 || v.forwards[0] != "127.0.0.1:5173" {
+		t.Errorf("forwards = %v, want [127.0.0.1:5173] (via App.PF.ForwardLines)", v.forwards)
+	}
+}
+
 // EC2 (ports): a bad socket falls through to the local EnsureMaster/DesiredPorts
 // path.
 func TestRunPorts_DaemonDown_Fallback(t *testing.T) {

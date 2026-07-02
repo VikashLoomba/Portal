@@ -19,6 +19,7 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/service"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
 )
 
 // App is the dependency container. NewProd wires real adapters; tests build
@@ -30,10 +31,15 @@ type App struct {
 	Clk       clock.Clock
 	Log       forward.Logger
 	Audit     *audit.Log
-	Transport sshctl.Transport
-	Ports     proc.PortLister
-	Discover  discover.RemoteDiscoverer
-	Service   service.Manager
+	Transport transport.Transport
+	// PF is the port-forwarding capability, acquired by type assertion at
+	// wiring time (the daemon requires it). run.go/inspect.go reach
+	// Forward/Cancel/ListForwards/ForwardLines ONLY through PF — those are
+	// never on the core Transport interface.
+	PF       transport.PortForwarder
+	Ports    forward.LocalPorts
+	Discover discover.RemoteDiscoverer
+	Service  service.Manager
 
 	// Split-daemon additions:
 	Bootstrap   *bootstrap.Manager
@@ -67,11 +73,16 @@ func NewProd() (*App, error) {
 	runner := run.OSRunner{}
 	clk := clock.Real{}
 	logf := forward.StdoutLogger()
-	transport := sshctl.New(paths.Sock, host, SSHOpts, runner)
+	// ONE *proc.Lsof serves both App.Ports (local-port conflict queries) and
+	// s.Forwards (the master-forward truth behind PortForwarder List/Lines).
+	ports := proc.New(LsofPath, runner)
+	s := sshctl.New(paths.Sock, host, SSHOpts, runner)
 	// Tee ssh stderr to our stderr so launchd's StandardErrorPath captures
 	// host-key churn / mux warnings — bash relies on stderr inheritance.
-	transport.StderrSink = os.Stderr
-	ports := proc.New(LsofPath, runner)
+	// (The u5 selection-aware factory will pass the sink through explicitly;
+	// this unit keeps NewProd's direct construction with the sink set inline.)
+	s.StderrSink = os.Stderr
+	s.Forwards = ports
 	svc := service.New(service.Spec{
 		Label:   paths.Label,
 		BinPath: paths.BinPath,
@@ -87,10 +98,10 @@ func NewProd() (*App, error) {
 	// channel is consumed by forward.Engine; AgentDiscoverer reads its
 	// cached Snapshot for desired-port lookups.
 	slogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	bs := bootstrap.New(transport, slogger)
+	bs := bootstrap.New(s, slogger)
 	h := hub.New()
 	ac := agentclient.New(agentclient.Config{
-		Transport:  transport,
+		Transport:  s,
 		Bootstrap:  bs,
 		Log:        slogger,
 		StderrSink: os.Stderr,
@@ -98,10 +109,18 @@ func NewProd() (*App, error) {
 	})
 	rd := discover.NewAgent(ac)
 
+	// The daemon requires port forwarding; assert the capability loudly at
+	// wiring time rather than failing deep in the engine.
+	var tr transport.Transport = s
+	pf, ok := tr.(transport.PortForwarder)
+	if !ok {
+		return nil, fmt.Errorf("transport %s does not implement PortForwarder", tr.Describe().Impl)
+	}
+
 	return &App{
 		Paths: paths, Cfg: cfg, Runner: runner, Clk: clk, Log: logf,
 		Audit:     audit.New(paths.ConfigDir),
-		Transport: transport, Ports: ports, Discover: rd, Service: svc,
+		Transport: tr, PF: pf, Ports: ports, Discover: rd, Service: svc,
 		Bootstrap: bs, AgentClient: ac, Hub: h,
 	}, nil
 }
@@ -111,7 +130,7 @@ func NewProd() (*App, error) {
 // handle OpenURL events should set the returned engine's OpenURLSink before
 // calling Run — or use NewEngineWithOpenURL for convenience.
 func (a *App) Engine() *forward.Engine {
-	e := forward.New(a.Transport, a.Ports, a.Discover, a.Cfg, a.Clk, a.Log,
+	e := forward.New(a.Transport, a.PF, a.Ports, a.Discover, a.Cfg, a.Clk, a.Log,
 		Interval, DenyPorts, SkipLocal)
 	if a.AgentClient != nil {
 		e.AgentEvents = adaptAgentEvents(a.AgentClient.Events())

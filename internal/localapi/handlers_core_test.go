@@ -3,6 +3,7 @@ package localapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/service"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
 )
 
 // fakeAgent is a function-level AgentSource fake (no wire, no goroutines).
@@ -29,11 +31,19 @@ func (f *fakeAgent) LastDisconnectErr() string          { return f.lastErr }
 
 type fakeMaster struct{ pid int }
 
-func (f fakeMaster) MasterPID(context.Context) (int, error) { return f.pid, nil }
+func (f fakeMaster) Health(context.Context) (transport.Health, error) {
+	if f.pid <= 0 {
+		return transport.Health{Up: false}, nil
+	}
+	return transport.Health{Up: true, Pid: f.pid, Detail: fmt.Sprintf("pid=%d", f.pid)}, nil
+}
+func (f fakeMaster) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: "fakehost", Endpoint: "/tmp/fake-sock"}
+}
 
 type fakeForwards struct{ lines []string }
 
-func (f fakeForwards) MasterForwardLines(context.Context, int) ([]string, error) {
+func (f fakeForwards) ForwardLines(context.Context) ([]string, error) {
 	return f.lines, nil
 }
 

@@ -218,13 +218,13 @@ func viewFromLocal(ctx context.Context, a *app.App) statusView {
 	if !v.hostKnown {
 		return v
 	}
-	pid, _ := a.Transport.MasterPID(ctx)
-	v.masterPID = pid
-	v.masterUp = pid > 0
+	h, _ := a.Transport.Health(ctx)
+	v.masterPID = h.Pid
+	v.masterUp = h.Up
 	if !v.masterUp {
 		return v
 	}
-	lines, _ := a.Ports.MasterForwardLines(ctx, pid)
+	lines, _ := a.PF.ForwardLines(ctx)
 	v.forwards = lines
 	if a.AgentClient != nil {
 		if ack := a.AgentClient.HelloAck(); ack != nil {
@@ -296,7 +296,11 @@ func runPorts(ctx context.Context, w, errw io.Writer, a *app.App) error {
 	if host == "" {
 		return fmt.Errorf("no dev box configured — run: %s install <ssh-host>", app.Tool)
 	}
-	if pid, _, err := a.Transport.EnsureMaster(ctx); err != nil || pid == 0 {
+	if _, err := a.Transport.Ensure(ctx); err != nil {
+		fmt.Fprintf(errw, "could not reach %s\n", host)
+		return errSilent
+	}
+	if h, _ := a.Transport.Health(ctx); !h.Up {
 		fmt.Fprintf(errw, "could not reach %s\n", host)
 		return errSilent
 	}

@@ -2,15 +2,17 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
 )
 
-// doctorFakeTransport implements sshctl.Transport for the doctor tests. It
+// doctorFakeTransport implements transport.Transport for the doctor tests. It
 // scripts ssh-exec replies by matching a substring of the script the doctor
 // passes to Exec (the doctor builds distinct scripts per probe), so a test can
 // simulate any combination of "shim wins / real wins / missing", "portald
@@ -24,31 +26,32 @@ type doctorFakeTransport struct {
 	matchOrder []string
 }
 
-func (f *doctorFakeTransport) MasterPID(ctx context.Context) (int, error) { return f.pid, nil }
-func (f *doctorFakeTransport) EnsureMaster(ctx context.Context) (int, bool, error) {
-	return f.pid, false, nil
+func (f *doctorFakeTransport) Ensure(context.Context) (bool, error) { return false, nil }
+func (f *doctorFakeTransport) Health(context.Context) (transport.Health, error) {
+	if f.pid <= 0 {
+		return transport.Health{Up: false}, nil
+	}
+	return transport.Health{Up: true, Pid: f.pid, Detail: fmt.Sprintf("pid=%d", f.pid)}, nil
 }
-func (f *doctorFakeTransport) Forward(ctx context.Context, l, r int) error { return nil }
-func (f *doctorFakeTransport) Cancel(ctx context.Context, l, r int) error  { return nil }
-func (f *doctorFakeTransport) Exit(ctx context.Context) (bool, error)      { return true, nil }
-func (f *doctorFakeTransport) Host() string                                { return "fakehost" }
-func (f *doctorFakeTransport) Sock() string                                { return "/tmp/sock-fake" }
-func (f *doctorFakeTransport) ExecBytes(_ context.Context, _ []byte, _ ...string) (string, string, error) {
-	return "", "", nil
+func (f *doctorFakeTransport) Close(context.Context) (bool, error) { return true, nil }
+func (f *doctorFakeTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: "fakehost", Endpoint: "/tmp/sock-fake"}
 }
-func (f *doctorFakeTransport) ExecStream(_ context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+func (f *doctorFakeTransport) Stream(_ context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	return nil, nil, nil, nil, nil
 }
 
-func (f *doctorFakeTransport) Exec(_ context.Context, _ string, argv ...string) (string, error) {
+func (f *doctorFakeTransport) Exec(_ context.Context, _ []byte, argv ...string) (string, string, error) {
 	joined := strings.Join(argv, " ")
 	for _, key := range f.matchOrder {
 		if strings.Contains(joined, key) {
-			return f.execReply[key], nil
+			return f.execReply[key], "", nil
 		}
 	}
-	return "", nil
+	return "", "", nil
 }
+
+var _ transport.Transport = (*doctorFakeTransport)(nil)
 
 // TestRunDoctor_AllGreen exercises the happy path: master up, both shims win
 // PATH, current shim version, portald present advertising both verbs, and a
