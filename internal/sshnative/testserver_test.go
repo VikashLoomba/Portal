@@ -1,0 +1,256 @@
+package sshnative
+
+import (
+	"bytes"
+	"crypto"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/crypto/ssh/knownhosts"
+)
+
+// testServer is an in-process x/crypto/ssh SERVER on a random loopback port. It
+// accepts publickey auth for a single test-generated key and runs each exec
+// request LOCALLY via `sh -c` — matching the shell-join model the native client
+// emits — piping stdout/stderr/exit-status back. It is _test-only (this file is
+// never shipped). The direct-tcpip handler for port forwarding arrives in u4.
+type testServer struct {
+	ln      net.Listener
+	hostKey ssh.Signer
+	addr    string // "127.0.0.1:<port>"
+}
+
+// newTestServer starts a server whose publickey callback accepts exactly
+// authorized. It generates a fresh host key and cleans up on test end.
+func newTestServer(t *testing.T, authorized ssh.PublicKey) *testServer {
+	t.Helper()
+	hostSigner := generateSSHKey(t)
+
+	cfg := &ssh.ServerConfig{
+		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if bytes.Equal(key.Marshal(), authorized.Marshal()) {
+				return &ssh.Permissions{}, nil
+			}
+			return nil, fmt.Errorf("unknown public key")
+		},
+	}
+	cfg.AddHostKey(hostSigner)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	s := &testServer{ln: ln, hostKey: hostSigner, addr: ln.Addr().String()}
+	go s.serve(cfg)
+	t.Cleanup(func() { ln.Close() })
+	return s
+}
+
+func (s *testServer) serve(cfg *ssh.ServerConfig) {
+	for {
+		conn, err := s.ln.Accept()
+		if err != nil {
+			return
+		}
+		go s.handleConn(conn, cfg)
+	}
+}
+
+func (s *testServer) handleConn(nConn net.Conn, cfg *ssh.ServerConfig) {
+	sconn, chans, reqs, err := ssh.NewServerConn(nConn, cfg)
+	if err != nil {
+		nConn.Close()
+		return
+	}
+	defer sconn.Close()
+	// Global requests include keepalive@openssh.com; DiscardRequests replies
+	// false (no error), which the client counts as a successful keepalive.
+	go ssh.DiscardRequests(reqs)
+	for newChan := range chans {
+		if newChan.ChannelType() != "session" {
+			newChan.Reject(ssh.UnknownChannelType, "only session channels are supported")
+			continue
+		}
+		go s.handleSession(newChan)
+	}
+}
+
+func (s *testServer) handleSession(newChan ssh.NewChannel) {
+	ch, reqs, err := newChan.Accept()
+	if err != nil {
+		return
+	}
+	for req := range reqs {
+		switch req.Type {
+		case "exec":
+			var payload struct{ Command string }
+			if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
+				req.Reply(false, nil)
+				ch.Close()
+				return
+			}
+			req.Reply(true, nil)
+			s.runCommand(ch, payload.Command)
+			return
+		default:
+			if req.WantReply {
+				req.Reply(false, nil)
+			}
+		}
+	}
+}
+
+// runCommand executes command via `sh -c` locally, wiring the channel as
+// stdin/stdout and the extended-data stream as stderr, then reports exit-status.
+func (s *testServer) runCommand(ch ssh.Channel, command string) {
+	cmd := exec.Command("sh", "-c", command)
+	cmd.Stdin = ch
+	cmd.Stdout = ch
+	cmd.Stderr = ch.Stderr()
+
+	var status uint32
+	if err := cmd.Run(); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			status = uint32(ee.ExitCode())
+		} else {
+			status = 1
+		}
+	}
+	ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
+	ch.Close()
+}
+
+// knownHostsLine renders the server's real host key as a known_hosts entry for
+// its loopback address, for tests to write to a temp file.
+func (s *testServer) knownHostsLine() string {
+	return knownhosts.Line([]string{knownhosts.Normalize(s.addr)}, s.hostKey.PublicKey())
+}
+
+// target returns user@127.0.0.1:<port> for New.
+func (s *testServer) target(user string) string { return user + "@" + s.addr }
+
+// insecureIgnoreHostKey is a host-key callback that accepts any key. Used ONLY
+// by unit tests that never dial (target-parse/Describe/no-dial), so no real
+// verification is exercised.
+var insecureIgnoreHostKey = ssh.InsecureIgnoreHostKey()
+
+// lineFor renders a known_hosts entry binding addr to signer's public key —
+// used to write a DELIBERATELY WRONG host key for the strict-failure test.
+func lineFor(addr string, signer ssh.Signer) string {
+	return knownhosts.Line([]string{knownhosts.Normalize(addr)}, signer.PublicKey())
+}
+
+// --- key/fixture helpers ---
+
+// generateSSHKey returns a fresh ed25519 ssh.Signer.
+func generateSSHKey(t *testing.T) ssh.Signer {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519: %v", err)
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("signer from key: %v", err)
+	}
+	return signer
+}
+
+// generateKeyPair returns a fresh ed25519 private key and its ssh.Signer.
+func generateKeyPair(t *testing.T) (ed25519.PrivateKey, ssh.Signer) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519: %v", err)
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("signer from key: %v", err)
+	}
+	return priv, signer
+}
+
+// writeKnownHosts writes line to a temp known_hosts file and returns its path.
+func writeKnownHosts(t *testing.T, line string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "known_hosts")
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatalf("write known_hosts: %v", err)
+	}
+	return path
+}
+
+// writeIdentityFile writes priv as an unencrypted OpenSSH PEM key to a temp
+// file and returns its path.
+func writeIdentityFile(t *testing.T, priv crypto.PrivateKey) string {
+	t.Helper()
+	block, err := ssh.MarshalPrivateKey(priv, "")
+	if err != nil {
+		t.Fatalf("marshal private key: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "id_ed25519")
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatalf("write identity file: %v", err)
+	}
+	return path
+}
+
+// writeEncryptedIdentityFile writes priv as a passphrase-encrypted OpenSSH PEM
+// key to a temp file and returns its path.
+func writeEncryptedIdentityFile(t *testing.T, priv crypto.PrivateKey) string {
+	t.Helper()
+	block, err := ssh.MarshalPrivateKeyWithPassphrase(priv, "", []byte("hunter2"))
+	if err != nil {
+		t.Fatalf("marshal encrypted private key: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "id_ed25519")
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatalf("write encrypted identity file: %v", err)
+	}
+	return path
+}
+
+// startFakeAgent serves an in-process ssh-agent holding priv over a temp unix
+// socket (short path to stay under the OS sun_path limit) and returns the
+// socket path.
+func startFakeAgent(t *testing.T, priv crypto.PrivateKey) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "a")
+	if err != nil {
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "s")
+
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen agent socket: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	keyring := agent.NewKeyring()
+	if err := keyring.Add(agent.AddedKey{PrivateKey: priv}); err != nil {
+		t.Fatalf("agent add key: %v", err)
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go agent.ServeAgent(keyring, conn)
+		}
+	}()
+	return sock
+}
