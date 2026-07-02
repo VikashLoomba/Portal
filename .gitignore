@@ -5,3 +5,4 @@
 /.go-cache/
 internal/bootstrap/agent/portald-linux-amd64
 internal/bootstrap/agent/sha.txt
+.claude/settings.local.json
