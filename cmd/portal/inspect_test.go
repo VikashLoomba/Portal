@@ -1,0 +1,259 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
+)
+
+// EC1: status sourced over the socket includes the agent line plus the master/
+// forward lines from the daemon's deps.
+func TestRunStatusTo_DaemonUp_AgentLine(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	d := startFakeDaemon(t, cfg,
+		withHelloAck(&protocol.HelloAck{
+			AgentPID:    4321,
+			AgentGitSHA: "0123456789abcdef", // > 12 runes: truncation asserted below
+			Kernel:      "Linux-test",
+		}),
+		withMasterPID(4242),
+		withForwardLines([]string{"127.0.0.1:9000"}),
+	)
+	a := newDaemonTestApp(t, d.path, cfg)
+
+	var buf bytes.Buffer
+	if err := runStatusTo(context.Background(), &buf, a); err != nil {
+		t.Fatalf("runStatusTo: %v", err)
+	}
+	got := buf.String()
+	for _, want := range []string{
+		"agent: pid=4321 sha=0123456789ab kernel=Linux-test\n",
+		"ssh master: UP (pid=4242) host=devbox\n",
+		"active forwards (local listeners owned by master):\n",
+		"  127.0.0.1:9000\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("status output missing %q\n--- got ---\n%s", want, got)
+		}
+	}
+}
+
+// EC4: the shared renderer produces today's exact layout. Case (a) vs (b) proves
+// the ONLY delta is the agent line.
+func TestRenderStatus_Golden(t *testing.T) {
+	const label = "com.test.portal"
+	const sock = "/tmp/cm.sock"
+
+	base := statusView{
+		host:       "devbox",
+		label:      label,
+		hostKnown:  true,
+		loaded:     true,
+		stateLines: []string{"state = running"},
+		masterUp:   true,
+		masterPID:  4242,
+		sock:       sock,
+		forwards:   []string{"127.0.0.1:8080", "[::1]:8080"},
+	}
+	withAgent := base
+	withAgent.agent = &statusAgentView{pid: 1234, sha: "abc123def456", kernel: "Linux"}
+
+	tests := []struct {
+		name string
+		view statusView
+		want string
+	}{
+		{
+			name: "host_master_up_agent_forwards",
+			view: withAgent,
+			want: "dev box: devbox\n" +
+				"service (com.test.portal):\n" +
+				"state = running\n" +
+				"\n" +
+				"ssh master: UP (pid=4242) host=devbox\n" +
+				"agent: pid=1234 sha=abc123def456 kernel=Linux\n" +
+				"active forwards (local listeners owned by master):\n" +
+				"  127.0.0.1:8080\n" +
+				"  [::1]:8080\n",
+		},
+		{
+			name: "same_without_agent",
+			view: base,
+			want: "dev box: devbox\n" +
+				"service (com.test.portal):\n" +
+				"state = running\n" +
+				"\n" +
+				"ssh master: UP (pid=4242) host=devbox\n" +
+				"active forwards (local listeners owned by master):\n" +
+				"  127.0.0.1:8080\n" +
+				"  [::1]:8080\n",
+		},
+		{
+			name: "master_down_early_return",
+			view: statusView{
+				host: "devbox", label: label, hostKnown: true,
+				loaded: false, masterUp: false, sock: sock,
+			},
+			want: "dev box: devbox\n" +
+				"service (com.test.portal):\n" +
+				"  not loaded (run: portal install)\n" +
+				"\n" +
+				"ssh master: DOWN (host=devbox sock=/tmp/cm.sock)\n",
+		},
+		{
+			name: "not_configured_early_return",
+			view: statusView{
+				label: label, hostKnown: false, loaded: false,
+			},
+			want: "dev box: <not configured>\n" +
+				"service (com.test.portal):\n" +
+				"  not loaded (run: portal install)\n" +
+				"\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var b bytes.Buffer
+			renderStatus(&b, tt.view)
+			if got := b.String(); got != tt.want {
+				t.Errorf("renderStatus mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, tt.want)
+			}
+		})
+	}
+}
+
+// wantLocalStatus is the exact viewFromLocal render for newDaemonTestApp's fakes
+// (host devbox, master pid 7777, service loaded, one forward line). No agent
+// line — a short-lived CLI has no in-process handshake.
+const wantLocalStatus = "dev box: devbox\n" +
+	"service (com.test.portal):\n" +
+	"state = running\n" +
+	"\n" +
+	"ssh master: UP (pid=7777) host=devbox\n" +
+	"active forwards (local listeners owned by master):\n" +
+	"  127.0.0.1:5173\n"
+
+// EC2: status falls back to viewFromLocal for a nonexistent socket, a plain
+// file, and a hung listener — each with no agent line and no error spam.
+func TestRunStatusTo_DaemonDown_Fallback(t *testing.T) {
+	t.Run("nonexistent_socket", func(t *testing.T) {
+		cfg := newTestConfig(t, "devbox")
+		a := newDaemonTestApp(t, filepath.Join(t.TempDir(), "nope.sock"), cfg)
+		assertLocalFallback(t, context.Background(), a)
+	})
+
+	t.Run("plain_file", func(t *testing.T) {
+		cfg := newTestConfig(t, "devbox")
+		f := filepath.Join(t.TempDir(), "notasocket")
+		if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		a := newDaemonTestApp(t, f, cfg)
+		assertLocalFallback(t, context.Background(), a)
+	})
+
+	t.Run("hung_listener", func(t *testing.T) {
+		cfg := newTestConfig(t, "devbox")
+		// A listener that never accepts: the dial succeeds, the HTTP request
+		// stalls, and the short ctx (not StatusTimeout) tears it down.
+		dir, err := os.MkdirTemp("/tmp", "portal-hung-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+		sock := filepath.Join(dir, "api.sock")
+		ln, err := net.Listen("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = ln.Close() })
+
+		a := newDaemonTestApp(t, sock, cfg)
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		assertLocalFallback(t, ctx, a)
+	})
+}
+
+// assertLocalFallback runs runStatusTo and asserts the local render byte-for-byte
+// (which also proves no error text leaked into the output).
+func assertLocalFallback(t *testing.T, ctx context.Context, a *app.App) {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := runStatusTo(ctx, &buf, a); err != nil {
+		t.Fatalf("runStatusTo: %v", err)
+	}
+	if got := buf.String(); got != wantLocalStatus {
+		t.Errorf("fallback render mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, wantLocalStatus)
+	}
+	if strings.Contains(buf.String(), "agent:") {
+		t.Errorf("fallback must not print an agent line, got:\n%s", buf.String())
+	}
+}
+
+// EC (ports): daemon-up serves the cached Snapshot as the port list.
+func TestRunPorts_DaemonUp_Snapshot(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	d := startFakeDaemon(t, cfg, withSnapshot([]uint16{8081, 9090}, true))
+	a := newDaemonTestApp(t, d.path, cfg)
+
+	var out, errb bytes.Buffer
+	if err := runPorts(context.Background(), &out, &errb, a); err != nil {
+		t.Fatalf("runPorts: %v", err)
+	}
+	want := "loopback dev ports listening on devbox (will be forwarded):\n" +
+		"  8081\n" +
+		"  9090\n"
+	if out.String() != want {
+		t.Errorf("ports output mismatch:\n--- got ---\n%s\n--- want ---\n%s", out.String(), want)
+	}
+	if errb.Len() != 0 {
+		t.Errorf("unexpected stderr: %q", errb.String())
+	}
+}
+
+// EC (ports): daemon up but no cached Snapshot yet (503 not_connected) prints
+// the header only — no CLI-side agent is spun up.
+func TestRunPorts_DaemonUp_NotConnected(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	d := startFakeDaemon(t, cfg, withSnapshot(nil, false))
+	a := newDaemonTestApp(t, d.path, cfg)
+
+	var out, errb bytes.Buffer
+	if err := runPorts(context.Background(), &out, &errb, a); err != nil {
+		t.Fatalf("runPorts: %v", err)
+	}
+	want := "loopback dev ports listening on devbox (will be forwarded):\n"
+	if out.String() != want {
+		t.Errorf("header-only mismatch:\n--- got ---\n%s\n--- want ---\n%s", out.String(), want)
+	}
+}
+
+// EC2 (ports): a bad socket falls through to the local EnsureMaster/DesiredPorts
+// path.
+func TestRunPorts_DaemonDown_Fallback(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	a := newDaemonTestApp(t, filepath.Join(t.TempDir(), "nope.sock"), cfg)
+
+	var out, errb bytes.Buffer
+	if err := runPorts(context.Background(), &out, &errb, a); err != nil {
+		t.Fatalf("runPorts: %v", err)
+	}
+	want := "loopback dev ports listening on devbox (will be forwarded):\n" +
+		"  5173\n" +
+		"  6006\n"
+	if out.String() != want {
+		t.Errorf("fallback ports mismatch:\n--- got ---\n%s\n--- want ---\n%s", out.String(), want)
+	}
+	if errb.Len() != 0 {
+		t.Errorf("unexpected stderr: %q", errb.String())
+	}
+}
