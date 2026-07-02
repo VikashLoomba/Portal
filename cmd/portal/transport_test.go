@@ -27,9 +27,13 @@ func TestRunTransport_NoArgPrintsActiveImpl(t *testing.T) {
 }
 
 // `portal transport native`/`system` round-trips through SetTransport and notes
-// the required daemon restart.
+// the required daemon restart. A native-compatible host (user@host) is written
+// first so the native selection passes the T2 host-compatibility gate.
 func TestRunTransport_SetRoundTrip(t *testing.T) {
 	cfg := config.New(t.TempDir())
+	if err := cfg.WriteHost("user@box"); err != nil {
+		t.Fatal(err)
+	}
 	a := &app.App{Cfg: cfg, Transport: nativeHealthTransport{up: true, pid: 0}}
 
 	for _, name := range []string{"native", "system"} {
@@ -46,6 +50,39 @@ func TestRunTransport_SetRoundTrip(t *testing.T) {
 		}
 		if !strings.Contains(buf.String(), "restart") {
 			t.Errorf("set %q output should note a daemon restart, got %q", name, buf.String())
+		}
+	}
+}
+
+// Selecting `native` against an ssh-alias host (not user@host[:port]) is a usage
+// error that NEVER persists the selection — the guard that prevents native+alias
+// from bricking App construction on every subsequent command. `system` against
+// the same alias host is always allowed (it resolves aliases via ssh_config).
+func TestRunTransport_NativeRejectedForAliasHost(t *testing.T) {
+	for _, host := range []string{"mybox", ""} {
+		cfg := config.New(t.TempDir())
+		if host != "" {
+			if err := cfg.WriteHost(host); err != nil {
+				t.Fatal(err)
+			}
+		}
+		a := &app.App{Cfg: cfg, Transport: nativeHealthTransport{up: true, pid: 0}}
+
+		err := runTransport(io.Discard, a, []string{"native"})
+		if err == nil {
+			t.Fatalf("host %q: selecting native against a non-native host should be a usage error", host)
+		}
+		if _, ok := err.(usageErr); !ok {
+			t.Errorf("host %q: error type = %T, want usageErr", host, err)
+		}
+		// The rejected selection must NOT be written: config stays system.
+		if got, _ := cfg.Transport(); got != "system" {
+			t.Errorf("host %q: config Transport = %q after rejected native select, want system (unchanged)", host, got)
+		}
+
+		// system is still selectable against the same alias host.
+		if err := runTransport(io.Discard, a, []string{"system"}); err != nil {
+			t.Errorf("host %q: selecting system should be allowed, got %v", host, err)
 		}
 	}
 }

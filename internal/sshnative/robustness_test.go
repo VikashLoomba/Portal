@@ -250,3 +250,52 @@ func TestKeepaliveMarksDeadOnConnectionDrop(t *testing.T) {
 		t.Errorf("post-heal Exec: out=%q err=%v", out, err)
 	}
 }
+
+// TestKeepaliveTimesOutOnBlackHole (finding 3) drives the REAL keepalive loop
+// against a BLACK-HOLED half-open connection: the server accepts the keepalive
+// global request but NEVER replies and NEVER closes the TCP conn (the laptop
+// sleep / wifi-drop / NAT-rebind scenario this tool must self-heal from). Unlike
+// dropConns (a clean RST that makes SendRequest return EOF immediately), here a
+// SendRequest with NO reply deadline would block until the OS TCP retransmit
+// timeout (~15 min), the ticker would never fire again, and Health.Up would stay
+// true forever. The per-probe reply deadline is the ONLY thing that detects
+// this; after keepaliveStrikes timed-out probes Health.Up must flip false within
+// the bounded strike window. A regression that drops the reply deadline hangs
+// here until the 3s guard fails.
+func TestKeepaliveTimesOutOnBlackHole(t *testing.T) {
+	clientPriv, clientSigner := generateKeyPair(t)
+	srv := newTestServer(t, clientSigner.PublicKey(), withSwallowGlobalRequests())
+	kh := writeKnownHosts(t, srv.knownHostsLine())
+	keyFile := writeIdentityFile(t, clientPriv)
+
+	// 20ms period / 3 strikes: each black-holed probe times out after ~period, so
+	// detection fires in roughly period*strikes — well inside the 3s guard.
+	c, err := New(srv.target("testuser"),
+		WithKnownHostsPath(kh),
+		WithIdentityFiles(keyFile),
+		WithAgentSocket(""),
+		WithKeepalive(20*time.Millisecond, 3))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { c.Close(context.Background()) })
+	if _, err := c.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if h, _ := c.Health(context.Background()); !h.Up {
+		t.Fatal("Health.Up = false right after dial, want true")
+	}
+
+	// The server holds every keepalive without replying and keeps the TCP conn
+	// open; only the reply deadline can notice. Health.Up must flip false.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if h, _ := c.Health(context.Background()); !h.Up {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Health.Up stayed true against a black-holed connection: keepalive has no reply deadline (blocks ~15min, never strikes)")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

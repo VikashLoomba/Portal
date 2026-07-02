@@ -171,6 +171,17 @@ func New(target string, opts ...Option) (*Client, error) {
 	return c, nil
 }
 
+// ValidTarget reports whether target is a well-formed user@host[:port] the
+// native transport can dial (the same parse New performs, without constructing a
+// client or touching ~/.ssh). Selection-time callers use it to reject
+// `transport native` for an ssh-alias or empty host — which native cannot
+// resolve — BEFORE the bad selection is persisted and bricks App construction on
+// every subsequent command.
+func ValidTarget(target string) error {
+	_, _, _, err := parseTarget(target)
+	return err
+}
+
 // parseTarget splits user@host[:port]. A missing user is an error naming the
 // accepted form. Missing port defaults to 22.
 func parseTarget(target string) (user, host string, port int, err error) {
@@ -312,19 +323,47 @@ func (c *Client) startKeepaliveLocked(client *ssh.Client) {
 			case <-stop:
 				return
 			case <-ticker.C:
-				_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
-				if err != nil {
-					strikes++
-					if strikes >= strikeLimit {
-						c.markDead(client)
-						return
-					}
+				if keepaliveProbe(client, period, stop) {
+					strikes = 0
 					continue
 				}
-				strikes = 0
+				strikes++
+				if strikes >= strikeLimit {
+					c.markDead(client)
+					return
+				}
 			}
 		}
 	}()
+}
+
+// keepaliveProbe sends one keepalive@openssh.com global request and waits at
+// most timeout for the reply, returning true only on a reply. A transport error
+// OR a timeout returns false (a strike). The reply deadline is ESSENTIAL: on a
+// black-holed half-open connection (laptop sleep, wifi drop, NAT rebind — the
+// primary failure this tool must self-heal from) the peer never replies and
+// never sends a FIN/RST, so a bare SendRequest blocks until the OS TCP
+// retransmit timeout (~15 min on Linux), leaving Health.Up=true and the ticker
+// stuck for the whole window. The probe goroutine may outlive this call while
+// still blocked in SendRequest; res is buffered so it never leaks, and it exits
+// when the connection is eventually torn down. A stop closes the wait promptly
+// (teardown) and is reported as success so the caller's next loop observes stop.
+func keepaliveProbe(client *ssh.Client, timeout time.Duration, stop <-chan struct{}) bool {
+	res := make(chan error, 1)
+	go func() {
+		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+		res <- err
+	}()
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case err := <-res:
+		return err == nil
+	case <-t.C:
+		return false // black-holed: no reply within the deadline -> strike
+	case <-stop:
+		return true // teardown; do not count a strike, the loop will exit on stop
+	}
 }
 
 // markDead flags the connection dead if client is still the current one, so the

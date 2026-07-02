@@ -30,6 +30,12 @@ type doctorFakeTransport struct {
 	// impl overrides Describe().Impl; empty means the default "system-ssh" so the
 	// existing byte-compat fixtures are unaffected.
 	impl string
+	// needsEnsure models the native shape: a freshly-built native client has not
+	// dialed, so Health reports DOWN until Ensure connects it. runDoctor MUST
+	// Ensure before the Health gate or a healthy native box wrongly fails the
+	// master check. ensured records whether runDoctor called Ensure.
+	needsEnsure bool
+	ensured     bool
 	// execReply maps a substring that must appear in the Exec script to the
 	// stdout to return. The FIRST matching key (in matchOrder) wins, so order
 	// disambiguates overlapping scripts.
@@ -37,8 +43,14 @@ type doctorFakeTransport struct {
 	matchOrder []string
 }
 
-func (f *doctorFakeTransport) Ensure(context.Context) (bool, error) { return false, nil }
+func (f *doctorFakeTransport) Ensure(context.Context) (bool, error) {
+	f.ensured = true
+	return true, nil
+}
 func (f *doctorFakeTransport) Health(context.Context) (transport.Health, error) {
+	if f.needsEnsure && !f.ensured {
+		return transport.Health{Up: false}, nil
+	}
 	if f.forceUp {
 		return transport.Health{Up: true, Pid: f.pid, Detail: fmt.Sprintf("pid=%d", f.pid)}, nil
 	}
@@ -104,6 +116,32 @@ func TestRunDoctor_AllGreen(t *testing.T) {
 	assertCheck(t, rep, "shim version", doctor.Pass)
 	assertCheck(t, rep, "agent verb: clip", doctor.Pass)
 	assertCheck(t, rep, "agent verb: notify", doctor.Pass)
+}
+
+// TestRunDoctor_EnsuresBeforeHealthGate pins finding 4: runDoctor must Ensure
+// the transport before the step-1 Health check. A freshly-built native client
+// reports Health.Up=false until it dials (New never dials), so the two direct
+// callers (install self-test, daemon-down fallback) would render a flatly-wrong
+// "ssh master DOWN" on a healthy native box without this Ensure. The fake here
+// is DOWN until Ensure is called, exactly like an undialed native client.
+func TestRunDoctor_EnsuresBeforeHealthGate(t *testing.T) {
+	order, reply := greenReplies()
+	tr := &doctorFakeTransport{
+		needsEnsure: true, // DOWN until Ensure dials (native shape)
+		forceUp:     true, // after Ensure: Up with pid 0
+		pid:         0,
+		impl:        "native-ssh",
+		matchOrder:  order,
+		execReply:   reply,
+	}
+	rep := runDoctor(context.Background(), "fakehost", tr)
+	if !tr.ensured {
+		t.Fatal("runDoctor must call Ensure before the Health gate (native needs a dial to become healthy)")
+	}
+	assertCheck(t, rep, "ssh master", doctor.Pass)
+	if !rep.OK() {
+		t.Fatalf("expected PASS after Ensure brought the native transport up, got:\n%s", reportString(rep))
+	}
 }
 
 // TestRunDoctor_MasterDown bails after the master check fails — no remote probe
@@ -372,10 +410,12 @@ func TestRunDoctor_NativeImpl_TransportAndForwardChecks(t *testing.T) {
 // TestRunDoctorCmd_FallbackNativeSelection: with the daemon down AND the native
 // transport selected in config, the fallback transport is factory-constructed so
 // the report surfaces `transport: native-ssh` (selection honored even with the
-// daemon down, T8). The native client is undialed here, so the master check
-// FAILs — we assert only that the selection surfaced, not overall PASS.
+// daemon down, T8). runDoctor now Ensures before the Health gate (finding 4), so
+// the native client attempts a dial; 127.0.0.1:1 refuses instantly (no DNS, no
+// timeout), the master check FAILs, and we assert only that the selection
+// surfaced — not overall PASS.
 func TestRunDoctorCmd_FallbackNativeSelection(t *testing.T) {
-	cfg := newTestConfig(t, "user@devbox")
+	cfg := newTestConfig(t, "user@127.0.0.1:1")
 	if err := cfg.SetTransport("native"); err != nil {
 		t.Fatal(err)
 	}

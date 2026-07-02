@@ -34,13 +34,30 @@ type testServer struct {
 	hostKey ssh.Signer
 	addr    string // "127.0.0.1:<port>"
 
+	// swallowGlobalRequests, when set, makes the server READ global requests
+	// (e.g. keepalive@openssh.com) but NEVER reply — modeling a black-holed
+	// half-open TCP link where packets are silently dropped and no RST arrives.
+	// The TCP connection is left open, so a client that blocks on the reply
+	// without a deadline never learns the peer is gone. Set before serving.
+	swallowGlobalRequests bool
+
 	mu    sync.Mutex
 	conns []net.Conn // every accepted TCP conn, so dropConns can sever them
 }
 
+// serverOption mutates a testServer before it starts serving.
+type serverOption func(*testServer)
+
+// withSwallowGlobalRequests makes the server drain global requests without ever
+// replying (black-hole), so a client keepalive with wantReply blocks until it
+// hits its own reply deadline.
+func withSwallowGlobalRequests() serverOption {
+	return func(s *testServer) { s.swallowGlobalRequests = true }
+}
+
 // newTestServer starts a server whose publickey callback accepts exactly
 // authorized. It generates a fresh host key and cleans up on test end.
-func newTestServer(t *testing.T, authorized ssh.PublicKey) *testServer {
+func newTestServer(t *testing.T, authorized ssh.PublicKey, opts ...serverOption) *testServer {
 	t.Helper()
 	hostSigner := generateSSHKey(t)
 
@@ -59,6 +76,9 @@ func newTestServer(t *testing.T, authorized ssh.PublicKey) *testServer {
 		t.Fatalf("listen: %v", err)
 	}
 	s := &testServer{ln: ln, hostKey: hostSigner, addr: ln.Addr().String()}
+	for _, o := range opts {
+		o(s)
+	}
 	go s.serve(cfg)
 	t.Cleanup(func() { ln.Close() })
 	return s
@@ -97,9 +117,19 @@ func (s *testServer) handleConn(nConn net.Conn, cfg *ssh.ServerConfig) {
 		return
 	}
 	defer sconn.Close()
-	// Global requests include keepalive@openssh.com; DiscardRequests replies
-	// false (no error), which the client counts as a successful keepalive.
-	go ssh.DiscardRequests(reqs)
+	// Global requests include keepalive@openssh.com. Normally DiscardRequests
+	// replies false (no error), which the client counts as a successful
+	// keepalive. In swallow mode we drain the requests but NEVER reply, so a
+	// client keepalive with wantReply blocks until its own reply deadline —
+	// the black-holed half-open link the keepalive deadline exists to catch.
+	if s.swallowGlobalRequests {
+		go func() {
+			for range reqs {
+			}
+		}()
+	} else {
+		go ssh.DiscardRequests(reqs)
+	}
 	for newChan := range chans {
 		switch newChan.ChannelType() {
 		case "session":
@@ -122,9 +152,13 @@ type directTCPIPPayload struct {
 }
 
 // handleDirectTCPIP dials the requested host:port on THIS machine and copies
-// bytes bidirectionally between the ssh channel and the local connection,
-// closing both on either side's EOF. This makes the native client's
-// direct-tcpip forwards round-trip fully in-process.
+// bytes bidirectionally between the ssh channel and the local connection with
+// TCP half-close semantics — exactly as a real ssh server does: a client FIN
+// (channel EOF) is mapped to shutdown(SHUT_WR) on the remote conn while the
+// reverse direction stays open, so a request/response service can still write
+// its reply after reading the request to EOF. Both ends are fully closed only
+// after BOTH copies finish. This makes the native client's direct-tcpip forwards
+// round-trip faithfully in-process, including the half-close path.
 func (s *testServer) handleDirectTCPIP(newChan ssh.NewChannel) {
 	var p directTCPIPPayload
 	if err := ssh.Unmarshal(newChan.ExtraData(), &p); err != nil {
@@ -143,8 +177,25 @@ func (s *testServer) handleDirectTCPIP(newChan ssh.NewChannel) {
 		return
 	}
 	go ssh.DiscardRequests(reqs)
-	go func() { io.Copy(ch, remote); ch.Close() }()
-	go func() { io.Copy(remote, ch); remote.Close() }()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(ch, remote)
+		ch.CloseWrite() // remote EOF -> channel EOF (client read side sees FIN)
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(remote, ch)
+		if cw, ok := remote.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite() // channel EOF -> remote SHUT_WR (half-close)
+		}
+	}()
+	go func() {
+		wg.Wait()
+		ch.Close()
+		remote.Close()
+	}()
 }
 
 func (s *testServer) handleSession(newChan ssh.NewChannel) {

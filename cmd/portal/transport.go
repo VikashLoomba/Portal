@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshnative"
 )
 
 // newTransportCmd implements `portal transport [name]` (T8). With no argument it
@@ -35,6 +36,20 @@ func runTransport(w io.Writer, a *app.App, args []string) error {
 		return nil
 	}
 	name := args[0]
+	// Reject `transport native` unless the configured host is a native target
+	// (user@host[:port]). Native has no ssh_config alias resolution, so selecting
+	// it against an alias/empty host would build a client that fails at App
+	// construction and brick EVERY subsequent command (including this revert).
+	// Fail here, before persisting, with a message that points at the fix.
+	if name == "native" {
+		host, _ := a.Cfg.ReadHost()
+		if err := sshnative.ValidTarget(host); err != nil {
+			return usageErr{msg: fmt.Sprintf(
+				"cannot select native transport: configured host %q is not a native target (%v); "+
+					"native requires user@host[:port] — set one with `%s host <user@host>` first",
+				host, err, app.Tool)}
+		}
+	}
 	if err := a.Cfg.SetTransport(name); err != nil {
 		return usageErr{msg: err.Error()}
 	}

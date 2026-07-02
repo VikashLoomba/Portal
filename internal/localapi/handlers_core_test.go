@@ -41,6 +41,19 @@ func (f fakeMaster) Describe() transport.Desc {
 	return transport.Desc{Impl: "system-ssh", Host: "fakehost", Endpoint: "/tmp/fake-sock"}
 }
 
+// nativeFakeMaster models a native-selected daemon: Up with Pid 0 (native has no
+// pid ground truth), Detail "connected", and Describe().Impl "native-ssh". It
+// pins the T9/EC7 wire fields Master.transport/Master.detail the daemon-up
+// `portal status` reads to decide whether to print the `transport: <impl>` line.
+type nativeFakeMaster struct{}
+
+func (nativeFakeMaster) Health(context.Context) (transport.Health, error) {
+	return transport.Health{Up: true, Pid: 0, Detail: "connected"}, nil
+}
+func (nativeFakeMaster) Describe() transport.Desc {
+	return transport.Desc{Impl: "native-ssh", Host: "box", Endpoint: "user@box:22"}
+}
+
 type fakeForwards struct{ lines []string }
 
 func (f fakeForwards) ForwardLines(context.Context) ([]string, error) {
@@ -172,8 +185,57 @@ func TestHandleStatus_AgentPresent(t *testing.T) {
 	if !got.Master.Up || got.Master.Pid != 4321 {
 		t.Errorf("Master = %+v, want Up pid=4321", got.Master)
 	}
+	// The Master.transport/detail wire fields (T9/EC7) must round-trip from
+	// Describe().Impl / Health.Detail — the daemon-up `portal status` reads these
+	// exact JSON fields to render the transport line.
+	if got.Master.Transport != "system-ssh" {
+		t.Errorf("Master.Transport = %q, want system-ssh", got.Master.Transport)
+	}
+	if got.Master.Detail != "pid=4321" {
+		t.Errorf("Master.Detail = %q, want pid=4321", got.Master.Detail)
+	}
 	if len(got.Forwards) != 1 || got.Forwards[0].Name != "127.0.0.1:8080->box:8080" {
 		t.Errorf("Forwards = %+v", got.Forwards)
+	}
+}
+
+// TestHandleStatus_NativeTransportWireFields pins finding 5 / T9 / EC7: on the
+// production daemon-up status path, the Master.transport and Master.detail JSON
+// fields must carry Describe().Impl and Health.Detail respectively (Pid stays 0
+// for native). A regression that populated Transport from the wrong Desc field
+// (e.g. Host) or dropped it would make a native daemon's `portal status` print a
+// wrong/missing transport line; this is the only test that asserts these two
+// wire-carried fields on the daemon-up path.
+func TestHandleStatus_NativeTransportWireFields(t *testing.T) {
+	s := New(Deps{
+		Version: VersionInfo{Version: "9.9", GitSHA: "deadbeef", ProtoVersion: 4},
+		Host:    func() (string, error) { return "box", nil },
+		Master:  nativeFakeMaster{},
+		Config:  config.New(t.TempDir()),
+		Hub:     hub.New(),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var got Status
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.Master.Up {
+		t.Error("Master.Up = false, want true (native connected)")
+	}
+	if got.Master.Transport != "native-ssh" {
+		t.Errorf("Master.Transport = %q, want native-ssh", got.Master.Transport)
+	}
+	if got.Master.Pid != 0 {
+		t.Errorf("Master.Pid = %d, want 0 (native has no pid)", got.Master.Pid)
+	}
+	if got.Master.Detail != "connected" {
+		t.Errorf("Master.Detail = %q, want connected", got.Master.Detail)
 	}
 }
 

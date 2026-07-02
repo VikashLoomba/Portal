@@ -166,6 +166,16 @@ func runDoctor(ctx context.Context, host string, tr transport.Transport) *doctor
 
 	// 1. Master connectivity. Without the ControlMaster the daemon can't relay a
 	// clip request at all; everything downstream is moot.
+	//
+	// Ensure BEFORE the Health gate: the two direct callers (install self-test,
+	// daemon-down fallback) build a FRESH transport that has never been brought
+	// up. For native that transport has not dialed, so Health reports DOWN until
+	// Ensure connects — without this a healthy native box would wrongly fail the
+	// master check. Ensure is idempotent for system (a no-op when the shared
+	// ControlMaster is already up, which is the install case running right after
+	// `portal start`). A dial error is not fatal here; the Health gate below
+	// still renders the DOWN line.
+	_, _ = tr.Ensure(ctx)
 	if h, err := tr.Health(ctx); err != nil || !h.Up {
 		rep.Add("ssh master", doctor.Fail, "DOWN — start the daemon: "+app.Tool+" start")
 		// Without a master we cannot run any remote probe; bail with what we have.

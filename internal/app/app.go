@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -80,11 +81,20 @@ func NewProd() (*App, error) {
 	ports := proc.New(LsofPath, runner)
 	// NewProd routes ssh stderr to os.Stderr so launchd's StandardErrorPath
 	// captures host-key churn / mux warnings — the DESIGN-split-daemon invariant
-	// (bash relied on stderr inheritance). An invalid transport config is a LOUD
-	// startup failure here, never a silent fallback.
+	// (bash relied on stderr inheritance).
+	//
+	// A transport-construction failure (e.g. `native` selected but the configured
+	// host is an ssh alias native cannot resolve — see NewTransport) must NOT
+	// abort App construction: main() builds the App before dispatching ANY
+	// command, so aborting here would brick every command — including the
+	// `transport system` revert and `host` reconfigure the user needs to recover.
+	// Instead we install errTransport, which surfaces the error LOUDLY (never a
+	// silent fallback to system) on the transport-touching commands while leaving
+	// config-only commands (transport/host/help/allow…) fully usable.
 	tr, pf, err := NewTransport(paths, host, runner, cfg, os.Stderr)
 	if err != nil {
-		return nil, err
+		et := errTransport{err: err}
+		tr, pf = et, et
 	}
 	svc := service.New(service.Spec{
 		Label:   paths.Label,
@@ -167,6 +177,46 @@ func NewTransport(paths Paths, host string, runner run.Runner, cfg *config.Store
 		return s, s, nil
 	}
 }
+
+// errTransport is the graceful-degradation placeholder NewProd installs when the
+// selection-aware factory cannot build the configured transport. It satisfies
+// both transport.Transport and transport.PortForwarder, returning the stored
+// construction error from every operation that would touch the box so the
+// failure is surfaced on the affected commands rather than aborting App
+// construction (which would brick the CLI's own recovery commands). Health
+// reports Down with the error as Detail (never itself an error) so `portal
+// status`/doctor render a clean DOWN line instead of crashing.
+type errTransport struct{ err error }
+
+var (
+	_ transport.Transport     = errTransport{}
+	_ transport.PortForwarder = errTransport{}
+)
+
+func (e errTransport) Ensure(context.Context) (bool, error) { return false, e.err }
+
+func (e errTransport) Health(context.Context) (transport.Health, error) {
+	return transport.Health{Up: false, Pid: 0, Detail: e.err.Error()}, nil
+}
+
+func (e errTransport) Exec(context.Context, []byte, ...string) (string, string, error) {
+	return "", "", e.err
+}
+
+func (e errTransport) Stream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+	return nil, nil, nil, nil, e.err
+}
+
+func (e errTransport) Close(context.Context) (bool, error) { return false, nil }
+
+func (e errTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: "unavailable", Endpoint: e.err.Error()}
+}
+
+func (e errTransport) Forward(context.Context, int, int) error        { return e.err }
+func (e errTransport) Cancel(context.Context, int, int) error         { return e.err }
+func (e errTransport) ListForwards(context.Context) ([]int, error)    { return nil, e.err }
+func (e errTransport) ForwardLines(context.Context) ([]string, error) { return nil, e.err }
 
 // Engine constructs a fresh forward.Engine using the App's wiring. The
 // engine is event-driven via AgentClient.Events(). Callers that want to

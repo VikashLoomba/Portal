@@ -21,6 +21,7 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"sync"
 
 	"golang.org/x/crypto/ssh"
 
@@ -69,8 +70,14 @@ func (c *Client) acceptForwards(ln net.Listener, remote int) {
 }
 
 // handleForwardConn opens a direct-tcpip channel to localhost:<remote> on the
-// current live client and copies bytes bidirectionally, closing both sides on
-// either side's EOF.
+// current live client and copies bytes bidirectionally with TCP half-close
+// semantics: when one direction reaches EOF it half-closes ONLY that direction
+// (so the peer observes EOF on its read side) and leaves the reverse direction
+// open. Both endpoints are fully closed (via the defers) only after BOTH copies
+// finish. This matches what system-ssh forwarding does and is REQUIRED for
+// request/response protocols where a client shutdown(SHUT_WR)s to signal
+// end-of-request and then reads the reply: full-closing on the first EOF would
+// drop the reply before the remote service writes it.
 func (c *Client) handleForwardConn(conn net.Conn, remote int) {
 	defer conn.Close()
 
@@ -84,12 +91,29 @@ func (c *Client) handleForwardConn(conn net.Conn, remote int) {
 	}
 	defer ch.Close()
 
-	// Copy in both directions; the first side to hit EOF triggers the defers,
-	// which close both endpoints and unblock the other copy.
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(ch, conn); done <- struct{}{} }()
-	go func() { io.Copy(conn, ch); done <- struct{}{} }()
-	<-done
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(ch, conn)  // client -> remote
+		halfCloseWrite(ch) // client FIN -> remote sees EOF (reverse stays open)
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(conn, ch)    // remote -> client
+		halfCloseWrite(conn) // remote EOF -> client sees FIN (forward stays open)
+	}()
+	wg.Wait()
+}
+
+// halfCloseWrite shuts down only the write half of c when it supports it (both
+// *net.TCPConn and the ssh direct-tcpip channel do), so the peer observes EOF on
+// its read side while the reverse direction keeps flowing. A conn without
+// CloseWrite is left untouched — the deferred full Close still tears it down.
+func halfCloseWrite(c net.Conn) {
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
 }
 
 // currentClient returns the live *ssh.Client, or nil if the connection is down

@@ -61,6 +61,33 @@ func startEchoRemote(t *testing.T) int {
 	return portOf(t, ln.Addr())
 }
 
+// startRequestResponseRemote stands up a TCP listener whose handler reads the
+// ENTIRE request to EOF (i.e. it waits for the client's shutdown(SHUT_WR)) and
+// only THEN writes its response before closing — the classic request/response
+// TCP protocol that a half-close-unaware proxy truncates. It returns the port.
+func startRequestResponseRemote(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("remote listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				req, _ := io.ReadAll(c) // blocks until the client half-closes its write side
+				c.Write([]byte("response-for:" + string(req)))
+			}(conn)
+		}
+	}()
+	return portOf(t, ln.Addr())
+}
+
 // reserveLocalPort binds an ephemeral loopback port, closes it, and returns the
 // number for use as a Forward local port. Small TOCTOU window tolerated (tests
 // are serial).
@@ -152,6 +179,50 @@ func TestForwardRoundTrip(t *testing.T) {
 	}
 	if refused := dialRefused(t, local); !refused {
 		t.Errorf("dial 127.0.0.1:%d after Cancel succeeded, want connection-refused", local)
+	}
+}
+
+// TestForwardHalfCloseDeliversResponse (finding 1) proves the forward honors TCP
+// half-close: a client that writes its request, shutdown(SHUT_WR)s to signal
+// end-of-request, and then reads the reply must receive the FULL response. The
+// remote service writes its reply only AFTER reading the request to EOF, so a
+// proxy that tears down both directions on the client FIN would truncate/drop
+// the reply. `cat`-style echo tests cannot catch this because they never
+// half-close; this test does.
+func TestForwardHalfCloseDeliversResponse(t *testing.T) {
+	ctx := context.Background()
+	c := newForwardClient(t)
+	remotePort := startRequestResponseRemote(t)
+	local := reserveLocalPort(t)
+
+	if err := c.Forward(ctx, local, remotePort); err != nil {
+		t.Fatalf("Forward(%d,%d): %v", local, remotePort, err)
+	}
+
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(local), 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial forwarded 127.0.0.1:%d: %v", local, err)
+	}
+	defer conn.Close()
+
+	req := []byte("half-close-request")
+	if _, err := conn.Write(req); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	// Signal end-of-request by half-closing the write side (SHUT_WR) while keeping
+	// the read side open for the reply.
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read response after half-close: %v", err)
+	}
+	want := []byte("response-for:" + string(req))
+	if !bytes.Equal(got, want) {
+		t.Errorf("response after half-close = %q, want %q (reply was truncated — half-close not honored)", got, want)
 	}
 }
 
