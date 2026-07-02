@@ -688,6 +688,101 @@ func TestProxyJumpPrecedenceOverCommand(t *testing.T) {
 	}
 }
 
+// countingCloser is a recording io.Closer: it counts Close calls so a test can
+// assert the ProxyCommand process closer was reaped exactly once.
+type countingCloser struct {
+	mu     sync.Mutex
+	closes int
+}
+
+func (c *countingCloser) Close() error {
+	c.mu.Lock()
+	c.closes++
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *countingCloser) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closes
+}
+
+// closeCountingConn wraps a net.Conn and counts Close calls, so a test can assert
+// the handshake-failure cleanup closed the ProxyCommand stdio conn too.
+type closeCountingConn struct {
+	net.Conn
+	mu     sync.Mutex
+	closes int
+}
+
+func (c *closeCountingConn) Close() error {
+	c.mu.Lock()
+	c.closes++
+	c.mu.Unlock()
+	return c.Conn.Close()
+}
+
+func (c *closeCountingConn) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closes
+}
+
+// TestProxyCommandHandshakeFailureClosesCloser (EC15) proves dialViaProxyCommand's
+// handshake-failure cleanup closes BOTH the stdio conn AND the process closer when
+// ssh.NewClientConn fails on a peer that connects but never speaks SSH. Every other
+// ProxyCommand test hands back a server end that handshakes successfully (or fails
+// before the seam), so the closer.Close on proxy.go's error branch — the ONLY thing
+// that reaps the real `sh -c` subprocess on a post-connect handshake failure, since
+// nothing is stored in c.proxyCloser for teardownLocked to reap — is otherwise
+// unexercised. The seam returns a live loopback conn whose server end is severed
+// immediately, so the SSH version exchange reads EOF and NewClientConn fails.
+// Dropping closer.Close() there leaks the subprocess and its fds; this test catches
+// that regression.
+func TestProxyCommandHandshakeFailureClosesCloser(t *testing.T) {
+	ctx := context.Background()
+	clientPriv, clientSigner := generateKeyPair(t)
+	b := newTestServer(t, clientSigner.PublicKey())
+	bHost, bPort := serverEndpoint(t, b)
+	fake := fakeResolver{
+		"target": {User: "testuser", HostName: bHost, Port: bPort, ProxyCommand: "nc %h %p"},
+	}
+	kh := writeKnownHostsLines(t, b)
+	keyFile := writeIdentityFile(t, clientPriv)
+
+	closer := &countingCloser{}
+	var conn *closeCountingConn
+	dialer := func(_ context.Context, _ string) (net.Conn, io.Closer, error) {
+		clientEnd, serverEnd := loopbackPipe(t)
+		// Sever the peer immediately: the client's SSH version exchange reads EOF,
+		// so ssh.NewClientConn fails without ever completing the handshake — the
+		// hermetic stand-in for a proxy conn that connects but speaks non-SSH.
+		serverEnd.Close()
+		conn = &closeCountingConn{Conn: clientEnd}
+		return conn, closer, nil
+	}
+	c := newProxyClient(t, fake, keyFile, kh, WithProxyCommandDialer(dialer))
+
+	if _, err := c.Ensure(ctx); err == nil {
+		t.Fatal("Ensure with non-SSH proxycommand peer: want handshake error, got nil")
+	} else if !strings.Contains(err.Error(), "proxycommand handshake") {
+		t.Errorf("error = %v, want proxycommand handshake failure", err)
+	}
+	if n := closer.count(); n != 1 {
+		t.Errorf("process closer Close calls = %d, want exactly 1 (handshake-failure cleanup)", n)
+	}
+	if conn == nil {
+		t.Fatal("seam was never invoked")
+	}
+	if n := conn.count(); n < 1 {
+		t.Errorf("stdio conn Close calls = %d, want >= 1 (handshake-failure cleanup)", n)
+	}
+	// The failed dial stored nothing: c.proxyCloser stays nil, so teardownLocked
+	// never re-reaps the closer — the error-branch Close is the sole reaper.
+	assertNothingStored(t, c)
+}
+
 // --- Chain teardown (EC15) ---
 
 // TestChainTeardownProxyJump (EC15) proves Close tears down the jump chain (the
