@@ -6,9 +6,10 @@ package sshnative
 // channel to each subsequent hop (and finally the target) as the next net.Conn.
 // Each hop is resolved by the SAME ConfigResolver; expandJumpChain is a
 // depth-first LEFT-EXPANSION — a hop that itself carries a ProxyJump is reached
-// through its own jumps FIRST (matching OpenSSH) — under a visited-set + hop-cap
-// guard whose termination is guaranteed: the visited set rejects any repeated
-// token (including a hop that loops back on itself) and the cap bounds a runaway
+// through its own jumps FIRST (matching OpenSSH) — under a per-branch
+// ancestor-path cycle guard + hop-cap whose termination is guaranteed: the
+// ancestor path rejects a hop that is its own ancestor (a true loop) while
+// allowing a hop shared by two sibling branches, and the cap bounds a runaway
 // resolver, both aborting with nothing dialed. Every hop enforces STRICT
 // host-key verification keyed by the RAW net.JoinHostPort query address — the
 // same locked mechanic New uses for the target: net.JoinHostPort(alias,"22")
@@ -77,19 +78,24 @@ func portOr22(p int) int {
 // first) by depth-first LEFT-EXPANSION of ProxyJump: each token is resolved by
 // the SAME ConfigResolver, and if the resolved hop carries its OWN ProxyJump it
 // is expanded (and thus dialed) FIRST — matching OpenSSH, where a hop `a` with
-// `ProxyJump x` reaches x before a. The visited-set (keyed by token) rejects
-// cycles (including a hop whose own ProxyJump loops back), and the hop-cap
-// bounds runaway chains; both return a clear error and leave nothing dialed.
+// `ProxyJump x` reaches x before a. Cycle detection tracks the ANCESTOR PATH
+// currently being expanded (per branch), not a global set of every hop ever
+// appended: a hop reached independently by two sibling branches is NOT a cycle
+// (OpenSSH dials it once per branch through its own connection context — e.g.
+// `target -> a,b` with `a -> bastion` and `b -> bastion` flattens to
+// [bastion,a,bastion,b], each direct-tcpip hop reaching the next), whereas a hop
+// that is its own ancestor IS a cycle and aborts. The ancestor path can hold no
+// repeat, so recursion depth is bounded by the distinct-host count; the hop-cap
+// bounds the flattened length against a runaway (diamond) config. Both return a
+// clear error and leave nothing dialed.
 func (c *Client) expandJumpChain(ctx context.Context) ([]ResolvedHost, error) {
 	var chain []ResolvedHost
-	visited := make(map[string]bool)
-	var expand func(jump string) error
-	expand = func(jump string) error {
+	var expand func(jump string, ancestors map[string]bool) error
+	expand = func(jump string, ancestors map[string]bool) error {
 		for _, token := range splitJumpList(jump) {
-			if visited[token] {
+			if ancestors[token] {
 				return fmt.Errorf("sshnative: proxyjump cycle at %q", token)
 			}
-			visited[token] = true
 			if len(chain) >= maxProxyHops {
 				return fmt.Errorf("sshnative: proxyjump exceeds %d hops", maxProxyHops)
 			}
@@ -98,15 +104,20 @@ func (c *Client) expandJumpChain(ctx context.Context) ([]ResolvedHost, error) {
 				return fmt.Errorf("sshnative: resolve proxyjump hop %q: %w", token, err)
 			}
 			if rh.ProxyJump != "" && rh.ProxyJump != "none" {
-				if err := expand(rh.ProxyJump); err != nil {
+				// Mark this token as an ancestor ONLY while its own ProxyJump is
+				// expanded, then unmark: a later sibling branch may legitimately
+				// reach the same hop again without it being a cycle.
+				ancestors[token] = true
+				if err := expand(rh.ProxyJump, ancestors); err != nil {
 					return err
 				}
+				delete(ancestors, token)
 			}
 			chain = append(chain, rh)
 		}
 		return nil
 	}
-	if err := expand(c.proxyJump); err != nil {
+	if err := expand(c.proxyJump, make(map[string]bool)); err != nil {
 		return nil, err
 	}
 	return chain, nil
@@ -309,6 +320,15 @@ func (p proxyProcessCloser) Close() error {
 // stdioConn adapts a subprocess's stdout (Read) and stdin (Write) to a net.Conn
 // for the ssh handshake. Deadlines are best-effort no-ops (a pipe has none);
 // CloseWrite closes stdin so the peer observes EOF on its read side.
+//
+// LocalAddr/RemoteAddr MUST return an addr whose String() splits into host:port:
+// x/crypto's knownhosts.check runs net.SplitHostPort(remote.String()) as its FIRST
+// step and returns that error before it ever consults the (correct) lookup-key
+// address, so an unsplittable remote (e.g. String()=="stdio") fails STRICT
+// host-key verification for EVERY ProxyCommand target even when the key is
+// recorded. A zero *net.TCPAddr (String()=="0.0.0.0:0") is splittable and mirrors
+// exactly what x/crypto's own direct-tcpip chanConn returns for the ProxyJump
+// path, so verification reaches the lookup-key preference and succeeds.
 type stdioConn struct {
 	stdout io.ReadCloser
 	stdin  io.WriteCloser
@@ -328,14 +348,14 @@ func (s *stdioConn) Close() error {
 
 func (s *stdioConn) CloseWrite() error { return s.stdin.Close() }
 
-func (s *stdioConn) LocalAddr() net.Addr                { return stdioAddr{} }
-func (s *stdioConn) RemoteAddr() net.Addr               { return stdioAddr{} }
+// stdioZeroAddr is the placeholder remote/local addr for a stdio-backed
+// ProxyCommand conn. Its String() ("0.0.0.0:0") is net.SplitHostPort-splittable,
+// which knownhosts.check requires before it consults the real lookup-key address;
+// it mirrors x/crypto's own chanConn zero addr on the ProxyJump path.
+var stdioZeroAddr net.Addr = &net.TCPAddr{}
+
+func (s *stdioConn) LocalAddr() net.Addr                { return stdioZeroAddr }
+func (s *stdioConn) RemoteAddr() net.Addr               { return stdioZeroAddr }
 func (s *stdioConn) SetDeadline(t time.Time) error      { return nil }
 func (s *stdioConn) SetReadDeadline(t time.Time) error  { return nil }
 func (s *stdioConn) SetWriteDeadline(t time.Time) error { return nil }
-
-// stdioAddr is the placeholder net.Addr for a stdio-backed ProxyCommand conn.
-type stdioAddr struct{}
-
-func (stdioAddr) Network() string { return "stdio" }
-func (stdioAddr) String() string  { return "stdio" }

@@ -1037,3 +1037,186 @@ func waitClosed(client *ssh.Client, timeout time.Duration) bool {
 		return false
 	}
 }
+
+// TestMain lets this test binary re-exec itself as a stdio<->TCP relay: when
+// PROXY_RELAY_ADDR is set it becomes the relay (a real ProxyCommand subprocess)
+// and never runs the suite. TestProxyCommandRealStdioConn uses this to drive the
+// REAL defaultProxyCommandDialer/stdioConn through a real SSH handshake.
+func TestMain(m *testing.M) {
+	if addr := os.Getenv("PROXY_RELAY_ADDR"); addr != "" {
+		os.Exit(runStdioTCPRelay(addr))
+	}
+	os.Exit(m.Run())
+}
+
+// runStdioTCPRelay copies this process's stdin->conn and conn->stdout for a TCP
+// conn to addr, mapping a stdin EOF to a TCP half-close — a minimal `nc`-style
+// relay so a real ProxyCommand subprocess reaches an in-process test server.
+func runStdioTCPRelay(addr string) int {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "relay dial:", err)
+		return 1
+	}
+	defer conn.Close()
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(conn, os.Stdin)
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(os.Stdout, conn)
+		done <- struct{}{}
+	}()
+	<-done
+	<-done
+	return 0
+}
+
+// shellSingleQuote wraps s in single quotes for safe `sh -c` interpolation.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// TestProxyCommandRealStdioConn (EC13) drives the REAL defaultProxyCommandDialer
+// and stdioConn end to end: a real ProxyCommand subprocess (this test binary
+// re-exec'd as a stdio<->TCP relay) reaches the in-process target's TCP listener,
+// and the whole SSH handshake + an Exec flow over the real stdioConn against the
+// REAL knownhosts-backed host-key callback (no WithProxyCommandDialer seam, no
+// WithHostKeyCallback override). This catches two production-only regressions the
+// loopback-TCP-seam round-trip tests mask: (1) an unsplittable stdioConn
+// RemoteAddr (String()=="stdio") failing strict host-key verification for every
+// ProxyCommand target, and (2) swapped stdioConn Read/Write/CloseWrite wiring
+// breaking the version/KEX exchange.
+func TestProxyCommandRealStdioConn(t *testing.T) {
+	ctx := context.Background()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	clientPriv, clientSigner := generateKeyPair(t)
+	b := newTestServer(t, clientSigner.PublicKey()) // target: reached over its real TCP listener
+	bHost, bPort := serverEndpoint(t, b)
+	// The relay connects to the target's real listen addr; %h/%p are irrelevant
+	// here (the relay reads PROXY_RELAY_ADDR), so use a fixed template.
+	cmd := fmt.Sprintf("PROXY_RELAY_ADDR=%s exec %s", b.addr, shellSingleQuote(exe))
+	fake := fakeResolver{
+		"target": {User: "testuser", HostName: bHost, Port: bPort, ProxyCommand: cmd},
+	}
+	kh := writeKnownHostsLines(t, b)
+	keyFile := writeIdentityFile(t, clientPriv)
+	// No WithProxyCommandDialer: the real subprocess dialer + stdioConn are used,
+	// and no host-key override: the real knownhosts callback verifies the target.
+	c := newProxyClient(t, fake, keyFile, kh)
+
+	if _, err := c.Ensure(ctx); err != nil {
+		t.Fatalf("Ensure via real ProxyCommand stdioConn: %v", err)
+	}
+	stdout, _, err := c.Exec(ctx, nil, "echo", "hi")
+	if err != nil {
+		t.Fatalf("Exec via real ProxyCommand stdioConn: %v", err)
+	}
+	if strings.TrimSpace(stdout) != "hi" {
+		t.Errorf("Exec stdout = %q, want %q", stdout, "hi")
+	}
+}
+
+// TestProxyJumpSharedHopDiamond (EC12) proves a hop shared by two sibling
+// ProxyJump branches is NOT rejected as a false cycle: `target -> a,b` with
+// `a -> bastion` and `b -> bastion` left-expands to [bastion,a,bastion,b] (the
+// shared bastion legitimately dialed once per branch, matching OpenSSH's
+// per-branch connection context) and the chain reaches the target. The old
+// global visited-set aborted this with `proxyjump cycle at "bastion"`.
+func TestProxyJumpSharedHopDiamond(t *testing.T) {
+	ctx := context.Background()
+	clientPriv, clientSigner := generateKeyPair(t)
+	bastion := newTestServer(t, clientSigner.PublicKey())
+	a := newTestServer(t, clientSigner.PublicKey())
+	bb := newTestServer(t, clientSigner.PublicKey())
+	target := newTestServer(t, clientSigner.PublicKey())
+	bastHost, bastPort := serverEndpoint(t, bastion)
+	aHost, aPort := serverEndpoint(t, a)
+	bHost, bPort := serverEndpoint(t, bb)
+	tHost, tPort := serverEndpoint(t, target)
+	fake := fakeResolver{
+		"target":  {User: "testuser", HostName: tHost, Port: tPort, ProxyJump: "a,b"},
+		"a":       {User: "testuser", HostName: aHost, Port: aPort, ProxyJump: "bastion"},
+		"b":       {User: "testuser", HostName: bHost, Port: bPort, ProxyJump: "bastion"},
+		"bastion": {User: "testuser", HostName: bastHost, Port: bastPort},
+	}
+	kh := writeKnownHostsLines(t, bastion, a, bb, target)
+	keyFile := writeIdentityFile(t, clientPriv)
+	c := newProxyClient(t, fake, keyFile, kh)
+
+	// Left-expansion flattens the diamond; the shared bastion appears in BOTH
+	// branches without being flagged as a cycle.
+	chain, err := c.expandJumpChain(ctx)
+	if err != nil {
+		t.Fatalf("expandJumpChain of shared-hop diamond: %v", err)
+	}
+	gotPorts := make([]int, len(chain))
+	for i, rh := range chain {
+		gotPorts[i] = rh.Port
+	}
+	wantPorts := []int{bastPort, aPort, bastPort, bPort}
+	if len(gotPorts) != len(wantPorts) {
+		t.Fatalf("chain ports = %v, want %v (bastion,a,bastion,b)", gotPorts, wantPorts)
+	}
+	for i := range wantPorts {
+		if gotPorts[i] != wantPorts[i] {
+			t.Fatalf("chain ports = %v, want %v (bastion,a,bastion,b)", gotPorts, wantPorts)
+		}
+	}
+
+	if _, err := c.Ensure(ctx); err != nil {
+		t.Fatalf("Ensure via shared-hop diamond: %v", err)
+	}
+	stdout, _, err := c.Exec(ctx, nil, "echo", "hi")
+	if err != nil {
+		t.Fatalf("Exec via shared-hop diamond: %v", err)
+	}
+	if strings.TrimSpace(stdout) != "hi" {
+		t.Errorf("Exec stdout = %q, want %q", stdout, "hi")
+	}
+}
+
+// TestProxyJumpWrongInnerHopKey (EC12) proves STRICT per-hop verification is
+// enforced at an INNER hop (position >= 2), not just the first hop: in the nested
+// chain hopa(A) -> hopb(B) -> target(C), a WRONG known_hosts key for the INNER
+// hop B (correct keys for A and C) aborts the WHOLE dial. A regression that
+// verified only the first hop (InsecureIgnoreHostKey for prev != nil) would
+// accept B's wrong key and reach C, so Ensure would wrongly succeed.
+func TestProxyJumpWrongInnerHopKey(t *testing.T) {
+	ctx := context.Background()
+	clientPriv, clientSigner := generateKeyPair(t)
+	a := newTestServer(t, clientSigner.PublicKey())  // first hop
+	b := newTestServer(t, clientSigner.PublicKey())  // INNER hop (position 2)
+	cc := newTestServer(t, clientSigner.PublicKey()) // target
+	aHost, aPort := serverEndpoint(t, a)
+	bHost, bPort := serverEndpoint(t, b)
+	cHost, cPort := serverEndpoint(t, cc)
+	fake := fakeResolver{
+		"target": {User: "testuser", HostName: cHost, Port: cPort, ProxyJump: "hopb"},
+		"hopb":   {User: "testuser", HostName: bHost, Port: bPort, ProxyJump: "hopa"},
+		"hopa":   {User: "testuser", HostName: aHost, Port: aPort},
+	}
+	// WRONG key for the INNER hop B; correct keys for first hop A and target C.
+	_, wrongSigner := generateKeyPair(t)
+	kh := writeKnownHosts(t, strings.Join([]string{
+		a.knownHostsLine(),
+		lineFor(b.addr, wrongSigner),
+		cc.knownHostsLine(),
+	}, "\n"))
+	keyFile := writeIdentityFile(t, clientPriv)
+	c := newProxyClient(t, fake, keyFile, kh)
+
+	if _, err := c.Ensure(ctx); err == nil {
+		t.Fatal("Ensure with wrong INNER hop key: want host-key error, got nil")
+	} else if !strings.Contains(err.Error(), "host key verification failed") {
+		t.Errorf("error = %v, want host-key verification failure", err)
+	}
+	assertNothingStored(t, c)
+}
