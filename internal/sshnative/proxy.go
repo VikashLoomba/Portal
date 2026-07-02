@@ -32,14 +32,21 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 )
 
-// maxProxyHops caps the flattened ProxyJump chain length so a runaway config
-// (or a resolver that keeps chaining) cannot dial without bound.
-const maxProxyHops = 10
+const (
+	// maxProxyHops caps the flattened ProxyJump chain length so a runaway config
+	// (or a resolver that keeps chaining) cannot dial without bound.
+	maxProxyHops = 10
+	// proxyCommandStderrLimit caps helper diagnostics so a chatty or looping
+	// ProxyCommand cannot grow memory without bound; the tail is kept because the
+	// useful failure detail is usually the last thing printed.
+	proxyCommandStderrLimit = 4 * 1024
+)
 
 // proxyCommandDialer execs a ProxyCommand and adapts its stdio to a net.Conn.
 // It is an injectable seam (WithProxyCommandDialer) so the ProxyCommand round
@@ -102,6 +109,9 @@ func (c *Client) expandJumpChain(ctx context.Context) ([]ResolvedHost, error) {
 			rh, err := c.resolver(ctx, token)
 			if err != nil {
 				return fmt.Errorf("sshnative: resolve proxyjump hop %q: %w", token, err)
+			}
+			if rh.ProxyCommand != "" && rh.ProxyCommand != "none" {
+				return fmt.Errorf("sshnative: proxyjump hop %q uses ProxyCommand, which native does not support for hops", token)
 			}
 			if rh.ProxyJump != "" && rh.ProxyJump != "none" {
 				// Mark this token as an ancestor ONLY while its own ProxyJump is
@@ -183,16 +193,20 @@ func (c *Client) dialViaProxyJump(ctx context.Context, targetCfg *ssh.ClientConf
 		hopAddr := net.JoinHostPort(rh.HostName, strconv.Itoa(portOr22(rh.Port)))
 		var raw net.Conn
 		if prev == nil {
-			raw, err = net.DialTimeout("tcp", hopAddr, dialTimeout)
+			dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+			raw, err = (&net.Dialer{Timeout: dialTimeout}).DialContext(dialCtx, "tcp", hopAddr)
+			cancel()
 		} else {
 			// A direct-tcpip channel from the current jump client is the next
 			// hop's underlying net.Conn.
-			raw, err = prev.Dial("tcp", hopAddr)
+			dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+			raw, err = prev.DialContext(dialCtx, "tcp", hopAddr)
+			cancel()
 		}
 		if err != nil {
 			return fail(fmt.Errorf("sshnative: dial proxyjump hop %s: %w", hopAddr, err))
 		}
-		conn, chans, reqs, err := ssh.NewClientConn(raw, hopAddr, hopCfg)
+		conn, chans, reqs, err := newClientConnWithWatchdog(ctx, raw, hopAddr, hopCfg)
 		if err != nil {
 			raw.Close()
 			return fail(fmt.Errorf("sshnative: handshake proxyjump hop %s: %w", hopAddr, err))
@@ -206,11 +220,13 @@ func (c *Client) dialViaProxyJump(ctx context.Context, targetCfg *ssh.ClientConf
 	// target's strict host-key callback (built by New), so the target is verified
 	// with the same raw-JoinHostPort mechanic.
 	targetAddr := net.JoinHostPort(c.host, strconv.Itoa(c.port))
-	raw, err := prev.Dial("tcp", targetAddr)
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	raw, err := prev.DialContext(dialCtx, "tcp", targetAddr)
+	cancel()
 	if err != nil {
 		return fail(fmt.Errorf("sshnative: dial target %s via proxyjump: %w", targetAddr, err))
 	}
-	conn, chans, reqs, err := ssh.NewClientConn(raw, targetAddr, targetCfg)
+	conn, chans, reqs, err := newClientConnWithWatchdog(ctx, raw, targetAddr, targetCfg)
 	if err != nil {
 		raw.Close()
 		return fail(fmt.Errorf("sshnative: handshake target %s via proxyjump: %w", targetAddr, err))
@@ -233,15 +249,67 @@ func (c *Client) dialViaProxyCommand(ctx context.Context, targetCfg *ssh.ClientC
 		return nil, nil, fmt.Errorf("sshnative: proxycommand dial: %w", err)
 	}
 	addr := net.JoinHostPort(c.host, strconv.Itoa(c.port))
-	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, targetCfg)
+	sshConn, chans, reqs, err := newClientConnWithWatchdog(ctx, conn, addr, targetCfg)
 	if err != nil {
 		conn.Close()
 		if closer != nil {
 			closer.Close()
 		}
+		stderr := proxyCommandStderr(closer)
+		if stderr != "" {
+			return nil, nil, fmt.Errorf("sshnative: proxycommand handshake %s: %w: %s", addr, err, stderr)
+		}
 		return nil, nil, fmt.Errorf("sshnative: proxycommand handshake %s: %w", addr, err)
 	}
 	return ssh.NewClient(sshConn, chans, reqs), closer, nil
+}
+
+// newClientConnWithWatchdog bounds ssh.NewClientConn for conns whose deadline
+// methods are ineffective (notably ProxyCommand stdio and direct-tcpip channels).
+// Closing the underlying net.Conn is the only portable way to unblock x/crypto's
+// handshake when the peer accepts but never speaks SSH.
+func newClientConnWithWatchdog(ctx context.Context, raw net.Conn, addr string, cfg *ssh.ClientConfig) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
+	done := make(chan struct{})
+	watchdogDone := make(chan struct{})
+	causeCh := make(chan error, 1)
+	timer := time.NewTimer(dialTimeout)
+
+	go func() {
+		defer close(watchdogDone)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			causeCh <- ctx.Err()
+			raw.Close()
+		case <-timer.C:
+			causeCh <- fmt.Errorf("handshake timeout after %s", dialTimeout)
+			raw.Close()
+		case <-done:
+		}
+	}()
+
+	conn, chans, reqs, err := ssh.NewClientConn(raw, addr, cfg)
+	close(done)
+	<-watchdogDone
+	if err != nil {
+		select {
+		case cause := <-causeCh:
+			if cause != nil {
+				return nil, nil, nil, fmt.Errorf("%w: %v", cause, err)
+			}
+		default:
+		}
+		return nil, nil, nil, err
+	}
+	select {
+	case cause := <-causeCh:
+		if cause != nil {
+			conn.Close()
+			return nil, nil, nil, cause
+		}
+	default:
+	}
+	return conn, chans, reqs, nil
 }
 
 // expandProxyCommand expands an OpenSSH ProxyCommand template in a single
@@ -292,6 +360,8 @@ func defaultProxyCommandDialer(ctx context.Context, command string) (net.Conn, i
 	// the caller), matching the direct-dial and ProxyJump paths, neither of which
 	// ties the persistent connection to ctx.
 	cmd := exec.CommandContext(context.WithoutCancel(ctx), "sh", "-c", command)
+	stderr := newLockedCappedBuffer(proxyCommandStderrLimit)
+	cmd.Stderr = stderr
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, nil, fmt.Errorf("sshnative: proxycommand stdin pipe: %w", err)
@@ -303,18 +373,77 @@ func defaultProxyCommandDialer(ctx context.Context, command string) (net.Conn, i
 	if err := cmd.Start(); err != nil {
 		return nil, nil, fmt.Errorf("sshnative: proxycommand start: %w", err)
 	}
-	return &stdioConn{stdout: stdout, stdin: stdin}, proxyProcessCloser{cmd: cmd}, nil
+	return &stdioConn{stdout: stdout, stdin: stdin}, proxyProcessCloser{cmd: cmd, stderr: stderr}, nil
 }
 
 // proxyProcessCloser kills and reaps the ProxyCommand subprocess. Close is the
 // process-exit teardown invoked from teardownLocked on Close/redial.
-type proxyProcessCloser struct{ cmd *exec.Cmd }
+type proxyProcessCloser struct {
+	cmd    *exec.Cmd
+	stderr *lockedCappedBuffer
+}
 
 func (p proxyProcessCloser) Close() error {
 	if p.cmd.Process != nil {
 		p.cmd.Process.Kill()
 	}
 	return p.cmd.Wait()
+}
+
+func (p proxyProcessCloser) proxyCommandStderr() string {
+	if p.stderr == nil {
+		return ""
+	}
+	return strings.TrimSpace(p.stderr.String())
+}
+
+type proxyCommandStderrProvider interface {
+	proxyCommandStderr() string
+}
+
+func proxyCommandStderr(closer io.Closer) string {
+	provider, ok := closer.(proxyCommandStderrProvider)
+	if !ok {
+		return ""
+	}
+	return provider.proxyCommandStderr()
+}
+
+// lockedCappedBuffer keeps only the stderr tail. os/exec may write to Stderr
+// from a copier goroutine while Close/Wait is still in progress, so readers and
+// writers synchronize even though dialViaProxyCommand reads after Close returns.
+type lockedCappedBuffer struct {
+	mu    sync.Mutex
+	limit int
+	buf   []byte
+}
+
+func newLockedCappedBuffer(limit int) *lockedCappedBuffer {
+	return &lockedCappedBuffer{limit: limit}
+}
+
+func (b *lockedCappedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.limit <= 0 {
+		return len(p), nil
+	}
+	if len(p) >= b.limit {
+		b.buf = append(b.buf[:0], p[len(p)-b.limit:]...)
+		return len(p), nil
+	}
+	b.buf = append(b.buf, p...)
+	if over := len(b.buf) - b.limit; over > 0 {
+		copy(b.buf, b.buf[over:])
+		b.buf = b.buf[:b.limit]
+	}
+	return len(p), nil
+}
+
+func (b *lockedCappedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(append([]byte(nil), b.buf...))
 }
 
 // stdioConn adapts a subprocess's stdout (Read) and stdin (Write) to a net.Conn
