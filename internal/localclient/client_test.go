@@ -460,6 +460,13 @@ func TestHungServerPerCallTimeout(t *testing.T) {
 	if _, err := c.Allow(ctx, 40085); err == nil {
 		t.Error("Allow err = nil, want a per-call StatusTimeout error")
 	}
+	// SetFeature is the PUT-with-body method; it must honor the per-call
+	// StatusTimeout under an unbounded ctx exactly like its GET/DELETE siblings.
+	// Before it was routed through newReq this case would hang forever if that
+	// inline timeout were dropped.
+	if _, err := c.SetFeature(ctx, config.FeatureNotify, false); err == nil {
+		t.Error("SetFeature err = nil, want a per-call StatusTimeout error")
+	}
 	if _, err := c.Doctor(ctx); err == nil {
 		t.Error("Doctor err = nil, want a per-call DoctorTimeout error")
 	}

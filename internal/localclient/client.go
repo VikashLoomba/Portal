@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -98,11 +99,14 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 }
 
 // newReq builds a request bound to the socket host under a fresh timeout derived
-// from ctx. The returned cancel MUST be deferred by the caller (it releases the
-// timeout even on the happy path).
-func (c *Client) newReq(ctx context.Context, method, path string, timeout time.Duration) (*http.Request, context.CancelFunc, error) {
+// from ctx. body is nil for GET/DELETE and the marshaled payload for PUT/POST.
+// Every method routes through here so the per-call timeout is applied uniformly
+// (there is no bespoke per-method timeout to drift out of coverage). The
+// returned cancel MUST be deferred by the caller (it releases the timeout even
+// on the happy path).
+func (c *Client) newReq(ctx context.Context, method, path string, timeout time.Duration, body io.Reader) (*http.Request, context.CancelFunc, error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
-	req, err := http.NewRequestWithContext(cctx, method, "http://unix"+path, nil)
+	req, err := http.NewRequestWithContext(cctx, method, "http://unix"+path, body)
 	if err != nil {
 		cancel()
 		return nil, nil, err
@@ -134,7 +138,7 @@ func decodeJSON[T any](resp *http.Response, v *T) error {
 // dial/transport error counts as down. It mirrors localapi.probeAlive but is
 // instance-scoped (uses this Client's socket + transport).
 func (c *Client) Available(ctx context.Context) bool {
-	req, cancel, err := c.newReq(ctx, http.MethodGet, "/v1/version", ProbeTimeout)
+	req, cancel, err := c.newReq(ctx, http.MethodGet, "/v1/version", ProbeTimeout, nil)
 	if err != nil {
 		return false
 	}
@@ -150,7 +154,7 @@ func (c *Client) Available(ctx context.Context) bool {
 // Status returns the full Status aggregate from GET /v1/status.
 func (c *Client) Status(ctx context.Context) (localapi.Status, error) {
 	var st localapi.Status
-	req, cancel, err := c.newReq(ctx, http.MethodGet, "/v1/status", StatusTimeout)
+	req, cancel, err := c.newReq(ctx, http.MethodGet, "/v1/status", StatusTimeout, nil)
 	if err != nil {
 		return st, err
 	}
@@ -172,7 +176,7 @@ func (c *Client) Status(ctx context.Context) (localapi.Status, error) {
 // Ports returns remote loopback listeners from GET /v1/ports. A 503 (no cached
 // Snapshot yet) maps to ErrNotConnected; any other non-2xx to *APIError.
 func (c *Client) Ports(ctx context.Context) ([]localapi.PortStatus, error) {
-	req, cancel, err := c.newReq(ctx, http.MethodGet, "/v1/ports", StatusTimeout)
+	req, cancel, err := c.newReq(ctx, http.MethodGet, "/v1/ports", StatusTimeout, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +217,7 @@ func (c *Client) Unallow(ctx context.Context, port int) ([]int, error) {
 }
 
 func (c *Client) mutateAllow(ctx context.Context, method string, port int) ([]int, error) {
-	req, cancel, err := c.newReq(ctx, method, "/v1/allow/"+strconv.Itoa(port), StatusTimeout)
+	req, cancel, err := c.newReq(ctx, method, "/v1/allow/"+strconv.Itoa(port), StatusTimeout, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +240,7 @@ func (c *Client) mutateAllow(ctx context.Context, method string, port int) ([]in
 // Features returns the capability gates as a name->enabled map from GET
 // /v1/features.
 func (c *Client) Features(ctx context.Context) (map[string]bool, error) {
-	req, cancel, err := c.newReq(ctx, http.MethodGet, "/v1/features", StatusTimeout)
+	req, cancel, err := c.newReq(ctx, http.MethodGet, "/v1/features", StatusTimeout, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -266,12 +270,14 @@ func (c *Client) SetFeature(ctx context.Context, name string, on bool) (map[stri
 	if err != nil {
 		return nil, err
 	}
-	cctx, cancel := context.WithTimeout(ctx, StatusTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(cctx, http.MethodPut, "http://unix/v1/features/"+name, bytes.NewReader(body))
+	// Routes through newReq so the per-call StatusTimeout is applied by the same
+	// mechanism as every sibling method — no bespoke inline timeout to drift out
+	// of the hung-server coverage.
+	req, cancel, err := c.newReq(ctx, http.MethodPut, "/v1/features/"+name, StatusTimeout, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.do(req)
 	if err != nil {
@@ -294,7 +300,7 @@ func (c *Client) SetFeature(ctx context.Context, name string, on bool) (map[stri
 // Reconcile kicks the daemon's forward-engine reconcile via POST /v1/reconcile.
 // It returns nil iff the daemon accepted it (202).
 func (c *Client) Reconcile(ctx context.Context) error {
-	req, cancel, err := c.newReq(ctx, http.MethodPost, "/v1/reconcile", ProbeTimeout)
+	req, cancel, err := c.newReq(ctx, http.MethodPost, "/v1/reconcile", ProbeTimeout, nil)
 	if err != nil {
 		return err
 	}
@@ -315,7 +321,7 @@ func (c *Client) Reconcile(ctx context.Context) error {
 // doctor.Status.UnmarshalJSON — without it {"status":"PASS"} fails to unmarshal
 // into the doctor.Status uint8 and Doctor would always error (§5.1 STAGE-1 fixup).
 func (c *Client) Doctor(ctx context.Context) (*doctor.Report, error) {
-	req, cancel, err := c.newReq(ctx, http.MethodPost, "/v1/doctor", DoctorTimeout)
+	req, cancel, err := c.newReq(ctx, http.MethodPost, "/v1/doctor", DoctorTimeout, nil)
 	if err != nil {
 		return nil, err
 	}

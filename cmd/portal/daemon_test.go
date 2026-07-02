@@ -89,6 +89,29 @@ func (f *fakeServiceStater) Status(context.Context) (service.Status, error) { re
 
 var _ localapi.ServiceStater = (*fakeServiceStater)(nil)
 
+// countingConfig wraps the shared config.Store and counts feature reads/writes
+// that go THROUGH the daemon. The CLI's daemon-down fallback touches a.Cfg (the
+// unwrapped *config.Store) directly, so it never advances these counters. That
+// gap is the only observable that distinguishes a real GET/PUT /v1/features
+// round-trip from a silent fall-through: without it the two paths share the same
+// backing files and produce byte-identical output. Concurrency-safe: the localapi
+// server touches it from handler goroutines while a test reads the counters.
+type countingConfig struct {
+	localapi.ConfigStore
+	reads  atomic.Int64
+	writes atomic.Int64
+}
+
+func (c *countingConfig) FeatureEnabled(feature string) bool {
+	c.reads.Add(1)
+	return c.ConfigStore.FeatureEnabled(feature)
+}
+
+func (c *countingConfig) SetFeature(feature string, on bool) error {
+	c.writes.Add(1)
+	return c.ConfigStore.SetFeature(feature, on)
+}
+
 // --- fake daemon ---
 
 // fakeDaemon is a real localapi.Server on a temp /tmp unix socket, backed by the
@@ -102,6 +125,7 @@ type fakeDaemon struct {
 	master *fakeMasterProber
 	fwd    *fakeForwardLister
 	svc    *fakeServiceStater
+	cfg    *countingConfig
 	kicks  atomic.Int64
 
 	cancel context.CancelFunc
@@ -151,6 +175,7 @@ func startFakeDaemon(t *testing.T, cfg *config.Store, opts ...fakeOpt) *fakeDaem
 		master: &fakeMasterProber{pid: 4242},
 		fwd:    &fakeForwardLister{},
 		svc:    &fakeServiceStater{},
+		cfg:    &countingConfig{ConfigStore: cfg},
 		done:   make(chan struct{}),
 	}
 	for _, o := range opts {
@@ -164,7 +189,7 @@ func startFakeDaemon(t *testing.T, cfg *config.Store, opts ...fakeOpt) *fakeDaem
 		Master:  d.master,
 		Ports:   d.fwd,
 		Service: d.svc,
-		Config:  cfg,
+		Config:  d.cfg,
 		Hub:     d.hub,
 		PushAllow: func(allow []int) error {
 			return d.agent.Subscribe(toU16(app.DenyPorts), toU16(allow), true)
@@ -209,6 +234,12 @@ func (d *fakeDaemon) Stop() {
 }
 
 func (d *fakeDaemon) kickCount() int { return int(d.kicks.Load()) }
+
+// featureReads/featureWrites report how many times GET/PUT /v1/features touched
+// the gates THROUGH the daemon. The daemon-down fallback bypasses this wrapper,
+// so a non-advancing counter proves a request never reached the daemon.
+func (d *fakeDaemon) featureReads() int  { return int(d.cfg.reads.Load()) }
+func (d *fakeDaemon) featureWrites() int { return int(d.cfg.writes.Load()) }
 
 // --- fake App adapters (the daemon-DOWN fallback path) ---
 

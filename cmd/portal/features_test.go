@@ -26,22 +26,35 @@ func setFeatures(t *testing.T, cfg *config.Store, states map[string]bool) {
 // the shared config.Store, `features` (no args) renders every gate in the fixed
 // featureNames order.
 func TestFeatures_DaemonUp_ListDeterministicOrder(t *testing.T) {
-	cfg := newTestConfig(t, "devbox")
-	setFeatures(t, cfg, map[string]bool{
+	// The daemon and the CLI read DISTINCT config.Stores seeded to opposite
+	// postures. A real GET /v1/features renders the daemon's posture; a silent
+	// fall-through to a.Cfg would render the CLI store's (inverted) posture, so
+	// the output assertion alone now distinguishes the two paths — they are no
+	// longer byte-identical over one shared store.
+	daemonCfg := newTestConfig(t, "devbox")
+	setFeatures(t, daemonCfg, map[string]bool{
 		config.FeatureClipImage: true,
 		config.FeatureClipText:  false,
 		config.FeatureNotify:    true,
 	})
-	d := startFakeDaemon(t, cfg)
-	a := newDaemonTestApp(t, d.path, cfg)
+	cliCfg := newTestConfig(t, "devbox")
+	setFeatures(t, cliCfg, map[string]bool{
+		config.FeatureClipImage: false,
+		config.FeatureClipText:  true,
+		config.FeatureNotify:    false,
+	})
+	d := startFakeDaemon(t, daemonCfg)
+	a := newDaemonTestApp(t, d.path, cliCfg)
 
 	var out, errw bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	before := d.featureReads()
 	if err := runFeatures(ctx, &out, &errw, a, nil); err != nil {
 		t.Fatalf("runFeatures list: %v", err)
 	}
 
+	// The daemon's posture, NOT the CLI store's inverted one.
 	want := "clip-image: on\nclip-text: off\nnotify: on\n"
 	if out.String() != want {
 		t.Errorf("list output:\n--- got ---\n%s--- want ---\n%s", out.String(), want)
@@ -49,25 +62,49 @@ func TestFeatures_DaemonUp_ListDeterministicOrder(t *testing.T) {
 	if errw.Len() != 0 {
 		t.Errorf("unexpected stderr: %q", errw.String())
 	}
+	// Direct proof the GET was served by the daemon: only a daemon round-trip
+	// advances the wrapper's read count (the fallback reads a.Cfg, unwrapped).
+	if d.featureReads() <= before {
+		t.Errorf("daemon feature reads did not advance (%d -> %d); list fell through to the config.Store fallback instead of GET /v1/features", before, d.featureReads())
+	}
 }
 
 // EC (features set, daemon up): `features clip-text off` PUTs through the daemon
 // (writing the shared config.Store) and echoes only the changed line.
 func TestFeatures_DaemonUp_SetWritesThroughDaemon(t *testing.T) {
-	cfg := newTestConfig(t, "devbox")
-	setFeatures(t, cfg, map[string]bool{config.FeatureClipText: true})
-	d := startFakeDaemon(t, cfg)
-	a := newDaemonTestApp(t, d.path, cfg)
+	// The daemon writes daemonCfg; the CLI's fallback would write the SEPARATE
+	// cliCfg (a.Cfg). Both start with clip-text on. This split is what makes the
+	// two paths distinguishable: a real PUT mutates daemonCfg and leaves cliCfg
+	// untouched, whereas any fall-through — even one where lc.SetFeature still
+	// fired the PUT but the branch also ran a.Cfg.SetFeature — mutates cliCfg.
+	daemonCfg := newTestConfig(t, "devbox")
+	setFeatures(t, daemonCfg, map[string]bool{config.FeatureClipText: true})
+	cliCfg := newTestConfig(t, "devbox")
+	setFeatures(t, cliCfg, map[string]bool{config.FeatureClipText: true})
+	d := startFakeDaemon(t, daemonCfg)
+	a := newDaemonTestApp(t, d.path, cliCfg)
 
 	var out, errw bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	before := d.featureWrites()
 	if err := runFeatures(ctx, &out, &errw, a, []string{"clip-text", "off"}); err != nil {
 		t.Fatalf("runFeatures set: %v", err)
 	}
 
-	if a.Cfg.FeatureEnabled(config.FeatureClipText) {
-		t.Error("PUT /v1/features did not disable clip-text in the shared config.Store")
+	// The daemon received exactly one PUT.
+	if got := d.featureWrites() - before; got != 1 {
+		t.Errorf("daemon feature writes advanced by %d, want 1; the set never reached PUT /v1/features", got)
+	}
+	// The daemon's store reflects the change...
+	if daemonCfg.FeatureEnabled(config.FeatureClipText) {
+		t.Error("PUT /v1/features did not disable clip-text in the daemon's config.Store")
+	}
+	// ...and the CLI's fallback store was NOT written. This is the decisive proof
+	// the write went THROUGH the daemon rather than falling through to a.Cfg: any
+	// fall-through would have flipped clip-text off here too.
+	if !a.Cfg.FeatureEnabled(config.FeatureClipText) {
+		t.Error("fallback config.Store was written; the set fell through to a.Cfg instead of PUT /v1/features")
 	}
 	if want := "clip-text: off\n"; out.String() != want {
 		t.Errorf("set output = %q, want %q", out.String(), want)
