@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fxamacker/cbor/v2"
+
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
@@ -85,6 +87,12 @@ type Client struct {
 	// Never closed by Run (the handler exits on ctx, not channel close).
 	notifyEvents chan EngineEvent
 
+	// registry is the client-side service registry: it demuxes inbound Msg
+	// frames to per-service handlers (openurl this unit; notify/clip after
+	// u4/u5) and advertises the client's handlers in Hello. Auto-populated in
+	// New; the handlers deliver through the existing publish* sinks (S11 facades).
+	registry *registry
+
 	// stream is the current send-side encoder; nil between connections.
 	streamMu sync.Mutex
 	enc      *protocol.Encoder
@@ -117,12 +125,79 @@ func New(cfg Config) *Client {
 	if cfg.ReconnectMax == 0 {
 		cfg.ReconnectMax = 10 * time.Second
 	}
-	return &Client{
+	c := &Client{
 		cfg:          cfg,
 		events:       make(chan EngineEvent, 64),
 		clipEvents:   make(chan EngineEvent, 8),
 		notifyEvents: make(chan EngineEvent, 16),
 	}
+	// Auto-register the compiled-in openurl handler so cmd/portal/run.go stays
+	// unchanged: it decodes the OpenURL payload and delivers via the shared
+	// events channel (publish) exactly as the old `case env.OpenURL` arm did.
+	c.registry = newRegistry(cfg.Log)
+	c.registry.register(HandlerSpec{
+		Service: "openurl",
+		Version: 1,
+		// The agent reads a whole `open\t<url>\n` line in one 4096-byte socket Read
+		// (server.go handleCmdConn), so a relayed URL can be ~4090 bytes; CBOR
+		// framing of OpenURL then pushes the payload just over 4096. Cap well above
+		// the socket line so any URL the agent can emit survives the client cap —
+		// a URL that fit the agent's Read must not be silently dropped here.
+		MaxPayload: 8192,
+		Decode: func(_ uint64, payload cbor.RawMessage) (EngineEvent, error) {
+			ou, err := protocol.UnmarshalPayload[protocol.OpenURL](payload)
+			if err != nil {
+				return EngineEvent{}, err
+			}
+			return EngineEvent{Kind: KindOpenURL, URL: ou.URL}, nil
+		},
+		Deliver: c.publish,
+	})
+	// Auto-register the notify handler: it decodes the Notify payload and
+	// delivers via publishNotify exactly as the old `case env.Notify` arm did —
+	// publishNotify still sends on notifyEvents AND fires the hub Queued tee, so
+	// the tee now relocates to this registry-driven dispatch site (S11) with
+	// byte-identical behavior. The seven notify payload fields carry through
+	// verbatim (Verified passthrough preserves the upstream classify/[unverified]
+	// split); the per-notification correlation Seq comes from the registry-stamped
+	// Msg.Seq (DESIGN S3), NOT the payload — the agent never duplicates it there.
+	c.registry.register(HandlerSpec{
+		Service:    "notify",
+		Version:    1,
+		MaxPayload: 4096,
+		Decode: func(seq uint64, payload cbor.RawMessage) (EngineEvent, error) {
+			nf, err := protocol.UnmarshalPayload[protocol.Notify](payload)
+			if err != nil {
+				return EngineEvent{}, err
+			}
+			return EngineEvent{Kind: KindNotify, Notify: &NotifyEvent{
+				Title: nf.Title, Body: nf.Body, Subtitle: nf.Subtitle,
+				Urgency: nf.Urgency, Verified: nf.Verified, Source: nf.Source,
+				Sound: nf.Sound, Seq: seq,
+			}}, nil
+		},
+		Deliver: c.publishNotify,
+	})
+	// Auto-register the clip handler: it decodes the ClipRequest payload into a
+	// KindClipRequest EngineEvent and delivers via publishClip (the DEDICATED
+	// cap-8 clip channel, DESIGN S10 QoS) exactly as the old `case env.ClipRequest`
+	// arm did. The Mac answers via SendClipResponse (still a thin facade, S11).
+	c.registry.register(HandlerSpec{
+		Service:    "clip",
+		Version:    1,
+		MaxPayload: 4096,
+		Decode: func(_ uint64, payload cbor.RawMessage) (EngineEvent, error) {
+			cr, err := protocol.UnmarshalPayload[protocol.ClipRequest](payload)
+			if err != nil {
+				return EngineEvent{}, err
+			}
+			return EngineEvent{Kind: KindClipRequest, Clip: &ClipEvent{
+				Nonce: cr.Nonce, Epoch: cr.Epoch, Kind: cr.Kind, Format: cr.Format,
+			}}, nil
+		},
+		Deliver: c.publishClip,
+	})
+	return c
 }
 
 // Events returns the demuxed event channel.
@@ -150,10 +225,14 @@ func (c *Client) SendClipResponse(resp *protocol.ClipResponse) error {
 	c.streamMu.Lock()
 	enc := c.enc
 	c.streamMu.Unlock()
-	if enc == nil {
-		return errors.New("agentclient: not connected")
+	// The ClipResponse now rides Msg.Payload (v4): marshal it and send via the
+	// registry's client→agent send path, which returns ErrNotConnected when enc
+	// is nil — the same "not connected" contract as before.
+	payload, err := protocol.MarshalPayload(*resp)
+	if err != nil {
+		return err
 	}
-	return enc.Write(&protocol.Envelope{ClipResponse: resp})
+	return c.registry.send(enc, "clip", "resp", payload)
 }
 
 // Snapshot returns the cached desired-set as the wire reports it.
@@ -393,6 +472,7 @@ func (c *Client) runOnce(ctx context.Context) error {
 		ClientGitSHA:  bootstrap.EmbeddedSHA(),
 		ClientPID:     os.Getpid(),
 		WantDestroyMC: true,
+		Services:      c.registry.services(),
 	}}); err != nil {
 		return fmt.Errorf("write Hello: %w", err)
 	}
@@ -422,6 +502,11 @@ func (c *Client) runOnce(ctx context.Context) error {
 	c.snapMu.Lock()
 	c.helloAck = first.HelloAck
 	c.snapMu.Unlock()
+
+	// Record the agent's advertised services (DESIGN S4). A registered handler
+	// the agent lacks — or advertises at a mismatched version — goes dormant
+	// with one warning and drops inbound frames for that service.
+	c.registry.setAgentServices(first.HelloAck.Services)
 
 	// 4b. Deploy/refresh the clipboard read shims now that the agent upload
 	// succeeded AND the HelloAck SHA matches (so the portald symlink points at
@@ -604,31 +689,14 @@ func (c *Client) demuxLoop(ctx context.Context, dec *protocol.Decoder) error {
 				c.snapMu.Unlock()
 				pendRemoved = append(pendRemoved, port)
 				resetTimer()
-			case env.OpenURL != nil:
-				c.publish(EngineEvent{Kind: KindOpenURL, URL: env.OpenURL.URL})
-			case env.ClipRequest != nil:
-				// Route to the DEDICATED clip channel, not the shared events
-				// channel — a port-event burst must not evict a pending paste
-				// (DESIGN §5). Non-blocking so the demux loop (which also runs
-				// the heartbeat watchdog) never stalls behind a slow handler;
-				// the channel is cap-8 > maxInflightClip(4) so a drop here means
-				// the handler is genuinely wedged, in which case the agent's
-				// clipTimeout answers "none" anyway.
-				cr := env.ClipRequest
-				c.publishClip(EngineEvent{Kind: KindClipRequest, Clip: &ClipEvent{
-					Nonce: cr.Nonce, Epoch: cr.Epoch, Kind: cr.Kind, Format: cr.Format,
-				}})
-			case env.Notify != nil:
-				// Route to the DEDICATED notify channel (same rationale as
-				// ClipRequest). Fire-and-forget: no response frame. Non-blocking
-				// so a slow notification handler never stalls the demux loop /
-				// heartbeat watchdog.
-				nf := env.Notify
-				c.publishNotify(EngineEvent{Kind: KindNotify, Notify: &NotifyEvent{
-					Title: nf.Title, Body: nf.Body, Subtitle: nf.Subtitle,
-					Urgency: nf.Urgency, Verified: nf.Verified, Source: nf.Source,
-					Sound: nf.Sound, Seq: nf.Seq,
-				}})
+			case env.Msg != nil:
+				// Inbound service frame (v4): route to the registry, which decodes
+				// per-service and delivers on the handler's declared sink (openurl
+				// → publish; notify → publishNotify; clip → publishClip, the
+				// DEDICATED cap-8 channel so a port-event burst can't evict a
+				// pending paste, DESIGN §5/S10). Unknown/dormant services and
+				// decode failures are logged drops — the session lives.
+				c.registry.dispatch(env.Msg)
 			case env.Heartbeat != nil:
 				// Already bumped above.
 			case env.SubscribeAck != nil:

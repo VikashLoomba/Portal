@@ -4,10 +4,16 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/fxamacker/cbor/v2"
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent/watcher"
@@ -241,3 +247,449 @@ func (p *probeOKTransport) ExecStream(context.Context, ...string) (io.WriteClose
 var _ = os.Getpid
 var _ = protocol.ProtoVersion
 var _ sshctl.Transport = (*shaOverridingTransport)(nil)
+
+// ---------------------------------------------------------------------------
+// u6: full-stack v4 exit-criteria suite (real agent.Server + real Client over
+// io.Pipe, driven through the agent's live cmd socket).
+// ---------------------------------------------------------------------------
+
+// shortSockPath returns a Unix-socket path under a SHORT temp dir. macOS caps
+// sun_path at 104 bytes, and t.TempDir() embeds the (long) test name, which
+// overflows the limit — so we mint our own short dir (mirrors the agent tests).
+func shortSockPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "ptle2e")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "cmd.sock")
+}
+
+// e2eTransport wires the Client to a REAL agent.Server over io.Pipe, giving the
+// agent a live cmd socket so the test can drive open/notify/clip verbs, plus a
+// configurable SHA, heartbeat interval, and slog sink. It embeds
+// fakeStreamTransport for the trivial Transport methods and overrides ExecStream.
+type e2eTransport struct {
+	*fakeStreamTransport
+	sha      string
+	sockPath string
+	agentLog *slog.Logger
+	hb       time.Duration
+}
+
+func (e *e2eTransport) ExecStream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+	c2aR, c2aW := io.Pipe()
+	a2cR, a2cW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
+	go stderrW.Close()
+	srv := agent.New(agent.Config{
+		In: c2aR, Out: a2cW, Watcher: e.w, AgentSHA: e.sha,
+		HeartbeatInterval: e.hb, CmdSockPath: e.sockPath, Log: e.agentLog,
+	})
+	go func() { _ = srv.Serve(ctx); _ = a2cW.Close() }()
+	wait := func() error { c2aR.Close(); return nil }
+	return c2aW, a2cR, stderrR, wait, nil
+}
+
+var _ sshctl.Transport = (*e2eTransport)(nil)
+
+// e2eSession bundles a running Client bound to a real agent over the e2e
+// transport, plus the agent's cmd-socket path and the shared fake watcher.
+type e2eSession struct {
+	c        *Client
+	sockPath string
+	w        *watcher.Fake
+	cancel   context.CancelFunc
+	wg       *sync.WaitGroup
+}
+
+// newE2ESession builds a Client + real agent, runs Run in a goroutine, and blocks
+// until the handshake+snapshot landed and the cmd socket is up. mutate (optional)
+// tweaks the Client between New and Run — the in-package seam for swapping/reset-
+// ting handlers before the session starts.
+func newE2ESession(t *testing.T, clientLog, agentLog *slog.Logger, mutate func(*Client)) *e2eSession {
+	t.Helper()
+	sha := bootstrap.EmbeddedSHA()
+	if sha == "" {
+		t.Skip("embedded SHA empty; run `make agent` first")
+	}
+	w := watcher.NewFake()
+	w.SetSnapshot(nil)
+	sockPath := shortSockPath(t)
+	tr := &e2eTransport{
+		fakeStreamTransport: &fakeStreamTransport{w: w},
+		sha:                 sha,
+		sockPath:            sockPath,
+		agentLog:            agentLog,
+		hb:                  100 * time.Millisecond,
+	}
+	if clientLog == nil {
+		clientLog = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	c := New(Config{
+		Transport:        tr,
+		HeartbeatTimeout: 5 * time.Second,
+		Log:              clientLog,
+	})
+	c.cfg.Bootstrap = (&realBootstrapShim{path: "/agent-" + sha}).asManager()
+	if mutate != nil {
+		mutate(c)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); _ = c.Run(ctx) }()
+
+	sess := &e2eSession{c: c, sockPath: sockPath, w: w, cancel: cancel, wg: &wg}
+	sess.waitConnected(t)
+	sess.waitSock(t)
+	return sess
+}
+
+func (s *e2eSession) waitConnected(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, _, ok := s.c.Snapshot(); ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("client never reached connected+snapshot state")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (s *e2eSession) waitSock(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if conn, err := net.DialTimeout("unix", s.sockPath, 100*time.Millisecond); err == nil {
+			conn.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("agent cmd socket did not come up")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (s *e2eSession) close() {
+	s.cancel()
+	s.wg.Wait()
+}
+
+// ask dials the agent's cmd socket, writes line, and returns the raw reply.
+func (s *e2eSession) ask(t *testing.T, line string) string {
+	t.Helper()
+	conn, err := net.DialTimeout("unix", s.sockPath, time.Second)
+	if err != nil {
+		t.Fatalf("dial cmd sock: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write([]byte(line)); err != nil {
+		t.Fatalf("write verb: %v", err)
+	}
+	buf := make([]byte, 256)
+	n, _ := conn.Read(buf)
+	return string(buf[:n])
+}
+
+// serveClip drains the client's dedicated clip channel and answers every request
+// with OK+sha via SendClipResponse — the in-test stand-in for runClipHandler.
+func (s *e2eSession) serveClip(ctx context.Context, sha string) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev := <-s.c.ClipEvents():
+				if ev.Clip == nil {
+					continue
+				}
+				_ = s.c.SendClipResponse(&protocol.ClipResponse{
+					Nonce: ev.Clip.Nonce, Epoch: ev.Clip.Epoch, OK: true, SHA: sha,
+				})
+			}
+		}
+	}()
+}
+
+// waitEvent reads the shared events channel until an event of kind arrives.
+func (s *e2eSession) waitEvent(t *testing.T, kind EngineEventKind) EngineEvent {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case ev := <-s.c.Events():
+			if ev.Kind == kind {
+				return ev
+			}
+		case <-deadline:
+			t.Fatalf("did not observe event kind %d", kind)
+			return EngineEvent{}
+		}
+	}
+}
+
+// waitNotify reads the dedicated notify channel.
+func (s *e2eSession) waitNotify(t *testing.T) EngineEvent {
+	t.Helper()
+	select {
+	case ev := <-s.c.NotifyEvents():
+		return ev
+	case <-time.After(3 * time.Second):
+		t.Fatal("no notify event")
+		return EngineEvent{}
+	}
+}
+
+func containsPort(ps []uint16, p uint16) bool {
+	for _, x := range ps {
+		if x == p {
+			return true
+		}
+	}
+	return false
+}
+
+// openurlHandler builds a client-side openurl HandlerSpec at the given version
+// with the supplied Deliver — the seam u6 tests use to swap in a panicking or
+// version-mismatched handler while keeping the real Decode.
+func openurlHandler(version uint32, deliver func(EngineEvent)) HandlerSpec {
+	return HandlerSpec{
+		Service: "openurl", Version: version, MaxPayload: 8192,
+		Decode: func(_ uint64, payload cbor.RawMessage) (EngineEvent, error) {
+			ou, err := protocol.UnmarshalPayload[protocol.OpenURL](payload)
+			if err != nil {
+				return EngineEvent{}, err
+			}
+			return EngineEvent{Kind: KindOpenURL, URL: ou.URL}, nil
+		},
+		Deliver: deliver,
+	}
+}
+
+// TestE2EAllThreeServicesRoundTrip (EC2) drives openurl, notify, and clip end to
+// end over a real agent+client pipe, both auto-registering all three services.
+// Every feature crosses via Msg frames ONLY (the legacy Envelope fields are
+// deleted — compiler-enforced, and asserted by the agent's deletion-invariant
+// test). HelloAck.Services proves the reverse-direction advertisement; the three
+// "ok" cmd replies prove the agent recorded the client's services (forward).
+func TestE2EAllThreeServicesRoundTrip(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef"
+	sess := newE2ESession(t, nil, nil, nil)
+	defer sess.close()
+
+	ack := sess.c.HelloAck()
+	if ack == nil {
+		t.Fatal("no HelloAck")
+	}
+	for _, svc := range []string{"openurl", "notify", "clip"} {
+		if v, ok := ack.Services[svc]; !ok || v != 1 {
+			t.Fatalf("HelloAck.Services[%q] = %d (present %v), want 1", svc, v, ok)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess.serveClip(ctx, sha)
+
+	// openurl.
+	if got := sess.ask(t, "open\thttp://example.com/x\n"); got != "ok\n" {
+		t.Fatalf("open = %q, want ok\\n", got)
+	}
+	if ev := sess.waitEvent(t, KindOpenURL); ev.URL != "http://example.com/x" {
+		t.Fatalf("KindOpenURL URL = %q", ev.URL)
+	}
+
+	// notify.
+	if got := sess.ask(t, "notify\t{\"title\":\"hi\",\"body\":\"b\",\"verified\":true}\n"); got != "ok\n" {
+		t.Fatalf("notify = %q, want ok\\n", got)
+	}
+	if ev := sess.waitNotify(t); ev.Notify == nil || ev.Notify.Title != "hi" || !ev.Notify.Verified {
+		t.Fatalf("KindNotify = %+v", ev.Notify)
+	}
+
+	// clip.
+	if got := sess.ask(t, "clip\timage\tpng\n"); got != "ok\t"+sha+"\n" {
+		t.Fatalf("clip = %q, want ok\\t<sha>\\n", got)
+	}
+}
+
+// TestZeroServiceConsumer (EC8) resets the Client's registry to EMPTY before Run
+// (a consumer that registers no service handlers). The handshake still completes
+// and Snapshot/PortAdded/PortRemoved flow normally; the agent answers its cmd
+// verbs no-client/none for the unadvertised services (hasClient() true,
+// clientHas() false).
+func TestZeroServiceConsumer(t *testing.T) {
+	sess := newE2ESession(t, nil, nil, func(c *Client) {
+		c.registry = newRegistry(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	})
+	defer sess.close()
+
+	if sess.c.HelloAck() == nil {
+		t.Fatal("handshake did not complete for zero-service consumer")
+	}
+
+	sess.w.Emit(watcher.Event{Kind: watcher.KindAdd, At: time.Now(),
+		Listen: watcher.Listen{Port: 8081, Family: 4, Addr: "127.0.0.1"}})
+	if ev := sess.waitEvent(t, KindDelta); !containsPort(ev.Added, 8081) {
+		t.Fatalf("KindDelta Added = %v, want 8081", ev.Added)
+	}
+	sess.w.Emit(watcher.Event{Kind: watcher.KindRemove, At: time.Now(),
+		Listen: watcher.Listen{Port: 8081, Family: 4, Addr: "127.0.0.1"}})
+	if ev := sess.waitEvent(t, KindDelta); !containsPort(ev.Removed, 8081) {
+		t.Fatalf("KindDelta Removed = %v, want 8081", ev.Removed)
+	}
+
+	if got := sess.ask(t, "open\thttp://example.com\n"); got != "no-client\n" {
+		t.Fatalf("open = %q, want no-client\\n", got)
+	}
+	if got := sess.ask(t, "clip\timage\tpng\n"); got != "none\n" {
+		t.Fatalf("clip = %q, want none\\n", got)
+	}
+	if got := sess.ask(t, "notify\t{\"title\":\"hi\"}\n"); got != "no-client\n" {
+		t.Fatalf("notify = %q, want no-client\\n", got)
+	}
+}
+
+// TestPanicIsolationBothEnds (EC6) swaps the Client's openurl handler for one
+// whose Deliver panics, then drives an open. The client dispatch recover drops
+// only that frame; the session survives on BOTH ends — notify still round-trips
+// (client end alive) and clip still round-trips (agent end alive), and the
+// session never disconnects.
+func TestPanicIsolationBothEnds(t *testing.T) {
+	const sha = "cccccccccccccccccccccccccccccccc"
+	sess := newE2ESession(t, nil, nil, func(c *Client) {
+		c.registry.register(openurlHandler(1, func(EngineEvent) {
+			panic("deliberate client openurl panic")
+		}))
+	})
+	defer sess.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess.serveClip(ctx, sha)
+
+	if got := sess.ask(t, "open\thttp://example.com/boom\n"); got != "ok\n" {
+		t.Fatalf("open = %q, want ok\\n (agent side unaffected)", got)
+	}
+
+	if got := sess.ask(t, "notify\t{\"title\":\"after\"}\n"); got != "ok\n" {
+		t.Fatalf("notify after panic = %q, want ok\\n", got)
+	}
+	if ev := sess.waitNotify(t); ev.Notify == nil || ev.Notify.Title != "after" {
+		t.Fatalf("notify after panic not delivered: %+v", ev.Notify)
+	}
+	if got := sess.ask(t, "clip\timage\tpng\n"); got != "ok\t"+sha+"\n" {
+		t.Fatalf("clip after panic = %q, want ok\\t<sha>\\n", got)
+	}
+
+	if e := sess.c.LastDisconnectErr(); e != "" {
+		t.Fatalf("session disconnected during panic isolation: %q", e)
+	}
+}
+
+// TestServiceVersionMismatchDisable (EC10) advertises the client's openurl at
+// version 2 while the agent registered it at 1. Exact-equality means BOTH sides
+// treat openurl as absent: exactly one warning each side, the open verb answers
+// no-client, and the other two services keep working with a healthy session.
+func TestServiceVersionMismatchDisable(t *testing.T) {
+	const sha = "dddddddddddddddddddddddddddddddd"
+	agentLog := &countHandler{}
+	clientLog := &countHandler{}
+	sess := newE2ESession(t, slog.New(clientLog), slog.New(agentLog), func(c *Client) {
+		c.registry.register(openurlHandler(2, c.publish))
+	})
+	defer sess.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess.serveClip(ctx, sha)
+
+	if got := sess.ask(t, "open\thttp://example.com\n"); got != "no-client\n" {
+		t.Fatalf("open (version-mismatched) = %q, want no-client\\n", got)
+	}
+
+	if got := sess.ask(t, "notify\t{\"title\":\"ok\"}\n"); got != "ok\n" {
+		t.Fatalf("notify = %q, want ok\\n", got)
+	}
+	if ev := sess.waitNotify(t); ev.Notify == nil || ev.Notify.Title != "ok" {
+		t.Fatalf("notify not delivered: %+v", ev.Notify)
+	}
+	if got := sess.ask(t, "clip\timage\tpng\n"); got != "ok\t"+sha+"\n" {
+		t.Fatalf("clip = %q, want ok\\t<sha>\\n", got)
+	}
+
+	// Exactly one warning on EACH side (agent: setClientServices mismatch;
+	// client: dormant-handler). Poll to let async handshake logging land, then pin
+	// — read BEFORE close() so Run's "session ended" warn can't inflate the count.
+	deadline := time.Now().Add(3 * time.Second)
+	for (agentLog.count() < 1 || clientLog.count() < 1) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := agentLog.count(); got != 1 {
+		t.Fatalf("agent warnings = %d, want exactly 1", got)
+	}
+	if got := clientLog.count(); got != 1 {
+		t.Fatalf("client warnings = %d, want exactly 1", got)
+	}
+}
+
+// TestClientNotify_SurfacesMsgSeq exercises the REAL client notify handler
+// (registered in New) through registry.dispatch and asserts NotifyEvent.Seq is
+// the registry-stamped Msg.Seq — NOT the payload field, which svc_notify never
+// sets. This guards the v4 regression where the client read the always-0 payload
+// Seq, collapsing every /v1/events notify line to seq:0.
+func TestClientNotify_SurfacesMsgSeq(t *testing.T) {
+	c := New(Config{})
+	// Payload carries NO seq (mirrors svc_notify, which stamps only Msg.Seq).
+	payload, err := protocol.MarshalPayload(protocol.Notify{Title: "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []uint64{7, 8} {
+		c.registry.dispatch(&protocol.Msg{Service: "notify", Kind: "event", Seq: want, Payload: payload})
+		select {
+		case ev := <-c.NotifyEvents():
+			if ev.Notify == nil {
+				t.Fatalf("notify not delivered for seq %d", want)
+			}
+			if ev.Notify.Seq != want {
+				t.Fatalf("NotifyEvent.Seq = %d, want %d (registry-stamped Msg.Seq)", ev.Notify.Seq, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("no notify event delivered for seq %d", want)
+		}
+	}
+}
+
+// TestClientOpenURL_LongURLSurvivesPayloadCap delivers a URL near the agent's
+// 4096-byte cmd-socket line, whose CBOR-framed payload exceeds 4096, and asserts
+// the client openurl handler still admits it. Guards the regression where the
+// client cap was pinned at the raw socket-read size (4096) and silently dropped
+// any URL a caller could actually pass to `portald open`.
+func TestClientOpenURL_LongURLSurvivesPayloadCap(t *testing.T) {
+	c := New(Config{})
+	url := "http://host/?q=" + strings.Repeat("a", 4070)
+	payload, err := protocol.MarshalPayload(protocol.OpenURL{URL: url})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) <= 4096 {
+		t.Fatalf("payload %d bytes is not over the old 4096 cap; test would not guard the regression", len(payload))
+	}
+	c.registry.dispatch(&protocol.Msg{Service: "openurl", Kind: "open", Payload: payload})
+	select {
+	case ev := <-c.Events():
+		if ev.Kind != KindOpenURL || ev.URL != url {
+			t.Fatalf("delivered %+v, want KindOpenURL carrying the long URL", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("long URL was dropped by the client payload cap")
+	}
+}

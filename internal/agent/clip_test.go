@@ -31,8 +31,9 @@ func tempSockPath(t *testing.T) string {
 // clipHarness drives a Server with a real cmd Unix socket and a connected
 // (subscribed) Mac client. The client side is a goroutine that the test
 // programs via a responder func: it decodes agent→client frames, and for every
-// ClipRequest it calls respond() and (if a ClipResponse is returned) writes it
-// back up the pipe. Heartbeats/snapshots are ignored.
+// clip request Msg it calls respond() and (if a ClipResponse is returned)
+// marshals it into a Msg{svc:clip,kind:resp} back up the pipe. Heartbeats/
+// snapshots are ignored. Clip now rides Msg.Payload (v4) end-to-end.
 type clipHarness struct {
 	srv      *Server
 	sockPath string
@@ -43,10 +44,23 @@ type clipHarness struct {
 	enc      *protocol.Encoder
 }
 
+// sendClipResp marshals a ClipResponse into a Msg{svc:clip,kind:resp} and writes
+// it up the pipe via enc — the in-test equivalent of the client registry's
+// send() path (a raw Encoder is fine in-test).
+func sendClipResp(enc *protocol.Encoder, resp *protocol.ClipResponse) error {
+	payload, err := protocol.MarshalPayload(*resp)
+	if err != nil {
+		return err
+	}
+	return enc.Write(&protocol.Envelope{Msg: &protocol.Msg{
+		Service: "clip", Kind: "resp", Payload: payload,
+	}})
+}
+
 // newClipHarness builds the server, completes the handshake+subscribe so
-// hasClient is true, and starts a client goroutine driving respond on each
-// ClipRequest. respond may return nil to swallow the request (simulate a Mac
-// that never answers), letting clipTimeout fire.
+// hasClient is true, and starts a client goroutine driving respond on each clip
+// request. respond may return nil to swallow the request (simulate a Mac that
+// never answers), letting the clip timeout fire.
 func newClipHarness(t *testing.T, respond func(req *protocol.ClipRequest) *protocol.ClipResponse) *clipHarness {
 	t.Helper()
 	sockPath := tempSockPath(t)
@@ -75,8 +89,14 @@ func newClipHarness(t *testing.T, respond func(req *protocol.ClipRequest) *proto
 	enc := protocol.NewEncoder(conn.c2aW)
 	dec := protocol.NewDecoder(conn.a2cR)
 
-	// Handshake.
-	if err := enc.Write(&protocol.Envelope{Hello: &protocol.Hello{ProtoVersion: protocol.ProtoVersion}}); err != nil {
+	// Handshake. Advertise the client's registered handlers so the agent's clip
+	// service gates open (hasClient()&&clientHas("clip")). openurl is advertised
+	// too, mirroring the real Client (DESIGN S4 symmetric advertisement), so
+	// TestClip_OpenStillWorks's "open" verb also passes its gate.
+	if err := enc.Write(&protocol.Envelope{Hello: &protocol.Hello{
+		ProtoVersion: protocol.ProtoVersion,
+		Services:     map[string]uint32{"openurl": 1, "clip": 1},
+	}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := dec.Read(); err != nil { // HelloAck
@@ -92,7 +112,7 @@ func newClipHarness(t *testing.T, respond func(req *protocol.ClipRequest) *proto
 		t.Fatal(err)
 	}
 
-	// Client goroutine: drain agent→client frames, answer ClipRequests.
+	// Client goroutine: drain agent→client frames, answer clip request Msgs.
 	var clientWG sync.WaitGroup
 	clientWG.Add(1)
 	go func() {
@@ -102,9 +122,13 @@ func newClipHarness(t *testing.T, respond func(req *protocol.ClipRequest) *proto
 			if err != nil {
 				return
 			}
-			if env.ClipRequest != nil && respond != nil {
-				if resp := respond(env.ClipRequest); resp != nil {
-					_ = enc.Write(&protocol.Envelope{ClipResponse: resp})
+			if env.Msg != nil && env.Msg.Service == "clip" && env.Msg.Kind == "req" && respond != nil {
+				req, err := protocol.UnmarshalPayload[protocol.ClipRequest](env.Msg.Payload)
+				if err != nil {
+					continue
+				}
+				if resp := respond(&req); resp != nil {
+					_ = sendClipResp(enc, resp)
 				}
 			}
 		}
@@ -153,9 +177,18 @@ func (h *clipHarness) ask(t *testing.T, line string) string {
 	return string(buf[:n])
 }
 
+// waiterCount reports the registry's outstanding clip-call waiter count — the
+// in-package accessor the MaxInflight test uses (the waiter table lifted from
+// the Server into the registry, DESIGN S9).
+func (h *clipHarness) waiterCount() int {
+	h.srv.reg.waiterMu.Lock()
+	defer h.srv.reg.waiterMu.Unlock()
+	return len(h.srv.reg.waiters)
+}
+
 // TestClip_WaiterCorrelation drives a full image-png request end to end: the
-// agent emits a ClipRequest, the client answers OK with a SHA, and the socket
-// reply is the byte-exact "ok\t<sha>\n".
+// agent emits a clip request Msg, the client answers OK with a SHA in a clip
+// response Msg, and the socket reply is the byte-exact "ok\t<sha>\n".
 func TestClip_WaiterCorrelation(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef"
 	var seen *protocol.ClipRequest
@@ -172,8 +205,8 @@ func TestClip_WaiterCorrelation(t *testing.T) {
 	if seen == nil || seen.Kind != "image" || seen.Format != "png" {
 		t.Fatalf("ClipRequest = %+v, want kind=image fmt=png", seen)
 	}
-	if seen.Epoch != h.srv.epoch {
-		t.Fatalf("ClipRequest.Epoch = %d, want server epoch %d", seen.Epoch, h.srv.epoch)
+	if seen.Epoch != h.srv.reg.epoch() {
+		t.Fatalf("ClipRequest.Epoch = %d, want registry epoch %d", seen.Epoch, h.srv.reg.epoch())
 	}
 }
 
@@ -219,20 +252,21 @@ func TestClip_TargetsNoImage(t *testing.T) {
 	}
 }
 
-// TestClip_EpochMismatchDrop: a ClipResponse carrying the wrong epoch must be
-// dropped, so the waiter never receives it and clipTimeout (shortened via a
-// custom server here is impractical) eventually fires. To keep the test fast we
-// assert the response is dropped by observing that a SECOND, correct response
-// is what actually satisfies the waiter — i.e. the wrong-epoch one did nothing.
+// TestClip_EpochMismatchDrop: a clip response Msg carrying the wrong epoch must
+// be dropped by reg.completeCall, so the waiter never receives it. To keep the
+// test fast we assert the wrong-epoch response did nothing by observing that a
+// SECOND, correct-epoch response is what actually satisfies the waiter — proving
+// the lifted Call epoch semantics (S9).
 func TestClip_EpochMismatchDrop(t *testing.T) {
 	const sha = "ffffffffffffffffffffffffffffffff"
 	var h *clipHarness
 	h = newClipHarness(t, func(req *protocol.ClipRequest) *protocol.ClipResponse {
-		// First send a wrong-epoch response directly (it must be ignored),
-		// then return the correct one which the harness writes for us.
-		_ = h.enc.Write(&protocol.Envelope{ClipResponse: &protocol.ClipResponse{
+		// First send a wrong-epoch response directly (it must be ignored), then
+		// return the correct one which the harness marshals+writes for us. Both
+		// writes happen on this (client) goroutine, so their order is preserved.
+		_ = sendClipResp(h.enc, &protocol.ClipResponse{
 			Nonce: req.Nonce, Epoch: req.Epoch ^ 0xdead, OK: true, SHA: "deadbeefdeadbeefdeadbeefdeadbeef",
-		}})
+		})
 		return &protocol.ClipResponse{Nonce: req.Nonce, Epoch: req.Epoch, OK: true, SHA: sha}
 	})
 	defer h.close()
@@ -312,7 +346,7 @@ func TestClip_NoClientImmediateNone(t *testing.T) {
 // TestClip_DefaultDeny: unknown verbs and malformed clip shapes are rejected.
 func TestClip_DefaultDeny(t *testing.T) {
 	h := newClipHarness(t, func(req *protocol.ClipRequest) *protocol.ClipResponse {
-		t.Errorf("unexpected ClipRequest for default-deny case: %+v", req)
+		t.Errorf("unexpected clip request for default-deny case: %+v", req)
 		return nil
 	})
 	defer h.close()
@@ -335,15 +369,15 @@ func TestClip_DefaultDeny(t *testing.T) {
 	}
 }
 
-// TestClip_OpenStillWorks: the open verb behavior is unchanged by the new
-// tab-framed dispatcher, including the http(s)-only default-deny.
+// TestClip_OpenStillWorks: the open verb behavior is unchanged by the clip
+// migration, including the http(s)-only default-deny.
 func TestClip_OpenStillWorks(t *testing.T) {
 	h := newClipHarness(t, nil)
 	defer h.close()
 
 	// Drain the OpenURL the agent will emit (so the client goroutine doesn't
 	// block the pipe). The harness client goroutine already drains frames, but
-	// here respond==nil so OpenURL is just dropped — fine.
+	// here respond==nil so the open Msg is just dropped — fine.
 	if got := h.ask(t, "open\thttp://example.com\n"); got != "ok\n" {
 		t.Errorf("open http reply = %q, want ok\\n", got)
 	}
@@ -352,12 +386,13 @@ func TestClip_OpenStillWorks(t *testing.T) {
 	}
 }
 
-// TestClip_MaxInflight bounds concurrent waiters: once maxInflightClip
+// TestClip_MaxInflight bounds concurrent waiters: once defaultMaxInflightClip
 // requests are parked (the client never answers them), the next request is
-// answered "none\n" immediately rather than registering another waiter.
+// answered "none\n" immediately rather than registering another waiter. The
+// waiter table now lives in the registry (S9), read via waiterCount().
 func TestClip_MaxInflight(t *testing.T) {
-	// respond==nil: the client drains ClipRequests but never answers, so each
-	// dial parks in handleClipReq until clipTimeout. We don't wait that long —
+	// respond==nil: the client drains clip requests but never answers, so each
+	// dial parks in reg.call until the clip timeout. We don't wait that long —
 	// we observe the registered-waiter count and the over-cap rejection, then
 	// tear the server down (which unblocks the parked diallers via ctx.Done()).
 	h := newClipHarness(t, nil)
@@ -367,7 +402,7 @@ func TestClip_MaxInflight(t *testing.T) {
 	// after the test returns.
 	defer func() { h.close(); parkedWG.Wait() }()
 
-	for i := 0; i < maxInflightClip; i++ {
+	for i := 0; i < defaultMaxInflightClip; i++ {
 		parkedWG.Add(1)
 		go func() {
 			defer parkedWG.Done()
@@ -377,24 +412,20 @@ func TestClip_MaxInflight(t *testing.T) {
 		}()
 	}
 
-	// Wait until all maxInflightClip waiters are registered in the server.
+	// Wait until all defaultMaxInflightClip waiters are registered in the registry.
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		h.srv.mu.Lock()
-		nWaiters := len(h.srv.clipWaiters)
-		h.srv.mu.Unlock()
-		if nWaiters >= maxInflightClip {
+		if n := h.waiterCount(); n >= defaultMaxInflightClip {
 			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("only %d/%d waiters registered", nWaiters, maxInflightClip)
+		} else if time.Now().After(deadline) {
+			t.Fatalf("only %d/%d waiters registered", n, defaultMaxInflightClip)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
 
-	// The (maxInflightClip+1)-th request must be rejected "none\n" immediately —
-	// the cap is hit, so no new waiter is registered and the responder is never
-	// consulted.
+	// The (defaultMaxInflightClip+1)-th request must be rejected "none\n"
+	// immediately — the cap is hit, so no new waiter is registered and the
+	// responder is never consulted.
 	start := time.Now()
 	if got := h.ask(t, "clip\timage\tpng\n"); got != "none\n" {
 		t.Fatalf("over-cap reply = %q, want none\\n", got)
@@ -405,9 +436,123 @@ func TestClip_MaxInflight(t *testing.T) {
 	// Parked diallers unblock when the deferred h.close() cancels ctx.
 }
 
-// TestClip_DoesNotAdvanceSeq asserts that emitting a ClipRequest (and handling
-// its ClipResponse) never advances s.seq — the port-event staleness counter
-// the client compares against. We snapshot seq, run a clip round trip, then
+// TestClip_TimeoutBudget (EC9) proves the agent answers "none\n" BEFORE the
+// clip socket deadline fires when the client never responds. The clip service's
+// clipTimeout and clipSockDeadline are overridable FIELDS read live at request
+// time (clipTimeout in reg.call; clipSockDeadline via Verbs()→routeVerb), so we
+// shorten BOTH here to milliseconds — preserving the ordering clipTimeout <
+// clipSockDeadline — and assert the "none\n" write wins the race against the
+// (also shortened) socket deadline. The shim's 13s clipReadTimeout is the OUTER
+// bound of the budget; it lives in cmd/portald/main.go (package main), is
+// remote-side, and is NOT importable from package agent, so it is documented
+// here rather than asserted. Because it mutates shared instance fields, this
+// test cannot t.Parallel.
+func TestClip_TimeoutBudget(t *testing.T) {
+	// Structural: the production defaults preserve the agent-side ordering
+	// (clipTimeout < clipSockDeadline). The outer 13s shim bound is not asserted
+	// (package-main / not importable across the package boundary).
+	if defaultClipTimeout >= defaultClipSockDeadline {
+		t.Fatalf("default budget ordering violated: clipTimeout %v >= clipSockDeadline %v",
+			defaultClipTimeout, defaultClipSockDeadline)
+	}
+
+	sockPath := tempSockPath(t)
+	w := watcher.NewFake()
+	w.SetSnapshot(nil)
+	conn := newConnPair()
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := New(Config{
+		In: conn.c2aR, Out: conn.a2cW, Watcher: w, AgentSHA: "testsha",
+		HeartbeatInterval: time.Hour, CmdSockPath: sockPath,
+	})
+
+	// Shorten the budget BEFORE Serve starts: the `go srv.Serve` below
+	// establishes a happens-before from these writes to every goroutine Serve
+	// spawns (the cmd-socket handler reading these fields live), so this is
+	// race-clean. Ordering preserved: clipTimeout (50ms) < clipSockDeadline
+	// (200ms). The short clipTimeout drives "none\n" fast; the larger socket
+	// deadline is the outer bound the write must beat.
+	const shortTimeout = 50 * time.Millisecond
+	const shortSockDeadline = 200 * time.Millisecond
+	srv.clip.clipTimeout = shortTimeout
+	srv.clip.clipSockDeadline = shortSockDeadline
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); _ = srv.Serve(ctx); conn.a2cW.Close() }()
+	defer func() { cancel(); conn.c2aW.Close(); wg.Wait(); conn.close() }()
+
+	enc := protocol.NewEncoder(conn.c2aW)
+	dec := protocol.NewDecoder(conn.a2cR)
+	// Advertise clip + subscribe so hasClient()&&clientHas("clip") both hold and
+	// the request actually reaches reg.call (rather than short-circuiting on the
+	// gate) — that is what exercises the clipTimeout.
+	enc.Write(&protocol.Envelope{Hello: &protocol.Hello{
+		ProtoVersion: protocol.ProtoVersion,
+		Services:     map[string]uint32{"clip": 1},
+	}})
+	if _, err := dec.Read(); err != nil { // HelloAck
+		t.Fatal(err)
+	}
+	enc.Write(&protocol.Envelope{Subscribe: &protocol.Subscribe{ResubscribeID: 1}})
+	if _, err := dec.Read(); err != nil { // SubscribeAck
+		t.Fatal(err)
+	}
+	if _, err := dec.Read(); err != nil { // initial Snapshot
+		t.Fatal(err)
+	}
+
+	// Client goroutine drains agent→client frames but NEVER answers the clip
+	// request, so the waiter is left to time out at the shortened clipTimeout.
+	go func() {
+		for {
+			if _, err := dec.Read(); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Wait for the socket.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := net.DialTimeout("unix", sockPath, 100*time.Millisecond); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cmd socket did not come up")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	c, err := net.DialTimeout("unix", sockPath, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	// Give the client read side plenty of time — the assertion is about WHICH
+	// bound fires (clipTimeout, not the socket deadline), not the client's own
+	// read deadline.
+	c.SetDeadline(time.Now().Add(2 * time.Second))
+	start := time.Now()
+	c.Write([]byte("clip\timage\tpng\n"))
+	buf := make([]byte, 64)
+	n, _ := c.Read(buf)
+	elapsed := time.Since(start)
+	if got := string(buf[:n]); got != "none\n" {
+		t.Fatalf("reply = %q, want none\\n", got)
+	}
+	// The "none\n" (fired by the shortened clipTimeout) must land before the
+	// shortened clipSockDeadline — the write wins the race against the socket
+	// deadline that routeVerb applied live from the shortened field.
+	if elapsed >= shortSockDeadline {
+		t.Fatalf("none\\n took %v, want < clipSockDeadline %v (write must beat the socket deadline)",
+			elapsed, shortSockDeadline)
+	}
+}
+
+// TestClip_DoesNotAdvanceSeq asserts that a clip round trip (request Msg +
+// response Msg) never advances s.seq — the port-event staleness counter the
+// client compares against (EC4). We snapshot seq, run a clip round trip, then
 // trigger a real port event and confirm its Seq is exactly prevSeq+1.
 func TestClip_DoesNotAdvanceSeq(t *testing.T) {
 	const sha = "00000000000000000000000000000000"
@@ -440,7 +585,10 @@ func TestClip_DoesNotAdvanceSeq(t *testing.T) {
 
 	enc := protocol.NewEncoder(conn.c2aW)
 	dec := protocol.NewDecoder(conn.a2cR)
-	enc.Write(&protocol.Envelope{Hello: &protocol.Hello{ProtoVersion: protocol.ProtoVersion}})
+	enc.Write(&protocol.Envelope{Hello: &protocol.Hello{
+		ProtoVersion: protocol.ProtoVersion,
+		Services:     map[string]uint32{"clip": 1},
+	}})
 	dec.Read() // HelloAck
 	enc.Write(&protocol.Envelope{Subscribe: &protocol.Subscribe{ResubscribeID: 1}})
 	dec.Read()            // SubscribeAck
@@ -450,8 +598,8 @@ func TestClip_DoesNotAdvanceSeq(t *testing.T) {
 	}
 	prevSeq := snap.Snapshot.Seq
 
-	// Client goroutine answers ClipRequests; for other frames, deliver them on
-	// a channel so the main test body can read the PortAdded later.
+	// Client goroutine answers clip request Msgs; for other frames, deliver them
+	// on a channel so the main test body can read the PortAdded later.
 	frames := make(chan *protocol.Envelope, 8)
 	clientWG.Add(1)
 	go func() {
@@ -461,10 +609,14 @@ func TestClip_DoesNotAdvanceSeq(t *testing.T) {
 			if err != nil {
 				return
 			}
-			if env.ClipRequest != nil {
-				_ = enc.Write(&protocol.Envelope{ClipResponse: &protocol.ClipResponse{
-					Nonce: env.ClipRequest.Nonce, Epoch: env.ClipRequest.Epoch, OK: true, SHA: sha,
-				}})
+			if env.Msg != nil && env.Msg.Service == "clip" && env.Msg.Kind == "req" {
+				req, err := protocol.UnmarshalPayload[protocol.ClipRequest](env.Msg.Payload)
+				if err != nil {
+					continue
+				}
+				_ = sendClipResp(enc, &protocol.ClipResponse{
+					Nonce: req.Nonce, Epoch: req.Epoch, OK: true, SHA: sha,
+				})
 				continue
 			}
 			frames <- env

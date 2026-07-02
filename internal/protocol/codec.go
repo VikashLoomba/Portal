@@ -170,17 +170,31 @@ func countEnvelopeFields(e *Envelope) int {
 	if e.Bye != nil {
 		n++
 	}
-	if e.OpenURL != nil {
-		n++
-	}
-	if e.ClipRequest != nil {
-		n++
-	}
-	if e.ClipResponse != nil {
-		n++
-	}
-	if e.Notify != nil {
+	if e.Msg != nil {
 		n++
 	}
 	return n
+}
+
+// MarshalPayload serializes a service payload struct into a Msg.Payload using
+// the package encMode, so services never construct their own CBOR mode. The
+// `any` constraint is the serialization boundary the cbor library requires;
+// generics keep call sites fully typed (no interface{}-typed value payloads).
+func MarshalPayload[T any](v T) (cbor.RawMessage, error) {
+	b, err := encMode.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return cbor.RawMessage(b), nil
+}
+
+// UnmarshalPayload decodes a Msg.Payload into a zero T using the package
+// decMode, so DupMapKeyEnforcedAPF also protects nested payload maps. The
+// `any` constraint is the serialization boundary the cbor library requires.
+func UnmarshalPayload[T any](data cbor.RawMessage) (T, error) {
+	var v T
+	if err := decMode.Unmarshal(data, &v); err != nil {
+		return v, err
+	}
+	return v, nil
 }
