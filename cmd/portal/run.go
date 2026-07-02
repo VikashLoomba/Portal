@@ -22,6 +22,7 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/localapi"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
@@ -143,9 +144,25 @@ func newOnceCmd(a *app.App) *cobra.Command {
 			if host == "" {
 				return fmt.Errorf("no dev box configured — run: %s install <ssh-host>", app.Tool)
 			}
-			// Spin the agent up briefly to populate Snapshot, then reconcile
-			// once. We use a child context so we can cancel Run() directly
-			// after Shutdown — avoiding a hang if Shutdown's Bye is lost.
+			// Daemon-up path: the running daemon already owns an AgentClient
+			// against this box. Trigger ITS reconcile over the socket rather than
+			// spinning a SECOND AgentClient against the same box — that duplicate
+			// is exactly what POST /v1/reconcile exists to avoid (DESIGN §5.2).
+			// Status is then rendered from GET /v1/status, so the agent line comes
+			// from the live daemon handshake. a.AgentClient.Run/Shutdown are NOT
+			// invoked on this branch.
+			lc := localclient.New(a.Paths.APISock)
+			if lc.Available(cmd.Context()) {
+				if err := lc.Reconcile(cmd.Context()); err == nil {
+					pollOnceStatus(cmd.Context(), lc)
+					return runStatusTo(cmd.Context(), cmd.OutOrStdout(), a)
+				}
+			}
+
+			// Daemon-down fallback: spin the agent up briefly to populate
+			// Snapshot, then reconcile once. We use a child context so we can
+			// cancel Run() directly after Shutdown — avoiding a hang if
+			// Shutdown's Bye is lost.
 			runCtx, runCancel := context.WithCancel(cmd.Context())
 			done := make(chan struct{})
 			go func() {
@@ -166,8 +183,35 @@ func newOnceCmd(a *app.App) *cobra.Command {
 			if err := a.Engine().Reconcile(runCtx); err != nil {
 				_ = err
 			}
-			return runStatus(cmd.Context(), a)
+			// Render via runStatusTo(cmd.OutOrStdout()), NOT runStatus (which
+			// writes os.Stdout): routing BOTH branches through the command's out
+			// writer keeps production stdout byte-identical (OutOrStdout defaults
+			// to os.Stdout) while making the fallback status capturable in tests
+			// exactly like the up-path (reviewer fix).
+			return runStatusTo(cmd.Context(), cmd.OutOrStdout(), a)
 		},
+	}
+}
+
+// pollOnceStatus is a bounded, best-effort poll that gives the daemon's async
+// Kick time to converge before `once` renders status. It calls lc.Status up to
+// ~1s in 50ms steps, returning as soon as Master.Up is true (or the deadline/ctx
+// elapses). It never errors — it is purely cosmetic, so `once` still returns
+// promptly even if the daemon never reports the master up.
+func pollOnceStatus(ctx context.Context, lc *localclient.Client) {
+	deadline := time.Now().Add(1 * time.Second)
+	for {
+		if st, err := lc.Status(ctx); err == nil && st.Master.Up {
+			return
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }
 
