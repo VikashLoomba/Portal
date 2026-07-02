@@ -1,5 +1,7 @@
 # portal
 
+[![CI](https://github.com/VikashLoomba/Portal/actions/workflows/ci.yml/badge.svg)](https://github.com/VikashLoomba/Portal/actions/workflows/ci.yml)
+
 Dynamic SSH port forwarding from a remote Linux dev box to your Mac — plus
 transparent **clipboard paste** (images *and* text) and **notification relay**
 for coding agents running on the box, over a plain `ssh` session.
@@ -15,17 +17,17 @@ same SSH connection portal already maintains.
 ### Recommended: download the latest release
 
 portal ships a pre-built **Apple Silicon** (arm64) Mac binary with every
-release. Download the latest one with the
-[`glab`](https://gitlab.com/gitlab-org/cli) CLI (it uses your existing GitLab
-login), make it executable, and run the installer:
+release. Download the latest one, make it executable, and run the installer:
 
 ```sh
-glab release download \
-  -R https://gitlab.i.extrahop.com/vikashl/devportal \
-  --asset-name=portal-darwin-arm64
+curl -fL -o portal-darwin-arm64 \
+  https://github.com/VikashLoomba/Portal/releases/latest/download/portal-darwin-arm64
 chmod +x portal-darwin-arm64
 ./portal-darwin-arm64 install <ssh-host>
 ```
+
+(Or, with the [`gh`](https://cli.github.com) CLI:
+`gh release download -R VikashLoomba/Portal --pattern portal-darwin-arm64`.)
 
 `portal install` copies the binary to `~/.local/bin/portal`, saves your dev-box
 config, loads the background login agent, deploys the clipboard shims and
@@ -46,8 +48,8 @@ Requires Go 1.25+. The build also cross-compiles the Linux dev-box agent
 (`portald`) and embeds it into the `portal` binary.
 
 ```sh
-git clone https://gitlab.i.extrahop.com/vikashl/devportal.git
-cd devportal
+git clone https://github.com/VikashLoomba/Portal.git
+cd Portal
 make build              # produces ./portal for your host architecture
 ./portal install <ssh-host>
 ```

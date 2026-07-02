@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/app"
 )
 
 // waitForSnapshot polls AgentClient.Snapshot() until it returns ok or the

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
+	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/hub"
 )
 
 // newEventsServer serves a Server with a real hub.Hub on a real unix socket in a

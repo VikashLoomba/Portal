@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"strings"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // Version is the content-version marker embedded in every shim. Ensure

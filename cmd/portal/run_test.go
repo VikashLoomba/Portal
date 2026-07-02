@@ -8,15 +8,15 @@ import (
 	"sync"
 	"testing"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/audit"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clip"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipupload"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/forward"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/agentclient"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/audit"
+	"github.com/VikashLoomba/Portal/internal/clip"
+	"github.com/VikashLoomba/Portal/internal/clipupload"
+	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/forward"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // errFake is an injectable read failure so a test can drive the

@@ -28,8 +28,8 @@ import (
 	"strings"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/run"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // MasterForwardSource enumerates the local LISTEN ports/lines a given master

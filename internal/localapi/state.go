@@ -8,11 +8,11 @@ package localapi
 import (
 	"context"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/service"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/doctor"
+	"github.com/VikashLoomba/Portal/internal/hub"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/service"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // VersionInfo is the payload of GET /v1/version: portal version, embedded git

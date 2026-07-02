@@ -10,8 +10,8 @@ import (
 	"strings"
 	"sync"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/clipshim"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // agentDigest caches the sha256 of EmbeddedAgent() so the probe can

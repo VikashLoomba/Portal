@@ -5,8 +5,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/bootstrap"
 )
 
 // versionLine is the single-line version string shared by the `version`

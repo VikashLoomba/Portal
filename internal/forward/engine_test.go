@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/clock"
+	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // fakeTransport implements BOTH transport.Transport and transport.PortForwarder

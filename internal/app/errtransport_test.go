@@ -6,7 +6,7 @@ import (
 	"io"
 	"testing"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // errTransport is the graceful-degradation placeholder NewProd installs when the

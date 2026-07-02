@@ -14,15 +14,15 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent/watcher"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/agent"
+	"github.com/VikashLoomba/Portal/internal/agent/watcher"
+	"github.com/VikashLoomba/Portal/internal/agentclient"
+	"github.com/VikashLoomba/Portal/internal/bootstrap"
+	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/doctor"
+	"github.com/VikashLoomba/Portal/internal/hub"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // integStreamTransport is the transport.Transport for the full-stack integration

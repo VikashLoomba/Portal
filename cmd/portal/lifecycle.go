@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/app"
 )
 
 func newUninstallCmd(a *app.App) *cobra.Command {

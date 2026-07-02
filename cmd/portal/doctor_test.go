@@ -9,12 +9,12 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshnative"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/clipshim"
+	"github.com/VikashLoomba/Portal/internal/doctor"
+	"github.com/VikashLoomba/Portal/internal/run"
+	"github.com/VikashLoomba/Portal/internal/sshnative"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // doctorFakeTransport implements transport.Transport for the doctor tests. It

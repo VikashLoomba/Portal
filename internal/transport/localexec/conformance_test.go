@@ -3,9 +3,9 @@ package localexec_test
 import (
 	"testing"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport/conformance"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport/localexec"
+	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/transport/conformance"
+	"github.com/VikashLoomba/Portal/internal/transport/localexec"
 )
 
 // The shared suite proves localexec under the shell-join model. The

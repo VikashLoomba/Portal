@@ -8,12 +8,12 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshnative"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/clipshim"
+	"github.com/VikashLoomba/Portal/internal/doctor"
+	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/internal/sshnative"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // newDoctorCmd self-tests the clipboard + notification path end to end over ssh

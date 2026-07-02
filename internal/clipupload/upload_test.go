@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // fakeTransport returns canned stdout/stderr/err from Exec so we can drive

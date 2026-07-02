@@ -15,11 +15,11 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent/watcher"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/agent"
+	"github.com/VikashLoomba/Portal/internal/agent/watcher"
+	"github.com/VikashLoomba/Portal/internal/bootstrap"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // fakeStreamTransport implements transport.Transport for the client test. It

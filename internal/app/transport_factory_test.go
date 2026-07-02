@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshnative"
+	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/sshnative"
 )
 
 // stderrRunner is a run.Runner that returns a fixed stderr on a code-0 Exec, so

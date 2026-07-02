@@ -14,11 +14,11 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/bootstrap"
+	"github.com/VikashLoomba/Portal/internal/clipshim"
+	"github.com/VikashLoomba/Portal/internal/hub"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // ErrNoSnapshot is returned by Snapshot() before the first SubscribeAck has

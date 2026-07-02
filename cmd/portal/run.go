@@ -14,16 +14,16 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clip"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipupload"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localapi"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/agentclient"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/bootstrap"
+	"github.com/VikashLoomba/Portal/internal/clip"
+	"github.com/VikashLoomba/Portal/internal/clipupload"
+	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/doctor"
+	"github.com/VikashLoomba/Portal/internal/localapi"
+	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/internal/protocol"
 )
 
 func newRunCmd(a *app.App) *cobra.Command {

@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
+	"github.com/VikashLoomba/Portal/internal/hub"
 )
 
 // eventLine is the typed envelope for one ndjson line of GET /v1/events. Exactly

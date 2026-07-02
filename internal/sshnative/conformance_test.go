@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport/conformance"
+	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/transport/conformance"
 )
 
 // TestConformance runs the shared T7 suite against the in-process T6 server via

@@ -25,7 +25,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 var _ transport.PortForwarder = (*Client)(nil)

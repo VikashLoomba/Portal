@@ -14,7 +14,7 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/protocol"
 )
 
 // Sentinel errors returned by the registry's Call helper (the lifted clip

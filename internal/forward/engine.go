@@ -13,10 +13,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/discover"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/clock"
+	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/discover"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // LocalPorts is the narrow LOCAL-port query surface the engine keeps for its

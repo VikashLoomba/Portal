@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // shQuote mirrors the install/doctor/conformance single-quote wrap so the

@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent/watcher"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/agent/watcher"
+	"github.com/VikashLoomba/Portal/internal/protocol"
 )
 
 // connPair holds two unidirectional pipes: client→agent and agent→client.

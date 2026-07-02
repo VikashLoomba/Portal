@@ -11,16 +11,16 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent/watcher"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/forward"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/agent"
+	"github.com/VikashLoomba/Portal/internal/agent/watcher"
+	"github.com/VikashLoomba/Portal/internal/agentclient"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/bootstrap"
+	"github.com/VikashLoomba/Portal/internal/clock"
+	"github.com/VikashLoomba/Portal/internal/forward"
+	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // onceStreamTransport wires each ExecStream to a REAL agent.Server over io.Pipe

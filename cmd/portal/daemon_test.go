@@ -11,16 +11,16 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/forward"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localapi"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/service"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/doctor"
+	"github.com/VikashLoomba/Portal/internal/forward"
+	"github.com/VikashLoomba/Portal/internal/hub"
+	"github.com/VikashLoomba/Portal/internal/localapi"
+	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/service"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // --- fake daemon dependencies (localapi.Deps narrow interfaces) ---

@@ -19,7 +19,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // Local runs commands on the local machine via `sh -c`.

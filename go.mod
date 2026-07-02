@@ -1,4 +1,4 @@
-module gitlab.i.extrahop.com/vikashl/devportal
+module github.com/VikashLoomba/Portal
 
 go 1.25.0
 

@@ -33,8 +33,8 @@ import (
 	"syscall"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent/watcher"
+	"github.com/VikashLoomba/Portal/internal/agent"
+	"github.com/VikashLoomba/Portal/internal/agent/watcher"
 )
 
 // readKernel is implemented per-OS (see uname_linux.go / stub elsewhere).

@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/app"
 )
 
 // newSSHCmd is a THIN PASSTHROUGH to the system ssh, kept only as an alias so

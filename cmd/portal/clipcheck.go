@@ -7,10 +7,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clip"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipupload"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/clip"
+	"github.com/VikashLoomba/Portal/internal/clipupload"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // clipUploadReachable gates the live clip upload on transport liveness: Ensure

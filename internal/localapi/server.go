@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/config"
 )
 
 // route is one mux entry: a Go 1.22 method-pattern handler. Method + " " +

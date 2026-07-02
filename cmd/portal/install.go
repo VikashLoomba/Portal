@@ -11,9 +11,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/clipshim"
+	"github.com/VikashLoomba/Portal/internal/sshctl"
 )
 
 func filepathDir(p string) string { return filepath.Dir(p) }

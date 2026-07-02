@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/agentclient"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/config"
 )
 
 // notifyDeliverTimeout bounds a single osascript/terminal-notifier invocation

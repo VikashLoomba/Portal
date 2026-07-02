@@ -4,11 +4,11 @@ import (
 	"os"
 	"testing"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/proc"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport/conformance"
+	"github.com/VikashLoomba/Portal/internal/proc"
+	"github.com/VikashLoomba/Portal/internal/run"
+	"github.com/VikashLoomba/Portal/internal/sshctl"
+	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/transport/conformance"
 )
 
 // TestConformance runs the shared transport conformance suite against a real

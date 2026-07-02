@@ -5,8 +5,8 @@ package service
 import (
 	"context"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
+	"github.com/VikashLoomba/Portal/internal/clock"
+	"github.com/VikashLoomba/Portal/internal/run"
 )
 
 // Stub allows the module to compile on non-darwin (e.g. Linux CI). All ops

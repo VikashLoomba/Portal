@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // shellQuote wraps s in single quotes, escaping embedded single quotes, so it
