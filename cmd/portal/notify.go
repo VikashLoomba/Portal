@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/agentclient"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/config"
 )
 
 // notifyDeliverTimeout bounds a single osascript/terminal-notifier invocation
@@ -42,7 +42,7 @@ func runNotifyHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a 
 			// writing "off" into ~/.config/portal/feature.notify. Drop the
 			// relayed event before raising anything when the feature is off.
 			if !a.Cfg.FeatureEnabled(config.FeatureNotify) {
-				a.Audit.NotifyDenied(a.Transport.Host(), "disabled")
+				a.Audit.NotifyDenied(a.Transport.Describe().Host, "disabled")
 				continue
 			}
 			title := n.Title
@@ -53,13 +53,13 @@ func runNotifyHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a 
 				title = "[unverified] " + title
 			}
 			a.Log.Logf("notify from %s: %q (verified=%v urgency=%d seq=%d)",
-				a.Transport.Host(), n.Title, n.Verified, n.Urgency, n.Seq)
-			a.Audit.Notify(a.Transport.Host(), n.Title, n.Verified, n.Urgency)
+				a.Transport.Describe().Host, n.Title, n.Verified, n.Urgency, n.Seq)
+			a.Audit.Notify(a.Transport.Describe().Host, n.Title, n.Verified, n.Urgency)
 			subtitle := n.Subtitle
 			if subtitle == "" {
 				// Default subtitle to the host for context, consistent with the
 				// agent binding Host on the envelope (recon recommendation).
-				subtitle = a.Transport.Host()
+				subtitle = a.Transport.Describe().Host
 			}
 			sound := n.Sound
 			if sound == "" {

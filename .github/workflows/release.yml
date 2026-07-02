@@ -1,0 +1,44 @@
+# portal release — runs only on version tags (v*): build the Apple Silicon
+# binary and publish it as a GitHub release asset. Unlike the old GitLab
+# pipeline, no package-registry hop is needed — GitHub release assets are
+# directly downloadable via /releases/latest/download/<asset>.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CGO_ENABLED: "0"
+  GOFLAGS: "-trimpath"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags so `git describe --tags` in the Makefile stamps
+          # VERSION with the release tag instead of a bare commit SHA.
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build the Apple Silicon binary
+        run: make portal-all
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES="Apple Silicon (arm64) Mac build. Download the latest with:
+
+              curl -fL -o portal-darwin-arm64 \\
+                https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/portal-darwin-arm64
+              chmod +x portal-darwin-arm64
+              ./portal-darwin-arm64 install <ssh-host>"
+          gh release create "$GITHUB_REF_NAME" portal-darwin-arm64 \
+            --title "portal $GITHUB_REF_NAME" \
+            --notes "$NOTES"

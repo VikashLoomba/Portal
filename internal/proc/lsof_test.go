@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
+	"github.com/VikashLoomba/Portal/internal/run"
 )
 
 func TestPortFromLsofName(t *testing.T) {

@@ -8,12 +8,11 @@ import (
 	"strings"
 	"testing"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
-// fakeTransport returns canned stdout/stderr/err from ExecBytes so we can
-// drive Upload's validation paths. Shaped after cmd/portal's
-// fakeUploadTransport.
+// fakeTransport returns canned stdout/stderr/err from Exec so we can drive
+// Upload's validation paths.
 type fakeTransport struct {
 	gotStdin []byte
 	gotArgv  []string
@@ -22,26 +21,24 @@ type fakeTransport struct {
 	err      error
 }
 
-func (f *fakeTransport) Host() string                                    { return "h" }
-func (f *fakeTransport) Sock() string                                    { return "/tmp/s" }
-func (f *fakeTransport) MasterPID(context.Context) (int, error)          { return 1, nil }
-func (f *fakeTransport) EnsureMaster(context.Context) (int, bool, error) { return 1, false, nil }
-func (f *fakeTransport) Forward(context.Context, int, int) error         { return nil }
-func (f *fakeTransport) Cancel(context.Context, int, int) error          { return nil }
-func (f *fakeTransport) Exit(context.Context) (bool, error)              { return false, nil }
-func (f *fakeTransport) Exec(context.Context, string, ...string) (string, error) {
-	return "", nil
+func (f *fakeTransport) Ensure(context.Context) (bool, error) { return false, nil }
+func (f *fakeTransport) Health(context.Context) (transport.Health, error) {
+	return transport.Health{Up: true, Pid: 1, Detail: "pid=1"}, nil
 }
-func (f *fakeTransport) ExecBytes(_ context.Context, stdin []byte, argv ...string) (string, string, error) {
+func (f *fakeTransport) Exec(_ context.Context, stdin []byte, argv ...string) (string, string, error) {
 	f.gotStdin = append([]byte(nil), stdin...)
 	f.gotArgv = argv
 	return f.stdout, f.stderr, f.err
 }
-func (f *fakeTransport) ExecStream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+func (f *fakeTransport) Stream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	return nil, nil, nil, func() error { return nil }, nil
 }
+func (f *fakeTransport) Close(context.Context) (bool, error) { return false, nil }
+func (f *fakeTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: "fakehost", Endpoint: "/tmp/fake-sock"}
+}
 
-var _ sshctl.Transport = (*fakeTransport)(nil)
+var _ transport.Transport = (*fakeTransport)(nil)
 
 // expectedName mirrors the content-addressed basename Upload computes.
 func expectedName(t *testing.T, png []byte) string {

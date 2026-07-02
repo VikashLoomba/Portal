@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/notify"
+	"github.com/VikashLoomba/Portal/internal/notify"
 )
 
 // notifyReadLimit bounds the hook JSON read from stdin. Claude Code hook

@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/service"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/service"
 )
 
 // EC1: status sourced over the socket includes the agent line plus the master/
@@ -274,6 +274,139 @@ func TestRunPorts_DaemonUp_NotConnected(t *testing.T) {
 	want := "loopback dev ports listening on devbox (will be forwarded):\n"
 	if out.String() != want {
 		t.Errorf("header-only mismatch:\n--- got ---\n%s\n--- want ---\n%s", out.String(), want)
+	}
+}
+
+// EC10c: viewFromLocal must set masterUp from Health.Up, NOT from Pid>0. Under a
+// native-shaped Health ({Up:true, Pid:0}) the fallback view must still report the
+// master up and fetch forwards via App.PF.ForwardLines.
+func TestViewFromLocal_NativeHealthPidZero(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	pf := &recordingForwarder{lines: []string{"127.0.0.1:5173"}}
+	a := &app.App{
+		Cfg:       cfg,
+		Paths:     app.Paths{Label: "com.test.portal", Sock: "/tmp/cm-fake.sock"},
+		Transport: nativeHealthTransport{up: true, pid: 0},
+		PF:        pf,
+		Service:   &appFakeService{st: service.Status{Loaded: true, StateLines: []string{"state = running"}}},
+	}
+
+	v := viewFromLocal(context.Background(), a)
+	if !v.masterUp {
+		t.Errorf("masterUp = false, want true (gated on Health.Up, not Pid>0)")
+	}
+	if v.masterPID != 0 {
+		t.Errorf("masterPID = %d, want 0 (native transport carries no pid)", v.masterPID)
+	}
+	if len(v.forwards) != 1 || v.forwards[0] != "127.0.0.1:5173" {
+		t.Errorf("forwards = %v, want [127.0.0.1:5173] (via App.PF.ForwardLines)", v.forwards)
+	}
+}
+
+// T8/T9: with the system transport selected the status output is byte-identical
+// to today — NO `transport:` line (the impl is "system-ssh", which the render
+// gate excludes). newDaemonTestApp's fake transport reports system-ssh.
+func TestStatus_System_NoTransportLine(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	a := newDaemonTestApp(t, filepath.Join(t.TempDir(), "nope.sock"), cfg)
+
+	var buf bytes.Buffer
+	renderStatus(&buf, viewFromLocal(context.Background(), a))
+	if strings.Contains(buf.String(), "transport:") {
+		t.Errorf("system status must not show a transport line, got:\n%s", buf.String())
+	}
+	if got := buf.String(); got != wantLocalStatus {
+		t.Errorf("system status not byte-identical:\n--- got ---\n%s\n--- want ---\n%s", got, wantLocalStatus)
+	}
+}
+
+// T8: with the native transport selected (Describe().Impl == native-ssh, a
+// healthy Health{Up:true,Pid:0}) the status shows the `transport: native-ssh`
+// line immediately after the `ssh master: UP ...` line.
+func TestStatus_Native_TransportLine(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	pf := &recordingForwarder{lines: []string{"127.0.0.1:5173"}}
+	a := &app.App{
+		Cfg:       cfg,
+		Paths:     app.Paths{Label: "com.test.portal", Sock: "/tmp/cm-fake.sock"},
+		Transport: nativeHealthTransport{up: true, pid: 0},
+		PF:        pf,
+		Service:   &appFakeService{st: service.Status{Loaded: true, StateLines: []string{"state = running"}}},
+	}
+
+	var buf bytes.Buffer
+	renderStatus(&buf, viewFromLocal(context.Background(), a))
+	want := "dev box: devbox\n" +
+		"service (com.test.portal):\n" +
+		"state = running\n" +
+		"\n" +
+		"ssh master: UP (pid=0) host=devbox\n" +
+		"transport: native-ssh\n" +
+		"active forwards (local listeners owned by master):\n" +
+		"  127.0.0.1:5173\n"
+	if got := buf.String(); got != want {
+		t.Errorf("native status mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+// T8: with the native transport selected but DOWN (box unreachable), the status
+// DOWN branch must still surface `transport: native-ssh` AND must NOT print a
+// `sock=` path — native never creates the ControlMaster socket, so naming one
+// falsely implies system ssh, exactly when the user needs to know which
+// transport is failing. Mirrors runDoctor's unconditional transport surfacing.
+func TestStatus_Native_Down_TransportLineNoSock(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	a := &app.App{
+		Cfg:       cfg,
+		Paths:     app.Paths{Label: "com.test.portal", Sock: "/tmp/cm-fake.sock"},
+		Transport: nativeHealthTransport{up: false, pid: 0},
+		PF:        &recordingForwarder{},
+		Service:   &appFakeService{st: service.Status{Loaded: true, StateLines: []string{"state = running"}}},
+	}
+
+	var buf bytes.Buffer
+	renderStatus(&buf, viewFromLocal(context.Background(), a))
+	want := "dev box: devbox\n" +
+		"service (com.test.portal):\n" +
+		"state = running\n" +
+		"\n" +
+		"ssh master: DOWN (host=devbox)\n" +
+		"transport: native-ssh\n"
+	if got := buf.String(); got != want {
+		t.Errorf("native DOWN status mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+	if strings.Contains(buf.String(), "sock=") {
+		t.Errorf("native DOWN status must not print a ControlMaster sock= path, got:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "/tmp/cm-fake.sock") {
+		t.Errorf("native DOWN status leaked the fictional ControlMaster path, got:\n%s", buf.String())
+	}
+}
+
+// T8/T9: with the SYSTEM transport DOWN the DOWN branch stays byte-identical to
+// today — the `sock=` path is present and NO `transport:` line appears.
+func TestStatus_System_Down_ByteCompat(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	a := &app.App{
+		Cfg:       cfg,
+		Paths:     app.Paths{Label: "com.test.portal", Sock: "/tmp/cm-sys.sock"},
+		Transport: systemDownTransport{},
+		PF:        &recordingForwarder{},
+		Service:   &appFakeService{st: service.Status{Loaded: true, StateLines: []string{"state = running"}}},
+	}
+
+	var buf bytes.Buffer
+	renderStatus(&buf, viewFromLocal(context.Background(), a))
+	want := "dev box: devbox\n" +
+		"service (com.test.portal):\n" +
+		"state = running\n" +
+		"\n" +
+		"ssh master: DOWN (host=devbox sock=/tmp/cm-sys.sock)\n"
+	if got := buf.String(); got != want {
+		t.Errorf("system DOWN status not byte-identical:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+	if strings.Contains(buf.String(), "transport:") {
+		t.Errorf("system DOWN status must not show a transport line, got:\n%s", buf.String())
 	}
 }
 

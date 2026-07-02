@@ -8,10 +8,11 @@ package localapi
 import (
 	"context"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/service"
+	"github.com/VikashLoomba/Portal/internal/doctor"
+	"github.com/VikashLoomba/Portal/internal/hub"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/service"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // VersionInfo is the payload of GET /v1/version: portal version, embedded git
@@ -48,10 +49,17 @@ type ServiceStatus struct {
 	StateLines []string `json:"stateLines"`
 }
 
-// MasterStatus reports the ssh ControlMaster: Up iff a live pid was found.
+// MasterStatus reports the transport liveness. Up is the liveness signal; Pid
+// is impl-specific ground truth (the system ssh transport fills the
+// ControlMaster pid; the native/localexec transports leave it 0 — documented).
+// Transport is the active Describe().Impl; Detail is the human liveness string
+// (the system ssh transport uses "pid=N"). Transport/Detail are additive and do
+// not perturb the byte-compat rendered status on the default (system) path.
 type MasterStatus struct {
-	Up  bool `json:"up"`
-	Pid int  `json:"pid"`
+	Up        bool   `json:"up"`
+	Pid       int    `json:"pid"`
+	Transport string `json:"transport"`
+	Detail    string `json:"detail"`
 }
 
 // Health carries daemon-internal liveness/QoS counters (§4.4).
@@ -90,14 +98,17 @@ type AgentSource interface {
 	LastDisconnectErr() string
 }
 
-// MasterProber probes the ssh ControlMaster pid (subset of sshctl.Transport).
+// MasterProber probes transport liveness and identity (subset of
+// transport.Transport). Health.Up is the liveness gate; Describe().Impl feeds
+// the additive Status.Master.transport field.
 type MasterProber interface {
-	MasterPID(ctx context.Context) (int, error)
+	Health(ctx context.Context) (transport.Health, error)
+	Describe() transport.Desc
 }
 
-// ForwardLister lists active local forwards (subset of proc.PortLister).
+// ForwardLister lists active local forwards (subset of transport.PortForwarder).
 type ForwardLister interface {
-	MasterForwardLines(ctx context.Context, masterPID int) ([]string, error)
+	ForwardLines(ctx context.Context) ([]string, error)
 }
 
 // ServiceStater reports launchd service state (subset of service.Manager).

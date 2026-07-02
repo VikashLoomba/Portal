@@ -8,11 +8,12 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/clipshim"
+	"github.com/VikashLoomba/Portal/internal/doctor"
+	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/internal/sshnative"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // newDoctorCmd self-tests the clipboard + notification path end to end over ssh
@@ -40,7 +41,12 @@ func newDoctorCmd(a *app.App) *cobra.Command {
 // self-test runs against the daemon's LIVE ControlMaster (better ground truth
 // than a fresh CLI-side probe); when the daemon is down it falls back to today's
 // in-process run. Both paths need a host.
-func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App) error {
+//
+// nativeOpts is a T5 hermeticity seam: production passes NONE (native resolves
+// the real ~/.ssh defaults), while the daemon-down fallback test injects temp-dir
+// known_hosts/identity fixtures so the native construction never touches the
+// runner's real ~/.ssh. It applies only to the native branch of the factory.
+func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App, nativeOpts ...sshnative.Option) error {
 	host, _ := a.Cfg.ReadHost()
 	if host == "" {
 		return fmt.Errorf("no dev box configured — run: %s install <ssh-host>", app.Tool)
@@ -65,16 +71,82 @@ func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App) error {
 		}
 		return nil
 	}
-	// Fallback (daemon down): the in-process run over a FRESH sshctl transport (never
-	// a.Transport — routing doctor probes through it would leak ssh stderr into
-	// the report). The only test seam that intercepts this path is a.Runner.
-	tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+	// Fallback (daemon down): the in-process run over a FRESH transport built by
+	// the selection-aware factory so a `native` selection is honored and surfaced
+	// even with the daemon down. The nil ssh-stderr sink preserves the current
+	// no-leak behavior (routing doctor probes through a.Transport, or a sink-wired
+	// transport, would tee ssh stderr into the report). The only test seam that
+	// intercepts this path is a.Runner.
+	tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil, nativeOpts...)
+	if err != nil {
+		return err
+	}
 	rep := runDoctor(ctx, host, tr)
+	// This branch is only reached with the daemon confirmed DOWN
+	// (lc.Available==false above). Force the daemon-down verdict to be honest
+	// under a non-system transport — see markDaemonDown.
+	markDaemonDown(rep, tr.Describe().Impl)
 	renderDoctor(w, rep)
 	if !rep.OK() {
 		return errSilent
 	}
 	return nil
+}
+
+// markDaemonDown makes the daemon-down fallback report honest under a NON-system
+// transport. The fallback in runDoctorCmd is only reached with the relay daemon
+// confirmed down, and for native runDoctor built a FRESH client and actively
+// Ensure'd it (a native dial is a cheap in-process connect that the install/
+// self-test path legitimately needs) — a throwaway connection that shares nothing
+// with the dead daemon. That dial succeeds against a reachable box, so the master
+// check renders "ssh master: UP (pid=0)" and every downstream probe passes, which
+// would render a FALSE "RESULT: PASS": the relay daemon is down, so
+// clip/notify/forwards are dead (native forwards have no ControlPersist analogue,
+// per T10). Seed a FAIL so the verdict matches reality.
+//
+// SYSTEM is a deliberate no-op (byte-identical per T9): its fresh transport shares
+// the persistent ControlMaster and doctor probes it PASSIVELY (never Ensures), so
+// a daemon-down system run already FAILs the master check on its own — adding a
+// line here would break the goldens.
+func markDaemonDown(rep *doctor.Report, impl string) {
+	if impl == "system-ssh" {
+		return
+	}
+	rep.Add("daemon", doctor.Fail,
+		"daemon not running — clip/notify/forwards are down; start it: "+app.Tool+" start")
+}
+
+// doctorTransport picks the transport the daemon-up /v1/doctor probe runs over.
+//
+// For NATIVE it returns the daemon's LIVE transport (a.Transport). A native
+// connection is in-process state: a freshly-constructed client shares nothing
+// with the daemon's live connection, so its Health reports DOWN without dialing
+// (New never dials) — the false "ssh master DOWN" a fresh factory client would
+// yield on a healthy native daemon. Ensure is idempotent: a no-op when the live
+// client is up, a same-client re-dial (no leaked connection) if the keepalive
+// marked it dead. Unlike system-ssh — whose fresh transport shares the persistent
+// ControlMaster socket and can probe it via `ssh -O check` — native must be
+// observed on the very connection the daemon holds.
+//
+// For SYSTEM it returns a FRESH nil-sink transport: routing doctor probes through
+// a.Transport (StderrSink=os.Stderr) would tee ssh stderr into the launchd log,
+// so the fresh transport keeps the report clean while still probing the shared
+// ControlMaster socket.
+func doctorTransport(ctx context.Context, a *app.App, host string) (transport.Transport, error) {
+	sel, err := a.Cfg.Transport()
+	if err != nil {
+		return nil, err
+	}
+	if sel == "native" && a.Transport != nil {
+		// Idempotent: no-op if already up, same-client re-dial if keepalive-dead.
+		_, _ = a.Transport.Ensure(ctx)
+		return a.Transport, nil
+	}
+	tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
+	if err != nil {
+		return nil, err
+	}
+	return tr, nil
 }
 
 // renderDoctor writes the human-readable report to w. It is a free function in
@@ -102,17 +174,54 @@ func renderDoctor(w io.Writer, rep *doctor.Report) {
 // runDoctor performs every probe over tr and returns the assembled report. It
 // is split out (taking a Transport) so a test can drive it with a fake
 // transport that scripts canned ssh-exec replies — no live dev box needed.
-func runDoctor(ctx context.Context, host string, tr sshctl.Transport) *doctor.Report {
+func runDoctor(ctx context.Context, host string, tr transport.Transport) *doctor.Report {
 	rep := &doctor.Report{Host: host}
+
+	// 0. Transport surfacing (T8) + failure-mode honesty (T10), gated so the
+	// default (system) doctor report stays byte-identical (T9). renderDoctor is
+	// UNCHANGED — it just renders whatever Checks exist here. The daemon's
+	// /v1/doctor closure and the daemon-down fallback both call runDoctor over a
+	// factory-built transport, so Impl reflects the config selection on either
+	// path. Warn is tolerated by Report.OK, so the note keeps RESULT at PASS.
+	if d := tr.Describe(); d.Impl != "system-ssh" {
+		rep.Add("transport", doctor.Pass, d.Impl)
+		if d.Impl == "native-ssh" {
+			rep.Add("forward lifetime", doctor.Warn,
+				"native forwards die with the daemon (no ControlPersist analogue); a daemon restart re-establishes them")
+		}
+	}
 
 	// 1. Master connectivity. Without the ControlMaster the daemon can't relay a
 	// clip request at all; everything downstream is moot.
-	if pid, err := tr.MasterPID(ctx); err != nil || pid == 0 {
+	//
+	// Ensure BEFORE the Health gate, but ONLY for native. The two direct callers
+	// (install self-test, daemon-down fallback) build a FRESH transport that has
+	// never been brought up. For native that transport has not dialed, so Health
+	// reports DOWN until Ensure connects — without this a healthy native box
+	// would wrongly fail the master check, and a native dial is a cheap
+	// in-process connect.
+	//
+	// For SYSTEM we must NOT Ensure here: sshctl.Ensure is not a passive
+	// dial-check — it removes the stale socket and spawns a persistent
+	// `ssh -fN -M -o ControlPersist=yes` ControlMaster whenever one isn't
+	// running. Calling it from `portal doctor` when the daemon is down (fresh
+	// boot, or right after `portal stop`) would flip the master check false-green,
+	// hide that the relay daemon is not running, and leave an orphaned master the
+	// user never asked for. The system path stays check-only so a daemon-down
+	// doctor run still reports `DOWN — start the daemon`, preserving the
+	// byte-compat diagnostic. When the daemon IS up the shared ControlMaster is
+	// already running, so Health sees it without any build.
+	if tr.Describe().Impl == "native-ssh" {
+		// A dial error is not fatal here; the Health gate below still renders
+		// the DOWN line.
+		_, _ = tr.Ensure(ctx)
+	}
+	if h, err := tr.Health(ctx); err != nil || !h.Up {
 		rep.Add("ssh master", doctor.Fail, "DOWN — start the daemon: "+app.Tool+" start")
 		// Without a master we cannot run any remote probe; bail with what we have.
 		return rep
 	} else {
-		rep.Add("ssh master", doctor.Pass, fmt.Sprintf("UP (pid=%d)", pid))
+		rep.Add("ssh master", doctor.Pass, fmt.Sprintf("UP (pid=%d)", h.Pid))
 	}
 
 	// 2. PATH-winner check — THE make-or-break. For each shim, resolve the tool
@@ -204,7 +313,7 @@ func runDoctor(ctx context.Context, host string, tr sshctl.Transport) *doctor.Re
 // ~/.bashrc / ~/.zshenv / ~/.profile by clipshim.ensurePathPrepend) is in
 // effect — matching the environment a coding agent inherits — rather than the
 // bare non-interactive ssh PATH which would not source those files.
-func resolveShimWinner(ctx context.Context, tr sshctl.Transport, tool string) (path string, isShim bool) {
+func resolveShimWinner(ctx context.Context, tr transport.Transport, tool string) (path string, isShim bool) {
 	// `bash -lic` = login + interactive so rc files (and the PATH block) load.
 	// command -v prints the resolved path; we then grep the file for the Marker.
 	script := fmt.Sprintf(
@@ -213,7 +322,7 @@ func resolveShimWinner(ctx context.Context, tr sshctl.Transport, tool string) (p
 			`if grep -qF %q "$p" 2>/dev/null; then echo "SHIM $p"; else echo "REAL $p"; fi`,
 		tool, clipshim.Marker,
 	)
-	out, err := tr.Exec(ctx, "", "bash", "-c", doctorShellQuote(script))
+	out, _, err := tr.Exec(ctx, nil, "bash", "-c", doctorShellQuote(script))
 	if err != nil {
 		return "", false
 	}
@@ -233,7 +342,7 @@ func resolveShimWinner(ctx context.Context, tr sshctl.Transport, tool string) (p
 // deployedShimVersion extracts the version number from the Marker line in the
 // deployed ~/.local/bin/xclip shim. Returns ok=false if the shim is absent or
 // carries no recognizable marker.
-func deployedShimVersion(ctx context.Context, tr sshctl.Transport) (version string, ok bool) {
+func deployedShimVersion(ctx context.Context, tr transport.Transport) (version string, ok bool) {
 	// The Marker is "Installed by portal clip-shim v<N>"; grep it out of the
 	// shim and print the trailing version token.
 	const prefix = "Installed by portal clip-shim v"
@@ -246,7 +355,7 @@ func deployedShimVersion(ctx context.Context, tr sshctl.Transport) (version stri
 			`echo "${line##*%s}"`,
 		prefix, prefix,
 	)
-	out, err := tr.Exec(ctx, "", "bash", "-c", doctorShellQuote(script))
+	out, _, err := tr.Exec(ctx, nil, "bash", "-c", doctorShellQuote(script))
 	if err != nil {
 		return "", false
 	}
@@ -275,7 +384,7 @@ type agentVerbs struct {
 // prints (a present subcommand prints its own usage to stderr; an absent one
 // falls through to the agent's flag parser). This avoids actually triggering a
 // clip/notify relay.
-func probePortaldVerbs(ctx context.Context, tr sshctl.Transport) (present bool, verbs agentVerbs) {
+func probePortaldVerbs(ctx context.Context, tr transport.Transport) (present bool, verbs agentVerbs) {
 	script := `
 pd="$HOME/.cache/portal/portald"
 [ -x "$pd" ] || { echo "NO_PORTALD"; exit 0; }
@@ -286,7 +395,7 @@ case "$cu" in *"usage: portald clip"*) echo "CLIP_OK";; esac
 nu=$("$pd" notify 2>&1 1>/dev/null; true)
 case "$nu" in *"usage: portald notify"*) echo "NOTIFY_OK";; esac
 `
-	out, err := tr.Exec(ctx, "", "bash", "-c", doctorShellQuote(script))
+	out, _, err := tr.Exec(ctx, nil, "bash", "-c", doctorShellQuote(script))
 	if err != nil {
 		return false, verbs
 	}
@@ -303,9 +412,9 @@ case "$nu" in *"usage: portald notify"*) echo "NOTIFY_OK";; esac
 // exit 1 == nothing servable (the expected/clean fall-through). We run it via a
 // wrapper that echoes the exit code so a non-zero exit (which Exec surfaces as
 // an error) is captured as data rather than swallowed.
-func smokeClipTargets(ctx context.Context, tr sshctl.Transport) (out string, code int) {
+func smokeClipTargets(ctx context.Context, tr transport.Transport) (out string, code int) {
 	script := `"$HOME/.cache/portal/portald" clip targets xclip; echo "EXIT=$?"`
-	raw, _ := tr.Exec(ctx, "", "bash", "-c", doctorShellQuote(script))
+	raw, _, _ := tr.Exec(ctx, nil, "bash", "-c", doctorShellQuote(script))
 	// Split the captured EXIT marker off the tail.
 	idx := strings.LastIndex(raw, "EXIT=")
 	if idx < 0 {

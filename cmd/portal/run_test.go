@@ -8,14 +8,15 @@ import (
 	"sync"
 	"testing"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/audit"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clip"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipupload"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/forward"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/agentclient"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/audit"
+	"github.com/VikashLoomba/Portal/internal/clip"
+	"github.com/VikashLoomba/Portal/internal/clipupload"
+	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/forward"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // errFake is an injectable read failure so a test can drive the
@@ -56,24 +57,28 @@ func (f *fakeClipboard) Text(context.Context) ([]byte, error) {
 
 var _ clip.Clipboard = (*fakeClipboard)(nil)
 
-// uploadFakeTransport is the minimal sshctl.Transport that clipupload.Upload*
-// needs: ExecBytes must echo back a path that validateRemotePath accepts
-// ("/<abs>/<name>"). It derives the expected basename from the script (which
-// ends with the content-addressed name) so any sha round-trips cleanly.
+// uploadFakeTransport is the minimal transport.Transport that clipupload.Upload*
+// needs: Exec (with byte stdin) must echo back a path that validateRemotePath
+// accepts ("/<abs>/<name>"). It derives the expected basename from the script
+// (which ends with the content-addressed name) so any sha round-trips cleanly.
 type uploadFakeTransport struct{}
 
-func (uploadFakeTransport) MasterPID(context.Context) (int, error)                  { return 1, nil }
-func (uploadFakeTransport) EnsureMaster(context.Context) (int, bool, error)         { return 1, false, nil }
-func (uploadFakeTransport) Forward(context.Context, int, int) error                 { return nil }
-func (uploadFakeTransport) Cancel(context.Context, int, int) error                  { return nil }
-func (uploadFakeTransport) Exit(context.Context) (bool, error)                      { return true, nil }
-func (uploadFakeTransport) Host() string                                            { return "fakehost" }
-func (uploadFakeTransport) Sock() string                                            { return "/tmp/sock-fake" }
-func (uploadFakeTransport) Exec(context.Context, string, ...string) (string, error) { return "", nil }
-func (uploadFakeTransport) ExecStream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+func (uploadFakeTransport) Ensure(context.Context) (bool, error) { return false, nil }
+func (uploadFakeTransport) Health(context.Context) (transport.Health, error) {
+	return transport.Health{Up: true, Pid: 1, Detail: "pid=1"}, nil
+}
+func (uploadFakeTransport) Close(context.Context) (bool, error) { return true, nil }
+func (uploadFakeTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: "fakehost", Endpoint: "/tmp/sock-fake"}
+}
+func (uploadFakeTransport) Stream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	return nil, nil, nil, nil, nil
 }
-func (uploadFakeTransport) ExecBytes(_ context.Context, _ []byte, argv ...string) (string, string, error) {
+func (uploadFakeTransport) Exec(_ context.Context, stdin []byte, argv ...string) (string, string, error) {
+	if len(stdin) == 0 {
+		// Non-upload probe path (nil stdin) — no canned reply needed.
+		return "", "", nil
+	}
 	// The upload script ends with: printf '%s' "$HOME/.cache/portal/clip/<name>"
 	// We can't run shell, so synthesize a path ending in the basename the
 	// script embeds. Extract the trailing /clip/<name>" token from the joined
@@ -93,6 +98,8 @@ func (uploadFakeTransport) ExecBytes(_ context.Context, _ []byte, argv ...string
 	return "/home/u/.cache/portal/clip/" + name, "", nil
 }
 
+var _ transport.Transport = (*uploadFakeTransport)(nil)
+
 // newTestApp builds an App with a fake transport + audit sink rooted at a temp
 // dir so feature-toggle files can be written per test.
 func newTestApp(t *testing.T) *app.App {
@@ -103,6 +110,50 @@ func newTestApp(t *testing.T) *app.App {
 		Log:       forward.StdoutLogger(),
 		Audit:     audit.New(dir),
 		Transport: uploadFakeTransport{},
+	}
+}
+
+// TestEnsureForwardedForURL_ForwardsUnderNativeHealth proves the run
+// auto-forward path (EC10b): under a healthy transport reporting Pid==0
+// (native-shaped Health) it still forwards a missing localhost port, and the
+// Forward call routes through App.PF (a transport.PortForwarder) — NOT
+// App.Transport, which no longer has forwarding methods. The recording
+// forwarder starts with no current forwards, so the URL's port must be added.
+func TestEnsureForwardedForURL_ForwardsUnderNativeHealth(t *testing.T) {
+	dir := t.TempDir()
+	pf := &recordingForwarder{current: nil}
+	a := &app.App{
+		Cfg:       config.New(dir),
+		Log:       forward.StdoutLogger(),
+		Audit:     audit.New(dir),
+		Transport: nativeHealthTransport{up: true, pid: 0},
+		PF:        pf,
+	}
+
+	ensureForwardedForURL(context.Background(), "http://localhost:39041/callback", a)
+
+	if len(pf.forwarded) != 1 || pf.forwarded[0] != [2]int{39041, 39041} {
+		t.Fatalf("Forward calls = %v, want [[39041 39041]] (routed through App.PF under Pid==0 Health)", pf.forwarded)
+	}
+}
+
+// TestEnsureForwardedForURL_SkipsWhenMasterDown proves the gate short-circuits
+// when Health.Up is false: no Forward is attempted.
+func TestEnsureForwardedForURL_SkipsWhenMasterDown(t *testing.T) {
+	dir := t.TempDir()
+	pf := &recordingForwarder{}
+	a := &app.App{
+		Cfg:       config.New(dir),
+		Log:       forward.StdoutLogger(),
+		Audit:     audit.New(dir),
+		Transport: nativeHealthTransport{up: false},
+		PF:        pf,
+	}
+
+	ensureForwardedForURL(context.Background(), "http://localhost:39041/callback", a)
+
+	if len(pf.forwarded) != 0 {
+		t.Fatalf("Forward calls = %v, want none when master down", pf.forwarded)
 	}
 }
 

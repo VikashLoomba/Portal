@@ -11,10 +11,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localapi"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/logfile"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/localapi"
+	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/internal/logfile"
 )
 
 func newStatusCmd(a *app.App) *cobra.Command {
@@ -120,8 +120,12 @@ type statusView struct {
 	masterUp   bool
 	masterPID  int
 	sock       string
-	agent      *statusAgentView
-	forwards   []string
+	// impl is the active transport's Describe().Impl. renderStatus prints an
+	// extra `transport: <impl>` line IFF impl is non-empty AND != "system-ssh",
+	// so the default (system) path stays byte-identical (T8/T9).
+	impl     string
+	agent    *statusAgentView
+	forwards []string
 }
 
 // renderStatus reproduces the historical runStatus output byte-for-byte (§5.2).
@@ -148,10 +152,25 @@ func renderStatus(w io.Writer, v statusView) {
 		return
 	}
 	if !v.masterUp {
-		fmt.Fprintf(w, "ssh master: DOWN (host=%s sock=%s)\n", v.host, v.sock)
+		// A native (non-system) transport never creates the ControlMaster
+		// socket, so printing sock= there would name a fictional path implying
+		// system ssh. Omit it and surface the active transport unconditionally
+		// (mirroring runDoctor), so a DOWN native connection still says which
+		// transport is failing (T8). System-ssh stays byte-identical (T8/T9).
+		if v.impl != "" && v.impl != "system-ssh" {
+			fmt.Fprintf(w, "ssh master: DOWN (host=%s)\n", v.host)
+			fmt.Fprintf(w, "transport: %s\n", v.impl)
+		} else {
+			fmt.Fprintf(w, "ssh master: DOWN (host=%s sock=%s)\n", v.host, v.sock)
+		}
 		return
 	}
 	fmt.Fprintf(w, "ssh master: UP (pid=%d) host=%s\n", v.masterPID, v.host)
+	// Surface the active transport only when it is NOT the default system ssh —
+	// the system path stays byte-identical (T8/T9).
+	if v.impl != "" && v.impl != "system-ssh" {
+		fmt.Fprintf(w, "transport: %s\n", v.impl)
+	}
 	if v.agent != nil {
 		fmt.Fprintf(w, "agent: pid=%d sha=%s kernel=%s\n", v.agent.pid, v.agent.sha, v.agent.kernel)
 	}
@@ -184,6 +203,7 @@ func viewFromStatus(a *app.App, st localapi.Status) statusView {
 		masterUp:   st.Master.Up,
 		masterPID:  st.Master.Pid,
 		sock:       a.Paths.Sock,
+		impl:       st.Master.Transport, // carried over the wire by localapi (u2).
 	}
 	for _, f := range st.Forwards {
 		v.forwards = append(v.forwards, f.Name)
@@ -210,6 +230,7 @@ func viewFromLocal(ctx context.Context, a *app.App) statusView {
 		label:     a.Paths.Label,
 		hostKnown: host != "",
 		sock:      a.Paths.Sock,
+		impl:      a.Transport.Describe().Impl,
 	}
 	if st, err := a.Service.Status(ctx); err == nil {
 		v.loaded = st.Loaded
@@ -218,13 +239,13 @@ func viewFromLocal(ctx context.Context, a *app.App) statusView {
 	if !v.hostKnown {
 		return v
 	}
-	pid, _ := a.Transport.MasterPID(ctx)
-	v.masterPID = pid
-	v.masterUp = pid > 0
+	h, _ := a.Transport.Health(ctx)
+	v.masterPID = h.Pid
+	v.masterUp = h.Up
 	if !v.masterUp {
 		return v
 	}
-	lines, _ := a.Ports.MasterForwardLines(ctx, pid)
+	lines, _ := a.PF.ForwardLines(ctx)
 	v.forwards = lines
 	if a.AgentClient != nil {
 		if ack := a.AgentClient.HelloAck(); ack != nil {
@@ -296,7 +317,11 @@ func runPorts(ctx context.Context, w, errw io.Writer, a *app.App) error {
 	if host == "" {
 		return fmt.Errorf("no dev box configured — run: %s install <ssh-host>", app.Tool)
 	}
-	if pid, _, err := a.Transport.EnsureMaster(ctx); err != nil || pid == 0 {
+	if _, err := a.Transport.Ensure(ctx); err != nil {
+		fmt.Fprintf(errw, "could not reach %s\n", host)
+		return errSilent
+	}
+	if h, _ := a.Transport.Health(ctx); !h.Up {
 		fmt.Fprintf(errw, "could not reach %s\n", host)
 		return errSilent
 	}

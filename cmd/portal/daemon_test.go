@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,16 +11,16 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localapi"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/proc"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/service"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/doctor"
+	"github.com/VikashLoomba/Portal/internal/forward"
+	"github.com/VikashLoomba/Portal/internal/hub"
+	"github.com/VikashLoomba/Portal/internal/localapi"
+	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/service"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // --- fake daemon dependencies (localapi.Deps narrow interfaces) ---
@@ -66,17 +67,25 @@ func (f *fakeAgentSource) RSID() int {
 
 var _ localapi.AgentSource = (*fakeAgentSource)(nil)
 
-// fakeMasterProber is a canned localapi.MasterProber.
+// fakeMasterProber is a canned localapi.MasterProber (Health + Describe).
 type fakeMasterProber struct{ pid int }
 
-func (f *fakeMasterProber) MasterPID(context.Context) (int, error) { return f.pid, nil }
+func (f *fakeMasterProber) Health(context.Context) (transport.Health, error) {
+	if f.pid <= 0 {
+		return transport.Health{Up: false}, nil
+	}
+	return transport.Health{Up: true, Pid: f.pid, Detail: fmt.Sprintf("pid=%d", f.pid)}, nil
+}
+func (f *fakeMasterProber) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: "fakehost", Endpoint: "/tmp/cm-fake.sock"}
+}
 
 var _ localapi.MasterProber = (*fakeMasterProber)(nil)
 
 // fakeForwardLister is a canned localapi.ForwardLister.
 type fakeForwardLister struct{ lines []string }
 
-func (f *fakeForwardLister) MasterForwardLines(context.Context, int) ([]string, error) {
+func (f *fakeForwardLister) ForwardLines(context.Context) ([]string, error) {
 	return append([]string(nil), f.lines...), nil
 }
 
@@ -250,30 +259,29 @@ func (d *fakeDaemon) featureWrites() int { return int(d.cfg.writes.Load()) }
 
 // --- fake App adapters (the daemon-DOWN fallback path) ---
 
-// appFakeTransport is a minimal sshctl.Transport for the fallback view: it only
-// needs to report a master pid.
+// appFakeTransport is a minimal transport.Transport for the fallback view: it
+// only needs to report master liveness (pid) and identity.
 type appFakeTransport struct{ pid int }
 
-func (f *appFakeTransport) MasterPID(context.Context) (int, error) { return f.pid, nil }
-func (f *appFakeTransport) EnsureMaster(context.Context) (int, bool, error) {
-	return f.pid, false, nil
+func (f *appFakeTransport) Ensure(context.Context) (bool, error) { return false, nil }
+func (f *appFakeTransport) Health(context.Context) (transport.Health, error) {
+	if f.pid <= 0 {
+		return transport.Health{Up: false}, nil
+	}
+	return transport.Health{Up: true, Pid: f.pid, Detail: fmt.Sprintf("pid=%d", f.pid)}, nil
 }
-func (f *appFakeTransport) Forward(context.Context, int, int) error { return nil }
-func (f *appFakeTransport) Cancel(context.Context, int, int) error  { return nil }
-func (f *appFakeTransport) Exit(context.Context) (bool, error)      { return false, nil }
-func (f *appFakeTransport) Host() string                            { return "fakehost" }
-func (f *appFakeTransport) Sock() string                            { return "/tmp/cm-fake.sock" }
-func (f *appFakeTransport) Exec(context.Context, string, ...string) (string, error) {
-	return "", nil
-}
-func (f *appFakeTransport) ExecBytes(context.Context, []byte, ...string) (string, string, error) {
+func (f *appFakeTransport) Exec(context.Context, []byte, ...string) (string, string, error) {
 	return "", "", nil
 }
-func (f *appFakeTransport) ExecStream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+func (f *appFakeTransport) Close(context.Context) (bool, error) { return false, nil }
+func (f *appFakeTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: "fakehost", Endpoint: "/tmp/cm-fake.sock"}
+}
+func (f *appFakeTransport) Stream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	return nil, nil, nil, func() error { return nil }, nil
 }
 
-var _ sshctl.Transport = (*appFakeTransport)(nil)
+var _ transport.Transport = (*appFakeTransport)(nil)
 
 // appFakeService is a canned service.Manager (only Status is exercised).
 type appFakeService struct{ st service.Status }
@@ -289,22 +297,30 @@ func (f *appFakeService) IsLoaded(context.Context) (bool, error)         { retur
 
 var _ service.Manager = (*appFakeService)(nil)
 
-// appFakePorts is a canned proc.PortLister.
+// appFakePorts satisfies BOTH forward.LocalPorts (App.Ports) and
+// transport.PortForwarder (App.PF): the fallback view reads forwards via
+// App.PF.ForwardLines while the engine's conflict path reads local holders via
+// App.Ports. One struct backs both so the fallback render sees a single set.
 type appFakePorts struct {
 	lines []string
 	ports []int
 }
 
-func (f *appFakePorts) MasterForwards(context.Context, int) ([]int, error) {
+func (f *appFakePorts) Forward(context.Context, int, int) error { return nil }
+func (f *appFakePorts) Cancel(context.Context, int, int) error  { return nil }
+func (f *appFakePorts) ListForwards(context.Context) ([]int, error) {
 	return append([]int(nil), f.ports...), nil
 }
-func (f *appFakePorts) MasterForwardLines(context.Context, int) ([]string, error) {
+func (f *appFakePorts) ForwardLines(context.Context) ([]string, error) {
 	return append([]string(nil), f.lines...), nil
 }
 func (f *appFakePorts) LocalHolder(context.Context, int) (int, error) { return 0, nil }
 func (f *appFakePorts) ProcessName(context.Context, int) string       { return "" }
 
-var _ proc.PortLister = (*appFakePorts)(nil)
+var (
+	_ forward.LocalPorts      = (*appFakePorts)(nil)
+	_ transport.PortForwarder = (*appFakePorts)(nil)
+)
 
 // appFakeDiscover is a canned discover.RemoteDiscoverer.
 type appFakeDiscover struct{ ports []int }
@@ -320,6 +336,7 @@ func (f *appFakeDiscover) DesiredPorts(context.Context, []int, []int) ([]int, er
 // observable.
 func newDaemonTestApp(t *testing.T, sockPath string, cfg *config.Store) *app.App {
 	t.Helper()
+	ports := &appFakePorts{lines: []string{"127.0.0.1:5173"}, ports: []int{5173}}
 	return &app.App{
 		Paths: app.Paths{
 			APISock: sockPath,
@@ -328,8 +345,9 @@ func newDaemonTestApp(t *testing.T, sockPath string, cfg *config.Store) *app.App
 		},
 		Cfg:         cfg,
 		Transport:   &appFakeTransport{pid: 7777},
+		PF:          ports,
 		Service:     &appFakeService{st: service.Status{Loaded: true, StateLines: []string{"state = running"}}},
-		Ports:       &appFakePorts{lines: []string{"127.0.0.1:5173"}, ports: []int{5173}},
+		Ports:       ports,
 		Discover:    &appFakeDiscover{ports: []int{5173, 6006}},
 		AgentClient: nil,
 	}

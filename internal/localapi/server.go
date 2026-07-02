@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/config"
 )
 
 // route is one mux entry: a Go 1.22 method-pattern handler. Method + " " +
@@ -298,13 +298,13 @@ func (s *Server) buildStatus(ctx context.Context) Status {
 		}
 	}
 
-	var masterPID int
+	var masterUp bool
 	if s.deps.Master != nil {
-		if pid, err := s.deps.Master.MasterPID(ctx); err == nil {
-			masterPID = pid
-		}
+		h, _ := s.deps.Master.Health(ctx)
+		d := s.deps.Master.Describe()
+		masterUp = h.Up
+		st.Master = MasterStatus{Up: h.Up, Pid: h.Pid, Transport: d.Impl, Detail: h.Detail}
 	}
-	st.Master = MasterStatus{Up: masterPID > 0, Pid: masterPID}
 
 	if s.deps.Agent != nil {
 		if ack := s.deps.Agent.HelloAck(); ack != nil {
@@ -322,8 +322,8 @@ func (s *Server) buildStatus(ctx context.Context) Status {
 		}
 	}
 
-	if s.deps.Ports != nil && masterPID > 0 {
-		if lines, err := s.deps.Ports.MasterForwardLines(ctx, masterPID); err == nil {
+	if s.deps.Ports != nil && masterUp {
+		if lines, err := s.deps.Ports.ForwardLines(ctx); err == nil {
 			for _, name := range lines {
 				st.Forwards = append(st.Forwards, ForwardStatus{Name: name})
 			}

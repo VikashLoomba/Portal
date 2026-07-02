@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/config"
 )
 
 // setFeatures pre-seeds the shared config.Store so both the daemon and the CLI

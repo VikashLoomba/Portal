@@ -17,7 +17,7 @@ AGENT_DIR     := internal/bootstrap/agent
 AGENT_PATH    := $(AGENT_DIR)/portald-linux-amd64
 SHA_PATH      := $(AGENT_DIR)/sha.txt
 
-MODULE         := gitlab.i.extrahop.com/vikashl/devportal
+MODULE         := github.com/VikashLoomba/Portal
 LDFLAGS_AGENT  := -s -w -X main.gitSHA=$(GIT_SHA)
 # Stamp the portal CLI: main.version (release string) + bootstrap.gitSHA (the
 # linker-injected build SHA the drift check in bootstrap/embed.go validates).

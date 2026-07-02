@@ -30,8 +30,51 @@ type Store struct {
 
 func New(dir string) *Store { return &Store{Dir: dir} }
 
-func (s *Store) hostFile() string  { return filepath.Join(s.Dir, "host") }
-func (s *Store) allowFile() string { return filepath.Join(s.Dir, "allow") }
+func (s *Store) hostFile() string      { return filepath.Join(s.Dir, "host") }
+func (s *Store) allowFile() string     { return filepath.Join(s.Dir, "allow") }
+func (s *Store) transportFile() string { return filepath.Join(s.Dir, "transport") }
+
+// Transport reports the configured transport selection (T8). It returns
+// "system" (the default) when the file is absent, the trimmed file value when
+// present, and an error naming the file and the bad value for anything other
+// than "system"/"native". An invalid value is a LOUD failure — callers surface
+// it at startup rather than silently falling back to system. "localexec" is
+// deliberately NOT accepted here (it is test/dev only, never config-selectable).
+func (s *Store) Transport() (string, error) {
+	b, err := os.ReadFile(s.transportFile())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "system", nil
+		}
+		return "", err
+	}
+	v := strings.TrimSpace(string(b))
+	switch v {
+	case "system", "native":
+		return v, nil
+	default:
+		return "", fmt.Errorf("invalid transport %q in %s (want \"system\" or \"native\")", v, s.transportFile())
+	}
+}
+
+// SetTransport persists the transport selection (creating Dir if needed),
+// validating that name is "system" or "native" (else an error). The value is
+// whitespace-trimmed before write so any SetTransport→Transport round-trip is
+// idempotent. "localexec" is rejected — it is test/dev only.
+func (s *Store) SetTransport(name string) error {
+	name = strings.TrimSpace(name)
+	switch name {
+	case "system", "native":
+	default:
+		return fmt.Errorf("invalid transport %q (want \"system\" or \"native\")", name)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(s.transportFile(), []byte(name+"\n"), 0o644)
+}
 
 // featureFile is the per-feature on/off toggle path, e.g. ~/.config/portal/
 // feature.clip-text. One file per feature (mirroring the host/allow file-per-

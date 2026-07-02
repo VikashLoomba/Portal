@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
+	"github.com/VikashLoomba/Portal/internal/hub"
 )
 
 // recvTimeout is generous: the tee is a synchronous, in-process channel send,

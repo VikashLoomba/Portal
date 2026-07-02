@@ -10,8 +10,8 @@ import (
 	"strings"
 	"sync"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"github.com/VikashLoomba/Portal/internal/clipshim"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // agentDigest caches the sha256 of EmbeddedAgent() so the probe can
@@ -55,12 +55,12 @@ const remoteDir = "~/.cache/portal"
 //  2. If missing or wrong size, atomically upload via `cat > .tmp.$$ ; mv`.
 //  3. Best-effort prune older agent-* files.
 type Manager struct {
-	T   sshctl.Transport
+	T   transport.Transport
 	Log *slog.Logger
 }
 
 // New constructs a Manager. If log is nil, slog.Default() is used.
-func New(t sshctl.Transport, log *slog.Logger) *Manager {
+func New(t transport.Transport, log *slog.Logger) *Manager {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -106,7 +106,7 @@ func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
 		`test -x %s && printf '%%s %%s' "$(stat -c %%s %s 2>/dev/null || stat -f %%z %s)" "$(sha256sum %s 2>/dev/null | awk '{print $1}' || sha256 -q %s 2>/dev/null || openssl dgst -sha256 -hex %s 2>/dev/null | awk '{print $NF}')" || echo MISSING`,
 		remotePath, remotePath, remotePath, remotePath, remotePath, remotePath,
 	)
-	out, err := m.T.Exec(ctx, "", "bash", "-c", shellQuoted(probe))
+	out, _, err := m.T.Exec(ctx, nil, "bash", "-c", shellQuoted(probe))
 	if err == nil {
 		got := strings.TrimSpace(out)
 		want := expectedSize + " " + expectedDigest
@@ -124,14 +124,14 @@ func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
 		`set -e; install -d -m 0700 %s && tmp=$(mktemp %s/.agent.tmp.XXXXXX) && trap 'rm -f "$tmp"' EXIT && cat > "$tmp" && [ "$(wc -c < "$tmp")" = "%s" ] && chmod 0755 "$tmp" && mv "$tmp" %s && trap - EXIT`,
 		remoteDir, remoteDir, expectedSize, remotePath,
 	)
-	if _, _, err := m.T.ExecBytes(ctx, agent, "bash", "-c", shellQuoted(script)); err != nil {
+	if _, _, err := m.T.Exec(ctx, agent, "bash", "-c", shellQuoted(script)); err != nil {
 		return "", fmt.Errorf("bootstrap: upload failed: %w", err)
 	}
 
 	// 3. Update the stable `portald` symlink so the xdg-open wrapper can
 	// always find the current agent without knowing the SHA.
 	symlink := fmt.Sprintf(`ln -sf %s %s/portald`, remotePath, remoteDir)
-	_, _ = m.T.Exec(ctx, "", "bash", "-c", shellQuoted(symlink))
+	_, _, _ = m.T.Exec(ctx, nil, "bash", "-c", shellQuoted(symlink))
 
 	// 4. Best-effort prune older agent-* (older than 1 day) and any leftover
 	// .agent.tmp.* fragments from earlier interrupted uploads.
@@ -142,7 +142,7 @@ func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
 		`find %s -maxdepth 1 -name 'agent-*' ! -name 'agent-%s' -mtime +0 -delete 2>/dev/null; find %s -maxdepth 1 -name '.agent.tmp.*' -delete 2>/dev/null; true`,
 		remoteDir, sha, remoteDir,
 	)
-	_, _ = m.T.Exec(ctx, "", "bash", "-c", shellQuoted(prune))
+	_, _, _ = m.T.Exec(ctx, nil, "bash", "-c", shellQuoted(prune))
 
 	return remotePath, nil
 }
@@ -157,7 +157,7 @@ func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
 func (m *Manager) PruneAll(ctx context.Context) error {
 	clipshim.Remove(ctx, m.T)
 	cmd := fmt.Sprintf(`rm -rf %s/agent-* %s/clip 2>/dev/null || true`, remoteDir, remoteDir)
-	_, err := m.T.Exec(ctx, "", "bash", "-c", shellQuoted(cmd))
+	_, _, err := m.T.Exec(ctx, nil, "bash", "-c", shellQuoted(cmd))
 	return err
 }
 

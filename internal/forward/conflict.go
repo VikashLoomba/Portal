@@ -3,9 +3,9 @@ package forward
 // conflictSet tracks ports we've already logged a "SKIP — local port held by
 // foreign process" message for. It is the ONLY in-memory state in the engine
 // and is NON-AUTHORITATIVE: it merely suppresses repeated log lines. The
-// forwarding source of truth is ALWAYS PortLister.MasterForwards(pid). Do
-// NOT add a forwarded-ports cache here — it would break the self-healing
-// stateless reconcile after a master rebuild.
+// forwarding source of truth is ALWAYS PortForwarder.ListForwards. Do NOT add
+// a forwarded-ports cache here — it would break the self-healing stateless
+// reconcile after a master rebuild.
 type conflictSet struct {
 	m map[int]struct{}
 }

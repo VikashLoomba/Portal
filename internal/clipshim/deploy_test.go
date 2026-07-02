@@ -5,51 +5,58 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
-// recordTransport implements sshctl.Transport, capturing every script Ensure /
-// Remove issue (both Exec and ExecBytes) so a test can assert the deploy wiring
-// WITHOUT a live dev box: which files get written, that the notify hook + PATH
-// block + settings.json merge run, and that Remove strips them. Exec replies are
-// scripted by substring so the steady-state "current" fast path can be forced.
+// recordTransport implements transport.Transport, capturing every script Ensure
+// / Remove issue so a test can assert the deploy wiring WITHOUT a live dev box:
+// which files get written, that the notify hook + PATH block + settings.json
+// merge run, and that Remove strips them. Nil-stdin calls (probes) land in
+// execScripts and are answered from reply by substring; byte-stdin calls
+// (file writes) land in execBytesScripts paired with their payload.
 type recordTransport struct {
-	// execScripts is every script passed to Exec, in order.
+	// execScripts is every nil-stdin script passed to Exec, in order.
 	execScripts []string
-	// execBytesScripts is every script passed to ExecBytes, in order, paired
-	// with the stdin payload (the shim/script text being written).
+	// execBytesScripts is every byte-stdin script passed to Exec, in order,
+	// paired with the stdin payload (the shim/script text being written).
 	execBytesScripts []string
 	execBytesStdin   [][]byte
 	// reply maps a substring of the Exec script to the stdout to return.
 	reply map[string]string
 }
 
-func (r *recordTransport) MasterPID(ctx context.Context) (int, error)          { return 1, nil }
-func (r *recordTransport) EnsureMaster(ctx context.Context) (int, bool, error) { return 1, false, nil }
-func (r *recordTransport) Forward(ctx context.Context, l, rr int) error        { return nil }
-func (r *recordTransport) Cancel(ctx context.Context, l, rr int) error         { return nil }
-func (r *recordTransport) Exit(ctx context.Context) (bool, error)              { return true, nil }
-func (r *recordTransport) Host() string                                        { return "fakehost" }
-func (r *recordTransport) Sock() string                                        { return "/tmp/sock" }
-func (r *recordTransport) ExecStream(_ context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+func (r *recordTransport) Ensure(context.Context) (bool, error) { return false, nil }
+func (r *recordTransport) Health(context.Context) (transport.Health, error) {
+	return transport.Health{Up: true, Pid: 1, Detail: "pid=1"}, nil
+}
+func (r *recordTransport) Close(context.Context) (bool, error) { return true, nil }
+func (r *recordTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: "fakehost", Endpoint: "/tmp/sock"}
+}
+func (r *recordTransport) Stream(_ context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	return nil, nil, nil, nil, nil
 }
 
-func (r *recordTransport) Exec(_ context.Context, _ string, argv ...string) (string, error) {
+// Exec folds the old Exec (nil stdin) and ExecBytes (byte stdin) recorders:
+// byte-stdin calls capture the payload; nil-stdin probes are answered by reply.
+func (r *recordTransport) Exec(_ context.Context, stdin []byte, argv ...string) (string, string, error) {
 	joined := strings.Join(argv, " ")
+	if len(stdin) > 0 {
+		r.execBytesScripts = append(r.execBytesScripts, joined)
+		r.execBytesStdin = append(r.execBytesStdin, stdin)
+		return "", "", nil
+	}
 	r.execScripts = append(r.execScripts, joined)
 	for key, out := range r.reply {
 		if strings.Contains(joined, key) {
-			return out, nil
+			return out, "", nil
 		}
 	}
-	return "", nil
-}
-
-func (r *recordTransport) ExecBytes(_ context.Context, stdin []byte, argv ...string) (string, string, error) {
-	r.execBytesScripts = append(r.execBytesScripts, strings.Join(argv, " "))
-	r.execBytesStdin = append(r.execBytesStdin, stdin)
 	return "", "", nil
 }
+
+var _ transport.Transport = (*recordTransport)(nil)
 
 // allScripts returns every Exec + ExecBytes script joined, for substring asserts.
 func (r *recordTransport) allScripts() string {

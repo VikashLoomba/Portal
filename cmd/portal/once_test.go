@@ -11,16 +11,16 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent/watcher"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/forward"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"github.com/VikashLoomba/Portal/internal/agent"
+	"github.com/VikashLoomba/Portal/internal/agent/watcher"
+	"github.com/VikashLoomba/Portal/internal/agentclient"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/bootstrap"
+	"github.com/VikashLoomba/Portal/internal/clock"
+	"github.com/VikashLoomba/Portal/internal/forward"
+	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // onceStreamTransport wires each ExecStream to a REAL agent.Server over io.Pipe
@@ -34,21 +34,19 @@ type onceStreamTransport struct {
 	connects atomic.Int64
 }
 
-func (t *onceStreamTransport) Host() string                                    { return "fakehost" }
-func (t *onceStreamTransport) Sock() string                                    { return "/tmp/fake-sock" }
-func (t *onceStreamTransport) MasterPID(context.Context) (int, error)          { return 1, nil }
-func (t *onceStreamTransport) EnsureMaster(context.Context) (int, bool, error) { return 1, false, nil }
-func (t *onceStreamTransport) Forward(context.Context, int, int) error         { return nil }
-func (t *onceStreamTransport) Cancel(context.Context, int, int) error          { return nil }
-func (t *onceStreamTransport) Exit(context.Context) (bool, error)              { return false, nil }
-func (t *onceStreamTransport) Exec(context.Context, string, ...string) (string, error) {
-	return "", nil
+func (t *onceStreamTransport) Ensure(context.Context) (bool, error) { return false, nil }
+func (t *onceStreamTransport) Health(context.Context) (transport.Health, error) {
+	return transport.Health{Up: true, Pid: 1, Detail: "pid=1"}, nil
 }
-func (t *onceStreamTransport) ExecBytes(context.Context, []byte, ...string) (string, string, error) {
+func (t *onceStreamTransport) Exec(context.Context, []byte, ...string) (string, string, error) {
 	return "", "", nil
 }
+func (t *onceStreamTransport) Close(context.Context) (bool, error) { return false, nil }
+func (t *onceStreamTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: "fakehost", Endpoint: "/tmp/fake-sock"}
+}
 
-func (t *onceStreamTransport) ExecStream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+func (t *onceStreamTransport) Stream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	t.connects.Add(1)
 	c2aR, c2aW := io.Pipe()
 	a2cR, a2cW := io.Pipe()
@@ -72,7 +70,7 @@ func (t *onceStreamTransport) ExecStream(ctx context.Context, _ ...string) (io.W
 
 func (t *onceStreamTransport) connectCount() int { return int(t.connects.Load()) }
 
-var _ sshctl.Transport = (*onceStreamTransport)(nil)
+var _ transport.Transport = (*onceStreamTransport)(nil)
 
 // onceProbeTransport answers the bootstrap stat-probe with the embedded agent's
 // byte size so EnsureUploaded short-circuits (no upload). Mirrors client_test.go
@@ -80,20 +78,21 @@ var _ sshctl.Transport = (*onceStreamTransport)(nil)
 // onceStreamTransport.
 type onceProbeTransport struct{}
 
-func (onceProbeTransport) Host() string                                    { return "p" }
-func (onceProbeTransport) Sock() string                                    { return "/tmp/p" }
-func (onceProbeTransport) MasterPID(context.Context) (int, error)          { return 1, nil }
-func (onceProbeTransport) EnsureMaster(context.Context) (int, bool, error) { return 1, false, nil }
-func (onceProbeTransport) Forward(context.Context, int, int) error         { return nil }
-func (onceProbeTransport) Cancel(context.Context, int, int) error          { return nil }
-func (onceProbeTransport) Exit(context.Context) (bool, error)              { return false, nil }
-func (onceProbeTransport) Exec(context.Context, string, ...string) (string, error) {
-	return strconv.Itoa(len(bootstrap.EmbeddedAgent())) + "\n", nil
+func (onceProbeTransport) Ensure(context.Context) (bool, error) { return false, nil }
+func (onceProbeTransport) Health(context.Context) (transport.Health, error) {
+	return transport.Health{Up: true, Pid: 1, Detail: "pid=1"}, nil
 }
-func (onceProbeTransport) ExecBytes(context.Context, []byte, ...string) (string, string, error) {
-	return "", "", nil
+func (onceProbeTransport) Exec(_ context.Context, stdin []byte, _ ...string) (string, string, error) {
+	if len(stdin) > 0 {
+		return "", "", nil
+	}
+	return strconv.Itoa(len(bootstrap.EmbeddedAgent())) + "\n", "", nil
 }
-func (onceProbeTransport) ExecStream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+func (onceProbeTransport) Close(context.Context) (bool, error) { return false, nil }
+func (onceProbeTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: "p", Endpoint: "/tmp/p"}
+}
+func (onceProbeTransport) Stream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	return nil, nil, nil, func() error { return nil }, nil
 }
 

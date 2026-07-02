@@ -1,7 +1,7 @@
 // Package forward is the reconcile engine. It is intentionally stateless:
-// the forwarded-ports set is derived each pass from the live ssh master's
-// LISTEN sockets via the PortLister, never cached in-process. A daemon
-// restart, a master rebuild, an `unallow` from another invocation — all
+// the forwarded-ports set is derived each pass from the live master's LISTEN
+// sockets via the PortForwarder's ListForwards, never cached in-process. A
+// daemon restart, a master rebuild, an `unallow` from another invocation — all
 // self-correct because the very next pass observes ground truth.
 package forward
 
@@ -13,17 +13,25 @@ import (
 	"sync/atomic"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/discover"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/proc"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"github.com/VikashLoomba/Portal/internal/clock"
+	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/discover"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
+
+// LocalPorts is the narrow LOCAL-port query surface the engine keeps for its
+// conflict messages — these inspect ports on THIS machine, not the master, and
+// are transport-agnostic. Satisfied by *proc.Lsof.
+type LocalPorts interface {
+	LocalHolder(ctx context.Context, port int) (int, error)
+	ProcessName(ctx context.Context, pid int) string
+}
 
 // Engine wires the dependencies the reconcile loop needs. Build with New().
 type Engine struct {
-	T         sshctl.Transport
-	PL        proc.PortLister
+	T         transport.Transport
+	PF        transport.PortForwarder
+	LP        LocalPorts
 	RD        discover.RemoteDiscoverer
 	Cfg       *config.Store
 	Clk       clock.Clock
@@ -93,11 +101,11 @@ const (
 )
 
 // New constructs an Engine with a fresh in-memory conflict set.
-func New(t sshctl.Transport, pl proc.PortLister, rd discover.RemoteDiscoverer,
-	cfg *config.Store, clk clock.Clock, log Logger,
+func New(t transport.Transport, pf transport.PortForwarder, lp LocalPorts,
+	rd discover.RemoteDiscoverer, cfg *config.Store, clk clock.Clock, log Logger,
 	interval time.Duration, deny, skipLocal []int) *Engine {
 	return &Engine{
-		T: t, PL: pl, RD: rd, Cfg: cfg, Clk: clk, Log: log,
+		T: t, PF: pf, LP: lp, RD: rd, Cfg: cfg, Clk: clk, Log: log,
 		Interval: interval, Deny: deny, SkipLocal: skipLocal,
 		kick:      make(chan struct{}, 1),
 		conflicts: newConflictSet(),
@@ -136,7 +144,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	allow, _ := e.Cfg.AllowedPorts()
 	host, _ := e.Cfg.ReadHost()
 	e.Log.Logf("portal autoforward starting: host=%s interval=%s sock=%s",
-		host, e.Interval, e.T.Sock())
+		host, e.Interval, e.T.Describe().Endpoint)
 	e.Log.Logf("deny=[%s] skip-local=[%s] allow=[%s]",
 		formatPorts(e.Deny), formatPortsOrNone(e.SkipLocal), formatPorts(allow))
 
@@ -246,11 +254,12 @@ func (e *Engine) runEventDriven(ctx context.Context) error {
 
 // Reconcile performs ONE stateless pass. Steps:
 //
-//  1. EnsureMaster — rebuild if the master is down, then re-derive everything.
+//  1. Ensure + Health — rebuild if the transport is down, then re-derive
+//     everything from ground truth.
 //  2. AllowedPorts — re-read the file each pass so allow/unallow propagate.
 //  3. DesiredPorts — what the remote wants forwarded right now. On error,
 //     keep current forwards (do NOT cancel anything).
-//  4. MasterForwards — what the live master is ACTUALLY forwarding (lsof).
+//  4. ListForwards — what the transport is ACTUALLY forwarding right now.
 //     This is the source of truth — never an in-memory cache.
 //  5. Add desired − current; cancel current − desired.
 func (e *Engine) Reconcile(ctx context.Context) error {
@@ -258,17 +267,22 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 	// waiter observing the counter advance knows the engine has re-derived
 	// ground truth once more, even when the master is momentarily unreachable.
 	defer e.reconciles.Add(1)
-	pid, rebuilt, err := e.T.EnsureMaster(ctx)
+	rebuilt, err := e.T.Ensure(ctx)
 	if err != nil {
 		e.Log.Logf("WARN: ssh master unreachable: %v", err)
 		return err
 	}
-	if pid == 0 {
-		e.Log.Logf("WARN: could not establish master to %s", e.T.Host())
+	h, err := e.T.Health(ctx)
+	if err != nil {
+		e.Log.Logf("WARN: ssh master unreachable: %v", err)
+		return err
+	}
+	if !h.Up {
+		e.Log.Logf("WARN: could not establish master to %s", e.T.Describe().Host)
 		return errMasterDown
 	}
 	if rebuilt {
-		e.Log.Logf("master established (pid=%d)", pid)
+		e.Log.Logf("master established (pid=%d)", h.Pid)
 	}
 
 	allow, _ := e.Cfg.AllowedPorts()
@@ -283,7 +297,7 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 		return err
 	}
 
-	current, _ := e.PL.MasterForwards(ctx, pid)
+	current, _ := e.PF.ListForwards(ctx)
 
 	desiredSet := indexSet(desired)
 	currentSet := indexSet(current)
@@ -296,15 +310,15 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 		if _, skip := skipSet[p]; skip {
 			continue
 		}
-		holder, _ := e.PL.LocalHolder(ctx, p)
-		if holder != 0 && holder != pid {
+		holder, _ := e.LP.LocalHolder(ctx, p)
+		if holder != 0 && holder != h.Pid {
 			// Lazy ProcessName: only consult ps if note() will actually
 			// log (i.e. this conflict isn't already deduped). Matches the
 			// bash early-return-before-`ps` behavior.
-			e.conflicts.note(p, holder, func() string { return e.PL.ProcessName(ctx, holder) }, e.Log)
+			e.conflicts.note(p, holder, func() string { return e.LP.ProcessName(ctx, holder) }, e.Log)
 			continue
 		}
-		if err := e.T.Forward(ctx, p, p); err != nil {
+		if err := e.PF.Forward(ctx, p, p); err != nil {
 			if fe, ok := err.(*ForwardErrorAdapter); ok {
 				e.Log.Logf("ERROR adding forward %d: %s", p, fe.Stderr)
 			} else {
@@ -313,12 +327,12 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 			continue
 		}
 		e.conflicts.clear(p)
-		e.Log.Logf("forwarded localhost:%d -> %s:%d", p, e.T.Host(), p)
+		e.Log.Logf("forwarded localhost:%d -> %s:%d", p, e.T.Describe().Host, p)
 	}
 
 	for _, p := range current {
 		if _, want := desiredSet[p]; !want {
-			_ = e.T.Cancel(ctx, p, p)
+			_ = e.PF.Cancel(ctx, p, p)
 			e.Log.Logf("removed forward %d (no longer wanted)", p)
 		}
 	}
@@ -327,10 +341,10 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 	return nil
 }
 
-// ForwardErrorAdapter is a re-export so engine.go can type-assert the sshctl
-// transport's error without an import cycle. The transport sets the same
-// underlying type; we copy the public fields here.
-type ForwardErrorAdapter = sshctl.ForwardError
+// ForwardErrorAdapter is a re-export so engine.go can type-assert the
+// transport's forward error without repeating the type. Every implementation's
+// Forward returns *transport.ForwardError.
+type ForwardErrorAdapter = transport.ForwardError
 
 func indexSet(in []int) map[int]struct{} {
 	m := make(map[int]struct{}, len(in))

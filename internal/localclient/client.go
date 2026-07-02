@@ -20,9 +20,9 @@ import (
 	"strconv"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/localapi"
+	"github.com/VikashLoomba/Portal/internal/doctor"
+	"github.com/VikashLoomba/Portal/internal/hub"
+	"github.com/VikashLoomba/Portal/internal/localapi"
 )
 
 // Per-call default timeouts, exposed as vars so tests can shrink them. Status/

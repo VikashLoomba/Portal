@@ -11,9 +11,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/clipshim"
+	"github.com/VikashLoomba/Portal/internal/sshctl"
 )
 
 func filepathDir(p string) string { return filepath.Dir(p) }
@@ -135,7 +135,13 @@ the headless launchd daemon can connect.`,
 			// install — the service is already loaded and the user can re-run
 			// `portal doctor` after fixing the cause.
 			fmt.Printf("\nrunning self-test (%s doctor) ...\n", app.Tool)
-			tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+			// nil ssh-stderr sink: install's transports carry no StderrSink (no
+			// leak into stdout). Install runs before the transport config exists,
+			// so the factory defaults to system.
+			tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
+			if err != nil {
+				return err
+			}
 			rep := runDoctor(cmd.Context(), host, tr)
 			renderDoctor(os.Stdout, rep)
 
@@ -278,7 +284,12 @@ export BROWSER="${BROWSER:-xdg-open}"
 // install, so a direct ssh call with `host` is required, mirroring
 // installXdgOpenWrapper).
 func ensureClipShims(ctx context.Context, host string, a *app.App) error {
-	tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+	// nil ssh-stderr sink; factory defaults to system (config not yet written on
+	// a fresh install).
+	tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
+	if err != nil {
+		return err
+	}
 	return clipshim.Ensure(ctx, tr)
 }
 
@@ -286,13 +297,18 @@ func ensureClipShims(ctx context.Context, host string, a *app.App) error {
 // on the dev box. Uses a direct (non-multiplexed) ssh call with the given
 // host so it works on a fresh install before the ControlMaster exists.
 func installXdgOpenWrapper(ctx context.Context, host string, a *app.App) error {
-	tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+	// nil ssh-stderr sink; factory defaults to system (config not yet written on
+	// a fresh install).
+	tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
+	if err != nil {
+		return err
+	}
 
 	// Write the BROWSER env snippet to ~/.config/portal/env.sh and source
 	// it from ~/.bashrc and ~/.zshrc (if they exist). This ensures Python's
 	// webbrowser module (used by aws sso login, etc.) delegates to xdg-open.
 	envScript := `mkdir -p ~/.config/portal && cat > ~/.config/portal/env.sh`
-	if _, _, err := tr.ExecBytes(ctx, []byte(browserEnvSnippet), "bash", "-c", shellQuoteRemote(envScript)); err != nil {
+	if _, _, err := tr.Exec(ctx, []byte(browserEnvSnippet), "bash", "-c", shellQuoteRemote(envScript)); err != nil {
 		return fmt.Errorf("write env snippet: %w", err)
 	}
 	// Source the snippet from each shell rc file that exists, idempotently.
@@ -302,17 +318,17 @@ for rc in ~/.bashrc ~/.zshrc; do
     grep -qF "portal/env.sh" "$rc" && continue
     printf '\n[ -f ~/.config/portal/env.sh ] && . ~/.config/portal/env.sh\n' >> "$rc"
 done`
-	if _, err := tr.Exec(ctx, "", "bash", "-c", shellQuoteRemote(sourceSnippet)); err != nil {
+	if _, _, err := tr.Exec(ctx, nil, "bash", "-c", shellQuoteRemote(sourceSnippet)); err != nil {
 		return fmt.Errorf("source env snippet: %w", err)
 	}
 
 	// Backup any pre-existing ~/.local/bin/xdg-open that isn't ours, so
 	// uninstall can restore it. Skip the backup if it's already our wrapper.
 	backupScript := `if [ -f ~/.local/bin/xdg-open ] && ! grep -qF "Installed by portal" ~/.local/bin/xdg-open 2>/dev/null; then cp ~/.local/bin/xdg-open ~/.local/bin/xdg-open.portal-backup; fi`
-	_, _ = tr.Exec(ctx, "", "bash", "-c", shellQuoteRemote(backupScript))
+	_, _, _ = tr.Exec(ctx, nil, "bash", "-c", shellQuoteRemote(backupScript))
 
 	wrapScript := `mkdir -p ~/.local/bin && cat > ~/.local/bin/xdg-open.portal.tmp && chmod 0755 ~/.local/bin/xdg-open.portal.tmp && mv ~/.local/bin/xdg-open.portal.tmp ~/.local/bin/xdg-open`
-	if _, _, err := tr.ExecBytes(ctx, []byte(xdgOpenWrapper), "bash", "-c", shellQuoteRemote(wrapScript)); err != nil {
+	if _, _, err := tr.Exec(ctx, []byte(xdgOpenWrapper), "bash", "-c", shellQuoteRemote(wrapScript)); err != nil {
 		return fmt.Errorf("write wrapper: %w", err)
 	}
 
@@ -322,14 +338,14 @@ done`
 	sha := a.Bootstrap.EmbeddedSHA()
 	if sha != "" {
 		symlinkScript := fmt.Sprintf(`ln -sf ~/.cache/portal/agent-%s ~/.cache/portal/portald 2>/dev/null || true`, sha)
-		_, _ = tr.Exec(ctx, "", "bash", "-c", shellQuoteRemote(symlinkScript))
+		_, _, _ = tr.Exec(ctx, nil, "bash", "-c", shellQuoteRemote(symlinkScript))
 	}
 
 	// Verify our wrapper landed correctly — check the file we just wrote
 	// rather than resolving xdg-open through PATH (which is unreliable in
 	// non-interactive ssh sessions and varies by distro).
 	verifyScript := `grep -qF "Installed by portal" ~/.local/bin/xdg-open 2>/dev/null && echo ok || echo missing`
-	out, _ := tr.Exec(ctx, "", "bash", "-c", shellQuoteRemote(verifyScript))
+	out, _, _ := tr.Exec(ctx, nil, "bash", "-c", shellQuoteRemote(verifyScript))
 	if strings.TrimSpace(out) != "ok" {
 		return fmt.Errorf("wrapper not found at ~/.local/bin/xdg-open on %s — check that the upload succeeded", host)
 	}

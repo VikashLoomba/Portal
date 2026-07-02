@@ -14,11 +14,11 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"github.com/VikashLoomba/Portal/internal/bootstrap"
+	"github.com/VikashLoomba/Portal/internal/clipshim"
+	"github.com/VikashLoomba/Portal/internal/hub"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // ErrNoSnapshot is returned by Snapshot() before the first SubscribeAck has
@@ -28,7 +28,7 @@ var ErrNoSnapshot = errors.New("agentclient: no snapshot yet")
 
 // Config bundles dependencies. Defaults are filled in by New.
 type Config struct {
-	Transport sshctl.Transport
+	Transport transport.Transport
 	Bootstrap *bootstrap.Manager
 	Log       *slog.Logger
 	// StderrSink is where the agent's stderr lines go (typically
@@ -450,10 +450,10 @@ func (c *Client) runOnce(ctx context.Context) error {
 	}
 
 	// 2. Spawn the long-lived exec.
-	stdin, stdout, stderr, wait, err := c.cfg.Transport.ExecStream(ctx,
+	stdin, stdout, stderr, wait, err := c.cfg.Transport.Stream(ctx,
 		remotePath, fmt.Sprintf("--proto-version=%d", protocol.ProtoVersion))
 	if err != nil {
-		return fmt.Errorf("ExecStream: %w", err)
+		return fmt.Errorf("Stream: %w", err)
 	}
 	defer func() {
 		_ = stdin.Close()
@@ -493,7 +493,7 @@ func (c *Client) runOnce(ctx context.Context) error {
 		c.cfg.Log.Error("agent SHA mismatch — forcing re-upload",
 			"agent", first.HelloAck.AgentGitSHA, "embedded", bootstrap.EmbeddedSHA())
 		rmPath := fmt.Sprintf("~/.cache/portal/agent-%s", first.HelloAck.AgentGitSHA)
-		_, _ = c.cfg.Transport.Exec(context.Background(), "", "bash", "-c",
+		_, _, _ = c.cfg.Transport.Exec(context.Background(), nil, "bash", "-c",
 			"rm -f "+rmPath)
 		return fmt.Errorf("agent SHA mismatch: agent=%s embedded=%s",
 			first.HelloAck.AgentGitSHA, bootstrap.EmbeddedSHA())

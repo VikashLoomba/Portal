@@ -14,19 +14,19 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agent/watcher"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"github.com/VikashLoomba/Portal/internal/agent"
+	"github.com/VikashLoomba/Portal/internal/agent/watcher"
+	"github.com/VikashLoomba/Portal/internal/agentclient"
+	"github.com/VikashLoomba/Portal/internal/bootstrap"
+	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/doctor"
+	"github.com/VikashLoomba/Portal/internal/hub"
+	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
-// integStreamTransport is the sshctl.Transport for the full-stack integration
-// harness: each ExecStream wires a REAL agent.Server over io.Pipe pairs (as
+// integStreamTransport is the transport.Transport for the full-stack integration
+// harness: each Stream wires a REAL agent.Server over io.Pipe pairs (as
 // agentclient/client_test.go does) instead of launching ssh. A drop() cancels
 // the current agent's context so agentclient's supervisor reconnects — letting
 // the events test observe a coalesced state line after a simulated reconnect.
@@ -42,26 +42,22 @@ type integStreamTransport struct {
 	connects int    // number of ExecStream calls (i.e. connections)
 }
 
-func (t *integStreamTransport) Host() string                           { return "fakehost" }
-func (t *integStreamTransport) Sock() string                           { return "/tmp/fake-sock" }
-func (t *integStreamTransport) MasterPID(context.Context) (int, error) { return 4242, nil }
-func (t *integStreamTransport) EnsureMaster(context.Context) (int, bool, error) {
-	return 4242, false, nil
+func (t *integStreamTransport) Ensure(context.Context) (bool, error) { return false, nil }
+func (t *integStreamTransport) Health(context.Context) (transport.Health, error) {
+	return transport.Health{Up: true, Pid: 4242, Detail: "pid=4242"}, nil
 }
-func (t *integStreamTransport) Forward(context.Context, int, int) error { return nil }
-func (t *integStreamTransport) Cancel(context.Context, int, int) error  { return nil }
-func (t *integStreamTransport) Exit(context.Context) (bool, error)      { return false, nil }
-func (t *integStreamTransport) Exec(context.Context, string, ...string) (string, error) {
-	return "", nil
-}
-func (t *integStreamTransport) ExecBytes(context.Context, []byte, ...string) (string, string, error) {
+func (t *integStreamTransport) Exec(context.Context, []byte, ...string) (string, string, error) {
 	return "", "", nil
 }
+func (t *integStreamTransport) Close(context.Context) (bool, error) { return false, nil }
+func (t *integStreamTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: "fakehost", Endpoint: "/tmp/fake-sock"}
+}
 
-// ExecStream wires a fresh agent.Server to the returned pipes. The agent runs
+// Stream wires a fresh agent.Server to the returned pipes. The agent runs
 // under a per-connection cancelable context recorded in dropCur so a test can
 // force a session drop.
-func (t *integStreamTransport) ExecStream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+func (t *integStreamTransport) Stream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	c2aR, c2aW := io.Pipe()
 	a2cR, a2cW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
@@ -110,7 +106,7 @@ func (t *integStreamTransport) connectCount() int {
 	return t.connects
 }
 
-var _ sshctl.Transport = (*integStreamTransport)(nil)
+var _ transport.Transport = (*integStreamTransport)(nil)
 
 // integProbeTransport answers the bootstrap stat-probe with the embedded agent's
 // byte size so EnsureUploaded short-circuits (no upload) — mirroring the
@@ -118,23 +114,26 @@ var _ sshctl.Transport = (*integStreamTransport)(nil)
 // integStreamTransport.
 type integProbeTransport struct{}
 
-func (integProbeTransport) Host() string                                    { return "probe" }
-func (integProbeTransport) Sock() string                                    { return "/tmp/probe" }
-func (integProbeTransport) MasterPID(context.Context) (int, error)          { return 1, nil }
-func (integProbeTransport) EnsureMaster(context.Context) (int, bool, error) { return 1, false, nil }
-func (integProbeTransport) Forward(context.Context, int, int) error         { return nil }
-func (integProbeTransport) Cancel(context.Context, int, int) error          { return nil }
-func (integProbeTransport) Exit(context.Context) (bool, error)              { return false, nil }
-func (integProbeTransport) Exec(context.Context, string, ...string) (string, error) {
+func (integProbeTransport) Ensure(context.Context) (bool, error) { return false, nil }
+func (integProbeTransport) Health(context.Context) (transport.Health, error) {
+	return transport.Health{Up: true, Pid: 1, Detail: "pid=1"}, nil
+}
+func (integProbeTransport) Exec(_ context.Context, stdin []byte, _ ...string) (string, string, error) {
+	if len(stdin) > 0 {
+		// The upload path (byte stdin) — never reached because the probe below
+		// short-circuits, but honor the shape.
+		return "", "", nil
+	}
 	// Answer the content-hash probe with the exact "<size> <sha256hex>" line
 	// EnsureUploaded expects so it short-circuits (no upload, no reconnect delay).
 	sum := sha256.Sum256(bootstrap.EmbeddedAgent())
-	return fmt.Sprintf("%d %s", len(bootstrap.EmbeddedAgent()), hex.EncodeToString(sum[:])), nil
+	return fmt.Sprintf("%d %s", len(bootstrap.EmbeddedAgent()), hex.EncodeToString(sum[:])), "", nil
 }
-func (integProbeTransport) ExecBytes(context.Context, []byte, ...string) (string, string, error) {
-	return "", "", nil
+func (integProbeTransport) Close(context.Context) (bool, error) { return false, nil }
+func (integProbeTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: "system-ssh", Host: "probe", Endpoint: "/tmp/probe"}
 }
-func (integProbeTransport) ExecStream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+func (integProbeTransport) Stream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	return nil, nil, nil, func() error { return nil }, nil
 }
 

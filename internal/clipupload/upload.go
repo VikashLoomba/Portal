@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"strings"
 
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // RemoteDir is where uploaded clipboard images land on the dev box.
@@ -37,7 +37,7 @@ const MaxUploadBytes = 8 << 20 // 8 MiB
 // remote shell non-interactively (--noprofile --norc) AND validates the
 // returned path against the basename it already knows, so callers can trust
 // the value with no risk of newline/control-byte injection.
-func Upload(ctx context.Context, t sshctl.Transport, pngData []byte) (string, error) {
+func Upload(ctx context.Context, t transport.Transport, pngData []byte) (string, error) {
 	if len(pngData) == 0 {
 		return "", fmt.Errorf("clipupload: empty image")
 	}
@@ -51,7 +51,7 @@ func Upload(ctx context.Context, t sshctl.Transport, pngData []byte) (string, er
 // the side channel for `clip text`: the ClipResponse carries only the sha and
 // the agent reconstructs ~/.cache/portal/clip/text-<sha>.txt from it. Text
 // bytes never cross the CBOR frame (DESIGN §4.1/§7), so the 1 MiB cap is safe.
-func UploadText(ctx context.Context, t sshctl.Transport, textData []byte) (path, sha string, err error) {
+func UploadText(ctx context.Context, t transport.Transport, textData []byte) (path, sha string, err error) {
 	if len(textData) == 0 {
 		return "", "", fmt.Errorf("clipupload: empty text")
 	}
@@ -62,7 +62,7 @@ func UploadText(ctx context.Context, t sshctl.Transport, textData []byte) (path,
 // UploadImage is Upload but also returns the short sha so the caller can put
 // it in a ClipResponse without recomputing it. The remote path is identical
 // to Upload's.
-func UploadImage(ctx context.Context, t sshctl.Transport, pngData []byte) (path, sha string, err error) {
+func UploadImage(ctx context.Context, t transport.Transport, pngData []byte) (path, sha string, err error) {
 	if len(pngData) == 0 {
 		return "", "", fmt.Errorf("clipupload: empty image")
 	}
@@ -86,7 +86,7 @@ func ShortSHA(data []byte) string {
 // EXPLICITLY via chmod (not umask — DESIGN §7.1), and validates the returned
 // path against the basename it already knows so an injected stdout line can
 // never reach the caller. Returns (absolute path, short sha).
-func upload(ctx context.Context, t sshctl.Transport, data []byte, name string) (string, string, error) {
+func upload(ctx context.Context, t transport.Transport, data []byte, name string) (string, string, error) {
 	if len(data) > MaxUploadBytes {
 		return "", "", fmt.Errorf("clipupload: payload too large: %d bytes (max %d)", len(data), MaxUploadBytes)
 	}
@@ -104,7 +104,7 @@ func upload(ctx context.Context, t sshctl.Transport, data []byte, name string) (
 	)
 	// --noprofile --norc keeps rc noise off stdout so the path is the only
 	// thing we read back.
-	stdout, stderr, err := t.ExecBytes(ctx, data, "bash", "--noprofile", "--norc", "-c", shellQuote(script))
+	stdout, stderr, err := t.Exec(ctx, data, "bash", "--noprofile", "--norc", "-c", shellQuote(script))
 	if err != nil {
 		if s := strings.TrimSpace(stderr); s != "" {
 			return "", "", fmt.Errorf("clipupload: %w: %s", err, s)
