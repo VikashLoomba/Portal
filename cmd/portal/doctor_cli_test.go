@@ -29,6 +29,15 @@ import (
 // dir keeps the path under the ~104-char sun_path limit macOS enforces.
 func serveDoctorDaemon(t *testing.T, cfg *config.Store, rep *doctor.Report) string {
 	t.Helper()
+	return serveDoctorDaemonFunc(t, cfg, func(context.Context) *doctor.Report { return rep })
+}
+
+// serveDoctorDaemonFunc is serveDoctorDaemon's generalization: the POST /v1/doctor
+// closure is doctorFn, so a test can serve a canned report OR a slow/blocking run
+// (doctorFn receives the request context, which the handler cancels on client
+// disconnect — a blocking closure must select on it to stay leak-free).
+func serveDoctorDaemonFunc(t *testing.T, cfg *config.Store, doctorFn func(context.Context) *doctor.Report) string {
+	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "portal-doctor-api-")
 	if err != nil {
 		t.Fatalf("mkdirtemp: %v", err)
@@ -45,7 +54,7 @@ func serveDoctorDaemon(t *testing.T, cfg *config.Store, rep *doctor.Report) stri
 		Service: &fakeServiceStater{},
 		Config:  cfg,
 		Hub:     hub.New(),
-		Doctor:  func(context.Context) *doctor.Report { return rep },
+		Doctor:  doctorFn,
 	}
 
 	ln, err := localapi.Listen(path)
@@ -116,6 +125,47 @@ func TestRunDoctorCmd_DaemonUp_Fail(t *testing.T) {
 	const trailer = "then re-run `portal doctor`.\n"
 	if !strings.HasSuffix(out.String(), trailer) {
 		t.Errorf("FAIL report should end with the FAIL trailer, got:\n%s", out.String())
+	}
+}
+
+// TestRunDoctorCmd_DaemonUp_ErrorNoFallback is the regression guard for the
+// silent-double-run finding: when the daemon is UP but the /v1/doctor call itself
+// fails (here it runs long and the caller's bounded ctx expires — the exact
+// high-latency case that the removed 30s cap used to abort), runDoctorCmd must
+// SURFACE the error, not silently re-run the whole self-test in-process. A silent
+// fallback would run doctor ~2x, discard the daemon's live-transport ground
+// truth, and render a second full report the user never asked for. We prove no
+// fallback happened two ways: the error is loud (not errSilent) and NOTHING is
+// written to the output buffer (a fallback would render a local report).
+func TestRunDoctorCmd_DaemonUp_ErrorNoFallback(t *testing.T) {
+	cfg := newTestConfig(t, "fakehost")
+	// /v1/doctor blocks until the client disconnects; the closure honors the
+	// request ctx (handleDoctor passes r.Context()) so it unblocks cleanly when the
+	// client's bounded ctx expires — no leaked goroutine.
+	doctorFn := func(ctx context.Context) *doctor.Report {
+		<-ctx.Done()
+		return nil
+	}
+	sock := serveDoctorDaemonFunc(t, cfg, doctorFn)
+	a := newDaemonTestApp(t, sock, cfg)
+	// Give the app a Runner so that IF a fallback wrongly ran, it would render a
+	// (master-DOWN) report rather than panic on a nil Runner — making the
+	// "no output" assertion below the meaningful signal.
+	a.Runner = &run.Fake{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	var out bytes.Buffer
+	err := runDoctorCmd(ctx, &out, a)
+	if err == nil {
+		t.Fatal("runDoctorCmd err = nil, want the daemon-up doctor failure surfaced")
+	}
+	if errors.Is(err, errSilent) {
+		t.Fatalf("daemon-up doctor failure must be a LOUD error (so the user learns the daemon path failed), got errSilent: %v", err)
+	}
+	if s := out.String(); s != "" {
+		t.Errorf("daemon-up doctor error must NOT fall back to a local render; got output:\n%s", s)
 	}
 }
 

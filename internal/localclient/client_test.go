@@ -434,14 +434,19 @@ func newHungServer(t *testing.T) *Client {
 	return New(path)
 }
 
-// TestHungServerPerCallTimeout proves the per-call StatusTimeout/DoctorTimeout/
-// ProbeTimeout in newReq are the ONLY thing that ends a request against a wedged
-// daemon when the caller passes an UNBOUNDED context — which is exactly what the
-// CLI does (cobra's root.Execute runs on context.Background()). Every request
-// here rides context.Background(); only shrinkTimeouts lowers the package
-// defaults. Dropping newReq's context.WithTimeout would make these calls hang
-// forever, so this test would hang and fail — the regression the other cases
-// (which inject their own bounded context) cannot catch.
+// TestHungServerPerCallTimeout proves the per-call StatusTimeout/ProbeTimeout in
+// newReq are the ONLY thing that ends a request against a wedged daemon when the
+// caller passes an UNBOUNDED context — which is exactly what the CLI does (cobra's
+// root.Execute runs on context.Background()). Every request here rides
+// context.Background(); only shrinkTimeouts lowers the package defaults. Dropping
+// newReq's context.WithTimeout would make these calls hang forever, so this test
+// would hang and fail — the regression the other cases (which inject their own
+// bounded context) cannot catch.
+//
+// Doctor is deliberately excluded: it has NO per-call cap (it is long-running and
+// rides the caller's ctx, §4.5), so under an unbounded ctx it MUST hang. Its
+// context-honoring contract is covered by TestDoctorHonorsContextDeadline (and by
+// the hung-server case in assertAllMethodsError, which passes a bounded ctx).
 func TestHungServerPerCallTimeout(t *testing.T) {
 	c := newHungServer(t)
 	restore := shrinkTimeouts(200 * time.Millisecond)
@@ -467,18 +472,39 @@ func TestHungServerPerCallTimeout(t *testing.T) {
 	if _, err := c.SetFeature(ctx, config.FeatureNotify, false); err == nil {
 		t.Error("SetFeature err = nil, want a per-call StatusTimeout error")
 	}
+}
+
+// TestDoctorHonorsContextDeadline locks the long-running contract: Doctor imposes
+// no artificial per-call cap and instead ends exactly when the CALLER's context
+// does. Against a hung server (never writes a response) a bounded ctx must make
+// Doctor return its context error — not hang, and not return early on some fixed
+// budget of its own. This is the regression guard for the removed DoctorTimeout:
+// if a small fixed cap were reintroduced, Doctor would stop ignoring the caller's
+// deadline and this contract (a slow-but-healthy daemon run is the caller's to
+// bound or cancel) would silently break.
+func TestDoctorHonorsContextDeadline(t *testing.T) {
+	c := newHungServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
 	if _, err := c.Doctor(ctx); err == nil {
-		t.Error("Doctor err = nil, want a per-call DoctorTimeout error")
+		t.Fatal("Doctor err = nil against a hung server, want the ctx deadline error")
+	}
+	// It must have waited for roughly the caller's budget, not returned on a
+	// smaller cap of its own.
+	if elapsed := time.Since(start); elapsed < 150*time.Millisecond {
+		t.Errorf("Doctor returned after %v, want it to honor the ~200ms ctx deadline", elapsed)
 	}
 }
 
 // shrinkTimeouts lowers the package default timeouts (for the hung-server case)
 // and returns a restore func. Serialized because the vars are package-global; the
-// daemon-down subtests do not run in parallel.
+// daemon-down subtests do not run in parallel. Doctor has no per-call cap to
+// shrink — it rides the caller's ctx — so it is not touched here.
 func shrinkTimeouts(d time.Duration) func() {
-	os, ds, ps := StatusTimeout, DoctorTimeout, ProbeTimeout
-	StatusTimeout, DoctorTimeout, ProbeTimeout = d, d, d
-	return func() { StatusTimeout, DoctorTimeout, ProbeTimeout = os, ds, ps }
+	os, ps := StatusTimeout, ProbeTimeout
+	StatusTimeout, ProbeTimeout = d, d
+	return func() { StatusTimeout, ProbeTimeout = os, ps }
 }
 
 // assertAllMethodsError calls every non-streaming method and Available and

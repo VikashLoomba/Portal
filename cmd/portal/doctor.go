@@ -38,25 +38,34 @@ func newDoctorCmd(a *app.App) *cobra.Command {
 // a buffer and an App. Production output is byte-identical (cmd.OutOrStdout()
 // defaults to os.Stdout). When the daemon is up it POSTs /v1/doctor so the
 // self-test runs against the daemon's LIVE ControlMaster (better ground truth
-// than a fresh CLI-side probe); when the daemon is down (or the socket errors)
-// it silently falls back to today's in-process run. Both paths need a host.
+// than a fresh CLI-side probe); when the daemon is down it falls back to today's
+// in-process run. Both paths need a host.
 func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App) error {
 	host, _ := a.Cfg.ReadHost()
 	if host == "" {
 		return fmt.Errorf("no dev box configured — run: %s install <ssh-host>", app.Tool)
 	}
-	// Prefer the daemon: it renders from its live transport. The decode only
-	// works because internal/doctor adds Status.UnmarshalJSON; any localclient
-	// error (down/dead/hung) silently drops to the local run below.
+	// Prefer the daemon: it renders from its live transport. We decide up/down with
+	// the same fast Available probe every other command uses (allow.go, inspect.go,
+	// run.go) so a dial "daemon is down" is cleanly distinguished from a /v1/doctor
+	// call that runs long: POST /v1/doctor is long-running (§4.5), so once the
+	// daemon is confirmed up we let its result stand. A slow or errored daemon run
+	// is REPORTED, never silently re-run in-process — a silent local fallback here
+	// would double the work (30s+), discard the daemon's live-transport ground
+	// truth, and hide from the user that the daemon path was abandoned.
 	lc := localclient.New(a.Paths.APISock)
-	if rep, err := lc.Doctor(ctx); err == nil {
+	if lc.Available(ctx) {
+		rep, err := lc.Doctor(ctx)
+		if err != nil {
+			return fmt.Errorf("daemon doctor failed (daemon is up; not falling back to a local run): %w", err)
+		}
 		renderDoctor(w, rep)
 		if !rep.OK() {
 			return errSilent
 		}
 		return nil
 	}
-	// Fallback: the in-process run over a FRESH sshctl transport (never
+	// Fallback (daemon down): the in-process run over a FRESH sshctl transport (never
 	// a.Transport — routing doctor probes through it would leak ssh stderr into
 	// the report). The only test seam that intercepts this path is a.Runner.
 	tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)

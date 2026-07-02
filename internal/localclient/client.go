@@ -26,13 +26,13 @@ import (
 )
 
 // Per-call default timeouts, exposed as vars so tests can shrink them. Status/
-// ports/allow/features share StatusTimeout; doctor runs a live probe inside the
-// daemon so it gets a longer budget; version-probe and reconcile are quick.
-// There is deliberately NO global http.Client.Timeout — an events stream is
+// ports/allow/features share StatusTimeout; version-probe and reconcile use the
+// quick ProbeTimeout. Doctor deliberately has NO per-call cap: POST /v1/doctor is
+// long-running and rides the caller's ctx (§4.5 "honors client disconnect") — see
+// Doctor. There is likewise NO global http.Client.Timeout — an events stream is
 // long-lived and a client timeout would tear it down mid-stream (§5.1).
 var (
 	StatusTimeout = 2 * time.Second
-	DoctorTimeout = 30 * time.Second
 	ProbeTimeout  = 1 * time.Second
 )
 
@@ -320,12 +320,20 @@ func (c *Client) Reconcile(ctx context.Context) error {
 // structured report. This decode only works because this package adds
 // doctor.Status.UnmarshalJSON — without it {"status":"PASS"} fails to unmarshal
 // into the doctor.Status uint8 and Doctor would always error (§5.1 STAGE-1 fixup).
+//
+// Unlike the status-class getters, Doctor imposes NO artificial per-call deadline
+// and rides the caller's ctx directly (like Events). POST /v1/doctor is
+// long-running (§4.5): the daemon runs a full clip/notify smoke test over its
+// live ssh transport, which on a high-latency link legitimately exceeds any small
+// fixed budget — a fixed cap here would abort a healthy-but-slow run and force the
+// caller into a redundant local fallback. The caller owns the deadline; cancelling
+// ctx (e.g. the user interrupting the CLI) closes the connection and the daemon
+// honors the disconnect.
 func (c *Client) Doctor(ctx context.Context) (*doctor.Report, error) {
-	req, cancel, err := c.newReq(ctx, http.MethodPost, "/v1/doctor", DoctorTimeout, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://unix/v1/doctor", nil)
 	if err != nil {
 		return nil, err
 	}
-	defer cancel()
 	resp, err := c.do(req)
 	if err != nil {
 		return nil, err
