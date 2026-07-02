@@ -18,12 +18,55 @@ import (
 )
 
 func newStatusCmd(a *app.App) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show box, service state, ssh master, active forwards (default)",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			watch, _ := cmd.Flags().GetBool("watch")
+			if watch {
+				return runStatusWatch(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), a)
+			}
 			return runStatusTo(cmd.Context(), cmd.OutOrStdout(), a)
 		},
+	}
+	cmd.Flags().BoolP("watch", "w", false, "continuously re-render on daemon state changes")
+	return cmd
+}
+
+// runStatusWatch streams GET /v1/events and re-renders the status block on every
+// snapshot/state line, exiting cleanly (nil) when the stream ends — which the
+// daemon's own shutdown produces because localapi.Serve wires its http.Server
+// BaseContext to the Serve ctx, so cancelling it cancels the /v1/events handler
+// and EOFs the stream (§5.2). A watch has nothing to watch when the daemon is
+// down, so an unreachable daemon prints one polite line and exits non-zero.
+func runStatusWatch(ctx context.Context, w, errw io.Writer, a *app.App) error {
+	lc := localclient.New(a.Paths.APISock)
+	if !lc.Available(ctx) {
+		fmt.Fprintf(errw, "%s status --watch needs the running daemon; run `%s status` instead\n", app.Tool, app.Tool)
+		return errSilent
+	}
+	events, errc, err := lc.Events(ctx)
+	if err != nil {
+		fmt.Fprintf(errw, "%s status --watch needs the running daemon; run `%s status` instead\n", app.Tool, app.Tool)
+		return errSilent
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case ev, ok := <-events:
+			if !ok {
+				return nil
+			}
+			// snapshot/state carry a full Status; notify/tick are ignored.
+			if ev.Type == "snapshot" || ev.Type == "state" {
+				if ev.Status != nil {
+					renderStatus(w, viewFromStatus(a, *ev.Status))
+				}
+			}
+		case <-errc:
+			return nil
+		}
 	}
 }
 
