@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
 
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/sshnative"
 )
 
 // The no-arg form prints the ACTIVE transport's Describe().Impl unconditionally
@@ -36,6 +39,12 @@ func TestRunTransport_SetRoundTrip(t *testing.T) {
 	}
 	a := &app.App{Cfg: cfg, Transport: nativeHealthTransport{up: true, pid: 0}}
 
+	// Hermeticity: stub the native-validation seam so the native leg does not
+	// exec real `ssh -G` for `user@box`.
+	restore := validateNativeHost
+	validateNativeHost = func(string) error { return nil }
+	defer func() { validateNativeHost = restore }()
+
 	for _, name := range []string{"native", "system"} {
 		var buf bytes.Buffer
 		if err := runTransport(&buf, a, []string{name}); err != nil {
@@ -54,36 +63,73 @@ func TestRunTransport_SetRoundTrip(t *testing.T) {
 	}
 }
 
-// Selecting `native` against an ssh-alias host (not user@host[:port]) is a usage
-// error that NEVER persists the selection — the guard that prevents native+alias
-// from bricking App construction on every subsequent command. `system` against
-// the same alias host is always allowed (it resolves aliases via ssh_config).
-func TestRunTransport_NativeRejectedForAliasHost(t *testing.T) {
-	for _, host := range []string{"mybox", ""} {
-		cfg := config.New(t.TempDir())
-		if host != "" {
-			if err := cfg.WriteHost(host); err != nil {
+// TestRunTransport_NativeResolveValidation (EC14): `transport native` succeeds
+// for a host that RESOLVES via ssh_config to a non-empty HostName and fails safe
+// (usageErr, nothing persisted) for an unresolvable host. The validateNativeHost
+// seam is overridden to delegate to the REAL sshnative.ValidTarget against a fake
+// resolver, so ValidTarget's resolve logic runs offline (no real `ssh -G`).
+func TestRunTransport_NativeResolveValidation(t *testing.T) {
+	tests := []struct {
+		name     string
+		resolver sshnative.ConfigResolver
+		wantErr  bool
+	}{
+		{
+			name: "resolvable alias succeeds",
+			resolver: func(_ context.Context, _ string) (sshnative.ResolvedHost, error) {
+				return sshnative.ResolvedHost{User: "me", HostName: "realhost.example", Port: 22}, nil
+			},
+			wantErr: false,
+		},
+		{
+			name: "resolver error fails safe",
+			resolver: func(_ context.Context, _ string) (sshnative.ResolvedHost, error) {
+				return sshnative.ResolvedHost{}, fmt.Errorf("ssh -G: no such host")
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty HostName fails safe",
+			resolver: func(_ context.Context, _ string) (sshnative.ResolvedHost, error) {
+				return sshnative.ResolvedHost{}, nil
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.New(t.TempDir())
+			if err := cfg.WriteHost("mybox"); err != nil {
 				t.Fatal(err)
 			}
-		}
-		a := &app.App{Cfg: cfg, Transport: nativeHealthTransport{up: true, pid: 0}}
+			a := &app.App{Cfg: cfg, Transport: nativeHealthTransport{up: true, pid: 0}}
 
-		err := runTransport(io.Discard, a, []string{"native"})
-		if err == nil {
-			t.Fatalf("host %q: selecting native against a non-native host should be a usage error", host)
-		}
-		if _, ok := err.(usageErr); !ok {
-			t.Errorf("host %q: error type = %T, want usageErr", host, err)
-		}
-		// The rejected selection must NOT be written: config stays system.
-		if got, _ := cfg.Transport(); got != "system" {
-			t.Errorf("host %q: config Transport = %q after rejected native select, want system (unchanged)", host, got)
-		}
+			restore := validateNativeHost
+			validateNativeHost = func(host string) error {
+				return sshnative.ValidTarget(context.Background(), host, tt.resolver)
+			}
+			defer func() { validateNativeHost = restore }()
 
-		// system is still selectable against the same alias host.
-		if err := runTransport(io.Discard, a, []string{"system"}); err != nil {
-			t.Errorf("host %q: selecting system should be allowed, got %v", host, err)
-		}
+			err := runTransport(io.Discard, a, []string{"native"})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("selecting native against an unresolvable host should be a usage error")
+				}
+				if _, ok := err.(usageErr); !ok {
+					t.Errorf("error type = %T, want usageErr", err)
+				}
+				if got, _ := cfg.Transport(); got != "system" {
+					t.Errorf("config Transport = %q after rejected native select, want system (unchanged)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("selecting native against a resolvable host: %v", err)
+			}
+			if got, _ := cfg.Transport(); got != "native" {
+				t.Errorf("config Transport = %q after accepted native select, want native", got)
+			}
+		})
 	}
 }
 

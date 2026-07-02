@@ -45,11 +45,15 @@ func TestNewTransport_SelectionMatrix(t *testing.T) {
 		if err := cfg.SetTransport("native"); err != nil {
 			t.Fatal(err)
 		}
-		// T5 hermeticity: inject a temp-dir known_hosts path via the native-options
-		// seam so New does not read the runner's real ~/.ssh/known_hosts (an
-		// unparseable line there would fail this selection-only assertion).
-		hermetic := sshnative.WithKnownHostsPath(filepath.Join(t.TempDir(), "known_hosts"))
-		tr, pf, err := NewTransport(Paths{}, "user@host", runner, cfg, nil, hermetic)
+		// T5/T11 hermeticity: inject a temp-dir known_hosts path AND a stub
+		// ConfigResolver via the native-options seam so New neither reads the
+		// runner's real ~/.ssh/known_hosts nor execs real `ssh -G` for this
+		// selection-only assertion.
+		knownHosts := sshnative.WithKnownHostsPath(filepath.Join(t.TempDir(), "known_hosts"))
+		resolver := sshnative.WithConfigResolver(func(_ context.Context, _ string) (sshnative.ResolvedHost, error) {
+			return sshnative.ResolvedHost{User: "user", HostName: "host", Port: 22}, nil
+		})
+		tr, pf, err := NewTransport(Paths{}, "user@host", runner, cfg, nil, knownHosts, resolver)
 		if err != nil {
 			t.Fatal(err)
 		}

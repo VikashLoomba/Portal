@@ -2,6 +2,7 @@ package sshnative
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -21,6 +22,15 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
+
+// passthroughResolver is the hermetic ConfigResolver every server-backed New
+// site injects via WithConfigResolver: it splits the in-process literal
+// user@host:port verbatim (NO ssh -G), returning exactly the endpoint the
+// retired literal short-circuit produced.
+func passthroughResolver(_ context.Context, target string) (ResolvedHost, error) {
+	u, h, p := splitTargetForResolve(target)
+	return ResolvedHost{User: u, HostName: h, Port: p}, nil
+}
 
 // testServer is an in-process x/crypto/ssh SERVER on a random loopback port. It
 // accepts publickey auth for a single test-generated key and runs each exec

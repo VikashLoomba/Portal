@@ -19,6 +19,7 @@ func TestAuthAgentPath(t *testing.T) {
 	missingKey := filepath.Join(t.TempDir(), "does-not-exist")
 
 	c, err := New(srv.target("testuser"),
+		WithConfigResolver(passthroughResolver),
 		WithKnownHostsPath(kh),
 		WithAgentSocket(sock),
 		WithIdentityFiles(missingKey))
@@ -53,6 +54,7 @@ func TestAuthIdentityFilePath(t *testing.T) {
 	keyFile := writeIdentityFile(t, clientPriv)
 
 	c, err := New(srv.target("testuser"),
+		WithConfigResolver(passthroughResolver),
 		WithKnownHostsPath(kh),
 		WithIdentityFiles(keyFile),
 		WithAgentSocket(""))
@@ -88,6 +90,7 @@ func TestAuthDeadAgentFallsThroughToKey(t *testing.T) {
 	deadSock := filepath.Join(t.TempDir(), "dead-agent.sock")
 
 	c, err := New(srv.target("testuser"),
+		WithConfigResolver(passthroughResolver),
 		WithKnownHostsPath(kh),
 		WithAgentSocket(deadSock),
 		WithIdentityFiles(keyFile))
@@ -117,6 +120,7 @@ func TestAuthEncryptedKey(t *testing.T) {
 	encKey := writeEncryptedIdentityFile(t, clientPriv)
 
 	c, err := New(srv.target("testuser"),
+		WithConfigResolver(passthroughResolver),
 		WithKnownHostsPath(kh),
 		WithIdentityFiles(encKey),
 		WithAgentSocket(""))
@@ -153,6 +157,7 @@ func TestAuthAgentWithEncryptedKey(t *testing.T) {
 	encKey := writeEncryptedIdentityFile(t, clientPriv)
 
 	c, err := New(srv.target("testuser"),
+		WithConfigResolver(passthroughResolver),
 		WithKnownHostsPath(kh),
 		WithAgentSocket(sock),
 		WithIdentityFiles(encKey))
@@ -184,6 +189,7 @@ func TestAuthUnencryptedKeyBesidesEncrypted(t *testing.T) {
 	plainKey := writeIdentityFile(t, clientPriv)
 
 	c, err := New(srv.target("testuser"),
+		WithConfigResolver(passthroughResolver),
 		WithKnownHostsPath(kh),
 		WithIdentityFiles(encKey, plainKey),
 		WithAgentSocket(""))
@@ -213,6 +219,7 @@ func TestAuthNoCredentials(t *testing.T) {
 	missingKey := filepath.Join(t.TempDir(), "does-not-exist")
 
 	c, err := New(srv.target("testuser"),
+		WithConfigResolver(passthroughResolver),
 		WithKnownHostsPath(kh),
 		WithIdentityFiles(missingKey),
 		WithAgentSocket(""))

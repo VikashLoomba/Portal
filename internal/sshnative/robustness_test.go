@@ -20,6 +20,7 @@ func dialedTestClient(t *testing.T) *Client {
 	keyFile := writeIdentityFile(t, clientPriv)
 
 	c, err := New(srv.target("testuser"),
+		WithConfigResolver(passthroughResolver),
 		WithKnownHostsPath(kh),
 		WithIdentityFiles(keyFile),
 		WithAgentSocket(""))
@@ -114,6 +115,7 @@ func TestKnownHostsMissingFailsClosed(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "no-such-dir", "known_hosts")
 
 	c, err := New(srv.target("testuser"),
+		WithConfigResolver(passthroughResolver),
 		WithKnownHostsPath(missing),
 		WithIdentityFiles(keyFile),
 		WithAgentSocket(""))
@@ -206,6 +208,7 @@ func TestKeepaliveMarksDeadOnConnectionDrop(t *testing.T) {
 	// 10ms period / 3 strikes: real detection fires in ~30ms yet the loop is the
 	// same code the 15s/3 production path runs.
 	c, err := New(srv.target("testuser"),
+		WithConfigResolver(passthroughResolver),
 		WithKnownHostsPath(kh),
 		WithIdentityFiles(keyFile),
 		WithAgentSocket(""),
@@ -271,6 +274,7 @@ func TestKeepaliveTimesOutOnBlackHole(t *testing.T) {
 	// 20ms period / 3 strikes: each black-holed probe times out after ~period, so
 	// detection fires in roughly period*strikes — well inside the 3s guard.
 	c, err := New(srv.target("testuser"),
+		WithConfigResolver(passthroughResolver),
 		WithKnownHostsPath(kh),
 		WithIdentityFiles(keyFile),
 		WithAgentSocket(""),

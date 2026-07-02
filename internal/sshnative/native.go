@@ -58,9 +58,14 @@ func WithKnownHostsPath(path string) Option {
 }
 
 // WithIdentityFiles overrides the private-key candidate list (default
-// ~/.ssh/id_ed25519 then ~/.ssh/id_rsa).
+// ~/.ssh/id_ed25519 then ~/.ssh/id_rsa). Setting it explicitly also pins the
+// list against ssh_config resolution: resolved IdentityFiles never replace an
+// explicitly-supplied list.
 func WithIdentityFiles(paths ...string) Option {
-	return func(c *Client) { c.identityFiles = append([]string(nil), paths...) }
+	return func(c *Client) {
+		c.identityFiles = append([]string(nil), paths...)
+		c.identityFilesExplicit = true
+	}
 }
 
 // WithAgentSocket overrides the ssh-agent socket (default $SSH_AUTH_SOCK). The
@@ -107,6 +112,20 @@ type Client struct {
 	agentSocket     string
 	hostKeyOverride ssh.HostKeyCallback
 
+	// resolver resolves target through ssh_config at New (default
+	// DefaultConfigResolver, overridable by WithConfigResolver). It never dials.
+	resolver ConfigResolver
+	// identityFilesExplicit records that WithIdentityFiles was supplied, so
+	// resolved ssh_config IdentityFiles do not replace the explicit list.
+	identityFilesExplicit bool
+	// hostKeyAlias, when non-empty, keys strict host-key verification instead of
+	// the resolved HostName (matching OpenSSH's HostKeyAlias).
+	hostKeyAlias string
+	// proxyJump/proxyCommand are the resolved proxy directives. Populated at New;
+	// CONSUMED only by the T12 dialing (u8) — a direct dial ignores them.
+	proxyJump    string
+	proxyCommand string
+
 	// Keepalive cadence: defaults from New (15s/3), overridable by WithKeepalive.
 	// Read once when startKeepaliveLocked launches; never mutated after New.
 	keepalivePeriod  time.Duration
@@ -133,23 +152,22 @@ type Client struct {
 
 var _ transport.Transport = (*Client)(nil)
 
-// New parses target (user@host[:port], default port 22), applies opts, resolves
-// the effective known_hosts path / identity-file list / agent socket from the
-// real ~/.ssh defaults (overridden by opts), and builds the STRICT host-key
-// callback. It does NOT dial: it returns a ready-to-Ensure Client so the u5
-// factory and doctor's daemon-down fallback can construct native cheaply
-// without a live box. ssh_config alias resolution is out of scope.
+// New builds a ready-to-Ensure Client for target by RESOLVING it through the
+// ConfigResolver (default DefaultConfigResolver, i.e. `ssh -G`) at construction —
+// EVERY target is resolved, with no literal short-circuit, so a bare alias, a
+// user@alias (honoring its ssh_config Host block), and a raw user@host[:port]
+// (which resolves to itself verbatim when no Host block matches) all become the
+// resolved dial endpoint. It applies opts first, then resolves, then builds the
+// STRICT host-key callback. It does NOT dial, so the u5 factory and doctor's
+// daemon-down fallback can construct native cheaply without a live box.
+// Describe().Endpoint reports the RESOLVED endpoint; host-key verification keys
+// on the resolved HostKeyAlias when set, else the resolved HostName.
 func New(target string, opts ...Option) (*Client, error) {
-	user, host, port, err := parseTarget(target)
-	if err != nil {
-		return nil, err
-	}
-	c := &Client{user: user, host: host, port: port}
-
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("sshnative: resolve home dir for ~/.ssh defaults: %w", err)
 	}
+	c := &Client{}
 	c.knownHostsPath = filepath.Join(home, ".ssh", "known_hosts")
 	c.identityFiles = []string{
 		filepath.Join(home, ".ssh", "id_ed25519"),
@@ -162,6 +180,40 @@ func New(target string, opts ...Option) (*Client, error) {
 	for _, o := range opts {
 		o(c)
 	}
+	if c.resolver == nil {
+		c.resolver = DefaultConfigResolver()
+	}
+
+	rh, rerr := c.resolver(context.Background(), target)
+	if rerr != nil {
+		return nil, fmt.Errorf("sshnative: resolve %q: %w", target, rerr)
+	}
+	if rh.HostName == "" {
+		return nil, fmt.Errorf("sshnative: resolved host for %q is empty; not a native target", target)
+	}
+	c.user = rh.User
+	c.host = rh.HostName
+	c.port = rh.Port
+	if c.port == 0 {
+		c.port = defaultPort
+	}
+	c.hostKeyAlias = rh.HostKeyAlias
+	c.proxyJump = rh.ProxyJump
+	c.proxyCommand = rh.ProxyCommand
+
+	// Resolved IdentityFiles (existing files only) REPLACE the id_ed25519/id_rsa
+	// defaults; an explicit WithIdentityFiles still wins.
+	if !c.identityFilesExplicit {
+		var filtered []string
+		for _, path := range rh.IdentityFiles {
+			if _, err := os.Stat(path); err == nil {
+				filtered = append(filtered, path)
+			}
+		}
+		if len(filtered) > 0 {
+			c.identityFiles = filtered
+		}
+	}
 
 	cb, err := c.buildHostKeyCallback()
 	if err != nil {
@@ -171,81 +223,76 @@ func New(target string, opts ...Option) (*Client, error) {
 	return c, nil
 }
 
-// ValidTarget reports whether target is a well-formed user@host[:port] the
-// native transport can dial (the same parse New performs, without constructing a
-// client or touching ~/.ssh). Selection-time callers use it to reject
-// `transport native` for an ssh-alias or empty host — which native cannot
-// resolve — BEFORE the bad selection is persisted and bricks App construction on
-// every subsequent command.
-func ValidTarget(target string) error {
-	_, _, _, err := parseTarget(target)
-	return err
+// ValidTarget reports whether target RESOLVES via resolver to a non-empty
+// HostName — i.e. whether native can dial it. It calls resolver directly (with
+// DefaultConfigResolver it execs `ssh -G`), so an ssh_config alias that resolves
+// is a valid native target (the T8/T11 amendment retired the parse-only
+// user@host guard). Selection-time callers use it to reject `transport native`
+// for an unresolvable host BEFORE the bad selection is persisted.
+func ValidTarget(ctx context.Context, target string, resolver ConfigResolver) error {
+	rh, err := resolver(ctx, target)
+	if err != nil {
+		return err
+	}
+	if rh.HostName == "" {
+		return fmt.Errorf("resolved host for %q is empty", target)
+	}
+	return nil
 }
 
-// parseTarget splits user@host[:port]. A missing user is an error naming the
-// accepted form. Missing port defaults to 22.
-func parseTarget(target string) (user, host string, port int, err error) {
-	at := strings.LastIndex(target, "@")
-	if at < 0 {
-		return "", "", 0, fmt.Errorf("sshnative: target %q missing user; expected user@host[:port]", target)
-	}
-	user = target[:at]
-	hostport := target[at+1:]
-	if user == "" {
-		return "", "", 0, fmt.Errorf("sshnative: target %q has empty user; expected user@host[:port]", target)
-	}
-	if hostport == "" {
-		return "", "", 0, fmt.Errorf("sshnative: target %q has empty host; expected user@host[:port]", target)
-	}
-	// A ':' denotes an explicit port. IPv6 literals (bracketed) also parse via
-	// SplitHostPort; a bare IPv6 without a port is out of scope.
-	if strings.Contains(hostport, ":") {
-		h, p, serr := net.SplitHostPort(hostport)
-		if serr != nil {
-			return "", "", 0, fmt.Errorf("sshnative: target %q: %v; expected user@host[:port]", target, serr)
-		}
-		n, aerr := strconv.Atoi(p)
-		if aerr != nil || n <= 0 || n > 65535 {
-			return "", "", 0, fmt.Errorf("sshnative: target %q has invalid port %q", target, p)
-		}
-		return user, h, n, nil
-	}
-	return user, hostport, defaultPort, nil
-}
-
-// buildHostKeyCallback constructs the STRICT host-key verifier. WithHostKeyCallback
-// replaces this wholesale; otherwise it is built from the resolved known_hosts
-// path. A missing known_hosts file is treated as "no known hosts" so every host
-// is unknown (strict) — New still succeeds and the failure surfaces at Ensure
-// with the remediation hint, never a raw file-not-found.
+// buildHostKeyCallback constructs the STRICT host-key verifier from the resolved
+// config, delegating to newStrictHostKeyCallback. WithHostKeyCallback replaces it
+// wholesale.
 func (c *Client) buildHostKeyCallback() (ssh.HostKeyCallback, error) {
-	if c.hostKeyOverride != nil {
-		return c.hostKeyOverride, nil
+	return newStrictHostKeyCallback(c.knownHostsPath, c.hostKeyOverride, c.hostKeyAlias, c.host, c.port)
+}
+
+// newStrictHostKeyCallback builds the STRICT host-key verifier. override replaces
+// the known_hosts-file construction wholesale (test escape hatch). Otherwise the
+// callback is built from knownHostsPath; a missing file is treated as "no known
+// hosts" (every host unknown → strict) so New still succeeds and the failure
+// surfaces at Ensure with the remediation hint, never a raw file-not-found.
+//
+// LOCKED QUERY-ADDRESS MECHANIC: the address handed to the knownhosts base MUST
+// always carry an explicit port and is a RAW net.JoinHostPort, NEVER a
+// knownhosts.Normalize'd value. When hostKeyAlias != "" the lookup key is
+// net.JoinHostPort(hostKeyAlias, "22") — the fixed :22 makes x/crypto's internal
+// Normalize collapse to the bare alias regardless of dial port, matching
+// OpenSSH's port-less HostKeyAlias lookup. Otherwise it is
+// net.JoinHostPort(host, port) — byte-identical to the dial address ssh.Dial
+// hands the callback for all ports (incl. 22). A knownhosts.Normalize'd address
+// would strip a default :22 to a bare host, and x/crypto's knownhosts.check runs
+// net.SplitHostPort on the query and errors on any port-less string — failing
+// verification unconditionally for every alias-keyed or port-22 target.
+func newStrictHostKeyCallback(knownHostsPath string, override ssh.HostKeyCallback, hostKeyAlias, host string, port int) (ssh.HostKeyCallback, error) {
+	if override != nil {
+		return override, nil
 	}
-	base, err := knownhosts.New(c.knownHostsPath)
+	base, err := knownhosts.New(knownHostsPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			base = func(string, net.Addr, ssh.PublicKey) error {
-				return fmt.Errorf("no known_hosts entry (%s does not exist)", c.knownHostsPath)
+				return fmt.Errorf("no known_hosts entry (%s does not exist)", knownHostsPath)
 			}
 		} else {
-			return nil, fmt.Errorf("sshnative: load known_hosts %s: %w", c.knownHostsPath, err)
+			return nil, fmt.Errorf("sshnative: load known_hosts %s: %w", knownHostsPath, err)
 		}
 	}
-	return c.strictHostKey(base), nil
-}
 
-// strictHostKey wraps base so an unknown OR mismatched key aborts the dial with
-// an error that CONTAINS the host and a remediation hint (run `ssh <host>` once
-// manually to record the correct host key).
-func (c *Client) strictHostKey(base ssh.HostKeyCallback) ssh.HostKeyCallback {
-	host := c.host
-	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-		if err := base(hostname, remote, key); err != nil {
-			return fmt.Errorf("host key verification failed for %s: %w; run `ssh %s` once manually to record the host key", host, err, host)
+	var lookupKey, errHost string
+	if hostKeyAlias != "" {
+		lookupKey = net.JoinHostPort(hostKeyAlias, "22")
+		errHost = hostKeyAlias
+	} else {
+		lookupKey = net.JoinHostPort(host, strconv.Itoa(port))
+		errHost = host
+	}
+	return func(_ string, remote net.Addr, key ssh.PublicKey) error {
+		if err := base(lookupKey, remote, key); err != nil {
+			return fmt.Errorf("host key verification failed for %s: %w; run `ssh %s` once manually to record the host key", errHost, err, errHost)
 		}
 		return nil
-	}
+	}, nil
 }
 
 // Ensure dials when no live client exists (or the previous one is dead).

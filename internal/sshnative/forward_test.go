@@ -22,6 +22,7 @@ func newForwardClient(t *testing.T) *Client {
 	keyFile := writeIdentityFile(t, clientPriv)
 
 	c, err := New(srv.target("testuser"),
+		WithConfigResolver(passthroughResolver),
 		WithKnownHostsPath(kh),
 		WithIdentityFiles(keyFile),
 		WithAgentSocket(""))

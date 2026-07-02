@@ -462,10 +462,15 @@ func TestRunDoctorCmd_FallbackNativeSelection(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	// T5 hermeticity: inject a temp-dir known_hosts path so the native client the
-	// fallback constructs never reads the runner's real ~/.ssh/known_hosts.
-	hermetic := sshnative.WithKnownHostsPath(filepath.Join(t.TempDir(), "known_hosts"))
-	_ = runDoctorCmd(context.Background(), &out, a, hermetic) // FAIL expected (native undialed)
+	// T5/T11 hermeticity: inject a temp-dir known_hosts path AND a stub
+	// ConfigResolver (127.0.0.1:1, refused instantly) so the native client the
+	// fallback constructs never reads the runner's real ~/.ssh/known_hosts nor
+	// execs real `ssh -G`.
+	knownHosts := sshnative.WithKnownHostsPath(filepath.Join(t.TempDir(), "known_hosts"))
+	resolver := sshnative.WithConfigResolver(func(_ context.Context, _ string) (sshnative.ResolvedHost, error) {
+		return sshnative.ResolvedHost{User: "user", HostName: "127.0.0.1", Port: 1}, nil
+	})
+	_ = runDoctorCmd(context.Background(), &out, a, knownHosts, resolver) // FAIL expected (native undialed)
 	if !strings.Contains(out.String(), "[PASS] transport: native-ssh") {
 		t.Errorf("daemon-down fallback must honor the native selection, got:\n%s", out.String())
 	}

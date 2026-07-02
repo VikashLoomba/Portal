@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 
@@ -9,6 +10,14 @@ import (
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/sshnative"
 )
+
+// validateNativeHost reports whether host RESOLVES via ssh_config to a native
+// target. It is a package-level seam so tests stay hermetic (overriding it)
+// without execing real `ssh -G`; in production it execs `ssh -G <host>` once at
+// selection time (a cheap local call bounded by the resolver's 5s timeout).
+var validateNativeHost = func(host string) error {
+	return sshnative.ValidTarget(context.Background(), host, sshnative.DefaultConfigResolver())
+}
 
 // newTransportCmd implements `portal transport [name]` (T8). With no argument it
 // prints the ACTIVE transport's Describe().Impl UNCONDITIONALLY — the canonical
@@ -36,17 +45,18 @@ func runTransport(w io.Writer, a *app.App, args []string) error {
 		return nil
 	}
 	name := args[0]
-	// Reject `transport native` unless the configured host is a native target
-	// (user@host[:port]). Native has no ssh_config alias resolution, so selecting
-	// it against an alias/empty host would build a client that fails at App
-	// construction and brick EVERY subsequent command (including this revert).
-	// Fail here, before persisting, with a message that points at the fix.
+	// Reject `transport native` unless the configured host RESOLVES via ssh_config
+	// to a non-empty HostName. Native resolves aliases through `ssh -G`, so an
+	// alias that resolves is a valid target; but an unresolvable/empty host would
+	// build a client that fails at App construction and brick EVERY subsequent
+	// command (including this revert). Fail here, before persisting, pointing at
+	// the fix.
 	if name == "native" {
 		host, _ := a.Cfg.ReadHost()
-		if err := sshnative.ValidTarget(host); err != nil {
+		if err := validateNativeHost(host); err != nil {
 			return usageErr{msg: fmt.Sprintf(
 				"cannot select native transport: configured host %q is not a native target (%v); "+
-					"native requires user@host[:port] — set one with `%s host <user@host>` first",
+					"native requires a host that resolves via ssh_config — set one with `%s host <user@host>` first",
 				host, err, app.Tool)}
 		}
 	}

@@ -24,6 +24,7 @@ func TestConformance(t *testing.T) {
 
 	conformance.Run(t, "sshnative", func(t *testing.T) transport.Transport {
 		c, err := New(srv.target("testuser"),
+			WithConfigResolver(passthroughResolver),
 			WithKnownHostsPath(kh),
 			WithIdentityFiles(keyFile),
 			WithAgentSocket(""))
@@ -50,6 +51,7 @@ func TestKnownHostsStrictFailure(t *testing.T) {
 	kh := writeKnownHosts(t, wrongLine)
 
 	c, err := New(srv.target("testuser"),
+		WithConfigResolver(passthroughResolver),
 		WithKnownHostsPath(kh),
 		WithIdentityFiles(keyFile),
 		WithAgentSocket(""))
