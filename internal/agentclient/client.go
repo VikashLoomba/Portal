@@ -148,6 +148,29 @@ func New(cfg Config) *Client {
 		},
 		Deliver: c.publish,
 	})
+	// Auto-register the notify handler: it decodes the Notify payload and
+	// delivers via publishNotify exactly as the old `case env.Notify` arm did —
+	// publishNotify still sends on notifyEvents AND fires the hub Queued tee, so
+	// the tee now relocates to this registry-driven dispatch site (S11) with
+	// byte-identical behavior. All eight Notify fields carry through verbatim
+	// (Verified passthrough preserves the upstream classify/[unverified] split).
+	c.registry.register(HandlerSpec{
+		Service:    "notify",
+		Version:    1,
+		MaxPayload: 4096,
+		Decode: func(payload cbor.RawMessage) (EngineEvent, error) {
+			nf, err := protocol.UnmarshalPayload[protocol.Notify](payload)
+			if err != nil {
+				return EngineEvent{}, err
+			}
+			return EngineEvent{Kind: KindNotify, Notify: &NotifyEvent{
+				Title: nf.Title, Body: nf.Body, Subtitle: nf.Subtitle,
+				Urgency: nf.Urgency, Verified: nf.Verified, Source: nf.Source,
+				Sound: nf.Sound, Seq: nf.Seq,
+			}}, nil
+		},
+		Deliver: c.publishNotify,
+	})
 	return c
 }
 
@@ -653,17 +676,6 @@ func (c *Client) demuxLoop(ctx context.Context, dec *protocol.Decoder) error {
 				cr := env.ClipRequest
 				c.publishClip(EngineEvent{Kind: KindClipRequest, Clip: &ClipEvent{
 					Nonce: cr.Nonce, Epoch: cr.Epoch, Kind: cr.Kind, Format: cr.Format,
-				}})
-			case env.Notify != nil:
-				// Route to the DEDICATED notify channel (same rationale as
-				// ClipRequest). Fire-and-forget: no response frame. Non-blocking
-				// so a slow notification handler never stalls the demux loop /
-				// heartbeat watchdog.
-				nf := env.Notify
-				c.publishNotify(EngineEvent{Kind: KindNotify, Notify: &NotifyEvent{
-					Title: nf.Title, Body: nf.Body, Subtitle: nf.Subtitle,
-					Urgency: nf.Urgency, Verified: nf.Verified, Source: nf.Source,
-					Sound: nf.Sound, Seq: nf.Seq,
 				}})
 			case env.Heartbeat != nil:
 				// Already bumped above.

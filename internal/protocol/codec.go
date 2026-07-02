@@ -176,9 +176,6 @@ func countEnvelopeFields(e *Envelope) int {
 	if e.ClipResponse != nil {
 		n++
 	}
-	if e.Notify != nil {
-		n++
-	}
 	if e.Msg != nil {
 		n++
 	}

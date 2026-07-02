@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -63,11 +62,6 @@ const (
 	// §7.1): a same-uid process spamming the socket cannot fork unbounded
 	// waiters / pending ClipRequest writes on the Serve loop.
 	maxInflightClip = 4
-	// notifyBodyMax bounds the inbound `notify` body on the cmd socket. The
-	// notify verb crosses the 1 MiB CBOR MaxFrameBytes downstream, but the
-	// notification surface (title/body) is tiny — cap it well under the 4096
-	// socket read so a malformed/oversized body is rejected before relay.
-	notifyBodyMax = 3072
 )
 
 // Server is the agent's RPC top loop. One Server per ssh-exec lifetime.
@@ -115,17 +109,6 @@ type Server struct {
 	// the cmd-socket goroutine; a full channel degrades to "none\n".
 	clipReqCh chan *protocol.ClipRequest
 
-	// notifyCh carries Notify envelopes from handleNotifyReq to the Serve loop,
-	// which is the SOLE writer of agent→client frames (mirrors clipReqCh /
-	// openURLCh). handleNotifyReq never writes the envelope itself. Buffered so a
-	// brief Serve stall doesn't block the cmd-socket goroutine; a full channel
-	// degrades to "dropped\n" — a missed notification is non-fatal.
-	notifyCh chan *protocol.Notify
-	// notifySeq is the monotonic sequence stamped on each relayed Notify, purely
-	// for client-side log correlation. Separate from s.seq (a Notify must never
-	// advance the port-event staleness counter). Bumped via atomic.
-	notifySeq uint64
-
 	// bpDeadline fires if the openURLCh or the main enc write stays stalled
 	// for BackpressureKill. Nil when nothing is queued.
 	bpDeadline *time.Timer
@@ -163,17 +146,17 @@ func New(cfg Config) *Server {
 		lastEmitted: map[uint16]protocol.Port{},
 		clipWaiters: map[uint64]chan *protocol.ClipResponse{},
 		clipReqCh:   make(chan *protocol.ClipRequest, 8),
-		notifyCh:    make(chan *protocol.Notify, 8),
 		epoch:       randEpoch(),
 		bpKillCh:    make(chan struct{}),
 	}
 	// Build the registry and bind the Server's guarded subscription reader so
 	// services can gate on `hasClient() && clientHas(svc)` without ever touching
-	// s.mu directly. Then auto-register the compiled-in services (openurl only
-	// this unit; notify/clip stay legacy until u4/u5).
+	// s.mu directly. Then auto-register the compiled-in services (openurl and
+	// notify this unit; clip stays legacy until u5).
 	s.reg = newRegistry(cfg.Log)
 	s.reg.bindHasClient(func() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.hasClient })
 	s.reg.register(newOpenURLService(s.reg, cfg.Log))
+	s.reg.register(newNotifyService(s.reg, cfg.Log))
 	return s
 }
 
@@ -331,20 +314,6 @@ func (s *Server) Serve(ctx context.Context) error {
 			s.mu.Unlock()
 			if active {
 				_ = s.enc.Write(&protocol.Envelope{ClipRequest: req})
-			}
-
-		case n := <-s.notifyCh:
-			// Same discipline as ClipRequest: the Serve loop is the SOLE writer
-			// of agent→client frames, so the Notify envelope is written here
-			// (interleaved with heartbeats) rather than by handleNotifyReq.
-			// Gate on hasClient so a notification that raced a disconnect is
-			// dropped (the caller already got "ok"; a missed notification is
-			// non-fatal). Does NOT touch s.seq.
-			s.mu.Lock()
-			active := s.hasClient
-			s.mu.Unlock()
-			if active {
-				_ = s.enc.Write(&protocol.Envelope{Notify: n})
 			}
 
 		case <-hb.C:
@@ -604,90 +573,18 @@ func (s *Server) handleCmdConn(ctx context.Context, conn net.Conn) {
 	}
 	verb, rest, _ := strings.Cut(line, "\t")
 	// Claimed verbs route to their registered service first ("open" → openurl,
-	// which applies its own 5s deadline). clip/notify are still served by the
-	// legacy handlers this unit (dual-stack until u4/u5); an unknown verb
-	// default-denies.
+	// "notify" → notify, each applying its own 5s deadline). clip is still
+	// served by the legacy handler this unit (dual-stack until u5); an unknown
+	// verb default-denies.
 	if s.reg.routeVerb(ctx, conn, verb, rest) {
 		return
 	}
 	switch verb {
 	case "clip":
 		s.handleClipReq(ctx, conn, rest)
-	case "notify":
-		s.handleNotifyReq(conn, rest)
 	default:
 		// Default-deny: a truly unknown token lands here.
 		_, _ = conn.Write([]byte("rejected\n"))
-	}
-}
-
-// notifyWire is the JSON shape `portald notify` writes on the cmd socket. It is
-// already classified on the remote side (the structured-hook vs generic split
-// happens in `portald notify`), so the agent just validates/bounds it and
-// relays it up the pipe — it does NOT re-interpret the payload. Verified
-// distinguishes a real Claude Code hook (true) from an arbitrary caller (false,
-// rendered "[unverified]" on the Mac). Fields beyond these are ignored.
-type notifyWire struct {
-	Title    string `json:"title"`
-	Body     string `json:"body"`
-	Subtitle string `json:"subtitle"`
-	Urgency  uint8  `json:"urgency"`
-	Verified bool   `json:"verified"`
-	Source   string `json:"source"`
-	Sound    string `json:"sound"`
-}
-
-// handleNotifyReq services a `notify\t<json>` verb. It parses the bounded JSON
-// body, gates on hasClient (mirroring handleOpenReq), and hands a Notify
-// envelope to the Serve loop (the sole frame writer) via the buffered notifyCh.
-// Replies "ok\n" once enqueued, "no-client\n" when no Mac is subscribed,
-// "dropped\n" when the relay channel is full, and "rejected\n" on a malformed /
-// oversized body (default-deny). It NEVER blocks the Serve loop: the relay is a
-// non-blocking channel send.
-func (s *Server) handleNotifyReq(conn net.Conn, body string) {
-	body = strings.TrimSpace(body)
-	if body == "" || len(body) > notifyBodyMax {
-		_, _ = conn.Write([]byte("rejected\n"))
-		return
-	}
-	var w notifyWire
-	if err := json.Unmarshal([]byte(body), &w); err != nil {
-		_, _ = conn.Write([]byte("rejected\n"))
-		return
-	}
-	// A notification with no title is unusable — reject rather than relay an
-	// empty frame the Mac would render as a blank notification.
-	if strings.TrimSpace(w.Title) == "" {
-		_, _ = conn.Write([]byte("rejected\n"))
-		return
-	}
-
-	s.mu.Lock()
-	active := s.hasClient
-	s.mu.Unlock()
-	if !active {
-		_, _ = conn.Write([]byte("no-client\n"))
-		return
-	}
-
-	n := &protocol.Notify{
-		Title:    w.Title,
-		Body:     w.Body,
-		Subtitle: w.Subtitle,
-		Urgency:  w.Urgency,
-		Verified: w.Verified,
-		Source:   w.Source,
-		Sound:    w.Sound,
-		Seq:      atomic.AddUint64(&s.notifySeq, 1),
-	}
-	select {
-	case s.notifyCh <- n:
-		_, _ = conn.Write([]byte("ok\n"))
-	default:
-		// Relay channel full — the Serve loop is badly backed up. Report the
-		// drop rather than falsely claiming success (a missed notification is
-		// non-fatal, unlike a misreported clip read).
-		_, _ = conn.Write([]byte("dropped\n"))
 	}
 }
 

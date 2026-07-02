@@ -61,11 +61,6 @@ type Envelope struct {
 	ClipRequest  *ClipRequest  `cbor:"clip_req,omitempty"`  // agent → client
 	ClipResponse *ClipResponse `cbor:"clip_resp,omitempty"` // client → agent
 
-	// notification relay (v3): fire-and-forget agent → client. A remote event
-	// (a Claude Code hook, or a generic `portald notify`) is relayed up the pipe
-	// and raised as a native macOS notification on the Mac. No response frame.
-	Notify *Notify `cbor:"notify,omitempty"` // agent → client
-
 	// services (v4): the ONLY feature frame, either direction.
 	Msg *Msg `cbor:"msg,omitempty"`
 }

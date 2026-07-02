@@ -47,7 +47,13 @@ func newNotifyHarness(t *testing.T, subscribe bool) *notifyHarness {
 
 	enc := protocol.NewEncoder(conn.c2aW)
 	dec := protocol.NewDecoder(conn.a2cR)
-	if err := enc.Write(&protocol.Envelope{Hello: &protocol.Hello{ProtoVersion: protocol.ProtoVersion}}); err != nil {
+	// Advertise the client's registered handlers so the agent's notify service
+	// gates open (clientHas("notify")). openurl is advertised too, mirroring the
+	// real Client which registers both handlers (DESIGN S4 symmetric advertise).
+	if err := enc.Write(&protocol.Envelope{Hello: &protocol.Hello{
+		ProtoVersion: protocol.ProtoVersion,
+		Services:     map[string]uint32{"openurl": 1, "notify": 1},
+	}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := dec.Read(); err != nil { // HelloAck
@@ -74,9 +80,19 @@ func newNotifyHarness(t *testing.T, subscribe bool) *notifyHarness {
 			if err != nil {
 				return
 			}
-			if env.Notify != nil {
+			// Notify now rides a Msg{svc:notify,kind:event} frame (v4). Decode the
+			// payload back into a protocol.Notify — the same shape the client
+			// registry's notify handler decodes. The per-service correlation Seq
+			// now lives on Msg.Seq (registry-stamped, DESIGN S3), not the payload
+			// field, so thread it in for the relay test's Seq!=0 assertion.
+			if env.Msg != nil && env.Msg.Service == "notify" && env.Msg.Kind == "event" {
+				n, err := protocol.UnmarshalPayload[protocol.Notify](env.Msg.Payload)
+				if err != nil {
+					continue
+				}
+				n.Seq = env.Msg.Seq
 				h.mu.Lock()
-				h.notifies = append(h.notifies, env.Notify)
+				h.notifies = append(h.notifies, &n)
 				h.mu.Unlock()
 			}
 		}
