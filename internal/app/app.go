@@ -14,6 +14,7 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/discover"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/forward"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/proc"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/service"
@@ -37,6 +38,11 @@ type App struct {
 	// Split-daemon additions:
 	Bootstrap   *bootstrap.Manager
 	AgentClient *agentclient.Client
+
+	// Hub is the read-only fan-out tee that agentclient publishes state and
+	// notify events into; internal/localapi's events stream subscribes to it.
+	// nil is tolerated everywhere (tests build App directly with fakes).
+	Hub *hub.Hub
 }
 
 // NewProd builds an App for normal use: reads HOME, derives Paths, opens
@@ -82,11 +88,13 @@ func NewProd() (*App, error) {
 	// cached Snapshot for desired-port lookups.
 	slogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	bs := bootstrap.New(transport, slogger)
+	h := hub.New()
 	ac := agentclient.New(agentclient.Config{
 		Transport:  transport,
 		Bootstrap:  bs,
 		Log:        slogger,
 		StderrSink: os.Stderr,
+		Hub:        h,
 	})
 	rd := discover.NewAgent(ac)
 
@@ -94,7 +102,7 @@ func NewProd() (*App, error) {
 		Paths: paths, Cfg: cfg, Runner: runner, Clk: clk, Log: logf,
 		Audit:     audit.New(paths.ConfigDir),
 		Transport: transport, Ports: ports, Discover: rd, Service: svc,
-		Bootstrap: bs, AgentClient: ac,
+		Bootstrap: bs, AgentClient: ac, Hub: h,
 	}, nil
 }
 

@@ -137,7 +137,7 @@ the headless launchd daemon can connect.`,
 			fmt.Printf("\nrunning self-test (%s doctor) ...\n", app.Tool)
 			tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
 			rep := runDoctor(cmd.Context(), host, tr)
-			rep.write(os.Stdout)
+			renderDoctor(os.Stdout, rep)
 
 			fmt.Printf("\ntry:  %s status\n", app.Tool)
 			return nil

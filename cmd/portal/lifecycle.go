@@ -28,6 +28,8 @@ func newUninstallCmd(a *app.App) *cobra.Command {
 				_, _ = a.Transport.Exit(cmd.Context())
 			}
 			_ = os.Remove(a.Paths.Sock)
+			// Best-effort: a stale api.sock must never block a fresh daemon.
+			_ = os.Remove(a.Paths.APISock)
 			_ = os.Remove(a.Paths.BinPath)
 			_ = os.RemoveAll(a.Paths.ConfigDir)
 			fmt.Printf("uninstalled (%s)\n", a.Paths.Label)
@@ -81,6 +83,8 @@ func newStopCmd(a *app.App) *cobra.Command {
 				}
 			}
 			_ = os.Remove(a.Paths.Sock)
+			// Best-effort: a stale api.sock must never block a fresh daemon.
+			_ = os.Remove(a.Paths.APISock)
 			fmt.Printf("stopped (%s) — run '%s start' to resume\n", a.Paths.Label, app.Tool)
 			return nil
 		},

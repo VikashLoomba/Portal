@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
 )
 
 // doctorFakeTransport implements sshctl.Transport for the doctor tests. It
@@ -73,15 +74,15 @@ func TestRunDoctor_AllGreen(t *testing.T) {
 		},
 	}
 	rep := runDoctor(context.Background(), "fakehost", tr)
-	if !rep.ok() {
+	if !rep.OK() {
 		t.Fatalf("expected PASS, got report:\n%s", reportString(rep))
 	}
 	// Spot-check the make-or-break PATH-winner lines passed.
-	assertCheck(t, rep, "PATH winner: xclip", checkPass)
-	assertCheck(t, rep, "PATH winner: wl-paste", checkPass)
-	assertCheck(t, rep, "shim version", checkPass)
-	assertCheck(t, rep, "agent verb: clip", checkPass)
-	assertCheck(t, rep, "agent verb: notify", checkPass)
+	assertCheck(t, rep, "PATH winner: xclip", doctor.Pass)
+	assertCheck(t, rep, "PATH winner: wl-paste", doctor.Pass)
+	assertCheck(t, rep, "shim version", doctor.Pass)
+	assertCheck(t, rep, "agent verb: clip", doctor.Pass)
+	assertCheck(t, rep, "agent verb: notify", doctor.Pass)
 }
 
 // TestRunDoctor_MasterDown bails after the master check fails — no remote probe
@@ -89,13 +90,13 @@ func TestRunDoctor_AllGreen(t *testing.T) {
 func TestRunDoctor_MasterDown(t *testing.T) {
 	tr := &doctorFakeTransport{pid: 0}
 	rep := runDoctor(context.Background(), "fakehost", tr)
-	if rep.ok() {
+	if rep.OK() {
 		t.Fatal("expected FAIL when master is down")
 	}
-	assertCheck(t, rep, "ssh master", checkFail)
+	assertCheck(t, rep, "ssh master", doctor.Fail)
 	// No further probes should have been attempted.
-	if len(rep.checks) != 1 {
-		t.Errorf("expected only the master check, got %d checks", len(rep.checks))
+	if len(rep.Checks) != 1 {
+		t.Errorf("expected only the master check, got %d checks", len(rep.Checks))
 	}
 }
 
@@ -118,13 +119,13 @@ func TestRunDoctor_RealBinaryWinsPATH(t *testing.T) {
 		},
 	}
 	rep := runDoctor(context.Background(), "fakehost", tr)
-	if rep.ok() {
+	if rep.OK() {
 		t.Fatal("expected FAIL when a real binary wins PATH ahead of the shim")
 	}
-	assertCheck(t, rep, "PATH winner: xclip", checkFail)
+	assertCheck(t, rep, "PATH winner: xclip", doctor.Fail)
 	// The detail must name the cause so the user can fix it.
 	c := findCheck(rep, "PATH winner: xclip")
-	if c == nil || !strings.Contains(c.detail, "real binary wins") {
+	if c == nil || !strings.Contains(c.Detail, "real binary wins") {
 		t.Errorf("xclip FAIL detail should name the real-binary-wins cause, got %q", detailOf(c))
 	}
 }
@@ -147,10 +148,10 @@ func TestRunDoctor_NoShimResolves(t *testing.T) {
 		},
 	}
 	rep := runDoctor(context.Background(), "fakehost", tr)
-	if rep.ok() {
+	if rep.OK() {
 		t.Fatal("expected FAIL when no shim resolves")
 	}
-	assertCheck(t, rep, "PATH winner: xclip", checkFail)
+	assertCheck(t, rep, "PATH winner: xclip", doctor.Fail)
 }
 
 // TestRunDoctor_PortaldMissing: the agent binary isn't uploaded yet (dangling
@@ -170,10 +171,10 @@ func TestRunDoctor_PortaldMissing(t *testing.T) {
 		},
 	}
 	rep := runDoctor(context.Background(), "fakehost", tr)
-	if rep.ok() {
+	if rep.OK() {
 		t.Fatal("expected FAIL when portald is missing")
 	}
-	assertCheck(t, rep, "portald binary", checkFail)
+	assertCheck(t, rep, "portald binary", doctor.Fail)
 	if findCheck(rep, "smoke: clip targets") != nil {
 		t.Error("smoke probe should be skipped when portald is missing")
 	}
@@ -198,10 +199,10 @@ func TestRunDoctor_EmptyClipboardSmoke(t *testing.T) {
 		},
 	}
 	rep := runDoctor(context.Background(), "fakehost", tr)
-	if !rep.ok() {
+	if !rep.OK() {
 		t.Fatalf("expected PASS (empty clipboard is a clean WARN), got:\n%s", reportString(rep))
 	}
-	assertCheck(t, rep, "smoke: clip targets", checkWarn)
+	assertCheck(t, rep, "smoke: clip targets", doctor.Warn)
 }
 
 // TestRunDoctor_ShimVersionDrift: a deployed shim older than embedded is a WARN
@@ -222,44 +223,100 @@ func TestRunDoctor_ShimVersionDrift(t *testing.T) {
 		},
 	}
 	rep := runDoctor(context.Background(), "fakehost", tr)
-	if !rep.ok() {
+	if !rep.OK() {
 		t.Fatalf("version drift should be a WARN (still PASS overall), got:\n%s", reportString(rep))
 	}
-	assertCheck(t, rep, "shim version", checkWarn)
+	assertCheck(t, rep, "shim version", doctor.Warn)
+}
+
+// TestRenderDoctor_Golden pins the CLI rendering byte-for-byte (EC7). Scripts
+// parse `portal doctor` output; this guards the header, every per-check line
+// shape (with and without detail, across all three tags), and both the PASS and
+// FAIL trailers against silent drift after the report types moved to
+// internal/doctor.
+func TestRenderDoctor_Golden(t *testing.T) {
+	tests := []struct {
+		name string
+		rep  *doctor.Report
+		want string
+	}{
+		{
+			name: "mixed_fail",
+			rep: &doctor.Report{
+				Host: "devbox",
+				Checks: []doctor.Check{
+					{Name: "ssh master", Status: doctor.Pass, Detail: "UP (pid=4242)"},
+					{Name: "agent verb: clip", Status: doctor.Pass},
+					{Name: "shim version", Status: doctor.Warn, Detail: "deployed=v2 embedded=v3 — re-run install to converge"},
+					{Name: "PATH winner: xclip", Status: doctor.Fail, Detail: "/usr/bin/xclip (real binary wins ahead of the shim) — re-run install to fix PATH order"},
+				},
+			},
+			want: "portal doctor — devbox\n" +
+				"  [PASS] ssh master: UP (pid=4242)\n" +
+				"  [PASS] agent verb: clip\n" +
+				"  [WARN] shim version: deployed=v2 embedded=v3 — re-run install to converge\n" +
+				"  [FAIL] PATH winner: xclip: /usr/bin/xclip (real binary wins ahead of the shim) — re-run install to fix PATH order\n" +
+				"\nRESULT: FAIL — clipboard paste will NOT work. Fix the FAIL lines above\n" +
+				"        (often: re-run `portal install devbox`), then re-run `portal doctor`.\n",
+		},
+		{
+			name: "warn_only_pass",
+			rep: &doctor.Report{
+				Host: "box2",
+				Checks: []doctor.Check{
+					{Name: "ssh master", Status: doctor.Pass, Detail: "UP (pid=1)"},
+					{Name: "shim version", Status: doctor.Warn, Detail: "could not read deployed shim version"},
+				},
+			},
+			want: "portal doctor — box2\n" +
+				"  [PASS] ssh master: UP (pid=1)\n" +
+				"  [WARN] shim version: could not read deployed shim version\n" +
+				"\nRESULT: PASS — clipboard paste should work over plain ssh.\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var b strings.Builder
+			renderDoctor(&b, tt.rep)
+			if got := b.String(); got != tt.want {
+				t.Errorf("renderDoctor mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, tt.want)
+			}
+		})
+	}
 }
 
 // --- helpers ---
 
-func findCheck(r *doctorReport, name string) *doctorCheck {
-	for i := range r.checks {
-		if r.checks[i].name == name {
-			return &r.checks[i]
+func findCheck(r *doctor.Report, name string) *doctor.Check {
+	for i := range r.Checks {
+		if r.Checks[i].Name == name {
+			return &r.Checks[i]
 		}
 	}
 	return nil
 }
 
-func assertCheck(t *testing.T, r *doctorReport, name string, want checkStatus) {
+func assertCheck(t *testing.T, r *doctor.Report, name string, want doctor.Status) {
 	t.Helper()
 	c := findCheck(r, name)
 	if c == nil {
 		t.Errorf("missing check %q", name)
 		return
 	}
-	if c.status != want {
-		t.Errorf("check %q: status = %s, want %s (detail=%q)", name, c.status.tag(), want.tag(), c.detail)
+	if c.Status != want {
+		t.Errorf("check %q: status = %s, want %s (detail=%q)", name, c.Status.Tag(), want.Tag(), c.Detail)
 	}
 }
 
-func detailOf(c *doctorCheck) string {
+func detailOf(c *doctor.Check) string {
 	if c == nil {
 		return ""
 	}
-	return c.detail
+	return c.Detail
 }
 
-func reportString(r *doctorReport) string {
+func reportString(r *doctor.Report) string {
 	var b strings.Builder
-	r.write(&b)
+	renderDoctor(&b, r)
 	return b.String()
 }

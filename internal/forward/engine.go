@@ -10,6 +10,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clock"
@@ -49,6 +50,21 @@ type Engine struct {
 	// non-nil, Interval when nil.
 	SafetyInterval time.Duration
 
+	// kick is a buffered (cap 1) coalescing trigger for an out-of-band
+	// reconcile — POST /v1/reconcile's clean entry point. Kick() does a
+	// non-blocking send; runEventDriven selects on it and fires the same
+	// debounce path as EvConnected/EvDelta. Created by New().
+	kick chan struct{}
+
+	// reconciles is a monotonic count of completed Reconcile passes (every
+	// return of Reconcile bumps it, success or failure). It is the ONLY signal
+	// a client can use to know an out-of-band Kick has actually run to
+	// completion: Kick/POST /v1/reconcile is async+debounced, so Master.Up (the
+	// master is already owned by the daemon) tells a caller nothing about
+	// convergence. `once` reads Reconciles() before its Kick and polls until it
+	// advances (see cmd/portal/run.go).
+	reconciles atomic.Uint64
+
 	conflicts *conflictSet
 }
 
@@ -83,9 +99,31 @@ func New(t sshctl.Transport, pl proc.PortLister, rd discover.RemoteDiscoverer,
 	return &Engine{
 		T: t, PL: pl, RD: rd, Cfg: cfg, Clk: clk, Log: log,
 		Interval: interval, Deny: deny, SkipLocal: skipLocal,
+		kick:      make(chan struct{}, 1),
 		conflicts: newConflictSet(),
 	}
 }
+
+// Kick requests an out-of-band reconcile. The send is non-blocking and
+// coalescing (cap-1 buffer): concurrent kicks collapse into at most one
+// pending trigger, and Kick never blocks its caller (POST /v1/reconcile).
+// Nil-safe: an Engine built without New() has no kick channel, so this is a
+// no-op there — New() always sets it.
+func (e *Engine) Kick() {
+	if e.kick == nil {
+		return
+	}
+	select {
+	case e.kick <- struct{}{}:
+	default:
+	}
+}
+
+// Reconciles reports the number of Reconcile passes that have completed. It is
+// monotonic and safe to call from any goroutine. A caller that Kick()s an
+// out-of-band reconcile can read this first, then wait for it to advance past
+// that baseline to know a full pass has run since (§5 `once` convergence).
+func (e *Engine) Reconciles() uint64 { return e.reconciles.Load() }
 
 // Run is event-driven when AgentEvents is non-nil: it reconciles whenever
 // an agent event lands (debounced 50ms to coalesce bursts) and on a 60s
@@ -193,6 +231,10 @@ func (e *Engine) runEventDriven(ctx context.Context) error {
 					e.Log.Logf("agent disconnected; preserving forwards")
 				}
 			}
+		case <-e.kick:
+			// Out-of-band reconcile trigger (POST /v1/reconcile). Same debounce
+			// path as EvConnected/EvDelta so bursts coalesce.
+			fireSoon()
 		case <-debounceC:
 			pending = false
 			_ = e.Reconcile(ctx)
@@ -212,6 +254,10 @@ func (e *Engine) runEventDriven(ctx context.Context) error {
 //     This is the source of truth — never an in-memory cache.
 //  5. Add desired − current; cancel current − desired.
 func (e *Engine) Reconcile(ctx context.Context) error {
+	// Count every completed pass (including the early error returns below) so a
+	// waiter observing the counter advance knows the engine has re-derived
+	// ground truth once more, even when the master is momentarily unreachable.
+	defer e.reconciles.Add(1)
 	pid, rebuilt, err := e.T.EnsureMaster(ctx)
 	if err != nil {
 		e.Log.Logf("WARN: ssh master unreachable: %v", err)

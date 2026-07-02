@@ -14,6 +14,7 @@ import (
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/hub"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
@@ -40,6 +41,12 @@ type Config struct {
 	// ReconnectMin/Max is the exponential backoff bounds. Defaults: 500ms / 10s.
 	ReconnectMin time.Duration
 	ReconnectMax time.Duration
+	// Hub is an OPTIONAL read-only fan-out tee for local API observers. nil
+	// (the default) means no tee. When set, publish/publishNotify tee an
+	// EXPLICIT kind→hub.Event enumeration into it — never a pass-through. The
+	// hub can never become a second event-ordering authority: the engine, clip
+	// handler, and notify handler keep their dedicated channels (DESIGN §3/§10).
+	Hub *hub.Hub
 }
 
 // Client speaks the protocol with the remote portald. One Client per portal
@@ -82,6 +89,12 @@ type Client struct {
 	streamMu sync.Mutex
 	enc      *protocol.Encoder
 	stdin    io.WriteCloser
+
+	// lastDiscErr holds the string form of the most recent KindDisconnected
+	// error ("" when the disconnect carried no error). It is the only
+	// Status.Health source that needs a client-side accessor; the hub tee
+	// carries no error payload. Always holds a string once set.
+	lastDiscErr atomic.Value
 }
 
 // New builds a Client; defaults applied here.
@@ -283,6 +296,33 @@ func (c *Client) publish(ev EngineEvent) {
 	case c.events <- ev:
 	default:
 	}
+	// Track the last disconnect error for Status.Health regardless of the hub.
+	if ev.Kind == KindDisconnected {
+		if ev.Err != nil {
+			c.lastDiscErr.Store(ev.Err.Error())
+		} else {
+			c.lastDiscErr.Store("")
+		}
+	}
+	// Tee state-change SIGNALs into the hub as an EXPLICIT enumeration — never
+	// a pass-through. KindOpenURL is deliberately NOT mapped (the URL relay
+	// stays daemon-internal in v1); clip is not representable in hub.Event.
+	if c.cfg.Hub != nil {
+		switch ev.Kind {
+		case KindConnected, KindDisconnected, KindSnapshotReplaced, KindDelta:
+			c.cfg.Hub.Publish(hub.Event{Class: hub.Coalesced})
+		}
+	}
+}
+
+// LastDisconnectErr returns the string form of the most recent
+// KindDisconnected error, or "" when unset or the last disconnect carried no
+// error. Feeds Status.Health.
+func (c *Client) LastDisconnectErr() string {
+	if s, ok := c.lastDiscErr.Load().(string); ok {
+		return s
+	}
+	return ""
 }
 
 // publishClip sends to the dedicated clip channel. Non-blocking (so the demux
@@ -303,6 +343,21 @@ func (c *Client) publishNotify(ev EngineEvent) {
 	select {
 	case c.notifyEvents <- ev:
 	default:
+	}
+	// Tee the notification into the hub's Queued class. Explicit field copy —
+	// hub.Notify is duplicated from NotifyEvent so the hub imports nothing from
+	// agentclient. Hub.Publish is non-blocking by contract.
+	if c.cfg.Hub != nil && ev.Notify != nil {
+		c.cfg.Hub.Publish(hub.Event{Class: hub.Queued, Notify: &hub.Notify{
+			Title:    ev.Notify.Title,
+			Body:     ev.Notify.Body,
+			Subtitle: ev.Notify.Subtitle,
+			Urgency:  ev.Notify.Urgency,
+			Verified: ev.Notify.Verified,
+			Source:   ev.Notify.Source,
+			Sound:    ev.Notify.Sound,
+			Seq:      ev.Notify.Seq,
+		}})
 	}
 }
 

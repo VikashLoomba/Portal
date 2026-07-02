@@ -10,6 +10,8 @@ import (
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
 
@@ -27,99 +29,90 @@ func newDoctorCmd(a *app.App) *cobra.Command {
 		Use:   "doctor",
 		Short: "Self-test the clipboard + notification path over ssh (PATH winner, shim version, agent verbs, smoke)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			host, _ := a.Cfg.ReadHost()
-			if host == "" {
-				return fmt.Errorf("no dev box configured — run: %s install <ssh-host>", app.Tool)
-			}
-			tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
-			rep := runDoctor(cmd.Context(), host, tr)
-			rep.write(cmd.OutOrStdout())
-			if !rep.ok() {
-				return errSilent
-			}
-			return nil
+			return runDoctorCmd(cmd.Context(), cmd.OutOrStdout(), a)
 		},
 	}
 }
 
-// checkStatus is the outcome of one doctor probe.
-type checkStatus int
-
-const (
-	checkPass checkStatus = iota
-	checkWarn             // non-fatal: a degraded-but-usable condition
-	checkFail             // fatal: the clip/notify path will NOT work
-)
-
-func (c checkStatus) tag() string {
-	switch c {
-	case checkPass:
-		return "PASS"
-	case checkWarn:
-		return "WARN"
-	default:
-		return "FAIL"
+// runDoctorCmd is newDoctorCmd.RunE's body, extracted so tests can drive it with
+// a buffer and an App. Production output is byte-identical (cmd.OutOrStdout()
+// defaults to os.Stdout). When the daemon is up it POSTs /v1/doctor so the
+// self-test runs against the daemon's LIVE ControlMaster (better ground truth
+// than a fresh CLI-side probe); when the daemon is down it falls back to today's
+// in-process run. Both paths need a host.
+func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App) error {
+	host, _ := a.Cfg.ReadHost()
+	if host == "" {
+		return fmt.Errorf("no dev box configured — run: %s install <ssh-host>", app.Tool)
 	}
-}
-
-// doctorCheck is one line of the report.
-type doctorCheck struct {
-	name   string
-	status checkStatus
-	detail string
-}
-
-// doctorReport accumulates the per-probe results and renders pass/fail loudly.
-type doctorReport struct {
-	host   string
-	checks []doctorCheck
-}
-
-func (r *doctorReport) add(name string, status checkStatus, detail string) {
-	r.checks = append(r.checks, doctorCheck{name: name, status: status, detail: detail})
-}
-
-// ok reports whether the report has zero FAIL checks (WARN is tolerated).
-func (r *doctorReport) ok() bool {
-	for _, c := range r.checks {
-		if c.status == checkFail {
-			return false
+	// Prefer the daemon: it renders from its live transport. We decide up/down with
+	// the same fast Available probe every other command uses (allow.go, inspect.go,
+	// run.go) so a dial "daemon is down" is cleanly distinguished from a /v1/doctor
+	// call that runs long: POST /v1/doctor is long-running (§4.5), so once the
+	// daemon is confirmed up we let its result stand. A slow or errored daemon run
+	// is REPORTED, never silently re-run in-process — a silent local fallback here
+	// would double the work (30s+), discard the daemon's live-transport ground
+	// truth, and hide from the user that the daemon path was abandoned.
+	lc := localclient.New(a.Paths.APISock)
+	if lc.Available(ctx) {
+		rep, err := lc.Doctor(ctx)
+		if err != nil {
+			return fmt.Errorf("daemon doctor failed (daemon is up; not falling back to a local run): %w", err)
 		}
+		renderDoctor(w, rep)
+		if !rep.OK() {
+			return errSilent
+		}
+		return nil
 	}
-	return true
+	// Fallback (daemon down): the in-process run over a FRESH sshctl transport (never
+	// a.Transport — routing doctor probes through it would leak ssh stderr into
+	// the report). The only test seam that intercepts this path is a.Runner.
+	tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+	rep := runDoctor(ctx, host, tr)
+	renderDoctor(w, rep)
+	if !rep.OK() {
+		return errSilent
+	}
+	return nil
 }
 
-func (r *doctorReport) write(w io.Writer) {
-	fmt.Fprintf(w, "portal doctor — %s\n", r.host)
-	for _, c := range r.checks {
-		if c.detail == "" {
-			fmt.Fprintf(w, "  [%s] %s\n", c.status.tag(), c.name)
+// renderDoctor writes the human-readable report to w. It is a free function in
+// package main (presentation stays here; the data types live in internal/doctor
+// so the local API can return them as JSON). Output is byte-for-byte compatible
+// with the historical (*doctorReport).write so scripts parsing doctor output do
+// not break.
+func renderDoctor(w io.Writer, rep *doctor.Report) {
+	fmt.Fprintf(w, "portal doctor — %s\n", rep.Host)
+	for _, c := range rep.Checks {
+		if c.Detail == "" {
+			fmt.Fprintf(w, "  [%s] %s\n", c.Status.Tag(), c.Name)
 		} else {
-			fmt.Fprintf(w, "  [%s] %s: %s\n", c.status.tag(), c.name, c.detail)
+			fmt.Fprintf(w, "  [%s] %s: %s\n", c.Status.Tag(), c.Name, c.Detail)
 		}
 	}
-	if r.ok() {
+	if rep.OK() {
 		fmt.Fprintln(w, "\nRESULT: PASS — clipboard paste should work over plain ssh.")
 	} else {
 		fmt.Fprintln(w, "\nRESULT: FAIL — clipboard paste will NOT work. Fix the FAIL lines above")
-		fmt.Fprintf(w, "        (often: re-run `%s install %s`), then re-run `%s doctor`.\n", app.Tool, r.host, app.Tool)
+		fmt.Fprintf(w, "        (often: re-run `%s install %s`), then re-run `%s doctor`.\n", app.Tool, rep.Host, app.Tool)
 	}
 }
 
 // runDoctor performs every probe over tr and returns the assembled report. It
 // is split out (taking a Transport) so a test can drive it with a fake
 // transport that scripts canned ssh-exec replies — no live dev box needed.
-func runDoctor(ctx context.Context, host string, tr sshctl.Transport) *doctorReport {
-	rep := &doctorReport{host: host}
+func runDoctor(ctx context.Context, host string, tr sshctl.Transport) *doctor.Report {
+	rep := &doctor.Report{Host: host}
 
 	// 1. Master connectivity. Without the ControlMaster the daemon can't relay a
 	// clip request at all; everything downstream is moot.
 	if pid, err := tr.MasterPID(ctx); err != nil || pid == 0 {
-		rep.add("ssh master", checkFail, "DOWN — start the daemon: "+app.Tool+" start")
+		rep.Add("ssh master", doctor.Fail, "DOWN — start the daemon: "+app.Tool+" start")
 		// Without a master we cannot run any remote probe; bail with what we have.
 		return rep
 	} else {
-		rep.add("ssh master", checkPass, fmt.Sprintf("UP (pid=%d)", pid))
+		rep.Add("ssh master", doctor.Pass, fmt.Sprintf("UP (pid=%d)", pid))
 	}
 
 	// 2. PATH-winner check — THE make-or-break. For each shim, resolve the tool
@@ -132,14 +125,14 @@ func runDoctor(ctx context.Context, host string, tr sshctl.Transport) *doctorRep
 			// Neither a shim NOR a real binary resolves. The shim is missing from
 			// ~/.local/bin (or ~/.local/bin isn't on PATH). For the headline image
 			// path this is a FAIL; agents fall back to "no clipboard".
-			rep.add("PATH winner: "+tool, checkFail,
+			rep.Add("PATH winner: "+tool, doctor.Fail,
 				"no "+tool+" resolves — shim not installed or ~/.local/bin not on PATH")
 		case isShim:
-			rep.add("PATH winner: "+tool, checkPass, path+" (portal shim)")
+			rep.Add("PATH winner: "+tool, doctor.Pass, path+" (portal shim)")
 		default:
 			// A REAL binary wins PATH ahead of our shim — the whole feature is
 			// silently dead for this tool. Loud FAIL with the cause.
-			rep.add("PATH winner: "+tool, checkFail,
+			rep.Add("PATH winner: "+tool, doctor.Fail,
 				path+" (real binary wins ahead of the shim) — re-run install to fix PATH order")
 		}
 	}
@@ -148,13 +141,13 @@ func runDoctor(ctx context.Context, host string, tr sshctl.Transport) *doctorRep
 	// newer behavior (e.g. the notify hook); WARN rather than FAIL.
 	if onDisk, ok := deployedShimVersion(ctx, tr); ok {
 		if onDisk == clipshim.Version {
-			rep.add("shim version", checkPass, "v"+onDisk+" (current)")
+			rep.Add("shim version", doctor.Pass, "v"+onDisk+" (current)")
 		} else {
-			rep.add("shim version", checkWarn,
+			rep.Add("shim version", doctor.Warn,
 				fmt.Sprintf("deployed=v%s embedded=v%s — re-run install to converge", onDisk, clipshim.Version))
 		}
 	} else {
-		rep.add("shim version", checkWarn, "could not read deployed shim version")
+		rep.Add("shim version", doctor.Warn, "could not read deployed shim version")
 	}
 
 	// 4. portald present + agent verb support. The shim relays through
@@ -163,20 +156,20 @@ func runDoctor(ctx context.Context, host string, tr sshctl.Transport) *doctorRep
 	// and notify subcommands (verb support) by running the usage probe.
 	portaldOK, verbs := probePortaldVerbs(ctx, tr)
 	if portaldOK {
-		rep.add("portald binary", checkPass, "~/.cache/portal/portald present + executable")
+		rep.Add("portald binary", doctor.Pass, "~/.cache/portal/portald present + executable")
 	} else {
-		rep.add("portald binary", checkFail,
+		rep.Add("portald binary", doctor.Fail,
 			"~/.cache/portal/portald missing — agent not uploaded yet (dangling-symlink window)")
 	}
 	if verbs.clip {
-		rep.add("agent verb: clip", checkPass, "")
+		rep.Add("agent verb: clip", doctor.Pass, "")
 	} else if portaldOK {
-		rep.add("agent verb: clip", checkWarn, "portald does not advertise the clip subcommand (old agent?)")
+		rep.Add("agent verb: clip", doctor.Warn, "portald does not advertise the clip subcommand (old agent?)")
 	}
 	if verbs.notify {
-		rep.add("agent verb: notify", checkPass, "")
+		rep.Add("agent verb: notify", doctor.Pass, "")
 	} else if portaldOK {
-		rep.add("agent verb: notify", checkWarn, "portald does not advertise the notify subcommand (old agent?)")
+		rep.Add("agent verb: notify", doctor.Warn, "portald does not advertise the notify subcommand (old agent?)")
 	}
 
 	// 5. End-to-end clip targets smoke. Only meaningful when the master is up and
@@ -186,16 +179,16 @@ func runDoctor(ctx context.Context, host string, tr sshctl.Transport) *doctorRep
 		switch {
 		case code == 0 && out != "":
 			// Something is on the Mac clipboard and was served — best case.
-			rep.add("smoke: clip targets", checkPass, "Mac clipboard served ("+strings.TrimSpace(out)+")")
+			rep.Add("smoke: clip targets", doctor.Pass, "Mac clipboard served ("+strings.TrimSpace(out)+")")
 		case code != 0:
 			// Exit 1 is the CORRECT, expected answer when nothing is on the Mac
 			// clipboard (or the daemon's gate is off). The round trip itself
 			// worked — the shim would cleanly fall through. WARN so the user can
 			// copy something and re-run for a green line, but don't FAIL.
-			rep.add("smoke: clip targets", checkWarn,
+			rep.Add("smoke: clip targets", doctor.Warn,
 				"round trip OK; nothing currently on the Mac clipboard to serve (copy an image/text and re-run)")
 		default:
-			rep.add("smoke: clip targets", checkWarn, "unexpected empty success — copy something and re-run")
+			rep.Add("smoke: clip targets", doctor.Warn, "unexpected empty success — copy something and re-run")
 		}
 	}
 

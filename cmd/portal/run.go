@@ -16,10 +16,15 @@ import (
 
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/agentclient"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/bootstrap"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clip"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipupload"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/config"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/localapi"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
 
 func newRunCmd(a *app.App) *cobra.Command {
@@ -33,6 +38,12 @@ func newRunCmd(a *app.App) *cobra.Command {
 			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
+			// A cancelable child of the signal ctx so a FATAL API bind/serve
+			// failure (D10) can bring the other goroutines down: cancelling it
+			// makes wg.Wait return so the daemon exits non-zero and launchd
+			// relaunches loudly.
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
 
 			// Push the initial Subscribe so the agent has the latest filter
 			// even before its first connect — Subscribe is buffered until
@@ -43,11 +54,12 @@ func newRunCmd(a *app.App) *cobra.Command {
 			engine, openURLCh := a.NewEngineWithOpenURL()
 
 			// Run agent supervisor, reconcile engine, URL opener, the
-			// clipboard-read handler, and the notification handler in parallel;
-			// any returning ends the daemon (launchd will relaunch).
+			// clipboard-read handler, the notification handler, and the local
+			// API server in parallel; any returning ends the daemon (launchd
+			// will relaunch).
 			var wg sync.WaitGroup
-			wg.Add(5)
-			errCh := make(chan error, 5)
+			wg.Add(6)
+			errCh := make(chan error, 6)
 
 			go func() {
 				defer wg.Done()
@@ -68,6 +80,48 @@ func newRunCmd(a *app.App) *cobra.Command {
 			go func() {
 				defer wg.Done()
 				runNotifyHandler(ctx, a.AgentClient.NotifyEvents(), a)
+			}()
+			go func() {
+				defer wg.Done()
+				// D10: API bind failure is FATAL. On a bind failure we cancel
+				// the shared ctx so the other five goroutines return, wg.Wait
+				// unblocks, and the daemon exits non-zero for launchd to relaunch
+				// loudly. A serve failure (Serve returns non-nil) is fatal for
+				// the same reason; a clean ctx-cancel shutdown returns nil.
+				ln, err := localapi.Listen(a.Paths.APISock)
+				if err != nil {
+					errCh <- err
+					cancel()
+					return
+				}
+				deps := localapi.Deps{
+					Version: localapi.VersionInfo{
+						Version:      version,
+						GitSHA:       bootstrap.EmbeddedSHA(),
+						ProtoVersion: protocol.ProtoVersion,
+					},
+					Host:    a.Cfg.ReadHost,
+					Agent:   a.AgentClient,
+					Master:  a.Transport,
+					Ports:   a.Ports,
+					Service: a.Service,
+					Config:  a.Cfg,
+					Hub:     a.Hub,
+					PushAllow: func(allow []int) error {
+						return a.AgentClient.Subscribe(toU16(app.DenyPorts), toU16(allow), true)
+					},
+					Kick:         engine.Kick,
+					ReconcileGen: engine.Reconciles,
+					Doctor: func(c context.Context) *doctor.Report {
+						tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+						return runDoctor(c, host, tr)
+					},
+				}
+				srv := localapi.New(deps)
+				if err := srv.Serve(ctx, ln); err != nil {
+					errCh <- err
+					cancel()
+				}
 			}()
 
 			wg.Wait()
@@ -91,9 +145,29 @@ func newOnceCmd(a *app.App) *cobra.Command {
 			if host == "" {
 				return fmt.Errorf("no dev box configured — run: %s install <ssh-host>", app.Tool)
 			}
-			// Spin the agent up briefly to populate Snapshot, then reconcile
-			// once. We use a child context so we can cancel Run() directly
-			// after Shutdown — avoiding a hang if Shutdown's Bye is lost.
+			// Daemon-up path: the running daemon already owns an AgentClient
+			// against this box. Trigger ITS reconcile over the socket rather than
+			// spinning a SECOND AgentClient against the same box — that duplicate
+			// is exactly what POST /v1/reconcile exists to avoid (DESIGN §5.2).
+			// Status is then rendered from GET /v1/status, so the agent line comes
+			// from the live daemon handshake. a.AgentClient.Run/Shutdown are NOT
+			// invoked on this branch.
+			lc := localclient.New(a.Paths.APISock)
+			if lc.Available(cmd.Context()) {
+				// Snapshot the reconcile counter BEFORE the kick so the poll below
+				// waits for a pass that ran AFTER our request, not one already in
+				// flight (POST /v1/reconcile is async+debounced).
+				gen0 := reconcileGen(cmd.Context(), lc)
+				if err := lc.Reconcile(cmd.Context()); err == nil {
+					pollOnceReconciled(cmd.Context(), lc, gen0, onceConvergeBudget)
+					return runStatusTo(cmd.Context(), cmd.OutOrStdout(), a)
+				}
+			}
+
+			// Daemon-down fallback: spin the agent up briefly to populate
+			// Snapshot, then reconcile once. We use a child context so we can
+			// cancel Run() directly after Shutdown — avoiding a hang if
+			// Shutdown's Bye is lost.
 			runCtx, runCancel := context.WithCancel(cmd.Context())
 			done := make(chan struct{})
 			go func() {
@@ -114,8 +188,55 @@ func newOnceCmd(a *app.App) *cobra.Command {
 			if err := a.Engine().Reconcile(runCtx); err != nil {
 				_ = err
 			}
-			return runStatus(cmd.Context(), a)
+			// Render via runStatusTo(cmd.OutOrStdout()), NOT runStatus (which
+			// writes os.Stdout): routing BOTH branches through the command's out
+			// writer keeps production stdout byte-identical (OutOrStdout defaults
+			// to os.Stdout) while making the fallback status capturable in tests
+			// exactly like the up-path (reviewer fix).
+			return runStatusTo(cmd.Context(), cmd.OutOrStdout(), a)
 		},
+	}
+}
+
+// onceConvergeBudget bounds how long `once` waits for the daemon's async,
+// debounced reconcile to complete before it renders status.
+const onceConvergeBudget = 1 * time.Second
+
+// reconcileGen reads the daemon's completed-reconcile-pass counter, or 0 if the
+// status probe fails. A missed baseline only makes pollOnceReconciled wait for
+// the first pass it observes — still correct, and still bounded by the budget.
+func reconcileGen(ctx context.Context, lc *localclient.Client) uint64 {
+	if st, err := lc.Status(ctx); err == nil {
+		return st.Health.ReconcileCount
+	}
+	return 0
+}
+
+// pollOnceReconciled is a bounded, best-effort poll that gives the daemon's
+// async, debounced Kick time to run a full reconcile pass before `once` renders
+// status. POST /v1/reconcile only SCHEDULES a pass (202, ~50ms debounce), so
+// keying off Master.Up is useless on the daemon-up branch — the running daemon
+// already owns the ControlMaster, so Master.Up is true on the first poll and the
+// render races ahead of the reconcile, printing the OLD forward set. Instead we
+// poll Status.Health.ReconcileCount and return once it advances past the pre-kick
+// baseline gen0, i.e. at least one full pass has completed since the kick was
+// queued (every pass re-derives ground truth, so any pass after gen0 reflects the
+// new listener/allow). It calls lc.Status up to `budget` in 50ms steps and never
+// errors — `once` still returns promptly if the daemon never reports progress.
+func pollOnceReconciled(ctx context.Context, lc *localclient.Client, gen0 uint64, budget time.Duration) {
+	deadline := time.Now().Add(budget)
+	for {
+		if st, err := lc.Status(ctx); err == nil && st.Health.ReconcileCount > gen0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,9 +60,21 @@ type fakePortLister struct {
 	masterForwardsByPID map[int][]int
 	holders             map[int]int
 	processNames        map[int]string
+
+	// reconciled is a SYNCHRONIZED reconcile signal: MasterForwards runs
+	// exactly once per Reconcile pass, so a non-blocking notify here emits one
+	// value per pass. Tests that want to observe reconciles set it to a
+	// buffered channel; a nil channel is never ready, so the three tests that
+	// leave it nil see no race and no behavior change. Reading the plain
+	// slices/maps above while Run is live would be a data race — use this.
+	reconciled chan struct{}
 }
 
 func (f *fakePortLister) MasterForwards(_ context.Context, pid int) ([]int, error) {
+	select {
+	case f.reconciled <- struct{}{}:
+	default:
+	}
 	return f.masterForwardsByPID[pid], nil
 }
 func (f *fakePortLister) MasterForwardLines(_ context.Context, pid int) ([]string, error) {
@@ -247,5 +260,68 @@ func TestRun_ContextCancelLeavesMasterAlone(t *testing.T) {
 	}
 	if tr.exitCalled {
 		t.Errorf("Run must not call Transport.Exit on signal")
+	}
+}
+
+// TestRun_KickTriggersReconcile proves Engine.Kick() drives a reconcile pass
+// (EC7). It observes reconciles via the fake's SYNCHRONIZED reconciled channel
+// — never by polling the fakes' unsynchronized slices/maps while Run is live
+// (that would be a data race). A non-nil, never-fed AgentEvents channel forces
+// the event-driven loop; the default 60s SafetyInterval is far past the 1s
+// window, so the second signal is unambiguously the Kick's, not the backstop.
+func TestRun_KickTriggersReconcile(t *testing.T) {
+	tr := &fakeTransport{host: "clementine", pid: 111}
+	pl := &fakePortLister{
+		masterForwardsByPID: map[int][]int{111: {}},
+		reconciled:          make(chan struct{}, 8),
+	}
+	d := &fakeDiscoverer{desired: []int{8081}}
+
+	e, _ := newTestEngine(tr, pl, d)
+	// Non-nil never-fed channel forces runEventDriven (event-driven select).
+	e.AgentEvents = make(chan EngineEvent)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = e.Run(ctx)
+	}()
+
+	// The immediate startup reconcile.
+	select {
+	case <-pl.reconciled:
+	case <-time.After(1 * time.Second):
+		cancel()
+		wg.Wait()
+		t.Fatal("no startup reconcile observed")
+	}
+
+	e.Kick()
+
+	// The kicked reconcile — comfortably past the 50ms debounce and far under
+	// the 60s safety ticker, so this signal is the Kick's.
+	select {
+	case <-pl.reconciled:
+	case <-time.After(1 * time.Second):
+		cancel()
+		wg.Wait()
+		t.Fatal("Kick did not trigger a reconcile within 1s")
+	}
+
+	cancel()
+	wg.Wait()
+
+	// Only now, with no concurrent writer left, may we read the plain slices.
+	// The kicked pass re-issued Forward(8081) since the fake master had none.
+	found := false
+	for _, c := range tr.addCalls {
+		if c == [2]int{8081, 8081} {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected Forward(8081,8081) across reconcile passes; addCalls=%v", tr.addCalls)
 	}
 }
