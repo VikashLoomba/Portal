@@ -1,6 +1,9 @@
 # Portal Generic Transport + Native SSH — Stage 4 Contract
 
 **Status:** Approved direction (Stage 4 of the platformization roadmap; Stages 1–3 merged to main).
+u1–u6 implemented on `feat/transport`; **u7–u9 amendment (T11/T12 native ssh_config + ProxyJump/
+ProxyCommand)** added per maintainer feedback ("portal is meant to work natively with ssh_config")
+before Stage 4 merges.
 **Audience:** repo maintainer + implementation agents.
 **Related:** `DESIGN-local-core-api.md` §7 (direction this contract locks), `DESIGN-split-daemon.md`
 (ControlMaster semantics the system transport preserves), `DESIGN-service-registration.md`
@@ -14,19 +17,31 @@
 lifecycle (`MasterPID`/`EnsureMaster`/`Exit`), port-forward verbs bound to `ssh -O`, and the
 engine's "current truth" coming from lsof against the master pid (`proc.PortLister.MasterForwards`).
 Stage 4 shrinks the core to transport-agnostic primitives, moves forward-truth behind an optional
-capability, and proves the seam with a second real implementation: **native `x/crypto/ssh`** (no
-dependence on the user's ssh binary/config — what a shippable desktop app needs), plus a
-**localexec** implementation used by a shared conformance suite and future dev mode.
+capability, and proves the seam with a second real implementation: **native `x/crypto/ssh`** —
+whose DATA PATH (dial/exec/stream/forward) is pure `x/crypto` with no ssh binary, and which reads
+the user's `~/.ssh/config` for fidelity by delegating resolution to `ssh -G` at construction time
+(T11/T12) so it is a real ssh_config drop-in — plus a **localexec** implementation used by a shared
+conformance suite and future dev mode.
 
 **Evidence the primitives are right:** every existing consumer already composes from them —
 bootstrap (`Exec` with binary stdin + its own atomic upload script), clipupload (`Exec`),
 agentclient (`Stream`), doctor probes (`Exec`), forwarding (`Forward`/`Cancel` + list).
 
-**Explicitly out of scope (v1):** ssh_config alias resolution for the native transport (it accepts
-`user@host[:port]`; the system transport remains the default so nothing regresses); encrypted-key
-passphrase prompting (clear error instead); an `Uploader` capability (bootstrap and clipupload keep
-their own hardened Exec-composed uploads — do NOT refactor them beyond the interface rename);
-making native the default; Windows.
+**ssh_config support (T11/T12, added in the u7–u9 amendment):** native now honors `~/.ssh/config`
+by delegating resolution to `ssh -G <target>` (the authoritative implementation — Host/Match/Include
+patterns, `HostName`/`User`/`Port`/`IdentityFile`/`HostKeyAlias`), and dials through `ProxyJump`
+(native `x/crypto` chained `direct-tcpip`, multi-hop) or `ProxyCommand` (exec + stdio `net.Conn`).
+Portal is meant to work natively with ssh_config; the earlier "user@host only" scope was reversed by
+maintainer feedback. This adds a resolution-time dependency on an `ssh` binary being present on the
+LOCAL machine (present on macOS/Linux/Win10+), but the data path stays pure `x/crypto`.
+
+**Explicitly out of scope (v1):** encrypted-key passphrase prompting (clear error instead); an
+`Uploader` capability (bootstrap and clipupload keep their own hardened Exec-composed uploads — do
+NOT refactor them beyond the interface rename); making native the default; Windows;
+`ProxyCommand` token expansion beyond `%h`/`%p`/`%r` (other tokens → clear error); interactive
+Tailscale-SSH / keyboard-interactive auth (native does agent + key auth only, so a Tailscale-SSH
+host — tailnet-managed rotating host keys + browser auth — is correctly rejected by strict
+knownhosts and is not a native target; the system transport handles such hosts).
 
 ---
 
@@ -38,12 +53,14 @@ making native the default; Windows.
 | T2 | **Core = 6 methods** | `Ensure(ctx) (rebuilt bool, err error)` (absorbs EnsureMaster; idempotent), `Health(ctx) (Health, error)` (absorbs MasterPID; `Health{Up bool, Pid int, Detail string}` — Pid is impl-specific ground truth where one exists: system-ssh fills the master pid, native fills 0; Detail is the human string, system-ssh `pid=N`), `Exec(ctx, stdin []byte, argv ...string) (stdout, stderr string, err error)` (merges Exec/ExecBytes; note the RETURN-ARITY change too: today's string-Exec callers read 2 values and must become `out, _, err :=` — the compiler enforces the sweep), `Stream(ctx, argv...)` (= today's ExecStream signature), `Close(ctx) (stopped bool, err error)` (absorbs Exit), `Describe() Desc` (`Desc{Impl, Host, Endpoint string}` — Impl=`"system-ssh"`/`"native-ssh"`/`"localexec"`; replaces `Host()`/`Sock()`). **Gating rule: NOTHING outside sshctl may gate behavior on `Pid > 0` — liveness gates use `Health.Up`** (a native connection has no pid; see the run.go/inspect.go/clipcheck.go rows in §3.2). |
 | T3 | **PortForwarder capability** | `Forward(ctx, local, remote int) error`, `Cancel(...)`, `ListForwards(ctx) ([]int, error)`, `ForwardLines(ctx) ([]string, error)`. system-ssh implements List/Lines via lsof against its own master pid (absorbing today's `proc.PortLister.MasterForwards/MasterForwardLines` call sites); native implements them from its in-process listener registry (more truthful than lsof). Acquired by type assertion at the composition root; the daemon requires it (portal without forwarding is not a thing yet — assert loudly at wiring, not deep in the engine). |
 | T4 | **Engine decoupling with truth preserved** | `forward.Engine` swaps `T sshctl.Transport, PL proc.PortLister` for `T transport.Transport, PF transport.PortForwarder` and derives current-truth from `PF.ListForwards` — the stateless-reconcile invariant (never trust in-process memory) is unchanged, just re-homed. The engine KEEPS a narrow local-port interface (`LocalHolder`/`ProcessName`, satisfied by `*proc.Lsof`) for its conflict messages — those query LOCAL ports, not the master, and are transport-agnostic. `proc` stays a package; only its master-forward call sites move. |
-| T5 | **Native ssh (`internal/sshnative`)** | One `*ssh.Client`; auth order: `SSH_AUTH_SOCK` agent, then unencrypted `~/.ssh/id_ed25519`/`id_rsa` (encrypted key → clear error naming the workaround); host key via `knownhosts` STRICT (unknown/mismatched → error telling the user to `ssh <host>` once manually); keepalive `keepalive@openssh.com` every 15s, 3 strikes → mark dead; `Ensure` re-dials a dead client. Forward = local `net.Listen` on 127.0.0.1:N + per-conn `direct-tcpip` dial; Cancel closes the listener; Stream = `ssh.Session` with pipes; Exec = session run with captured output. Accepts `user@host[:port]`. **Constructor: `New(target string, opts ...Option)` with explicit injection seams — `WithKnownHostsPath(string)`, `WithIdentityFiles(paths ...string)`, `WithAgentSocket(string)` (empty string disables agent auth), `WithHostKeyCallback(cb)` (test escape hatch). Defaults resolve `~/.ssh/known_hosts`, `id_ed25519`/`id_rsa`, `$SSH_AUTH_SOCK`. The T6 in-process-server tests and the conformance factory use these Options EXCLUSIVELY (temp-dir fixtures) — hermetic in CI, never touching the runner's real `~/.ssh`.** Only new dependency: `golang.org/x/crypto`. |
+| T5 | **Native ssh (`internal/sshnative`)** | One `*ssh.Client`; auth order: `SSH_AUTH_SOCK` agent, then unencrypted `~/.ssh/id_ed25519`/`id_rsa` (encrypted key → clear error naming the workaround); host key via `knownhosts` STRICT (unknown/mismatched → error telling the user to `ssh <host>` once manually); keepalive `keepalive@openssh.com` every 15s, 3 strikes → mark dead; `Ensure` re-dials a dead client. Forward = local `net.Listen` on 127.0.0.1:N + per-conn `direct-tcpip` dial; Cancel closes the listener; Stream = `ssh.Session` with pipes; Exec = session run with captured output. Accepts a raw `user@host[:port]` OR an ssh_config alias — resolved via the T11 `ConfigResolver` at `New` (ProxyJump/ProxyCommand per T12). **Constructor: `New(target string, opts ...Option)` with explicit injection seams — `WithKnownHostsPath(string)`, `WithIdentityFiles(paths ...string)`, `WithAgentSocket(string)` (empty string disables agent auth), `WithHostKeyCallback(cb)` (test escape hatch). Defaults resolve `~/.ssh/known_hosts`, `id_ed25519`/`id_rsa`, `$SSH_AUTH_SOCK`. The T6 in-process-server tests and the conformance factory use these Options EXCLUSIVELY (temp-dir fixtures) — hermetic in CI, never touching the runner's real `~/.ssh`.** Only new dependency: `golang.org/x/crypto`. |
 | T6 | **In-process ssh server for CI** | `internal/sshnative` tests run against an in-process `x/crypto/ssh` SERVER (test-only: publickey auth with a generated key, exec handler running argv locally, direct-tcpip handler dialing locally). This gives the native transport full conformance + knownhosts-failure coverage in CI with no live box. |
 | T7 | **Conformance suite** | `conformance.Run(t, name, factory)` covering: Exec stdout/stderr/exit-code/binary-stdin round-trip; Stream bidirectional + stdin-close EOF + wait; Ensure idempotency (second call rebuilt=false); Health up/down; Close; PortForwarder loopback round-trip + ListForwards truth + Cancel. Runs in CI for `localexec` and `sshnative` (vs T6 server); for `sshctl` it runs only when `PORTAL_TEST_SSH_HOST` is set (else `t.Skip` naming the variable). |
-| T8 | **Selection** | New config file `<ConfigDir>/transport` (`system` default when absent, or `native`), read via `config.Store` at composition; invalid value → loud error at startup, not silent fallback. Consumer rule honored: new CLI `portal transport [system\|native]` (get/set; the no-arg form prints the active Impl and is the UNCONDITIONAL way to see it). `status` and `doctor` surface `Describe().Impl` **only when the active transport is not `system`** (one additional line each) — the default path stays byte-identical per T9; this conditional rule is the reconciliation of T8 with T9, not an oversight. Every transport-construction site (app wiring, doctor's daemon-down fallback probe, install) goes through ONE selection-aware factory `app.NewTransport(paths, host, runner, cfg, sshStderr io.Writer)` so a `native` selection is honored everywhere — no direct `sshctl.New` outside the factory (install runs before config exists → factory defaults to system). The final `sshStderr` param is the explicit, caller-supplied ssh-stderr sink for the SYSTEM transport ONLY: `NewProd` passes `os.Stderr` so ssh warnings reach launchd's log (the DESIGN-split-daemon invariant), while every DOCTOR-path caller passes `nil` so raw ssh stderr is never tee'd into the doctor report (the native transport has no ambient ssh-stderr stream — each session captures its own — so the param does not apply to it). `localexec` is NOT selectable via config (test/dev only). |
+| T8 | **Selection** | New config file `<ConfigDir>/transport` (`system` default when absent, or `native`), read via `config.Store` at composition; invalid value → loud error at startup, not silent fallback. Consumer rule honored: new CLI `portal transport [system\|native]` (get/set; the no-arg form prints the active Impl and is the UNCONDITIONAL way to see it). `status` and `doctor` surface `Describe().Impl` **only when the active transport is not `system`** (one additional line each) — the default path stays byte-identical per T9; this conditional rule is the reconciliation of T8 with T9, not an oversight. Every transport-construction site (app wiring, doctor's daemon-down fallback probe, install) goes through ONE selection-aware factory `app.NewTransport(paths, host, runner, cfg, sshStderr io.Writer)` so a `native` selection is honored everywhere — no direct `sshctl.New` outside the factory (install runs before config exists → factory defaults to system). **T11 amendment:** the `portal transport native` guard NO LONGER rejects ssh_config aliases (that guard existed only because native was `user@host`-only); it now validates that the configured host RESOLVES via the `ConfigResolver` to a non-empty `HostName` (a `ssh -G` failure or empty HostName → the same actionable "not a native target" error, before persisting), so selecting native against a real alias succeeds and selecting it against an unresolvable host still fails safe. The final `sshStderr` param is the explicit, caller-supplied ssh-stderr sink for the SYSTEM transport ONLY: `NewProd` passes `os.Stderr` so ssh warnings reach launchd's log (the DESIGN-split-daemon invariant), while every DOCTOR-path caller passes `nil` so raw ssh stderr is never tee'd into the doctor report (the native transport has no ambient ssh-stderr stream — each session captures its own — so the param does not apply to it). `localexec` is NOT selectable via config (test/dev only). |
 | T9 | **Byte-compat on the default path** | With `system` selected, `portal status`, `doctor`, and log lines stay byte-identical (Health carries the pid; the "master established (pid=N)" log renders from it). Enforcement: the Stage-2 golden tests (which must pass unmodified in intent) **plus a NEW engine test pinning the "master established (pid=N)" log line** (no existing test asserts it — grep confirms; add one in u2). localapi `Status.Master` keeps `{up, pid}` and gains additive `transport` (Impl) + `detail` fields; `pid` is 0 for native (documented). |
 | T10 | **Failure-mode honesty** | Native forwards die with the daemon (no ControlPersist analogue) — documented in the doc + surfaced by `doctor` when native is active. agentclient consumes only `Stream`, whose exact semantics (bidirectional piping, stdin-close EOF, wait-after-close) the conformance suite pins per-implementation — that is the machine-verifiable coverage; full agentclient-over-native (heartbeats, reconnect supervisor) is deliberately deferred to the live-box validation (§7 item 2), NOT claimed as harness coverage. |
+| T11 | **Native ssh_config resolution via `ssh -G`** | Native resolves its target through the AUTHORITATIVE ssh implementation, never a reimplementation. A seam `type ConfigResolver func(ctx context.Context, target string) (ResolvedHost, error)` (default runs `ssh -G <target>` with a short timeout — NO network — and parses its lowercased `key value` lines into a typed `ResolvedHost{User, HostName string; Port int; IdentityFiles []string; ProxyJump, ProxyCommand, HostKeyAlias string}`) is injected via `WithConfigResolver(ConfigResolver)` so EVERY test is hermetic (fixtures, never real `ssh -G`). `New` resolves at construction (local, cheap, still no dial — preserves "construct without a live box"): the resolved `HostName`/`Port`/`User` become the dial endpoint, `Describe().Endpoint` reports it, and `IdentityFiles` from ssh_config (`~`-expanded, existing files only) REPLACE the `id_ed25519`/`id_rsa` defaults when non-empty (explicit `WithIdentityFiles` still overrides both). **Host-key verification is keyed by `HostKeyAlias` when set, else `HostName`** (matching OpenSSH), strict knownhosts otherwise unchanged. A resolver error, or an empty resolved `HostName`, is a clear construction error. This RETIRES the T8 alias rejection (see T8 note). |
+| T12 | **Native ProxyJump / ProxyCommand dialing** | When `ResolvedHost.ProxyJump` is non-empty and ≠ `"none"`: native builds the connection through the hop chain WITHOUT the ssh binary — `net.Dial` to hop1's resolved endpoint + ssh handshake, then for each subsequent hop open a `direct-tcpip` channel from the current jump `*ssh.Client` to the next hop's endpoint and handshake over that `net.Conn`, and finally `direct-tcpip` to the TARGET endpoint → the target client. Each hop is resolved by the SAME `ConfigResolver` (recursively), gets its own agent/key auth and its own strict host-key check (keyed by that hop's `HostKeyAlias`/`HostName`); comma-separated multi-hop supported; a hop-count cap (e.g. 10) and a visited-set guard prevent runaway/cyclic chains. When `ProxyCommand` is set instead (non-empty, ≠ `"none"`): exec it via `sh -c` with `%h`/`%p`/`%r` token-expanded to the target `HostName`/`Port`/`User` (other tokens → clear error), adapt the process stdin+stdout to a `net.Conn`, and handshake over it → the target client. ProxyJump takes precedence if both appear (matches OpenSSH). The whole chain (jump clients + any ProxyCommand process) is torn down on `Close`/redial. Testability: the T6 in-process server gains a jump mode (accepts `direct-tcpip` to a second in-process server) for a hermetic 2-hop round-trip; the ProxyCommand exec goes through an injectable command seam so its round-trip is tested with an in-process pipe (no real subprocess). |
 
 ### 2.1 Shell-join argv contract (Exec / Stream)
 
@@ -86,6 +103,8 @@ re-split behavior*, which the conformance suite's Exec/Stream cases pin.
 | `internal/transport/localexec/localexec.go` (+`_test.go`) | Local subprocess implementation: `Exec`/`Stream` honor the §2.1 shell-join contract by space-joining `argv` and running `sh -c <joined>` on THIS machine via `exec.CommandContext` (the local shell is the "target shell" that re-splits — this is the localexec realization of the shared argv contract, NOT a raw exec-vector spawn), `Ensure`/`Health`/`Close` trivial, `Describe{Impl:"localexec"}`. Implements `PortForwarder` with plain local listeners? **No** — localexec does NOT implement PortForwarder (forwarding to yourself is meaningless); the conformance suite runs its PortForwarder section only for implementations that assert the capability. |
 | `internal/transport/conformance/conformance.go` | The T7 suite as an exported `Run(t *testing.T, name string, newT func(t *testing.T) transport.Transport)`; PortForwarder section gated on capability assertion. Uses only stdlib + the transport package. |
 | `internal/sshnative/native.go`, `auth.go`, `forward.go` (+ tests) | The T5 implementation. |
+| `internal/sshnative/sshconfig.go` (+`_test.go`) | T11: `ResolvedHost` type, the `ConfigResolver` seam, the default `ssh -G` resolver (parse + `~`-expansion + timeout), and its wiring into `New`. Tests use a fake resolver plus one real-`ssh -G` smoke gated on the binary being present. |
+| `internal/sshnative/proxy.go` (+`_test.go`) | T12: ProxyJump chained `direct-tcpip` dialing (multi-hop, hop-cap + visited-set guard) and ProxyCommand exec+stdio-`net.Conn` dialing (`%h`/`%p`/`%r` expansion, injectable command seam). Tested hermetically via the T6 jump-mode server and an in-process ProxyCommand pipe. |
 | `internal/sshnative/testserver_test.go` | The T6 in-process server harness (test-only; `_test.go` so it never ships). |
 | `internal/sshnative/conformance_test.go` | Runs the T7 suite vs the T6 server; knownhosts strict-failure test (wrong host key → actionable error). |
 | `internal/transport/localexec/conformance_test.go` | Runs the T7 suite for localexec. |
@@ -115,6 +134,9 @@ re-split behavior*, which the conformance suite's Exec/Stream cases pin.
 | u4 | sshnative `PortForwarder` (listeners + direct-tcpip + registry List/Lines) + conformance forward section + knownhosts strict-failure test. |
 | u5 | Selection (config file + `portal transport` + app wiring + status/doctor surfacing + T10 doctor note) + e2e: daemon-level test with localexec? NO — the daemon needs portald; keep e2e at the existing io.Pipe/fake level. Unit-test the selection matrix (absent→system, native→sshnative, junk→error). |
 | u6 | Hardening: full-suite pass, greps (no `sshctl.Transport` outside sshctl, no `MasterForwards` outside sshctl/proc), doc-comment sweep, EC audit fills gaps. |
+| u7 | **T11 ssh_config resolution.** `sshconfig.go`: `ResolvedHost`, `ConfigResolver` seam + `WithConfigResolver`, default `ssh -G` resolver (parse/`~`-expand/timeout). Wire into `New` (resolve at construction; endpoint + identity-file + host-key-alias plumbing; `Describe().Endpoint` = resolved). Retire the `portal transport native` alias rejection → resolve-based validation (`cmd/portal/transport.go`, `ValidTarget`). Hermetic tests (fake resolver: alias→endpoint/user/port/identity, host-key keyed by alias) + one real-`ssh -G` smoke gated on availability. Green after unit. |
+| u8 | **T12 ProxyJump/ProxyCommand.** `proxy.go`: ProxyJump native chained `direct-tcpip` (multi-hop, hop-cap + visited guard, per-hop auth + strict host-key), ProxyCommand exec+stdio-`net.Conn` (`%h`/`%p`/`%r`, injectable command seam), chain teardown on Close/redial. Extend the T6 server with jump mode; hermetic 2-hop ProxyJump round-trip + in-process ProxyCommand round-trip. Green after unit. |
+| u9 | **Amendment hardening.** Full `-race` + conformance still green; greps (native data path uses no `os/exec` except the `ssh -G` resolver and the ProxyCommand seam); doc-comment sweep; EC audit for the new criteria (11–15). |
 
 ## 5. Exit criteria
 
@@ -129,6 +151,20 @@ re-split behavior*, which the conformance suite's Exec/Stream cases pin.
     gate behave correctly with a healthy transport reporting `Pid=0` (native-shaped Health fake).
 8. `go.mod` delta is exactly `golang.org/x/crypto` (+ its transitive entries).
 9. Native auth: agent-socket path and key-file path each covered vs the in-process server; encrypted-key and no-credentials paths produce actionable errors (unit-tested).
+11. **ssh_config resolution (T11):** with a fake resolver, `New("myalias")` dials the resolved
+    `HostName`/`Port`/`User`, uses the resolved `IdentityFiles`, and keys host-key verification on
+    `HostKeyAlias` (else `HostName`); an empty-`HostName`/resolver-error is a clear construction
+    error; a real-`ssh -G` smoke (skipped when no ssh binary) confirms the parser against the live
+    tool. `Describe().Endpoint` reflects the resolved endpoint, not the alias.
+12. **ProxyJump (T12):** a hermetic 2-hop chain (in-process jump-mode server → in-process target
+    server) completes Exec + a forward round-trip; the hop-cap/visited-set guard rejects a cyclic
+    chain; each hop enforces strict host-key verification.
+13. **ProxyCommand (T12):** with the injected command seam, the target is reached over the
+    stdio-`net.Conn`; `%h`/`%p`/`%r` expand to the resolved target; an unsupported token → clear error.
+14. **Alias selection:** `portal transport native` SUCCEEDS for a resolvable alias host and still
+    fails safe (actionable error, nothing persisted) for an unresolvable host.
+15. **Chain teardown:** `Close`/redial tears down all jump clients and any ProxyCommand process (no
+    leaked goroutines/fds — verified by a listener/process-exit assertion).
 
 ## 6. Risks
 
@@ -147,3 +183,12 @@ re-split behavior*, which the conformance suite's Exec/Stream cases pin.
    (visit a forwarded port), paste/notify round trips work, `portal status` shows `native-ssh`.
 3. Kill the daemon under native: forwards drop immediately (T10) — observed and expected.
 4. `portal transport system` restores the default; doctor PASS on both.
+5. **ssh_config alias (T11):** with native selected against an ssh_config ALIAS (e.g. `vikash-system`
+   → `HostName`/`User` in `~/.ssh/config`), native resolves to the right endpoint and reaches the
+   host-key/auth stage — i.e. it NO LONGER fails with `dial <alias>: no such host`. (Against a
+   Tailscale-SSH box the strict host-key check then correctly rejects the tailnet-managed key; that
+   is expected per §1 out-of-scope, not a regression — validate full round-trip against a
+   standard-sshd host or a pinned host key.)
+6. **ProxyJump (T12), if a bastion is reachable:** native against a `ProxyJump`-configured host
+   completes the handshake through the jump without invoking the ssh binary for the hop. (Best-effort;
+   N/A when no bastion is available.)
