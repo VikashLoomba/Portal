@@ -51,8 +51,14 @@ type testServer struct {
 	// without a deadline never learns the peer is gone. Set before serving.
 	swallowGlobalRequests bool
 
+	// cfg is the server config, stashed so a raw net.Conn (e.g. a net.Pipe end)
+	// can be served in-process with NO subprocess via serveConn — the hermetic
+	// ProxyCommand test.
+	cfg *ssh.ServerConfig
+
 	mu    sync.Mutex
 	conns []net.Conn // every accepted TCP conn, so dropConns can sever them
+	dials []string   // direct-tcpip dest addrs, so ProxyJump tests can assert the jump was traversed
 }
 
 // serverOption mutates a testServer before it starts serving.
@@ -85,7 +91,7 @@ func newTestServer(t *testing.T, authorized ssh.PublicKey, opts ...serverOption)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	s := &testServer{ln: ln, hostKey: hostSigner, addr: ln.Addr().String()}
+	s := &testServer{ln: ln, hostKey: hostSigner, addr: ln.Addr().String(), cfg: cfg}
 	for _, o := range opts {
 		o(s)
 	}
@@ -93,6 +99,11 @@ func newTestServer(t *testing.T, authorized ssh.PublicKey, opts ...serverOption)
 	t.Cleanup(func() { ln.Close() })
 	return s
 }
+
+// serveConn feeds a raw net.Conn (e.g. one end of a net.Pipe) into the in-process
+// server with NO subprocess — the ProxyCommand test hands the client end to the
+// native transport and serves the peer end here.
+func (s *testServer) serveConn(conn net.Conn) { s.handleConn(conn, s.cfg) }
 
 func (s *testServer) serve(cfg *ssh.ServerConfig) {
 	for {
@@ -176,6 +187,9 @@ func (s *testServer) handleDirectTCPIP(newChan ssh.NewChannel) {
 		return
 	}
 	dest := net.JoinHostPort(p.HostToConnect, strconv.Itoa(int(p.PortToConnect)))
+	s.mu.Lock()
+	s.dials = append(s.dials, dest)
+	s.mu.Unlock()
 	remote, err := net.Dial("tcp", dest)
 	if err != nil {
 		newChan.Reject(ssh.ConnectionFailed, err.Error())
@@ -206,6 +220,14 @@ func (s *testServer) handleDirectTCPIP(newChan ssh.NewChannel) {
 		ch.Close()
 		remote.Close()
 	}()
+}
+
+// directDials returns a snapshot of the direct-tcpip dest addrs this server has
+// been asked to proxy — the ProxyJump tests assert the chain traversed each jump.
+func (s *testServer) directDials() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.dials...)
 }
 
 func (s *testServer) handleSession(newChan ssh.NewChannel) {

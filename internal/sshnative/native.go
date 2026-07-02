@@ -125,6 +125,10 @@ type Client struct {
 	// CONSUMED only by the T12 dialing (u8) — a direct dial ignores them.
 	proxyJump    string
 	proxyCommand string
+	// proxyCommandDialer execs a ProxyCommand into a net.Conn (default
+	// defaultProxyCommandDialer, overridable by WithProxyCommandDialer for
+	// hermetic tests). Never dials for a non-ProxyCommand target.
+	proxyCommandDialer proxyCommandDialer
 
 	// Keepalive cadence: defaults from New (15s/3), overridable by WithKeepalive.
 	// Read once when startKeepaliveLocked launches; never mutated after New.
@@ -140,6 +144,13 @@ type Client struct {
 	dead          bool
 	agentConn     net.Conn      // held open for the client's lifetime; closed on redial/Close
 	keepaliveStop chan struct{} // closed to stop the current keepalive goroutine
+
+	// Proxy chain state, set on a ProxyJump/ProxyCommand dial and torn down (with
+	// the client) by teardownLocked on redial/Close. jumpClients is dial-ordered
+	// (first hop first); proxyCloser is the ProxyCommand process closer.
+	jumpClients   []*ssh.Client
+	hopAgentConns []net.Conn
+	proxyCloser   io.Closer
 
 	// fwdMu guards forwards, the in-process port-forward registry (keyed by
 	// local port). This registry is the GROUND TRUTH for ListForwards/
@@ -182,6 +193,9 @@ func New(target string, opts ...Option) (*Client, error) {
 	}
 	if c.resolver == nil {
 		c.resolver = DefaultConfigResolver()
+	}
+	if c.proxyCommandDialer == nil {
+		c.proxyCommandDialer = defaultProxyCommandDialer
 	}
 
 	rh, rerr := c.resolver(context.Background(), target)
@@ -319,23 +333,63 @@ func (c *Client) Ensure(ctx context.Context) (bool, error) {
 		Timeout:         dialTimeout,
 	}
 	addr := net.JoinHostPort(c.host, strconv.Itoa(c.port))
-	client, err := ssh.Dial("tcp", addr, cfg)
+
+	// Dispatch on the resolved proxy directives. ProxyJump wins when both are set
+	// (matches OpenSSH); `none` (case-sensitive) disables a directive. A target
+	// with neither takes the byte-unchanged direct dial.
+	var (
+		client   *ssh.Client
+		jumps    []*ssh.Client
+		hopConns []net.Conn
+		closer   io.Closer
+	)
+	switch {
+	case c.proxyJump != "" && c.proxyJump != "none":
+		client, jumps, hopConns, err = c.dialViaProxyJump(ctx, cfg)
+	case c.proxyCommand != "" && c.proxyCommand != "none":
+		client, closer, err = c.dialViaProxyCommand(ctx, cfg)
+	default:
+		client, err = ssh.Dial("tcp", addr, cfg)
+		if err != nil {
+			err = fmt.Errorf("sshnative: dial %s: %w", addr, err)
+		}
+	}
 	if err != nil {
 		if agentConn != nil {
 			agentConn.Close()
 		}
-		return false, fmt.Errorf("sshnative: dial %s: %w", addr, err)
+		return false, err
 	}
 	c.client = client
 	c.dead = false
 	c.agentConn = agentConn
+	c.jumpClients = jumps
+	c.hopAgentConns = hopConns
+	c.proxyCloser = closer
 	c.startKeepaliveLocked(client)
 	return true, nil
 }
 
-// teardownLocked releases the current client, keepalive goroutine, and agent
-// connection. Caller holds mu.
+// teardownLocked releases the current client, its proxy chain, the keepalive
+// goroutine, and the agent connection (LIFO). The proxy chain is dropped first
+// — the ProxyCommand process, then the jump clients (reverse order) and their
+// agent conns — so both redial and graceful Close release the WHOLE chain, not
+// just the target connection. Caller holds mu.
 func (c *Client) teardownLocked() {
+	if c.proxyCloser != nil {
+		c.proxyCloser.Close()
+		c.proxyCloser = nil
+	}
+	for i := len(c.jumpClients) - 1; i >= 0; i-- {
+		c.jumpClients[i].Close()
+	}
+	c.jumpClients = nil
+	for _, ac := range c.hopAgentConns {
+		if ac != nil {
+			ac.Close()
+		}
+	}
+	c.hopAgentConns = nil
 	if c.keepaliveStop != nil {
 		close(c.keepaliveStop)
 		c.keepaliveStop = nil
