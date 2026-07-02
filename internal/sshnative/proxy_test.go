@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -406,6 +407,72 @@ func TestProxyJumpHopCapPositiveBoundary(t *testing.T) {
 	}
 	if strings.TrimSpace(stdout) != "hi" {
 		t.Errorf("Exec stdout = %q, want %q", stdout, "hi")
+	}
+}
+
+// TestProxyJumpAgentConnsClosedOnTeardown proves the shared-agent hop-auth path
+// runs with a REAL agent conn — the production default, where $SSH_AUTH_SOCK is
+// non-empty — and that teardownLocked closes EVERY per-hop agent conn on Close.
+// The rest of the proxy suite disables the agent (newProxyClient hardcodes
+// WithAgentSocket("")), so c.hopAgentConns stays nil and neither the per-hop
+// acquisition (hopAuthMethods -> buildAuthMethods dials a fresh unix agent conn)
+// nor the teardown close-loop is ever exercised with a live conn. Here the
+// identity file is absent, so BOTH the hop and the target authenticate SOLELY
+// through the agent: each opens an agent conn (the hop's lands in
+// c.hopAgentConns), and the counting agent makes closing them observable.
+// Dropping the teardown close-loop leaks the hop conn — live() never returns to 0
+// — where every agent-disabled proxy test still passes.
+func TestProxyJumpAgentConnsClosedOnTeardown(t *testing.T) {
+	ctx := context.Background()
+	clientPriv, clientSigner := generateKeyPair(t)
+	a := newTestServer(t, clientSigner.PublicKey()) // hop: accepts the agent key
+	b := newTestServer(t, clientSigner.PublicKey()) // target: accepts the agent key
+	aHost, aPort := serverEndpoint(t, a)
+	bHost, bPort := serverEndpoint(t, b)
+	fake := fakeResolver{
+		"target": {User: "testuser", HostName: bHost, Port: bPort, ProxyJump: "hopa"},
+		"hopa":   {User: "testuser", HostName: aHost, Port: aPort},
+	}
+	kh := writeKnownHostsLines(t, a, b)
+	ca := startCountingAgent(t, clientPriv)
+	// A missing identity file forces auth through the agent for BOTH hops, so the
+	// hop agent conn is real and non-empty (not the nil the rest of the suite has).
+	missingKey := filepath.Join(t.TempDir(), "no-identity")
+	c := newProxyClient(t, fake, missingKey, kh, WithAgentSocket(ca.sock))
+
+	if _, err := c.Ensure(ctx); err != nil {
+		t.Fatalf("Ensure via agent-authenticated proxyjump: %v", err)
+	}
+	// The chain actually authenticated through the agent for both hop and target.
+	if _, _, err := c.Exec(ctx, nil, "echo", "hi"); err != nil {
+		t.Fatalf("Exec via agent-authenticated proxyjump: %v", err)
+	}
+	// Acquisition path ran with a live conn: one hop => one stored hop agent conn,
+	// and the agent holds both the hop and target conns open.
+	c.mu.Lock()
+	hopConns := append([]net.Conn(nil), c.hopAgentConns...)
+	c.mu.Unlock()
+	if len(hopConns) != 1 || hopConns[0] == nil {
+		t.Fatalf("hopAgentConns after Ensure = %v, want 1 non-nil conn", hopConns)
+	}
+	if live := ca.live(); live != 2 {
+		t.Fatalf("agent live conns after Ensure = %d, want 2 (hop + target)", live)
+	}
+
+	if _, err := c.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	c.mu.Lock()
+	drained := len(c.hopAgentConns)
+	c.mu.Unlock()
+	if drained != 0 {
+		t.Errorf("hopAgentConns after Close = %d, want 0 (drained)", drained)
+	}
+	// Every agent conn (hop + target) is actually closed: each served goroutine
+	// returns and live() reaches 0. A dropped teardown close-loop leaves the hop
+	// conn open, so live() stays >=1 and this never settles.
+	if !waitFor(func() bool { return ca.live() == 0 }, 3*time.Second) {
+		t.Errorf("agent live conns after Close = %d, want 0; a hop agent conn leaked", ca.live())
 	}
 }
 
@@ -826,6 +893,7 @@ func assertNothingStored(t *testing.T, c *Client) {
 	c.mu.Lock()
 	clientNil := c.client == nil
 	jumps := len(c.jumpClients)
+	hopAgents := len(c.hopAgentConns)
 	closerNil := c.proxyCloser == nil
 	c.mu.Unlock()
 	if !clientNil {
@@ -834,12 +902,29 @@ func assertNothingStored(t *testing.T, c *Client) {
 	if jumps != 0 {
 		t.Errorf("jumpClients = %d after failed dial, want 0", jumps)
 	}
+	if hopAgents != 0 {
+		t.Errorf("hopAgentConns = %d after failed dial, want 0", hopAgents)
+	}
 	if !closerNil {
 		t.Error("proxyCloser stored after failed dial, want nil")
 	}
 	if h, _ := c.Health(context.Background()); h.Up {
 		t.Error("Health.Up true after failed dial, want false")
 	}
+}
+
+// waitFor polls cond until it is true or timeout elapses, so a test can wait on
+// asynchronous teardown (e.g. an agent's served goroutine returning) without a
+// fixed sleep. It returns cond's final value.
+func waitFor(cond func() bool, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return cond()
 }
 
 // waitClosed reports whether client's connection closes within timeout — proof

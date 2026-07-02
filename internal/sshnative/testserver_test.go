@@ -399,3 +399,66 @@ func startFakeAgent(t *testing.T, priv crypto.PrivateKey) string {
 	}()
 	return sock
 }
+
+// countingAgent is an in-process ssh-agent that tracks how many client
+// connections are currently open, so a test can observe per-hop agent-conn
+// acquisition and teardown. open is incremented on accept and decremented when a
+// served connection ends (the client closed its side, so ServeAgent returns).
+type countingAgent struct {
+	sock string
+	mu   sync.Mutex
+	open int
+}
+
+// live reports the number of currently-open client connections.
+func (a *countingAgent) live() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.open
+}
+
+// startCountingAgent serves priv over a temp unix socket like startFakeAgent but
+// counts live client connections: each ProxyJump hop and the target dial their
+// OWN agent conn, so a chain authenticated through this agent lets a test assert
+// every conn is CLOSED on teardown (live returns to 0). A dropped teardown
+// close-loop leaves a hop conn open and live never settles at 0.
+func startCountingAgent(t *testing.T, priv crypto.PrivateKey) *countingAgent {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "a")
+	if err != nil {
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "s")
+
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen agent socket: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	keyring := agent.NewKeyring()
+	if err := keyring.Add(agent.AddedKey{PrivateKey: priv}); err != nil {
+		t.Fatalf("agent add key: %v", err)
+	}
+	ca := &countingAgent{sock: sock}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			ca.mu.Lock()
+			ca.open++
+			ca.mu.Unlock()
+			go func() {
+				agent.ServeAgent(keyring, conn)
+				conn.Close()
+				ca.mu.Lock()
+				ca.open--
+				ca.mu.Unlock()
+			}()
+		}
+	}()
+	return ca
+}
