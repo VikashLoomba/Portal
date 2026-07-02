@@ -4,11 +4,24 @@ package sshnative
 // ssh client. ProxyJump builds the connection through the resolved hop chain
 // with NO ssh binary: net.Dial to the first hop, then a chained direct-tcpip
 // channel to each subsequent hop (and finally the target) as the next net.Conn.
-// Each hop is resolved by the SAME ConfigResolver — recursively, so a hop that
-// itself carries a ProxyJump is reached through its own jumps first (OpenSSH
-// left-expansion) — under a visited-set + hop-cap guard that rejects runaway or
-// cyclic chains. ProxyCommand execs `sh -c` with %h/%p/%r expansion behind an
-// injectable seam. The whole chain is torn down on Close/redial (teardownLocked).
+// Each hop is resolved by the SAME ConfigResolver; expandJumpChain is a
+// depth-first LEFT-EXPANSION — a hop that itself carries a ProxyJump is reached
+// through its own jumps FIRST (matching OpenSSH) — under a visited-set + hop-cap
+// guard whose termination is guaranteed: the visited set rejects any repeated
+// token (including a hop that loops back on itself) and the cap bounds a runaway
+// resolver, both aborting with nothing dialed. Every hop enforces STRICT
+// host-key verification keyed by the RAW net.JoinHostPort query address — the
+// same locked mechanic New uses for the target: net.JoinHostPort(alias,"22")
+// when the hop has a HostKeyAlias, else net.JoinHostPort(host,port); NEVER a
+// knownhosts.Normalize'd (port-less) string, which knownhosts.check rejects. A
+// wrong hop key aborts the WHOLE dial. ProxyJump WINS when both directives are
+// set (Ensure's dispatch), and the case-sensitive `none` sentinel disables
+// either directive (direct dial). ProxyCommand execs `sh -c` with %h/%p/%r
+// expansion behind an injectable seam; expandProxyCommand treats %% as a literal
+// % and errors on a dangling lone % or any unsupported %X token, all BEFORE the
+// seam is invoked. The whole chain — jump clients, per-hop agent conns, and the
+// ProxyCommand process — dies on Close/redial (teardownLocked, LIFO): native has
+// NO ControlPersist analogue, so nothing outlives the client.
 
 import (
 	"context"

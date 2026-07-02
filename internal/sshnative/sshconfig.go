@@ -1,3 +1,16 @@
+// sshconfig.go implements native ssh_config resolution (T11). Resolution
+// DELEGATES to the authoritative `ssh -G` — never a reimplementation of
+// OpenSSH's Host/Match grammar — and runs at CONSTRUCTION (New) under a short
+// timeout with NO network: `-G` only prints the resolved config. The default
+// resolver ALWAYS execs `ssh -G` for EVERY target (no literal short-circuit): a
+// bare alias and a user@alias honor their Host block, while a target that
+// matches no Host block resolves to itself verbatim. An explicit user/port is
+// split out of the target and passed as -l/-p so `ssh -G` reflects them, while a
+// port-less target omits -p so a Host-block Port wins. Resolved IdentityFiles
+// replace the id_* defaults only when they exist on disk (applied by New in
+// native.go). The os/exec import here is the resolution seam — one of exactly
+// two in the package (the other is proxy.go's ProxyCommand dialer).
+
 package sshnative
 
 import (
