@@ -98,3 +98,63 @@ func TestReportMarshalJSON(t *testing.T) {
 		t.Errorf("Marshal mismatch:\n got: %s\nwant: %s", got, want)
 	}
 }
+
+// TestStatusUnmarshalJSON proves the symmetric decode added for localclient.Doctor
+// and u5's renderDoctor: a known tag maps to its enum value, while an unknown
+// token or a malformed value defaults to Fail so a corrupt status never reads as
+// a pass.
+func TestStatusUnmarshalJSON(t *testing.T) {
+	tests := []struct {
+		in   string
+		want Status
+	}{
+		{`"PASS"`, Pass},
+		{`"WARN"`, Warn},
+		{`"FAIL"`, Fail},
+		{`"NOPE"`, Fail}, // unknown token -> Fail
+		{`123`, Fail},    // malformed (not a string) -> Fail
+		{`"pass"`, Fail}, // case-sensitive: lowercase is not a known tag
+	}
+	for _, tt := range tests {
+		var s Status
+		if err := json.Unmarshal([]byte(tt.in), &s); err != nil {
+			t.Fatalf("Unmarshal(%s): unexpected error %v", tt.in, err)
+		}
+		if s != tt.want {
+			t.Errorf("Unmarshal(%s) = %v (tag %q), want %v (tag %q)", tt.in, s, s.Tag(), tt.want, tt.want.Tag())
+		}
+	}
+}
+
+// TestReportRoundTrip proves a full Report survives Marshal->Unmarshal with every
+// Check.Status preserved, so renderDoctor's Tag() reads correctly after a decode
+// over the socket.
+func TestReportRoundTrip(t *testing.T) {
+	want := Report{
+		Host: "devbox",
+		Checks: []Check{
+			{Name: "ssh master", Status: Pass, Detail: "UP (pid=1)"},
+			{Name: "agent verb: clip", Status: Warn},
+			{Name: "notify", Status: Fail, Detail: "no path"},
+		},
+	}
+	b, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var got Report
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.Host != want.Host {
+		t.Errorf("Host = %q, want %q", got.Host, want.Host)
+	}
+	if len(got.Checks) != len(want.Checks) {
+		t.Fatalf("got %d checks, want %d", len(got.Checks), len(want.Checks))
+	}
+	for i, c := range got.Checks {
+		if c != want.Checks[i] {
+			t.Errorf("check %d = %+v, want %+v", i, c, want.Checks[i])
+		}
+	}
+}

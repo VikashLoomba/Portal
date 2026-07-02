@@ -181,7 +181,18 @@ func (l *peerCredListener) Accept() (net.Conn, error) {
 // a short deadline and unlinks the socket (best-effort). Bind/serve errors
 // propagate to the caller (run.go makes them fatal per D10).
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	srv := &http.Server{Handler: s.middleware(s.mux)}
+	srv := &http.Server{
+		Handler: s.middleware(s.mux),
+		// Derive every in-flight request context from the Serve ctx so cancelling
+		// it cancels each handler's r.Context() — including GET /v1/events'. Graceful
+		// Shutdown alone never force-closes an attached streaming conn, so without
+		// this the events handler's `case <-ctx.Done()` never fires and the stream
+		// never EOFs on daemon shutdown (it also stops Shutdown blocking the full 2s
+		// while a status --watch stream is attached). With it wired, the handler
+		// returns, net/http finalizes the chunked body (clean EOF to the client),
+		// and Shutdown then reaps the now-idle conn.
+		BaseContext: func(net.Listener) context.Context { return ctx },
+	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	select {

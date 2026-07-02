@@ -5,7 +5,10 @@
 // internal/app — it is a leaf so there is no layering cycle.
 package doctor
 
-import "strconv"
+import (
+	"encoding/json"
+	"strconv"
+)
 
 // Status is the outcome of one doctor probe.
 type Status uint8
@@ -34,6 +37,28 @@ func (s Status) Tag() string {
 // (fixing the previously unserializable int-enum status).
 func (s Status) MarshalJSON() ([]byte, error) {
 	return []byte(strconv.Quote(s.Tag())), nil
+}
+
+// UnmarshalJSON parses the quoted tag emitted by MarshalJSON back into a Status,
+// so *Report decodes cleanly over the wire (localclient.Doctor, u5's renderDoctor
+// path). It is symmetric with Tag()/MarshalJSON: "PASS"->Pass, "WARN"->Warn,
+// "FAIL"->Fail; any other token or a malformed value -> Fail, so an unknown or
+// corrupt status can never read as a pass. Pointer receiver: it mutates *s.
+func (s *Status) UnmarshalJSON(b []byte) error {
+	var tag string
+	if err := json.Unmarshal(b, &tag); err != nil {
+		*s = Fail
+		return nil
+	}
+	switch tag {
+	case "PASS":
+		*s = Pass
+	case "WARN":
+		*s = Warn
+	default:
+		*s = Fail
+	}
+	return nil
 }
 
 // Check is one line of the report.
