@@ -120,8 +120,12 @@ type statusView struct {
 	masterUp   bool
 	masterPID  int
 	sock       string
-	agent      *statusAgentView
-	forwards   []string
+	// impl is the active transport's Describe().Impl. renderStatus prints an
+	// extra `transport: <impl>` line IFF impl is non-empty AND != "system-ssh",
+	// so the default (system) path stays byte-identical (T8/T9).
+	impl     string
+	agent    *statusAgentView
+	forwards []string
 }
 
 // renderStatus reproduces the historical runStatus output byte-for-byte (§5.2).
@@ -152,6 +156,11 @@ func renderStatus(w io.Writer, v statusView) {
 		return
 	}
 	fmt.Fprintf(w, "ssh master: UP (pid=%d) host=%s\n", v.masterPID, v.host)
+	// Surface the active transport only when it is NOT the default system ssh —
+	// the system path stays byte-identical (T8/T9).
+	if v.impl != "" && v.impl != "system-ssh" {
+		fmt.Fprintf(w, "transport: %s\n", v.impl)
+	}
 	if v.agent != nil {
 		fmt.Fprintf(w, "agent: pid=%d sha=%s kernel=%s\n", v.agent.pid, v.agent.sha, v.agent.kernel)
 	}
@@ -184,6 +193,7 @@ func viewFromStatus(a *app.App, st localapi.Status) statusView {
 		masterUp:   st.Master.Up,
 		masterPID:  st.Master.Pid,
 		sock:       a.Paths.Sock,
+		impl:       st.Master.Transport, // carried over the wire by localapi (u2).
 	}
 	for _, f := range st.Forwards {
 		v.forwards = append(v.forwards, f.Name)
@@ -210,6 +220,7 @@ func viewFromLocal(ctx context.Context, a *app.App) statusView {
 		label:     a.Paths.Label,
 		hostKnown: host != "",
 		sock:      a.Paths.Sock,
+		impl:      a.Transport.Describe().Impl,
 	}
 	if st, err := a.Service.Status(ctx); err == nil {
 		v.loaded = st.Loaded

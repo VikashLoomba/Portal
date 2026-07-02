@@ -135,7 +135,13 @@ the headless launchd daemon can connect.`,
 			// install — the service is already loaded and the user can re-run
 			// `portal doctor` after fixing the cause.
 			fmt.Printf("\nrunning self-test (%s doctor) ...\n", app.Tool)
-			tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+			// nil ssh-stderr sink: install's transports carry no StderrSink (no
+			// leak into stdout). Install runs before the transport config exists,
+			// so the factory defaults to system.
+			tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
+			if err != nil {
+				return err
+			}
 			rep := runDoctor(cmd.Context(), host, tr)
 			renderDoctor(os.Stdout, rep)
 
@@ -278,7 +284,12 @@ export BROWSER="${BROWSER:-xdg-open}"
 // install, so a direct ssh call with `host` is required, mirroring
 // installXdgOpenWrapper).
 func ensureClipShims(ctx context.Context, host string, a *app.App) error {
-	tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+	// nil ssh-stderr sink; factory defaults to system (config not yet written on
+	// a fresh install).
+	tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
+	if err != nil {
+		return err
+	}
 	return clipshim.Ensure(ctx, tr)
 }
 
@@ -286,7 +297,12 @@ func ensureClipShims(ctx context.Context, host string, a *app.App) error {
 // on the dev box. Uses a direct (non-multiplexed) ssh call with the given
 // host so it works on a fresh install before the ControlMaster exists.
 func installXdgOpenWrapper(ctx context.Context, host string, a *app.App) error {
-	tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+	// nil ssh-stderr sink; factory defaults to system (config not yet written on
+	// a fresh install).
+	tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
+	if err != nil {
+		return err
+	}
 
 	// Write the BROWSER env snippet to ~/.config/portal/env.sh and source
 	// it from ~/.bashrc and ~/.zshrc (if they exist). This ensures Python's

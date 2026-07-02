@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/user"
@@ -19,6 +20,7 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/service"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshnative"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
 )
 
@@ -73,16 +75,17 @@ func NewProd() (*App, error) {
 	runner := run.OSRunner{}
 	clk := clock.Real{}
 	logf := forward.StdoutLogger()
-	// ONE *proc.Lsof serves both App.Ports (local-port conflict queries) and
-	// s.Forwards (the master-forward truth behind PortForwarder List/Lines).
+	// App.Ports serves the engine's LOCAL-port conflict queries; the master-
+	// forward truth behind PortForwarder List/Lines is wired inside NewTransport.
 	ports := proc.New(LsofPath, runner)
-	s := sshctl.New(paths.Sock, host, SSHOpts, runner)
-	// Tee ssh stderr to our stderr so launchd's StandardErrorPath captures
-	// host-key churn / mux warnings — bash relies on stderr inheritance.
-	// (The u5 selection-aware factory will pass the sink through explicitly;
-	// this unit keeps NewProd's direct construction with the sink set inline.)
-	s.StderrSink = os.Stderr
-	s.Forwards = ports
+	// NewProd routes ssh stderr to os.Stderr so launchd's StandardErrorPath
+	// captures host-key churn / mux warnings — the DESIGN-split-daemon invariant
+	// (bash relied on stderr inheritance). An invalid transport config is a LOUD
+	// startup failure here, never a silent fallback.
+	tr, pf, err := NewTransport(paths, host, runner, cfg, os.Stderr)
+	if err != nil {
+		return nil, err
+	}
 	svc := service.New(service.Spec{
 		Label:   paths.Label,
 		BinPath: paths.BinPath,
@@ -98,10 +101,10 @@ func NewProd() (*App, error) {
 	// channel is consumed by forward.Engine; AgentDiscoverer reads its
 	// cached Snapshot for desired-port lookups.
 	slogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	bs := bootstrap.New(s, slogger)
+	bs := bootstrap.New(tr, slogger)
 	h := hub.New()
 	ac := agentclient.New(agentclient.Config{
-		Transport:  s,
+		Transport:  tr,
 		Bootstrap:  bs,
 		Log:        slogger,
 		StderrSink: os.Stderr,
@@ -109,20 +112,55 @@ func NewProd() (*App, error) {
 	})
 	rd := discover.NewAgent(ac)
 
-	// The daemon requires port forwarding; assert the capability loudly at
-	// wiring time rather than failing deep in the engine.
-	var tr transport.Transport = s
-	pf, ok := tr.(transport.PortForwarder)
-	if !ok {
-		return nil, fmt.Errorf("transport %s does not implement PortForwarder", tr.Describe().Impl)
-	}
-
 	return &App{
 		Paths: paths, Cfg: cfg, Runner: runner, Clk: clk, Log: logf,
 		Audit:     audit.New(paths.ConfigDir),
 		Transport: tr, PF: pf, Ports: ports, Discover: rd, Service: svc,
 		Bootstrap: bs, AgentClient: ac, Hub: h,
 	}, nil
+}
+
+// NewTransport is the ONE selection-aware transport factory (T8) and the ONLY
+// place transports are constructed. It reads cfg.Transport() and builds the
+// selected implementation:
+//
+//   - "system" (the default when the transport file is absent): sshctl.New over
+//     the ControlMaster socket, wired with the lsof-backed master-forward source
+//     and the caller-supplied ssh-stderr sink.
+//   - "native": sshnative.New against the configured user@host[:port], using the
+//     real ~/.ssh defaults (no Options).
+//
+// An invalid config value returns the error unchanged — a loud startup failure,
+// NEVER a silent fallback to system.
+//
+// sshStderr is the ssh-stderr sink for the SYSTEM transport only (nil = quiet,
+// no tee). NewProd passes os.Stderr so ssh warnings reach launchd's log (the
+// DESIGN-split-daemon invariant); every DOCTOR-path caller passes nil so ssh
+// stderr is never tee'd into the report. The native transport has no ambient
+// ssh-stderr stream to tee (each session captures its own stderr), so sshStderr
+// does NOT apply to it.
+//
+// The concrete *sshctl.SSH and *sshnative.Client each satisfy BOTH
+// transport.Transport and transport.PortForwarder at compile time, so the
+// returned pair needs no runtime assertion.
+func NewTransport(paths Paths, host string, runner run.Runner, cfg *config.Store, sshStderr io.Writer) (transport.Transport, transport.PortForwarder, error) {
+	sel, err := cfg.Transport()
+	if err != nil {
+		return nil, nil, err
+	}
+	switch sel {
+	case "native":
+		c, err := sshnative.New(host)
+		if err != nil {
+			return nil, nil, err
+		}
+		return c, c, nil
+	default: // "system"
+		s := sshctl.New(paths.Sock, host, SSHOpts, runner)
+		s.Forwards = proc.New(LsofPath, runner)
+		s.StderrSink = sshStderr // nil-safe: sshctl guards a nil sink.
+		return s, s, nil
+	}
 }
 
 // Engine constructs a fresh forward.Engine using the App's wiring. The

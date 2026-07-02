@@ -24,7 +24,6 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/localapi"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/protocol"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 )
 
 func newRunCmd(a *app.App) *cobra.Command {
@@ -113,7 +112,11 @@ func newRunCmd(a *app.App) *cobra.Command {
 					Kick:         engine.Kick,
 					ReconcileGen: engine.Reconciles,
 					Doctor: func(c context.Context) *doctor.Report {
-						tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+						// nil ssh-stderr sink: routing doctor probes through a
+						// sink-wired transport would leak ssh stderr into the
+						// launchd log on the daemon-up path. Config was validated at
+						// startup (NewProd), so ignoring the factory error is safe.
+						tr, _, _ := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
 						return runDoctor(c, host, tr)
 					},
 				}

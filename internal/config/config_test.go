@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -191,6 +192,89 @@ func TestAllowUnallow_ConcurrentMutationsNoLostWrite(t *testing.T) {
 	for _, p := range base {
 		if !have[p] {
 			t.Errorf("base port %d missing — clobbered by a racing rewrite", p)
+		}
+	}
+}
+
+func TestTransport_DefaultValidInvalid(t *testing.T) {
+	t.Run("absent file defaults to system", func(t *testing.T) {
+		s := New(t.TempDir())
+		got, err := s.Transport()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "system" {
+			t.Errorf("Transport (absent) = %q, want system", got)
+		}
+	})
+	t.Run("present native (trimmed)", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "transport"), []byte("  native \n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got, err := New(dir).Transport()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "native" {
+			t.Errorf("Transport = %q, want native", got)
+		}
+	})
+	t.Run("present system", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "transport"), []byte("system\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got, err := New(dir).Transport()
+		if err != nil || got != "system" {
+			t.Errorf("Transport = %q, err %v; want system, nil", got, err)
+		}
+	})
+	t.Run("invalid value errors naming file and value", func(t *testing.T) {
+		dir := t.TempDir()
+		file := filepath.Join(dir, "transport")
+		// localexec is test/dev only — must NOT be config-selectable.
+		if err := os.WriteFile(file, []byte("localexec\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := New(dir).Transport()
+		if err == nil {
+			t.Fatal("Transport(localexec) should error, not silently fall back")
+		}
+		if !strings.Contains(err.Error(), "localexec") || !strings.Contains(err.Error(), file) {
+			t.Errorf("error must name the bad value and the file, got %v", err)
+		}
+	})
+}
+
+func TestSetTransport_RoundTripAndRejection(t *testing.T) {
+	s := New(t.TempDir())
+	for _, name := range []string{"native", "system"} {
+		if err := s.SetTransport(name); err != nil {
+			t.Fatalf("SetTransport(%q): %v", name, err)
+		}
+		got, err := s.Transport()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != name {
+			t.Errorf("after SetTransport(%q), Transport = %q", name, got)
+		}
+	}
+	// Idempotent: setting the same value twice is a no-op that still round-trips.
+	if err := s.SetTransport("native"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTransport("native"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Transport(); got != "native" {
+		t.Errorf("idempotent SetTransport(native) left %q", got)
+	}
+	// Invalid names are rejected (localexec included).
+	for _, bad := range []string{"localexec", "bogus", ""} {
+		if err := s.SetTransport(bad); err == nil {
+			t.Errorf("SetTransport(%q) should be rejected", bad)
 		}
 	}
 }

@@ -50,6 +50,7 @@ func newRootCmd(a *app.App) *cobra.Command {
 	root.AddCommand(newUninstallCmd(a))
 	root.AddCommand(newReloadCmd(a))
 	root.AddCommand(newHostCmd(a))
+	root.AddCommand(newTransportCmd(a))
 	root.AddCommand(newStartCmd(a))
 	root.AddCommand(newStopCmd(a))
 	root.AddCommand(newRestartCmd(a))

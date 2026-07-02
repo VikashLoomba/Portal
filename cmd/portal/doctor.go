@@ -12,7 +12,6 @@ import (
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/localclient"
-	"gitlab.i.extrahop.com/vikashl/devportal/internal/sshctl"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
 )
 
@@ -66,10 +65,16 @@ func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App) error {
 		}
 		return nil
 	}
-	// Fallback (daemon down): the in-process run over a FRESH sshctl transport (never
-	// a.Transport — routing doctor probes through it would leak ssh stderr into
-	// the report). The only test seam that intercepts this path is a.Runner.
-	tr := sshctl.New(a.Paths.Sock, host, app.SSHOpts, a.Runner)
+	// Fallback (daemon down): the in-process run over a FRESH transport built by
+	// the selection-aware factory so a `native` selection is honored and surfaced
+	// even with the daemon down. The nil ssh-stderr sink preserves the current
+	// no-leak behavior (routing doctor probes through a.Transport, or a sink-wired
+	// transport, would tee ssh stderr into the report). The only test seam that
+	// intercepts this path is a.Runner.
+	tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
+	if err != nil {
+		return err
+	}
 	rep := runDoctor(ctx, host, tr)
 	renderDoctor(w, rep)
 	if !rep.OK() {
@@ -105,6 +110,20 @@ func renderDoctor(w io.Writer, rep *doctor.Report) {
 // transport that scripts canned ssh-exec replies — no live dev box needed.
 func runDoctor(ctx context.Context, host string, tr transport.Transport) *doctor.Report {
 	rep := &doctor.Report{Host: host}
+
+	// 0. Transport surfacing (T8) + failure-mode honesty (T10), gated so the
+	// default (system) doctor report stays byte-identical (T9). renderDoctor is
+	// UNCHANGED — it just renders whatever Checks exist here. The daemon's
+	// /v1/doctor closure and the daemon-down fallback both call runDoctor over a
+	// factory-built transport, so Impl reflects the config selection on either
+	// path. Warn is tolerated by Report.OK, so the note keeps RESULT at PASS.
+	if d := tr.Describe(); d.Impl != "system-ssh" {
+		rep.Add("transport", doctor.Pass, d.Impl)
+		if d.Impl == "native-ssh" {
+			rep.Add("forward lifetime", doctor.Warn,
+				"native forwards die with the daemon (no ControlPersist analogue); a daemon restart re-establishes them")
+		}
+	}
 
 	// 1. Master connectivity. Without the ControlMaster the daemon can't relay a
 	// clip request at all; everything downstream is moot.

@@ -303,6 +303,52 @@ func TestViewFromLocal_NativeHealthPidZero(t *testing.T) {
 	}
 }
 
+// T8/T9: with the system transport selected the status output is byte-identical
+// to today — NO `transport:` line (the impl is "system-ssh", which the render
+// gate excludes). newDaemonTestApp's fake transport reports system-ssh.
+func TestStatus_System_NoTransportLine(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	a := newDaemonTestApp(t, filepath.Join(t.TempDir(), "nope.sock"), cfg)
+
+	var buf bytes.Buffer
+	renderStatus(&buf, viewFromLocal(context.Background(), a))
+	if strings.Contains(buf.String(), "transport:") {
+		t.Errorf("system status must not show a transport line, got:\n%s", buf.String())
+	}
+	if got := buf.String(); got != wantLocalStatus {
+		t.Errorf("system status not byte-identical:\n--- got ---\n%s\n--- want ---\n%s", got, wantLocalStatus)
+	}
+}
+
+// T8: with the native transport selected (Describe().Impl == native-ssh, a
+// healthy Health{Up:true,Pid:0}) the status shows the `transport: native-ssh`
+// line immediately after the `ssh master: UP ...` line.
+func TestStatus_Native_TransportLine(t *testing.T) {
+	cfg := newTestConfig(t, "devbox")
+	pf := &recordingForwarder{lines: []string{"127.0.0.1:5173"}}
+	a := &app.App{
+		Cfg:       cfg,
+		Paths:     app.Paths{Label: "com.test.portal", Sock: "/tmp/cm-fake.sock"},
+		Transport: nativeHealthTransport{up: true, pid: 0},
+		PF:        pf,
+		Service:   &appFakeService{st: service.Status{Loaded: true, StateLines: []string{"state = running"}}},
+	}
+
+	var buf bytes.Buffer
+	renderStatus(&buf, viewFromLocal(context.Background(), a))
+	want := "dev box: devbox\n" +
+		"service (com.test.portal):\n" +
+		"state = running\n" +
+		"\n" +
+		"ssh master: UP (pid=0) host=devbox\n" +
+		"transport: native-ssh\n" +
+		"active forwards (local listeners owned by master):\n" +
+		"  127.0.0.1:5173\n"
+	if got := buf.String(); got != want {
+		t.Errorf("native status mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
 // EC2 (ports): a bad socket falls through to the local EnsureMaster/DesiredPorts
 // path.
 func TestRunPorts_DaemonDown_Fallback(t *testing.T) {

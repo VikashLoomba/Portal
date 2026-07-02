@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/app"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/clipshim"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/doctor"
+	"gitlab.i.extrahop.com/vikashl/devportal/internal/run"
 	"gitlab.i.extrahop.com/vikashl/devportal/internal/transport"
 )
 
@@ -19,6 +23,12 @@ import (
 // present / absent", and "clipboard has content / empty".
 type doctorFakeTransport struct {
 	pid int
+	// forceUp reports Health.Up=true even when pid==0 — the native-transport
+	// shape (a pidless connection). Left false, Health gates on pid>0 as before.
+	forceUp bool
+	// impl overrides Describe().Impl; empty means the default "system-ssh" so the
+	// existing byte-compat fixtures are unaffected.
+	impl string
 	// execReply maps a substring that must appear in the Exec script to the
 	// stdout to return. The FIRST matching key (in matchOrder) wins, so order
 	// disambiguates overlapping scripts.
@@ -28,6 +38,9 @@ type doctorFakeTransport struct {
 
 func (f *doctorFakeTransport) Ensure(context.Context) (bool, error) { return false, nil }
 func (f *doctorFakeTransport) Health(context.Context) (transport.Health, error) {
+	if f.forceUp {
+		return transport.Health{Up: true, Pid: f.pid, Detail: fmt.Sprintf("pid=%d", f.pid)}, nil
+	}
 	if f.pid <= 0 {
 		return transport.Health{Up: false}, nil
 	}
@@ -35,7 +48,11 @@ func (f *doctorFakeTransport) Health(context.Context) (transport.Health, error) 
 }
 func (f *doctorFakeTransport) Close(context.Context) (bool, error) { return true, nil }
 func (f *doctorFakeTransport) Describe() transport.Desc {
-	return transport.Desc{Impl: "system-ssh", Host: "fakehost", Endpoint: "/tmp/sock-fake"}
+	impl := f.impl
+	if impl == "" {
+		impl = "system-ssh"
+	}
+	return transport.Desc{Impl: impl, Host: "fakehost", Endpoint: "/tmp/sock-fake"}
 }
 func (f *doctorFakeTransport) Stream(_ context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
 	return nil, nil, nil, nil, nil
@@ -285,6 +302,98 @@ func TestRenderDoctor_Golden(t *testing.T) {
 				t.Errorf("renderDoctor mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, tt.want)
 			}
 		})
+	}
+}
+
+// greenReplies returns the AllGreen matchOrder/execReply so both a system and a
+// native fixture can produce an all-green report body.
+func greenReplies() (order []string, reply map[string]string) {
+	order = []string{
+		"command -v xclip",
+		"command -v wl-paste",
+		"line=$(grep -F",
+		"PORTALD_OK",
+		"clip targets xclip; echo",
+	}
+	reply = map[string]string{
+		"command -v xclip":         "SHIM /home/u/.local/bin/xclip",
+		"command -v wl-paste":      "SHIM /home/u/.local/bin/wl-paste",
+		"line=$(grep -F":           clipshim.Version + ". Intercepts",
+		"PORTALD_OK":               "PORTALD_OK\nCLIP_OK\nNOTIFY_OK\n",
+		"clip targets xclip; echo": "image/png\nEXIT=0",
+	}
+	return order, reply
+}
+
+// T8/T9: a system-Impl transport adds NEITHER a `transport` nor a `forward
+// lifetime` Check — the system doctor report stays byte-identical to today.
+func TestRunDoctor_SystemImpl_NoExtraChecks(t *testing.T) {
+	order, reply := greenReplies()
+	tr := &doctorFakeTransport{pid: 4242, matchOrder: order, execReply: reply} // impl defaults system-ssh
+	rep := runDoctor(context.Background(), "fakehost", tr)
+	if !rep.OK() {
+		t.Fatalf("expected PASS, got:\n%s", reportString(rep))
+	}
+	if findCheck(rep, "transport") != nil {
+		t.Error("system transport must not add a `transport` check (byte-compat)")
+	}
+	if findCheck(rep, "forward lifetime") != nil {
+		t.Error("system transport must not add a `forward lifetime` check (byte-compat)")
+	}
+}
+
+// T8/T10: a native-Impl transport with Health{Up:true,Pid:0} adds the
+// `transport: native-ssh` check and the `forward lifetime` Warn note, renders
+// the master line as UP (pid=0), and overall RESULT stays PASS (Warn tolerated).
+func TestRunDoctor_NativeImpl_TransportAndForwardChecks(t *testing.T) {
+	order, reply := greenReplies()
+	tr := &doctorFakeTransport{
+		forceUp:    true, // Up with Pid 0 — the native shape
+		pid:        0,
+		impl:       "native-ssh",
+		matchOrder: order,
+		execReply:  reply,
+	}
+	rep := runDoctor(context.Background(), "fakehost", tr)
+	if !rep.OK() {
+		t.Fatalf("expected PASS (Warn tolerated), got:\n%s", reportString(rep))
+	}
+	assertCheck(t, rep, "transport", doctor.Pass)
+	if c := findCheck(rep, "transport"); c == nil || c.Detail != "native-ssh" {
+		t.Errorf("transport check detail = %q, want native-ssh", detailOf(c))
+	}
+	assertCheck(t, rep, "forward lifetime", doctor.Warn)
+	if m := findCheck(rep, "ssh master"); m == nil || m.Detail != "UP (pid=0)" {
+		t.Errorf("master line detail = %q, want UP (pid=0)", detailOf(m))
+	}
+}
+
+// TestRunDoctorCmd_FallbackNativeSelection: with the daemon down AND the native
+// transport selected in config, the fallback transport is factory-constructed so
+// the report surfaces `transport: native-ssh` (selection honored even with the
+// daemon down, T8). The native client is undialed here, so the master check
+// FAILs — we assert only that the selection surfaced, not overall PASS.
+func TestRunDoctorCmd_FallbackNativeSelection(t *testing.T) {
+	cfg := newTestConfig(t, "user@devbox")
+	if err := cfg.SetTransport("native"); err != nil {
+		t.Fatal(err)
+	}
+	a := &app.App{
+		Paths: app.Paths{
+			APISock: filepath.Join(t.TempDir(), "does-not-exist", "api.sock"),
+			Sock:    "/tmp/cm-nonexistent.sock",
+		},
+		Cfg:    cfg,
+		Runner: &run.Fake{}, // native ignores the runner; present for the factory signature.
+	}
+
+	var out bytes.Buffer
+	_ = runDoctorCmd(context.Background(), &out, a) // FAIL expected (native undialed)
+	if !strings.Contains(out.String(), "[PASS] transport: native-ssh") {
+		t.Errorf("daemon-down fallback must honor the native selection, got:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "forward lifetime") {
+		t.Errorf("native fallback should include the T10 forward-lifetime note, got:\n%s", out.String())
 	}
 }
 
