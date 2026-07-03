@@ -46,3 +46,6 @@ paths:
   /v1/doctor:
     post:
       summary: Run the doctor self-test; returns the structured report.
+  /v1/exec:
+    post:
+      summary: Upgrade to a WebSocket exec stream over the local Unix socket.

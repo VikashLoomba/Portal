@@ -97,6 +97,9 @@ const (
 	// FeatureNotify gates raising a native macOS notification from a relayed
 	// remote event (Claude Code hook / generic `portald notify`).
 	FeatureNotify = "notify"
+	// FeatureExec gates the local exec WebSocket bridge that launches commands
+	// through the configured transport.
+	FeatureExec = "exec"
 )
 
 // FeatureEnabled reports whether the named capability is enabled. The contract

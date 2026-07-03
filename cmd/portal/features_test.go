@@ -36,12 +36,14 @@ func TestFeatures_DaemonUp_ListDeterministicOrder(t *testing.T) {
 		config.FeatureClipImage: true,
 		config.FeatureClipText:  false,
 		config.FeatureNotify:    true,
+		config.FeatureExec:      false,
 	})
 	cliCfg := newTestConfig(t, "devbox")
 	setFeatures(t, cliCfg, map[string]bool{
 		config.FeatureClipImage: false,
 		config.FeatureClipText:  true,
 		config.FeatureNotify:    false,
+		config.FeatureExec:      true,
 	})
 	d := startFakeDaemon(t, daemonCfg)
 	a := newDaemonTestApp(t, d.path, cliCfg)
@@ -55,7 +57,7 @@ func TestFeatures_DaemonUp_ListDeterministicOrder(t *testing.T) {
 	}
 
 	// The daemon's posture, NOT the CLI store's inverted one.
-	want := "clip-image: on\nclip-text: off\nnotify: on\n"
+	want := "clip-image: on\nclip-text: off\nnotify: on\nexec: off\n"
 	if out.String() != want {
 		t.Errorf("list output:\n--- got ---\n%s--- want ---\n%s", out.String(), want)
 	}
@@ -130,7 +132,7 @@ func TestFeatures_UnknownName(t *testing.T) {
 	if !errors.As(err, &ue) {
 		t.Fatalf("err = %v, want usageErr", err)
 	}
-	if want := "unknown feature: bogus (known: clip-image, clip-text, notify)\n"; errw.String() != want {
+	if want := "unknown feature: bogus (known: clip-image, clip-text, notify, exec)\n"; errw.String() != want {
 		t.Errorf("stderr = %q, want %q", errw.String(), want)
 	}
 	if out.Len() != 0 {
@@ -147,6 +149,7 @@ func TestFeatures_DaemonDown_Fallback(t *testing.T) {
 		config.FeatureClipImage: false,
 		config.FeatureClipText:  true,
 		config.FeatureNotify:    true,
+		config.FeatureExec:      true,
 	})
 	// Point APISock at a nonexistent path so localclient dials fail fast.
 	a := newDaemonTestApp(t, filepath.Join(t.TempDir(), "nope.sock"), cfg)
@@ -159,7 +162,7 @@ func TestFeatures_DaemonDown_Fallback(t *testing.T) {
 	if err := runFeatures(ctx, &out, &errw, a, nil); err != nil {
 		t.Fatalf("runFeatures list (down): %v", err)
 	}
-	if want := "clip-image: off\nclip-text: on\nnotify: on\n"; out.String() != want {
+	if want := "clip-image: off\nclip-text: on\nnotify: on\nexec: on\n"; out.String() != want {
 		t.Errorf("fallback list:\n--- got ---\n%s--- want ---\n%s", out.String(), want)
 	}
 	if errw.Len() != 0 {
@@ -169,13 +172,13 @@ func TestFeatures_DaemonDown_Fallback(t *testing.T) {
 	// SET falls back to writing a.Cfg directly.
 	out.Reset()
 	errw.Reset()
-	if err := runFeatures(ctx, &out, &errw, a, []string{"notify", "off"}); err != nil {
+	if err := runFeatures(ctx, &out, &errw, a, []string{"exec", "off"}); err != nil {
 		t.Fatalf("runFeatures set (down): %v", err)
 	}
-	if a.Cfg.FeatureEnabled(config.FeatureNotify) {
-		t.Error("fallback set did not disable notify in config.Store")
+	if a.Cfg.FeatureEnabled(config.FeatureExec) {
+		t.Error("fallback set did not disable exec in config.Store")
 	}
-	if want := "notify: off\n"; out.String() != want {
+	if want := "exec: off\n"; out.String() != want {
 		t.Errorf("fallback set output = %q, want %q", out.String(), want)
 	}
 	if errw.Len() != 0 {

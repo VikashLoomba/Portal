@@ -19,6 +19,8 @@ func TestLog_AppendsLines(t *testing.T) {
 	l.Notify("box", "Claude finished", true, 0)
 	l.NotifyDenied("box", "disabled")
 	l.OpenURL("box", "https://example.com/path")
+	l.ExecOpen("box", "printf hello", 501)
+	l.ExecClose("box", 4, "remote\nfailure", 2*time.Second)
 
 	b, err := os.ReadFile(l.Path())
 	if err != nil {
@@ -32,14 +34,16 @@ func TestLog_AppendsLines(t *testing.T) {
 		"notify\thost=box\tverified=true\turgency=0\ttitle=Claude finished",
 		"notify-denied\thost=box\treason=disabled",
 		"open-url\thost=box\turl=https://example.com/path",
+		"exec-open\thost=box\tuid=501\targv=printf hello",
+		"exec-close\thost=box\tcode=4\terr=remote failure\tdur=2s",
 	}
 	for _, w := range wantSubstrings {
 		if !strings.Contains(got, w) {
 			t.Errorf("audit log missing line %q\nfull log:\n%s", w, got)
 		}
 	}
-	if n := strings.Count(got, "\n"); n != 5 {
-		t.Errorf("expected 5 lines, got %d:\n%s", n, got)
+	if n := strings.Count(got, "\n"); n != 7 {
+		t.Errorf("expected 7 lines, got %d:\n%s", n, got)
 	}
 }
 
@@ -69,6 +73,8 @@ func TestLog_NilSafe(t *testing.T) {
 	l.ClipServed("h", "image", "x")
 	l.Notify("h", "t", false, 1)
 	l.OpenURL("h", "u")
+	l.ExecOpen("h", "argv", 1)
+	l.ExecClose("h", 0, "", time.Millisecond)
 	if l.Path() != "" {
 		t.Errorf("nil Log.Path() should be empty")
 	}

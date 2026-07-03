@@ -306,6 +306,9 @@ func TestIntegration_StatusAgentIdentity(t *testing.T) {
 	if !st.Master.Up {
 		t.Error("Master.Up = false, want true (fake MasterPID is live)")
 	}
+	if !st.Features[config.FeatureExec] {
+		t.Error("status Features[exec] = false/missing, want default enabled")
+	}
 }
 
 // TestIntegration_EventsReconnectNotifyTick (EC3): the events stream is
