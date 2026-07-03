@@ -94,8 +94,7 @@ func runCore(t *testing.T, newT func(t *testing.T) transport.Transport) {
 		if !ok || code != 3 {
 			t.Errorf("ExitCode(err) = (%d, %v), want (3, true)", code, ok)
 		}
-		tr2 := newT(t)
-		_, _, err2 := tr2.Exec(ctx, nil, "true")
+		_, _, err2 := tr.Exec(ctx, nil, "true")
 		if err2 != nil {
 			t.Fatalf("Exec true: %v", err2)
 		}
