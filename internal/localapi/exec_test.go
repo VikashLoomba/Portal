@@ -7,7 +7,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/textproto"
@@ -15,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -174,6 +178,25 @@ func TestExecAuditOpenCloseOnce(t *testing.T) {
 	}
 }
 
+func TestExecEmptyArgvReturnsInvalidRequestWithoutUpgrade(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+
+	status, _, body := rawExecHTTP(t, path, nil)
+	if !strings.Contains(status, "400") {
+		t.Fatalf("status = %q, want 400", status)
+	}
+	if strings.Contains(status, "101") {
+		t.Fatalf("empty argv upgraded unexpectedly: %q", status)
+	}
+	var eb errorBody
+	if err := json.Unmarshal(body, &eb); err != nil {
+		t.Fatalf("decode error body %q: %v", string(body), err)
+	}
+	if eb.Error.Code != "invalid_request" {
+		t.Fatalf("error code = %q, want invalid_request", eb.Error.Code)
+	}
+}
+
 func TestExecClientDisconnectCancelsStream(t *testing.T) {
 	a := audit.New(t.TempDir())
 	path, _ := startExecServer(t, config.New(t.TempDir()), a, localexec.New())
@@ -193,6 +216,149 @@ func TestExecClientDisconnectCancelsStream(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("goroutines after disconnect = %d, baseline = %d", got, baseline)
+}
+
+func TestExecBridgeNoGoroutineLeakAcrossOrderings(t *testing.T) {
+	a := audit.New(t.TempDir())
+	path, _ := startExecServer(t, config.New(t.TempDir()), a, localexec.New())
+
+	warm := dialExecWS(t, path, []string{"printf", "warm"})
+	_ = readExecFramesUntilExit(t, warm, 2*time.Second)
+	_ = warm.Close()
+	baseline := settledGoroutines()
+
+	for i := 0; i < 5; i++ {
+		normal := dialExecWS(t, path, []string{"printf", "hello"})
+		frames := readExecFramesUntilExit(t, normal, 2*time.Second)
+		if got := joinFrameData(frames, ExecStreamStdout); got != "hello" {
+			normal.Close()
+			t.Fatalf("normal stdout = %q, want hello", got)
+		}
+		if got := lastExitCode(frames); got != 0 {
+			normal.Close()
+			t.Fatalf("normal exit = %d, want 0", got)
+		}
+		_ = normal.Close()
+
+		// The process sleeps longer than the settle window below. Passing this
+		// test proves the connection close cancels Stream instead of leaving
+		// bridge goroutines blocked until the remote command exits naturally.
+		disconnected := dialExecWS(t, path, []string{"sh", "-c", "'sleep 5; echo hi'"})
+		_ = disconnected.Close()
+
+		nonZero := dialExecWS(t, path, []string{"sh", "-c", "'exit 4'"})
+		frames = readExecFramesUntilExit(t, nonZero, 2*time.Second)
+		if got := lastExitCode(frames); got != 4 {
+			nonZero.Close()
+			t.Fatalf("non-zero exit = %d, want 4", got)
+		}
+		_ = nonZero.Close()
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var got int
+	for time.Now().Before(deadline) {
+		got = runtime.NumGoroutine()
+		if got <= baseline+8 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("goroutines after exec ordering stress = %d, baseline = %d, want <= baseline+8", got, baseline)
+}
+
+func TestExecBridgeDoesNotDoubleShellArgv(t *testing.T) {
+	src, err := os.ReadFile("exec.go")
+	if err != nil {
+		t.Fatalf("read exec.go: %v", err)
+	}
+	if bytes.Contains(src, []byte(`"sh", "-c"`)) {
+		t.Fatal(`exec.go contains bridge-level "sh", "-c" wrapping; argv must pass through to Stream`)
+	}
+	if !bytes.Contains(src, []byte("Stream(bctx, argv...)")) {
+		t.Fatal("exec.go does not contain Stream(bctx, argv...) passthrough")
+	}
+}
+
+func TestNoThirdPartyWebSocketImportsAndGoModPinned(t *testing.T) {
+	root := moduleRoot(t)
+
+	banned := map[string]bool{
+		"github.com/gorilla/websocket": true,
+		"nhooyr.io/websocket":          true,
+		"golang.org/x/net/websocket":   true,
+	}
+	for _, dir := range []string{"internal", "cmd"} {
+		err := filepath.WalkDir(filepath.Join(root, dir), func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() || filepath.Ext(path) != ".go" {
+				return nil
+			}
+			file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+			if err != nil {
+				return err
+			}
+			for _, imp := range file.Imports {
+				importPath := strings.Trim(imp.Path.Value, `"`)
+				if banned[importPath] {
+					t.Errorf("%s imports forbidden websocket package %q", path, importPath)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk %s: %v", dir, err)
+		}
+	}
+
+	// Stage 5 uses in-tree WebSocket framing: the require set stays pinned to
+	// main, including the Stage-4 x/crypto dependency and existing indirect
+	// x/net module, but no websocket subpackage dependency is introduced.
+	got := requiredModules(t, filepath.Join(root, "go.mod"))
+	want := map[string]bool{
+		"github.com/fxamacker/cbor/v2":         true,
+		"github.com/mdlayher/netlink":          true,
+		"github.com/spf13/cobra":               true,
+		"golang.org/x/crypto":                  true,
+		"golang.org/x/sys":                     true,
+		"github.com/google/go-cmp":             true,
+		"github.com/inconshreveable/mousetrap": true,
+		"github.com/mdlayher/socket":           true,
+		"github.com/spf13/pflag":               true,
+		"github.com/x448/float16":              true,
+		"golang.org/x/net":                     true,
+		"golang.org/x/sync":                    true,
+	}
+	if missing, extra := moduleSetDiff(want, got); len(missing) > 0 || len(extra) > 0 {
+		t.Fatalf("go.mod require set changed; missing=%v extra=%v", missing, extra)
+	}
+}
+
+func TestExecMalformedInboundFrameTearsDownSession(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	c := dialExecWS(t, path, []string{"cat"})
+	defer c.Close()
+
+	if _, err := c.Write(oversizedMaskedFrameHeader(wsMaxPayload + 1)); err != nil {
+		t.Fatalf("write oversized frame header: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		op, _, err := readServerFrame(c, time.Until(deadline))
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				break
+			}
+			return
+		}
+		if op == opClose {
+			return
+		}
+	}
+	t.Fatal("server did not close or end the exec session after malformed inbound frame")
 }
 
 type wsTestConn struct {
@@ -483,4 +649,85 @@ func waitAuditLines(t *testing.T, path string, want int, timeout time.Duration) 
 	b, _ := os.ReadFile(path)
 	t.Fatalf("audit log did not reach %d lines:\n%s", want, string(b))
 	return nil
+}
+
+func settledGoroutines() int {
+	last := runtime.NumGoroutine()
+	for i := 0; i < 5; i++ {
+		time.Sleep(20 * time.Millisecond)
+		now := runtime.NumGoroutine()
+		if now == last {
+			return now
+		}
+		last = now
+	}
+	return last
+}
+
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get cwd: %v", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("go.mod not found above test working directory")
+		}
+		dir = parent
+	}
+}
+
+func requiredModules(t *testing.T, path string) map[string]bool {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read go.mod: %v", err)
+	}
+	mods := make(map[string]bool)
+	inRequire := false
+	for _, line := range strings.Split(string(b), "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "" || strings.HasPrefix(trimmed, "//"):
+			continue
+		case strings.HasPrefix(trimmed, "require ("):
+			inRequire = true
+			continue
+		case inRequire && trimmed == ")":
+			inRequire = false
+			continue
+		case inRequire:
+			fields := strings.Fields(trimmed)
+			if len(fields) >= 2 {
+				mods[fields[0]] = true
+			}
+		case strings.HasPrefix(trimmed, "require "):
+			fields := strings.Fields(trimmed)
+			if len(fields) >= 3 {
+				mods[fields[1]] = true
+			}
+		}
+	}
+	return mods
+}
+
+func moduleSetDiff(want, got map[string]bool) (missing, extra []string) {
+	for mod := range want {
+		if !got[mod] {
+			missing = append(missing, mod)
+		}
+	}
+	for mod := range got {
+		if !want[mod] {
+			extra = append(extra, mod)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(extra)
+	return missing, extra
 }

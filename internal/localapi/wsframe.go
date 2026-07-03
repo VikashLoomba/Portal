@@ -161,14 +161,20 @@ func wsReadPayloadLen(r io.Reader, len7 byte) (uint64, error) {
 	}
 }
 
+// wsWriteBinary writes one unmasked, FIN-set binary server frame for a complete
+// message payload; callers must not pass fragmented message chunks.
 func wsWriteBinary(w io.Writer, payload []byte) error {
 	return wsWriteFrame(w, opBinary, payload)
 }
 
+// wsWritePong writes one unmasked server pong frame with the caller-supplied
+// control payload.
 func wsWritePong(w io.Writer, payload []byte) error {
 	return wsWriteFrame(w, opPong, payload)
 }
 
+// wsWriteClose writes one unmasked server close frame; the status code is
+// encoded in the two-byte RFC 6455 close payload prefix.
 func wsWriteClose(w io.Writer, code uint16, reason string) error {
 	payload := make([]byte, 2, 2+len(reason))
 	binary.BigEndian.PutUint16(payload, code)
@@ -176,6 +182,8 @@ func wsWriteClose(w io.Writer, code uint16, reason string) error {
 	return wsWriteFrame(w, opClose, payload)
 }
 
+// wsWriteFrame writes a single unfragmented server frame and never masks it;
+// RFC 6455 masking is required only on client-to-server frames.
 func wsWriteFrame(w io.Writer, op wsOpcode, payload []byte) error {
 	header := []byte{0x80 | byte(op)}
 	n := len(payload)

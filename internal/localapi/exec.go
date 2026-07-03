@@ -15,7 +15,7 @@ import (
 	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
-// ExecFrame is the X7 typed envelope carried in binary WebSocket frames.
+// ExecFrame is the X7 typed envelope carried in one binary WebSocket message.
 // stdin/stdout/stderr/error carry Data; exit carries Code.
 type ExecFrame struct {
 	Stream string `cbor:"s"`
@@ -23,8 +23,8 @@ type ExecFrame struct {
 	Code   int    `cbor:"c,omitempty"`
 }
 
-// ExecStream* names are the stable X7 stream vocabulary. Clients send only
-// stdin; servers send stdout, stderr, exit, and error.
+// ExecStream* names are the stable X7 stream vocabulary. Clients may send only
+// stdin; servers may send only stdout, stderr, exit, and error.
 const (
 	ExecStreamStdin  = "stdin"
 	ExecStreamStdout = "stdout"
@@ -33,13 +33,13 @@ const (
 	ExecStreamError  = "error"
 )
 
-// EncodeExecFrame returns the CBOR payload for one ExecFrame.
+// EncodeExecFrame returns the CBOR payload for exactly one ExecFrame envelope.
 func EncodeExecFrame(f ExecFrame) ([]byte, error) {
 	return cbor.Marshal(f)
 }
 
-// DecodeExecFrame decodes one CBOR ExecFrame and returns an error for malformed
-// input.
+// DecodeExecFrame decodes exactly one CBOR ExecFrame and rejects malformed
+// input before the bridge acts on it.
 func DecodeExecFrame(b []byte) (ExecFrame, error) {
 	var f ExecFrame
 	if err := cbor.Unmarshal(b, &f); err != nil {
@@ -48,6 +48,12 @@ func DecodeExecFrame(b []byte) (ExecFrame, error) {
 	return f, nil
 }
 
+// handleExec enforces the exec feature gate and non-empty argv before any
+// WebSocket upgrade; audits exactly one open and close with the peer uid; passes
+// argv verbatim to ExecStream.Stream per the T2 shell-join contract; binds the
+// stream context to the connection lifetime so client disconnect cancels the
+// remote Stream; and joins stdout/stderr copy goroutines, the WebSocket reader,
+// and wait before returning.
 func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	if s.deps.Config == nil || !s.deps.Config.FeatureEnabled(config.FeatureExec) {
 		writeError(w, http.StatusForbidden, "feature_disabled", "exec capability is disabled")
