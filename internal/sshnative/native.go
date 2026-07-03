@@ -507,8 +507,8 @@ func (c *Client) liveClient(ctx context.Context) (*ssh.Client, error) {
 }
 
 // Exec opens a session, runs the space-joined argv, feeds stdin, and captures
-// stdout/stderr. A non-zero remote exit maps to an error carrying the code and
-// trimmed stderr; stdout/stderr are still returned.
+// stdout/stderr. A non-zero remote exit maps to transport.ExitError with
+// best-effort signal and trimmed stderr; stdout/stderr are still returned.
 func (c *Client) Exec(ctx context.Context, stdin []byte, argv ...string) (string, string, error) {
 	client, err := c.liveClient(ctx)
 	if err != nil {
@@ -545,7 +545,11 @@ func (c *Client) Exec(ctx context.Context, stdin []byte, argv ...string) (string
 	}
 	var ee *ssh.ExitError
 	if errors.As(runErr, &ee) {
-		return stdout, stderr, fmt.Errorf("sshnative exit %d: %s", ee.ExitStatus(), strings.TrimSpace(stderr))
+		return stdout, stderr, &transport.ExitError{Code: ee.ExitStatus(), Signal: ee.Signal(), Stderr: strings.TrimSpace(stderr)}
+	}
+	var me *ssh.ExitMissingError
+	if errors.As(runErr, &me) {
+		return stdout, stderr, &transport.ExitError{Code: -1, Signal: "missing"}
 	}
 	return stdout, stderr, fmt.Errorf("sshnative: exec: %w", runErr)
 }
@@ -591,6 +595,10 @@ func (c *Client) Stream(ctx context.Context, argv ...string) (io.WriteCloser, io
 		sess.Close()
 		if ctx != nil && ctx.Err() != nil {
 			return ctx.Err()
+		}
+		var ee *ssh.ExitError
+		if errors.As(werr, &ee) {
+			return &transport.ExitError{Code: ee.ExitStatus(), Signal: ee.Signal()}
 		}
 		return werr
 	}

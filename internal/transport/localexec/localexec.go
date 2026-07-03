@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os/exec"
 	"strings"
@@ -43,7 +42,7 @@ func (l *Local) Health(ctx context.Context) (transport.Health, error) {
 
 // Exec joins argv and runs `sh -c <joined>` on this machine, feeding stdin and
 // capturing stdout/stderr. A non-zero exit (sh propagates the inner command's
-// status) returns an error mentioning the exit code and trimmed stderr; the
+// status) returns transport.ExitError with best-effort trimmed stderr; the
 // stdout/stderr strings are still returned.
 func (l *Local) Exec(ctx context.Context, stdin []byte, argv ...string) (string, string, error) {
 	cmd := exec.CommandContext(ctx, "sh", "-c", join(argv))
@@ -60,7 +59,7 @@ func (l *Local) Exec(ctx context.Context, stdin []byte, argv ...string) (string,
 	}
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
-		return stdout, stderr, fmt.Errorf("localexec exit %d: %s", ee.ExitCode(), strings.TrimSpace(stderr))
+		return stdout, stderr, &transport.ExitError{Code: ee.ExitCode(), Stderr: strings.TrimSpace(stderr)}
 	}
 	return stdout, stderr, err
 }
@@ -84,7 +83,14 @@ func (l *Local) Stream(ctx context.Context, argv ...string) (io.WriteCloser, io.
 	if err := cmd.Start(); err != nil {
 		return nil, nil, nil, nil, err
 	}
-	wait := func() error { return cmd.Wait() }
+	wait := func() error {
+		werr := cmd.Wait()
+		var ee *exec.ExitError
+		if errors.As(werr, &ee) {
+			return &transport.ExitError{Code: ee.ExitCode()}
+		}
+		return werr
+	}
 	return stdin, stdout, stderr, wait, nil
 }
 

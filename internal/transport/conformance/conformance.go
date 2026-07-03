@@ -84,6 +84,26 @@ func runCore(t *testing.T, newT func(t *testing.T) transport.Transport) {
 		}
 	})
 
+	t.Run("exit_code_typed", func(t *testing.T) {
+		tr := newT(t)
+		_, _, err := tr.Exec(ctx, nil, "sh", "-c", shellQuote("exit 3"))
+		if err == nil {
+			t.Fatal("Exec exit 3: want error, got nil")
+		}
+		code, ok := transport.ExitCode(err)
+		if !ok || code != 3 {
+			t.Errorf("ExitCode(err) = (%d, %v), want (3, true)", code, ok)
+		}
+		tr2 := newT(t)
+		_, _, err2 := tr2.Exec(ctx, nil, "true")
+		if err2 != nil {
+			t.Fatalf("Exec true: %v", err2)
+		}
+		if c2, ok2 := transport.ExitCode(err2); ok2 {
+			t.Errorf("ExitCode(nil err) = (%d, %v), want (0, false)", c2, ok2)
+		}
+	})
+
 	t.Run("exec_binary_stdin", func(t *testing.T) {
 		tr := newT(t)
 		payload := []byte{0x00, 0x01, 0xff, 0xfe, 0x0a, 0x7f, 0x80}
