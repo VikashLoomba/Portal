@@ -82,7 +82,10 @@ func (onceProbeTransport) Ensure(context.Context) (bool, error) { return false, 
 func (onceProbeTransport) Health(context.Context) (transport.Health, error) {
 	return transport.Health{Up: true, Pid: 1, Detail: "pid=1"}, nil
 }
-func (onceProbeTransport) Exec(_ context.Context, stdin []byte, _ ...string) (string, string, error) {
+func (onceProbeTransport) Exec(_ context.Context, stdin []byte, argv ...string) (string, string, error) {
+	if len(argv) > 0 && argv[0] == "uname" {
+		return "Linux x86_64\n", "", nil
+	}
 	if len(stdin) > 0 {
 		return "", "", nil
 	}

@@ -14,23 +14,6 @@ import (
 	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
-// agentDigest caches the sha256 of EmbeddedAgent() so the probe can
-// compare CONTENT, not just length. Without this a same-size on-disk file
-// (partial-write leftover, attacker swap, non-deterministic rebuild that
-// happened to land on the same length) would silently bypass re-upload.
-var (
-	agentDigestOnce sync.Once
-	agentDigest     string
-)
-
-func embeddedSHA256() string {
-	agentDigestOnce.Do(func() {
-		sum := sha256.Sum256(EmbeddedAgent())
-		agentDigest = hex.EncodeToString(sum[:])
-	})
-	return agentDigest
-}
-
 // shellQuoted wraps a shell script in single quotes, escaping any embedded
 // single quote with the standard close-escape-reopen sh idiom (the
 // ReplaceAll below). Required because ssh joins every argv argument after
@@ -57,6 +40,11 @@ const remoteDir = "~/.cache/portal"
 type Manager struct {
 	T   transport.Transport
 	Log *slog.Logger
+
+	archMu       sync.Mutex
+	probedArch   *artifact
+	probedBootID string
+	bootID       string
 }
 
 // New constructs a Manager. If log is nil, slog.Default() is used.
@@ -65,6 +53,41 @@ func New(t transport.Transport, log *slog.Logger) *Manager {
 		log = slog.Default()
 	}
 	return &Manager{T: t, Log: log}
+}
+
+// SetBootID records the last BootID reported by a successful HelloAck.
+func (m *Manager) SetBootID(id string) {
+	m.archMu.Lock()
+	m.bootID = id
+	m.archMu.Unlock()
+}
+
+func (m *Manager) selectArtifactCached(ctx context.Context) (artifact, error) {
+	m.archMu.Lock()
+	defer m.archMu.Unlock()
+
+	// A probe before any handshake has probedBootID=="". That UNKNOWN result
+	// adopts the first later non-empty boot ID without re-probing; only a
+	// change between two known non-empty BootIDs invalidates the cached arch.
+	reprobe := m.probedArch == nil || (m.probedBootID != "" && m.bootID != "" && m.bootID != m.probedBootID)
+	if !reprobe {
+		if m.probedBootID == "" && m.bootID != "" {
+			m.probedBootID = m.bootID
+		}
+		return *m.probedArch, nil
+	}
+
+	out, _, err := m.T.Exec(ctx, nil, "uname", "-sm")
+	if err != nil {
+		return artifact{}, err
+	}
+	art, err := selectArtifact(strings.TrimSpace(out))
+	if err != nil {
+		return artifact{}, err
+	}
+	m.probedArch = &art
+	m.probedBootID = m.bootID
+	return art, nil
 }
 
 // EnsureUploaded probes the dev box for the right agent binary and uploads
@@ -88,44 +111,22 @@ func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
 	if sha == "" {
 		return "", fmt.Errorf("bootstrap: embedded agent has no SHA — `make agent` must run before build")
 	}
-	agent := EmbeddedAgent()
-	if len(agent) == 0 {
+	art, err := m.selectArtifactCached(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(art.bytes) == 0 {
 		return "", fmt.Errorf("bootstrap: embedded agent is empty — `make agent` must run before build")
 	}
 
 	remotePath := remoteDir + "/agent-" + sha
-	expectedSize := strconv.Itoa(len(agent))
-	expectedDigest := embeddedSHA256()
-
-	// 1. Probe by content hash. We still gate on length first because
-	// sha256sum on a misshapen file is wasted IO. The probe prints a
-	// SINGLE line "<size> <digest>" or "MISSING" so parsing is trivial.
-	// Portable sha256 probe: tries sha256sum (Linux), then sha256 -q (FreeBSD/macOS),
-	// then openssl dgst -sha256 as a last resort.
-	probe := fmt.Sprintf(
-		`test -x %s && printf '%%s %%s' "$(stat -c %%s %s 2>/dev/null || stat -f %%z %s)" "$(sha256sum %s 2>/dev/null | awk '{print $1}' || sha256 -q %s 2>/dev/null || openssl dgst -sha256 -hex %s 2>/dev/null | awk '{print $NF}')" || echo MISSING`,
-		remotePath, remotePath, remotePath, remotePath, remotePath, remotePath,
-	)
-	out, _, err := m.T.Exec(ctx, nil, "bash", "-c", shellQuoted(probe))
-	if err == nil {
-		got := strings.TrimSpace(out)
-		want := expectedSize + " " + expectedDigest
-		if got == want {
-			m.Log.Debug("agent already present", "remote", remotePath, "sha", sha[:min(8, len(sha))])
-			return remotePath, nil
-		}
+	present, err := m.uploadVerified(ctx, remotePath, art.bytes, art.sha)
+	if err != nil {
+		return "", err
 	}
-
-	// 2. Upload atomically with size-verification before rename.
-	m.Log.Info("uploading agent", "remote", remotePath, "sha", sha[:min(8, len(sha))], "bytes", len(agent))
-	script := fmt.Sprintf(
-		// install -d creates the directory atomically at 0700 in one syscall,
-		// avoiding the mkdir-then-chmod window where the dir is briefly 0755.
-		`set -e; install -d -m 0700 %s && tmp=$(mktemp %s/.agent.tmp.XXXXXX) && trap 'rm -f "$tmp"' EXIT && cat > "$tmp" && [ "$(wc -c < "$tmp")" = "%s" ] && chmod 0755 "$tmp" && mv "$tmp" %s && trap - EXIT`,
-		remoteDir, remoteDir, expectedSize, remotePath,
-	)
-	if _, _, err := m.T.Exec(ctx, agent, "bash", "-c", shellQuoted(script)); err != nil {
-		return "", fmt.Errorf("bootstrap: upload failed: %w", err)
+	if present {
+		m.Log.Debug("agent already present", "remote", remotePath, "sha", sha[:min(8, len(sha))])
+		return remotePath, nil
 	}
 
 	// 3. Update the stable `portald` symlink so the xdg-open wrapper can
@@ -145,6 +146,57 @@ func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
 	_, _, _ = m.T.Exec(ctx, nil, "bash", "-c", shellQuoted(prune))
 
 	return remotePath, nil
+}
+
+// EnsureArtifact uploads content to a content-addressed path and points name at it.
+func (m *Manager) EnsureArtifact(ctx context.Context, name string, content []byte) (remotePath string, err error) {
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+	remotePath = remoteDir + "/" + name + "-" + digest
+
+	if _, err := m.uploadVerified(ctx, remotePath, content, digest); err != nil {
+		return "", err
+	}
+
+	symlink := fmt.Sprintf(`ln -sf %s %s/%s`, remotePath, remoteDir, name)
+	_, _, _ = m.T.Exec(ctx, nil, "bash", "-c", shellQuoted(symlink))
+	return remotePath, nil
+}
+
+func (m *Manager) uploadVerified(ctx context.Context, remotePath string, content []byte, digest string) (present bool, err error) {
+	expectedSize := strconv.Itoa(len(content))
+	expectedDigest := digest
+
+	// 1. Probe by content hash. We still gate on length first because
+	// sha256sum on a misshapen file is wasted IO. The probe prints a
+	// SINGLE line "<size> <digest>" or "MISSING" so parsing is trivial.
+	// Portable sha256 probe: tries sha256sum (Linux), then sha256 -q (FreeBSD/macOS),
+	// then openssl dgst -sha256 as a last resort.
+	probe := fmt.Sprintf(
+		`test -x %s && printf '%%s %%s' "$(stat -c %%s %s 2>/dev/null || stat -f %%z %s)" "$(sha256sum %s 2>/dev/null | awk '{print $1}' || sha256 -q %s 2>/dev/null || openssl dgst -sha256 -hex %s 2>/dev/null | awk '{print $NF}')" || echo MISSING`,
+		remotePath, remotePath, remotePath, remotePath, remotePath, remotePath,
+	)
+	out, _, err := m.T.Exec(ctx, nil, "bash", "-c", shellQuoted(probe))
+	if err == nil {
+		got := strings.TrimSpace(out)
+		want := expectedSize + " " + expectedDigest
+		if got == want {
+			return true, nil
+		}
+	}
+
+	// 2. Upload atomically with size-verification before rename.
+	m.Log.Info("uploading artifact", "remote", remotePath, "bytes", len(content))
+	script := fmt.Sprintf(
+		// install -d creates the directory atomically at 0700 in one syscall,
+		// avoiding the mkdir-then-chmod window where the dir is briefly 0755.
+		`set -e; install -d -m 0700 %s && tmp=$(mktemp %s/.agent.tmp.XXXXXX) && trap 'rm -f "$tmp"' EXIT && cat > "$tmp" && [ "$(wc -c < "$tmp")" = "%s" ] && chmod 0755 "$tmp" && mv "$tmp" %s && trap - EXIT`,
+		remoteDir, remoteDir, expectedSize, remotePath,
+	)
+	if _, _, err := m.T.Exec(ctx, content, "bash", "-c", shellQuoted(script)); err != nil {
+		return false, fmt.Errorf("bootstrap: upload failed: %w", err)
+	}
+	return false, nil
 }
 
 // PruneAll removes every agent-* file and the clipboard-image cache dir from
