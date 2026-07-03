@@ -438,6 +438,58 @@ func TestProxyJumpHopCap(t *testing.T) {
 	assertNothingStored(t, c)
 }
 
+func nestedProxyJumpFake(hops int, target ResolvedHost) fakeResolver {
+	fake := fakeResolver{}
+	if hops > 0 {
+		target.ProxyJump = "h1"
+	}
+	fake["target"] = target
+	for i := 1; i <= hops; i++ {
+		tok := fmt.Sprintf("h%d", i)
+		rh := ResolvedHost{User: "testuser", HostName: "127.0.0.1", Port: i}
+		if i < hops {
+			rh.ProxyJump = fmt.Sprintf("h%d", i+1)
+		}
+		fake[tok] = rh
+	}
+	return fake
+}
+
+// TestProxyJumpNestedHopCap proves a depth-first nested chain exceeding
+// maxProxyHops is rejected before any hop is appended or dialed.
+func TestProxyJumpNestedHopCap(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	clientPriv, clientSigner := generateKeyPair(t)
+	target := newTestServer(t, clientSigner.PublicKey())
+	listener := startBlackholeListener(t)
+	defer listener.close()
+	tHost, tPort := serverEndpoint(t, target)
+	hHost, hPort := listener.endpoint(t)
+	fake := nestedProxyJumpFake(maxProxyHops+1, ResolvedHost{User: "testuser", HostName: tHost, Port: tPort})
+	for tok, rh := range fake {
+		if tok == "target" {
+			continue
+		}
+		rh.HostName = hHost
+		rh.Port = hPort
+		fake[tok] = rh
+	}
+	kh := writeKnownHostsLines(t, target)
+	keyFile := writeIdentityFile(t, clientPriv)
+	c := newProxyClient(t, fake, keyFile, kh)
+
+	if _, err := c.Ensure(ctx); err == nil {
+		t.Fatal("Ensure with nested over-cap chain: want error, got nil")
+	} else if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %v, want hop-cap error mentioning 'exceeds'", err)
+	}
+	if got := listener.acceptCount(); got != 0 {
+		t.Errorf("hop listener accepts = %d, want 0 (rejected before dial)", got)
+	}
+	assertNothingStored(t, c)
+}
+
 // TestProxyJumpCycleGuard (EC12) proves the visited-set catches a recursion
 // cycle — a hop whose own ProxyJump points back at itself — not just a flat
 // repeat, and stores nothing.
@@ -604,6 +656,28 @@ func TestProxyJumpHopCapPositiveBoundary(t *testing.T) {
 	}
 	if strings.TrimSpace(stdout) != "hi" {
 		t.Errorf("Exec stdout = %q, want %q", stdout, "hi")
+	}
+}
+
+// TestProxyJumpNestedHopCapPositiveBoundary proves a nested chain of EXACTLY
+// maxProxyHops hops is accepted by the pre-recursion cap.
+func TestProxyJumpNestedHopCapPositiveBoundary(t *testing.T) {
+	ctx := context.Background()
+	fake := nestedProxyJumpFake(maxProxyHops, ResolvedHost{User: "testuser", HostName: "127.0.0.1", Port: 22})
+	c := &Client{proxyJump: fake["target"].ProxyJump, resolver: fake.resolve}
+
+	chain, err := c.expandJumpChain(ctx)
+	if err != nil {
+		t.Fatalf("expandJumpChain of nested maxProxyHops: %v", err)
+	}
+	if len(chain) != maxProxyHops {
+		t.Fatalf("chain length = %d, want maxProxyHops=%d", len(chain), maxProxyHops)
+	}
+	for i, rh := range chain {
+		wantPort := maxProxyHops - i
+		if rh.Port != wantPort {
+			t.Fatalf("chain[%d].Port = %d, want %d", i, rh.Port, wantPort)
+		}
 	}
 }
 

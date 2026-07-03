@@ -146,6 +146,38 @@ func runCore(t *testing.T, newT func(t *testing.T) transport.Transport) {
 		}
 	})
 
+	t.Run("stream_nonzero_exit_typed", func(t *testing.T) {
+		tr := newT(t)
+		stdin, stdout, stderr, wait, err := tr.Stream(ctx, "sh", "-c", shellQuote("exit 3"))
+		if err != nil {
+			t.Fatalf("Stream exit 3: %v", err)
+		}
+		if err := stdin.Close(); err != nil {
+			t.Fatalf("close stdin: %v", err)
+		}
+		if out, err := io.ReadAll(stdout); err != nil {
+			t.Fatalf("drain stdout: %v", err)
+		} else if len(out) != 0 {
+			t.Errorf("stdout = %q, want empty", out)
+		}
+		if errOut, err := io.ReadAll(stderr); err != nil {
+			t.Fatalf("drain stderr: %v", err)
+		} else if len(errOut) != 0 {
+			t.Errorf("stderr = %q, want empty", errOut)
+		}
+		werr := wait()
+		if werr == nil {
+			t.Fatal("wait exit 3: want error, got nil")
+		}
+		code, ok := transport.ExitCode(werr)
+		if !ok || code != 3 {
+			t.Errorf("ExitCode(wait err) = (%d, %v), want (3, true)", code, ok)
+		}
+		if msg := werr.Error(); msg == "" || !strings.Contains(msg, "3") {
+			t.Errorf("wait error = %q, want non-empty message mentioning 3", msg)
+		}
+	})
+
 	t.Run("ensure_idempotent", func(t *testing.T) {
 		tr := newT(t)
 		if _, err := tr.Ensure(ctx); err != nil {

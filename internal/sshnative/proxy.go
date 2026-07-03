@@ -9,8 +9,9 @@ package sshnative
 // through its own jumps FIRST (matching OpenSSH) — under a per-branch
 // ancestor-path cycle guard + hop-cap whose termination is guaranteed: the
 // ancestor path rejects a hop that is its own ancestor (a true loop) while
-// allowing a hop shared by two sibling branches, and the cap bounds a runaway
-// resolver, both aborting with nothing dialed. Every hop enforces STRICT
+// allowing a hop shared by two sibling branches, and the cap counts every hop
+// occurrence before recursive descent so a runaway resolver cannot recurse or
+// dial without bound. Both abort with nothing dialed. Every hop enforces STRICT
 // host-key verification keyed by the RAW net.JoinHostPort query address — the
 // same locked mechanic New uses for the target: net.JoinHostPort(alias,"22")
 // when the hop has a HostKeyAlias, else net.JoinHostPort(host,port); NEVER a
@@ -39,8 +40,9 @@ import (
 )
 
 const (
-	// maxProxyHops caps the flattened ProxyJump chain length so a runaway config
-	// (or a resolver that keeps chaining) cannot dial without bound.
+	// maxProxyHops caps total ProxyJump hop occurrences in the flattened chain,
+	// counted before recursive descent, so flat and nested configs cannot dial or
+	// recurse without bound.
 	maxProxyHops = 10
 	// proxyCommandStderrLimit caps helper diagnostics so a chatty or looping
 	// ProxyCommand cannot grow memory without bound; the tail is kept because the
@@ -91,19 +93,22 @@ func portOr22(p int) int {
 // (OpenSSH dials it once per branch through its own connection context — e.g.
 // `target -> a,b` with `a -> bastion` and `b -> bastion` flattens to
 // [bastion,a,bastion,b], each direct-tcpip hop reaching the next), whereas a hop
-// that is its own ancestor IS a cycle and aborts. The ancestor path can hold no
-// repeat, so recursion depth is bounded by the distinct-host count; the hop-cap
-// bounds the flattened length against a runaway (diamond) config. Both return a
-// clear error and leave nothing dialed.
+// that is its own ancestor IS a cycle and aborts. The hop-cap counts every token
+// occurrence at loop entry, before resolving it or descending into its own
+// ProxyJump, so flat and nested chains longer than maxProxyHops fail before any
+// dial and before recursion can grow past the cap. Both return a clear error and
+// leave nothing dialed.
 func (c *Client) expandJumpChain(ctx context.Context) ([]ResolvedHost, error) {
 	var chain []ResolvedHost
+	resolvedHops := 0
 	var expand func(jump string, ancestors map[string]bool) error
 	expand = func(jump string, ancestors map[string]bool) error {
 		for _, token := range splitJumpList(jump) {
 			if ancestors[token] {
 				return fmt.Errorf("sshnative: proxyjump cycle at %q", token)
 			}
-			if len(chain) >= maxProxyHops {
+			resolvedHops++
+			if resolvedHops > maxProxyHops {
 				return fmt.Errorf("sshnative: proxyjump exceeds %d hops", maxProxyHops)
 			}
 			rh, err := c.resolver(ctx, token)
