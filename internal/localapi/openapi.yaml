@@ -48,4 +48,4 @@ paths:
       summary: Run the doctor self-test; returns the structured report.
   /v1/exec:
     post:
-      summary: Upgrade to a WebSocket exec stream over the local Unix socket.
+      summary: Upgrade to a WebSocket exec stream over the local Unix socket; argv is carried as repeated arg query parameters and binary messages are CBOR ExecFrame envelopes with stdin/stdout/stderr/exit/error stream kinds, where zero-length stdin means EOF and 403 feature_disabled is returned when the exec gate is off.
