@@ -25,6 +25,7 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/audit"
 	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/transport"
 	"github.com/VikashLoomba/Portal/internal/transport/localexec"
 )
 
@@ -359,6 +360,101 @@ func TestExecMalformedInboundFrameTearsDownSession(t *testing.T) {
 		}
 	}
 	t.Fatal("server did not close or end the exec session after malformed inbound frame")
+}
+
+func TestExecReaderCloseReleasesBlockedOutputWriter(t *testing.T) {
+	a := audit.New(t.TempDir())
+	streamer := &blockedOutputExecStreamer{waitCalled: make(chan struct{})}
+	s := New(Deps{
+		Version:    VersionInfo{Version: "9.9"},
+		Config:     config.New(t.TempDir()),
+		ExecStream: streamer,
+		Audit:      a,
+	})
+
+	server, client := net.Pipe()
+	defer client.Close()
+	w := newHijackResponseWriter(server)
+	r := wsUpgradeRequest("dGhlIHNhbXBsZSBub25jZQ==")
+	r.Method = http.MethodPost
+	q := r.URL.Query()
+	q.Add("arg", "spammer")
+	r.URL.RawQuery = q.Encode()
+
+	done := make(chan struct{})
+	go func() {
+		s.handleExec(w, r)
+		close(done)
+	}()
+
+	br := bufio.NewReader(client)
+	tp := textproto.NewReader(br)
+	status, err := tp.ReadLine()
+	if err != nil {
+		t.Fatalf("read upgrade status: %v", err)
+	}
+	if status != "HTTP/1.1 101 Switching Protocols" {
+		t.Fatalf("upgrade status = %q, want 101", status)
+	}
+	if _, err := tp.ReadMIMEHeader(); err != nil {
+		t.Fatalf("read upgrade headers: %v", err)
+	}
+
+	if err := client.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set write deadline: %v", err)
+	}
+	if err := writeClientFrame(client, opClose, []byte{0x03, 0xe8}); err != nil {
+		t.Fatalf("write close frame: %v", err)
+	}
+	if err := client.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear write deadline: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleExec did not return after client close with blocked output writer")
+	}
+	select {
+	case <-streamer.waitCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream wait was not called")
+	}
+	lines := waitAuditLines(t, a.Path(), 2, 2*time.Second)
+	if !strings.Contains(lines[len(lines)-1], "\texec-close\t") {
+		t.Fatalf("last audit line = %q, want exec-close", lines[len(lines)-1])
+	}
+}
+
+type blockedOutputExecStreamer struct {
+	waitCalled chan struct{}
+}
+
+func (s *blockedOutputExecStreamer) Stream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+	wait := func() error {
+		close(s.waitCalled)
+		return nil
+	}
+	return nopWriteCloser{}, io.NopCloser(infiniteReader{}), io.NopCloser(bytes.NewReader(nil)), wait, nil
+}
+
+func (s *blockedOutputExecStreamer) Describe() transport.Desc {
+	return transport.Desc{Impl: "test", Host: "blocked-output", Endpoint: "net.Pipe"}
+}
+
+type nopWriteCloser struct{}
+
+func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+
+func (nopWriteCloser) Close() error { return nil }
+
+type infiniteReader struct{}
+
+func (infiniteReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
 }
 
 type wsTestConn struct {

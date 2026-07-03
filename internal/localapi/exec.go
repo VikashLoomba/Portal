@@ -134,6 +134,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	// canceling a local CommandContext before Wait can mask a clean exit.
 	if readClosed {
 		cancel()
+		_ = conn.Close()
 	}
 	_ = stdin.Close()
 	for copiesDone < 2 {

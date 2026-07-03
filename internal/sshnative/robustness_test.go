@@ -2,10 +2,14 @@ package sshnative
 
 import (
 	"context"
+	"errors"
+	"io"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
 // dialedTestClient starts an in-process T6 server, points a native Client at it
@@ -13,9 +17,13 @@ import (
 // nothing touches the runner's real ~/.ssh, Ensures it, and returns the connected
 // client. It fails the test on any setup error.
 func dialedTestClient(t *testing.T) *Client {
+	return dialedTestClientWithServerOptions(t)
+}
+
+func dialedTestClientWithServerOptions(t *testing.T, opts ...serverOption) *Client {
 	t.Helper()
 	clientPriv, clientSigner := generateKeyPair(t)
-	srv := newTestServer(t, clientSigner.PublicKey())
+	srv := newTestServer(t, clientSigner.PublicKey(), opts...)
 	kh := writeKnownHosts(t, srv.knownHostsLine())
 	keyFile := writeIdentityFile(t, clientPriv)
 
@@ -97,6 +105,37 @@ func TestStreamHonorsContextCancel(t *testing.T) {
 	}
 	if ctx.Err() == nil {
 		t.Fatal("ctx should be canceled")
+	}
+}
+
+func TestStreamMapsMissingExitStatus(t *testing.T) {
+	c := dialedTestClientWithServerOptions(t, withMissingSessionExitStatus())
+
+	stdin, stdout, stderr, wait, err := c.Stream(context.Background(), "true")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if err := stdin.Close(); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("close stdin: %v", err)
+	}
+	if out, err := io.ReadAll(stdout); err != nil {
+		t.Fatalf("drain stdout: %v", err)
+	} else if len(out) != 0 {
+		t.Fatalf("stdout = %q, want empty", out)
+	}
+	if errOut, err := io.ReadAll(stderr); err != nil {
+		t.Fatalf("drain stderr: %v", err)
+	} else if len(errOut) != 0 {
+		t.Fatalf("stderr = %q, want empty", errOut)
+	}
+
+	werr := wait()
+	var exitErr *transport.ExitError
+	if !errors.As(werr, &exitErr) {
+		t.Fatalf("wait error = %T %[1]v, want *transport.ExitError", werr)
+	}
+	if exitErr.Code != -1 || exitErr.Signal != "missing" {
+		t.Fatalf("ExitError = %+v, want code -1 signal missing", exitErr)
 	}
 }
 

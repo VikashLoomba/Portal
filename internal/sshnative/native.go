@@ -600,6 +600,10 @@ func (c *Client) Stream(ctx context.Context, argv ...string) (io.WriteCloser, io
 		if errors.As(werr, &ee) {
 			return &transport.ExitError{Code: ee.ExitStatus(), Signal: ee.Signal()}
 		}
+		var me *ssh.ExitMissingError
+		if errors.As(werr, &me) {
+			return &transport.ExitError{Code: -1, Signal: "missing"}
+		}
 		return werr
 	}
 	// ssh.Session pipes are io.Reader; adapt to io.ReadCloser (session Close, in
