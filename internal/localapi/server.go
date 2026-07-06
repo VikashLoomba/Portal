@@ -40,7 +40,7 @@ type Server struct {
 // the route table into the mux via Go 1.22 method patterns.
 func New(deps Deps) *Server {
 	if len(deps.FeatureNames) == 0 {
-		deps.FeatureNames = []string{config.FeatureClipImage, config.FeatureClipText, config.FeatureNotify}
+		deps.FeatureNames = []string{config.FeatureClipImage, config.FeatureClipText, config.FeatureNotify, config.FeatureExec}
 	}
 	s := &Server{
 		deps:         deps,
@@ -71,6 +71,7 @@ func (s *Server) registerRoutes() []route {
 		{http.MethodPut, "/v1/features/{name}", s.handleFeaturePut},
 		{http.MethodPost, "/v1/reconcile", s.handleReconcile},
 		{http.MethodPost, "/v1/doctor", s.handleDoctor},
+		{http.MethodPost, "/v1/exec", s.handleExec},
 	}
 }
 
@@ -152,6 +153,11 @@ type peerCredListener struct {
 	uidOf func(*net.UnixConn) (int, error)
 }
 
+type uidConn struct {
+	net.Conn
+	uid int
+}
+
 // Accept returns the next connection from a same-uid peer, transparently
 // closing and skipping mismatched or unreadable peers.
 func (l *peerCredListener) Accept() (net.Conn, error) {
@@ -173,9 +179,11 @@ func (l *peerCredListener) Accept() (net.Conn, error) {
 			c.Close()
 			continue
 		}
-		return c, nil
+		return &uidConn{Conn: c, uid: uid}, nil
 	}
 }
+
+type peerUIDKey struct{}
 
 // Serve runs the HTTP server on ln until ctx is cancelled, then shuts down with
 // a short deadline and unlinks the socket (best-effort). Bind/serve errors
@@ -192,6 +200,12 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		// returns, net/http finalizes the chunked body (clean EOF to the client),
 		// and Shutdown then reaps the now-idle conn.
 		BaseContext: func(net.Listener) context.Context { return ctx },
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if uc, ok := c.(*uidConn); ok {
+				return context.WithValue(ctx, peerUIDKey{}, uc.uid)
+			}
+			return ctx
+		},
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()

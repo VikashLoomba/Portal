@@ -216,7 +216,10 @@ func (p *probeOKTransport) Ensure(context.Context) (bool, error) { return false,
 func (p *probeOKTransport) Health(context.Context) (transport.Health, error) {
 	return transport.Health{Up: true, Pid: 1, Detail: "pid=1"}, nil
 }
-func (p *probeOKTransport) Exec(_ context.Context, _ []byte, _ ...string) (string, string, error) {
+func (p *probeOKTransport) Exec(_ context.Context, _ []byte, argv ...string) (string, string, error) {
+	if len(argv) > 0 && argv[0] == "uname" {
+		return "Linux x86_64\n", "", nil
+	}
 	return fmt.Sprintf("%d\n", len(bootstrap.EmbeddedAgent())), "", nil
 }
 func (p *probeOKTransport) Close(context.Context) (bool, error) { return false, nil }

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -78,6 +79,16 @@ func (l *Log) NotifyDenied(host, reason string) {
 // OpenURL records that a URL was opened on the Mac at the remote's request.
 func (l *Log) OpenURL(host, url string) {
 	l.write("open-url", "host="+host, "url="+oneLine(url))
+}
+
+// ExecOpen records that an exec WebSocket session was opened by peer uid.
+func (l *Log) ExecOpen(host, argv string, uid int) {
+	l.write("exec-open", "host="+host, "uid="+strconv.Itoa(uid), "argv="+oneLine(argv))
+}
+
+// ExecClose records the exec session result exactly once at stream teardown.
+func (l *Log) ExecClose(host string, code int, errStr string, dur time.Duration) {
+	l.write("exec-close", "host="+host, fmt.Sprintf("code=%d", code), "err="+oneLine(errStr), "dur="+dur.String())
 }
 
 // write appends one tab-separated, timestamped line. Best-effort: on any error

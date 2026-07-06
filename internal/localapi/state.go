@@ -7,7 +7,9 @@ package localapi
 
 import (
 	"context"
+	"io"
 
+	"github.com/VikashLoomba/Portal/internal/audit"
 	"github.com/VikashLoomba/Portal/internal/doctor"
 	"github.com/VikashLoomba/Portal/internal/hub"
 	"github.com/VikashLoomba/Portal/internal/protocol"
@@ -126,10 +128,18 @@ type ConfigStore interface {
 	SetFeature(feature string, on bool) error
 }
 
+// ExecStreamer is the live byte-stream command capability. The argv contract is
+// Transport.Stream's shell-join contract; callers must pass argv through
+// verbatim without adding another shell.
+type ExecStreamer interface {
+	Stream(ctx context.Context, argv ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error)
+	Describe() transport.Desc
+}
+
 // Deps is the dependency set for a Server. The interface fields are narrow so
 // tests fake them without constructing an App; Doctor/PushAllow/Kick are
 // closures wired by run.go so localapi never imports package app. FeatureNames
-// defaults to [clip-image, clip-text, notify] when empty.
+// defaults to [clip-image, clip-text, notify, exec] when empty.
 type Deps struct {
 	Version      VersionInfo
 	Host         func() (string, error)
@@ -139,6 +149,8 @@ type Deps struct {
 	Service      ServiceStater
 	Config       ConfigStore
 	Hub          *hub.Hub
+	ExecStream   ExecStreamer
+	Audit        *audit.Log
 	PushAllow    func([]int) error
 	Kick         func()
 	ReconcileGen func() uint64

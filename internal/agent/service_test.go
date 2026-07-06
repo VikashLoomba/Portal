@@ -91,6 +91,17 @@ func (f *fakeService) handledKinds() []string {
 	return out
 }
 
+type fakeCallService struct {
+	name string
+}
+
+func (f fakeCallService) Name() string                      { return f.name }
+func (f fakeCallService) Version() uint32                   { return 1 }
+func (f fakeCallService) MaxPayload() int                   { return 4096 }
+func (f fakeCallService) OutboxCap() int                    { return 8 }
+func (f fakeCallService) Verbs() []Verb                     { return nil }
+func (f fakeCallService) HandleMsg(string, cbor.RawMessage) {}
+
 // fakeAddr satisfies net.Addr for fakeConn.
 type fakeAddr struct{}
 
@@ -138,6 +149,40 @@ func waitWaiters(t *testing.T, r *registry, n int) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("waiter count never reached %d (got %d)", n, got)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitInflight(t *testing.T, r *registry, service string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		r.waiterMu.Lock()
+		got := r.inflight[service]
+		r.waiterMu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("inflight count for %q never reached %d (got %d)", service, want, got)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitInflightAbsent(t *testing.T, r *registry, service string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		r.waiterMu.Lock()
+		got, ok := r.inflight[service]
+		r.waiterMu.Unlock()
+		if !ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("inflight count for %q never cleaned up (got %d)", service, got)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -323,6 +368,56 @@ func TestRegistry_CallNoWaiterCapacity(t *testing.T) {
 	}
 	// Unblock the first waiter so its goroutine exits cleanly.
 	r.completeCall(n1, r.epoch(), nil)
+}
+
+func TestPerServiceWaiterBudgetIndependent(t *testing.T) {
+	r := newRegistry(nil)
+	r.register(fakeCallService{name: "A"})
+	r.register(fakeCallService{name: "B"})
+
+	const capA = 2
+	const capB = 2
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	errCh := make(chan error, capA)
+	for i := 0; i < capA; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := r.call(ctx, "A", "req", 2*time.Second, capA, r.nextNonce(), nil)
+			errCh <- err
+		}()
+	}
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+
+	waitInflight(t, r, "A", capA)
+
+	_, err := r.call(context.Background(), "A", "req", 2*time.Second, capA, r.nextNonce(), nil)
+	if !errors.Is(err, ErrNoWaiterCapacity) {
+		t.Fatalf("want ErrNoWaiterCapacity for saturated service A, got %v", err)
+	}
+
+	_, err = r.call(context.Background(), "B", "req", 50*time.Millisecond, capB, r.nextNonce(), nil)
+	if errors.Is(err, ErrNoWaiterCapacity) {
+		t.Fatalf("service B was rejected by service A's waiter budget: %v", err)
+	}
+	if !errors.Is(err, ErrCallTimeout) {
+		t.Fatalf("want service B call to proceed until ErrCallTimeout, got %v", err)
+	}
+
+	cancel()
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("want parked service A call to return context.Canceled, got %v", err)
+		}
+	}
+	waitInflightAbsent(t, r, "A")
 }
 
 func TestRegistry_CallStaleEpochDropped(t *testing.T) {

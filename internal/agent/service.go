@@ -20,8 +20,8 @@ import (
 // Sentinel errors returned by the registry's Call helper (the lifted clip
 // request/response machinery, DESIGN S9).
 var (
-	// ErrNoWaiterCapacity is returned by call when the outstanding-waiter count
-	// has already hit maxInflight (the DoS guard generalizing maxInflightClip).
+	// ErrNoWaiterCapacity is returned by call when the service's waiter count has
+	// already hit maxInflight (the DoS guard generalizing maxInflightClip).
 	ErrNoWaiterCapacity = errors.New("agent: call waiter capacity exceeded")
 	// ErrCallTimeout is returned by call when no matching completeCall arrives
 	// before the per-call timeout (or the request could not be admitted to the
@@ -109,6 +109,7 @@ type registry struct {
 
 	waiterMu sync.Mutex
 	waiters  map[uint64]chan cbor.RawMessage
+	inflight map[string]int
 }
 
 // newRegistry constructs an empty registry. hasClientFn is left nil (bound
@@ -122,6 +123,7 @@ func newRegistry(log *slog.Logger) *registry {
 		svcs:     map[string]*serviceEntry{},
 		claims:   map[string]*serviceEntry{},
 		waiters:  map[uint64]chan cbor.RawMessage{},
+		inflight: map[string]int{},
 		outboxCh: make(chan *protocol.Envelope), // resized on register
 		ep:       newEpoch(),
 	}
@@ -341,24 +343,29 @@ func (r *registry) epoch() uint64 { return r.ep }
 func (r *registry) nextNonce() uint64 { return atomic.AddUint64(&r.nonce, 1) }
 
 // call is the lifted clip request/response machinery (DESIGN S9). ctx is the
-// Serve ctx threaded through Verb.Handle. If outstanding waiters already hit
+// Serve ctx threaded through Verb.Handle. If the service's waiters already hit
 // maxInflight it returns ErrNoWaiterCapacity; otherwise it registers a
 // buffered-1 waiter keyed by nonce, emits the request, and waits for the waiter,
 // ctx, or timeout (ErrCallTimeout / ctx.Err on the adverse paths). The waiter is
 // always deleted on exit so a late/duplicate completeCall is dropped.
 func (r *registry) call(ctx context.Context, service, kind string, timeout time.Duration, maxInflight int, nonce uint64, payload cbor.RawMessage) (cbor.RawMessage, error) {
 	r.waiterMu.Lock()
-	if len(r.waiters) >= maxInflight {
+	if r.inflight[service] >= maxInflight {
 		r.waiterMu.Unlock()
 		return nil, ErrNoWaiterCapacity
 	}
 	ch := make(chan cbor.RawMessage, 1)
+	r.inflight[service]++
 	r.waiters[nonce] = ch
 	r.waiterMu.Unlock()
 
 	defer func() {
 		r.waiterMu.Lock()
 		delete(r.waiters, nonce)
+		r.inflight[service]--
+		if r.inflight[service] == 0 {
+			delete(r.inflight, service)
+		}
 		r.waiterMu.Unlock()
 	}()
 

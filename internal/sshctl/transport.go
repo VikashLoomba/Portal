@@ -223,7 +223,7 @@ func (s *SSH) Exec(ctx context.Context, stdin []byte, argv ...string) (string, s
 		return stdoutStr, stderrStr, err
 	}
 	if code != 0 {
-		return stdoutStr, stderrStr, fmt.Errorf("ssh exec exit %d: %s", code, strings.TrimSpace(stderrStr))
+		return stdoutStr, stderrStr, &transport.ExitError{Code: code, Stderr: strings.TrimSpace(stderrStr)}
 	}
 	s.teeStderr(stderrStr)
 	return stdoutStr, stderrStr, nil
@@ -259,7 +259,14 @@ func (s *SSH) Stream(ctx context.Context, argv ...string) (io.WriteCloser, io.Re
 	if err := cmd.Start(); err != nil {
 		return nil, nil, nil, nil, err
 	}
-	wait := func() error { return cmd.Wait() }
+	wait := func() error {
+		werr := cmd.Wait()
+		var ee *exec.ExitError
+		if errors.As(werr, &ee) {
+			return &transport.ExitError{Code: ee.ExitCode()}
+		}
+		return werr
+	}
 	return stdin, stdout, stderr, wait, nil
 }
 

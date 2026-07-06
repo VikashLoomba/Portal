@@ -61,6 +61,7 @@ func newRootCmd(a *app.App) *cobra.Command {
 	root.AddCommand(newUnallowCmd(a))
 	root.AddCommand(newAllowedCmd(a))
 	root.AddCommand(newFeaturesCmd(a))
+	root.AddCommand(newExecCmd(a))
 	root.AddCommand(newSSHCmd(a))
 	root.AddCommand(newClipCheckCmd(a))
 	root.AddCommand(newDoctorCmd(a))

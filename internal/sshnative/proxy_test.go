@@ -64,6 +64,13 @@ func writeKnownHostsLines(t *testing.T, servers ...*testServer) string {
 // disabled, and any extra options. It does NOT Ensure.
 func newProxyClient(t *testing.T, fake fakeResolver, keyFile, kh string, extra ...Option) *Client {
 	t.Helper()
+	c := newProxyClientNoCleanup(t, fake, keyFile, kh, extra...)
+	t.Cleanup(func() { c.Close(context.Background()) })
+	return c
+}
+
+func newProxyClientNoCleanup(t *testing.T, fake fakeResolver, keyFile, kh string, extra ...Option) *Client {
+	t.Helper()
 	opts := []Option{
 		WithConfigResolver(fake.resolve),
 		WithKnownHostsPath(kh),
@@ -75,8 +82,105 @@ func newProxyClient(t *testing.T, fake fakeResolver, keyFile, kh string, extra .
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { c.Close(context.Background()) })
 	return c
+}
+
+// blackholeListener accepts TCP and keeps each conn open without speaking SSH.
+// Cleanup is explicit so timeout tests can close it before closing a client that
+// may be blocked in Ensure on a regression.
+type blackholeListener struct {
+	ln net.Listener
+
+	mu      sync.Mutex
+	conns   []net.Conn
+	accepts int
+
+	accepted     chan struct{}
+	acceptedOnce sync.Once
+	closeOnce    sync.Once
+}
+
+func startBlackholeListener(t *testing.T) *blackholeListener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("blackhole listen: %v", err)
+	}
+	b := &blackholeListener{ln: ln, accepted: make(chan struct{})}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			b.mu.Lock()
+			b.conns = append(b.conns, conn)
+			b.accepts++
+			b.mu.Unlock()
+			b.acceptedOnce.Do(func() { close(b.accepted) })
+		}
+	}()
+	return b
+}
+
+func (b *blackholeListener) endpoint(t *testing.T) (string, int) {
+	t.Helper()
+	host, portStr, err := net.SplitHostPort(b.ln.Addr().String())
+	if err != nil {
+		t.Fatalf("split blackhole addr %q: %v", b.ln.Addr().String(), err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("parse blackhole port %q: %v", portStr, err)
+	}
+	return host, port
+}
+
+func (b *blackholeListener) acceptCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.accepts
+}
+
+func (b *blackholeListener) close() {
+	b.closeOnce.Do(func() {
+		b.ln.Close()
+		b.mu.Lock()
+		conns := append([]net.Conn(nil), b.conns...)
+		b.mu.Unlock()
+		for _, conn := range conns {
+			conn.Close()
+		}
+	})
+}
+
+func ensureErrorWithin(t *testing.T, c *Client, ctx context.Context, limit time.Duration, onTimeout func()) (error, time.Duration) {
+	t.Helper()
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := c.Ensure(ctx)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("Ensure: want error, got nil")
+		}
+		return err, elapsed
+	case <-time.After(limit):
+		if onTimeout != nil {
+			onTimeout()
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("Ensure did not return within %s; returned after timeout cleanup with %v", limit, err)
+		case <-time.After(time.Second):
+			t.Fatalf("Ensure did not return within %s", limit)
+		}
+	}
+	return nil, 0
 }
 
 // --- ProxyJump ---
@@ -111,6 +215,99 @@ func TestProxyJumpTwoHopExec(t *testing.T) {
 	if !contains(a.directDials(), b.addr) {
 		t.Errorf("jump A directDials = %v, want to contain target %q", a.directDials(), b.addr)
 	}
+}
+
+// TestProxyJumpBlackHoleHopHandshakeHonorsContext proves a first hop that accepts
+// TCP but never speaks SSH is bounded by the caller ctx, not the 15s dialTimeout.
+func TestProxyJumpBlackHoleHopHandshakeHonorsContext(t *testing.T) {
+	clientPriv, clientSigner := generateKeyPair(t)
+	target := newTestServer(t, clientSigner.PublicKey())
+	blackhole := startBlackholeListener(t)
+	t.Cleanup(func() { blackhole.close() })
+	bhHost, bhPort := blackhole.endpoint(t)
+	tHost, tPort := serverEndpoint(t, target)
+	fake := fakeResolver{
+		"target": {User: "testuser", HostName: tHost, Port: tPort, ProxyJump: "blackhole"},
+		"blackhole": {
+			User:     "testuser",
+			HostName: bhHost,
+			Port:     bhPort,
+		},
+	}
+	kh := writeKnownHostsLines(t, target)
+	keyFile := writeIdentityFile(t, clientPriv)
+	c := newProxyClientNoCleanup(t, fake, keyFile, kh)
+	defer c.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	defer cancel()
+	err, elapsed := ensureErrorWithin(t, c, ctx, 4*time.Second, blackhole.close)
+	if !strings.Contains(err.Error(), "handshake proxyjump hop") {
+		t.Errorf("error = %v, want proxyjump hop handshake failure", err)
+	}
+	if elapsed >= 2500*time.Millisecond {
+		t.Errorf("Ensure elapsed = %s, want near the 1.2s ctx timeout and well below dialTimeout %s", elapsed, dialTimeout)
+	}
+	assertNothingStored(t, c)
+}
+
+// TestProxyJumpChainedBlackHoleHonorsCancel proves ctx cancellation aborts a
+// chained direct-tcpip hop promptly after the first jump has connected.
+func TestProxyJumpChainedBlackHoleHonorsCancel(t *testing.T) {
+	clientPriv, clientSigner := generateKeyPair(t)
+	a := newTestServer(t, clientSigner.PublicKey())
+	target := newTestServer(t, clientSigner.PublicKey())
+	blackhole := startBlackholeListener(t)
+	t.Cleanup(func() { blackhole.close() })
+	aHost, aPort := serverEndpoint(t, a)
+	bhHost, bhPort := blackhole.endpoint(t)
+	tHost, tPort := serverEndpoint(t, target)
+	fake := fakeResolver{
+		"target": {User: "testuser", HostName: tHost, Port: tPort, ProxyJump: "hopa,blackhole"},
+		"hopa":   {User: "testuser", HostName: aHost, Port: aPort},
+		"blackhole": {
+			User:     "testuser",
+			HostName: bhHost,
+			Port:     bhPort,
+		},
+	}
+	kh := writeKnownHostsLines(t, a, target)
+	keyFile := writeIdentityFile(t, clientPriv)
+	c := newProxyClientNoCleanup(t, fake, keyFile, kh)
+	defer c.Close(context.Background())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Ensure(ctx)
+		done <- err
+	}()
+	select {
+	case <-blackhole.accepted:
+	case <-time.After(3 * time.Second):
+		blackhole.close()
+		t.Fatal("blackhole hop was not reached through the first jump")
+	}
+
+	cancelStarted := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Ensure after cancel: want error, got nil")
+		}
+		if !strings.Contains(err.Error(), "context canceled") {
+			t.Errorf("error = %v, want context cancellation to surface", err)
+		}
+		if elapsed := time.Since(cancelStarted); elapsed >= 2*time.Second {
+			t.Errorf("Ensure returned %s after cancel, want prompt cancellation", elapsed)
+		}
+	case <-time.After(3 * time.Second):
+		blackhole.close()
+		t.Fatal("Ensure did not return promptly after ctx cancellation")
+	}
+	assertNothingStored(t, c)
 }
 
 // TestProxyJumpNestedChain (EC12) proves a hop's OWN ProxyJump is followed
@@ -237,6 +434,58 @@ func TestProxyJumpHopCap(t *testing.T) {
 		t.Fatal("Ensure with over-cap chain: want error, got nil")
 	} else if !strings.Contains(err.Error(), "exceeds") {
 		t.Errorf("error = %v, want hop-cap error mentioning 'exceeds'", err)
+	}
+	assertNothingStored(t, c)
+}
+
+func nestedProxyJumpFake(hops int, target ResolvedHost) fakeResolver {
+	fake := fakeResolver{}
+	if hops > 0 {
+		target.ProxyJump = "h1"
+	}
+	fake["target"] = target
+	for i := 1; i <= hops; i++ {
+		tok := fmt.Sprintf("h%d", i)
+		rh := ResolvedHost{User: "testuser", HostName: "127.0.0.1", Port: i}
+		if i < hops {
+			rh.ProxyJump = fmt.Sprintf("h%d", i+1)
+		}
+		fake[tok] = rh
+	}
+	return fake
+}
+
+// TestProxyJumpNestedHopCap proves a depth-first nested chain exceeding
+// maxProxyHops is rejected before any hop is appended or dialed.
+func TestProxyJumpNestedHopCap(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	clientPriv, clientSigner := generateKeyPair(t)
+	target := newTestServer(t, clientSigner.PublicKey())
+	listener := startBlackholeListener(t)
+	defer listener.close()
+	tHost, tPort := serverEndpoint(t, target)
+	hHost, hPort := listener.endpoint(t)
+	fake := nestedProxyJumpFake(maxProxyHops+1, ResolvedHost{User: "testuser", HostName: tHost, Port: tPort})
+	for tok, rh := range fake {
+		if tok == "target" {
+			continue
+		}
+		rh.HostName = hHost
+		rh.Port = hPort
+		fake[tok] = rh
+	}
+	kh := writeKnownHostsLines(t, target)
+	keyFile := writeIdentityFile(t, clientPriv)
+	c := newProxyClient(t, fake, keyFile, kh)
+
+	if _, err := c.Ensure(ctx); err == nil {
+		t.Fatal("Ensure with nested over-cap chain: want error, got nil")
+	} else if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %v, want hop-cap error mentioning 'exceeds'", err)
+	}
+	if got := listener.acceptCount(); got != 0 {
+		t.Errorf("hop listener accepts = %d, want 0 (rejected before dial)", got)
 	}
 	assertNothingStored(t, c)
 }
@@ -410,6 +659,28 @@ func TestProxyJumpHopCapPositiveBoundary(t *testing.T) {
 	}
 }
 
+// TestProxyJumpNestedHopCapPositiveBoundary proves a nested chain of EXACTLY
+// maxProxyHops hops is accepted by the pre-recursion cap.
+func TestProxyJumpNestedHopCapPositiveBoundary(t *testing.T) {
+	ctx := context.Background()
+	fake := nestedProxyJumpFake(maxProxyHops, ResolvedHost{User: "testuser", HostName: "127.0.0.1", Port: 22})
+	c := &Client{proxyJump: fake["target"].ProxyJump, resolver: fake.resolve}
+
+	chain, err := c.expandJumpChain(ctx)
+	if err != nil {
+		t.Fatalf("expandJumpChain of nested maxProxyHops: %v", err)
+	}
+	if len(chain) != maxProxyHops {
+		t.Fatalf("chain length = %d, want maxProxyHops=%d", len(chain), maxProxyHops)
+	}
+	for i, rh := range chain {
+		wantPort := maxProxyHops - i
+		if rh.Port != wantPort {
+			t.Fatalf("chain[%d].Port = %d, want %d", i, rh.Port, wantPort)
+		}
+	}
+}
+
 // TestProxyJumpAgentConnsClosedOnTeardown proves the shared-agent hop-auth path
 // runs with a REAL agent conn — the production default, where $SSH_AUTH_SOCK is
 // non-empty — and that teardownLocked closes EVERY per-hop agent conn on Close.
@@ -473,6 +744,77 @@ func TestProxyJumpAgentConnsClosedOnTeardown(t *testing.T) {
 	// conn open, so live() stays >=1 and this never settles.
 	if !waitFor(func() bool { return ca.live() == 0 }, 3*time.Second) {
 		t.Errorf("agent live conns after Close = %d, want 0; a hop agent conn leaked", ca.live())
+	}
+}
+
+// TestProxyJumpHopProxyCommandRejectedBeforeDial proves native rejects a
+// ProxyCommand on a ProxyJump hop during chain expansion, before any hop dial.
+func TestProxyJumpHopProxyCommandRejectedBeforeDial(t *testing.T) {
+	clientPriv, clientSigner := generateKeyPair(t)
+	target := newTestServer(t, clientSigner.PublicKey())
+	listener := startBlackholeListener(t)
+	defer listener.close()
+	tHost, tPort := serverEndpoint(t, target)
+	hHost, hPort := listener.endpoint(t)
+	fake := fakeResolver{
+		"target": {User: "testuser", HostName: tHost, Port: tPort, ProxyJump: "hopcmd"},
+		"hopcmd": {
+			User:         "testuser",
+			HostName:     hHost,
+			Port:         hPort,
+			ProxyCommand: "ssh -W %h:%p inner",
+		},
+	}
+	kh := writeKnownHostsLines(t, target)
+	keyFile := writeIdentityFile(t, clientPriv)
+	c := newProxyClientNoCleanup(t, fake, keyFile, kh)
+	defer c.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := c.Ensure(ctx)
+	want := `sshnative: proxyjump hop "hopcmd" uses ProxyCommand, which native does not support for hops`
+	if err == nil {
+		t.Fatal("Ensure with ProxyCommand on hop: want error, got nil")
+	}
+	if err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+	if got := listener.acceptCount(); got != 0 {
+		t.Errorf("hop listener accepts = %d, want 0 (rejected before dial)", got)
+	}
+	assertNothingStored(t, c)
+}
+
+// TestProxyJumpHopProxyCommandNoneAllowed proves the case-sensitive "none"
+// sentinel disables a hop ProxyCommand and leaves the ProxyJump path usable.
+func TestProxyJumpHopProxyCommandNoneAllowed(t *testing.T) {
+	ctx := context.Background()
+	clientPriv, clientSigner := generateKeyPair(t)
+	a := newTestServer(t, clientSigner.PublicKey())
+	b := newTestServer(t, clientSigner.PublicKey())
+	aHost, aPort := serverEndpoint(t, a)
+	bHost, bPort := serverEndpoint(t, b)
+	fake := fakeResolver{
+		"target": {User: "testuser", HostName: bHost, Port: bPort, ProxyJump: "hopa"},
+		"hopa":   {User: "testuser", HostName: aHost, Port: aPort, ProxyCommand: "none"},
+	}
+	kh := writeKnownHostsLines(t, a, b)
+	keyFile := writeIdentityFile(t, clientPriv)
+	c := newProxyClient(t, fake, keyFile, kh)
+
+	if _, err := c.Ensure(ctx); err != nil {
+		t.Fatalf("Ensure through ProxyCommand=none hop: %v", err)
+	}
+	stdout, _, err := c.Exec(ctx, nil, "echo", "hi")
+	if err != nil {
+		t.Fatalf("Exec through ProxyCommand=none hop: %v", err)
+	}
+	if strings.TrimSpace(stdout) != "hi" {
+		t.Errorf("Exec stdout = %q, want %q", stdout, "hi")
+	}
+	if !contains(a.directDials(), b.addr) {
+		t.Errorf("jump directDials = %v, want to contain target %q", a.directDials(), b.addr)
 	}
 }
 
@@ -780,6 +1122,35 @@ func TestProxyCommandHandshakeFailureClosesCloser(t *testing.T) {
 	}
 	// The failed dial stored nothing: c.proxyCloser stays nil, so teardownLocked
 	// never re-reaps the closer — the error-branch Close is the sole reaper.
+	assertNothingStored(t, c)
+}
+
+// TestDefaultProxyCommandStderrIncludedOnHandshakeFailure drives the REAL
+// defaultProxyCommandDialer and proves helper stderr is surfaced when the stdio
+// peer exits before SSH can complete its handshake.
+func TestDefaultProxyCommandStderrIncludedOnHandshakeFailure(t *testing.T) {
+	ctx := context.Background()
+	clientPriv, clientSigner := generateKeyPair(t)
+	b := newTestServer(t, clientSigner.PublicKey())
+	bHost, bPort := serverEndpoint(t, b)
+	fake := fakeResolver{
+		"target": {User: "testuser", HostName: bHost, Port: bPort, ProxyCommand: "echo helper-diag >&2; exit 1"},
+	}
+	kh := writeKnownHostsLines(t, b)
+	keyFile := writeIdentityFile(t, clientPriv)
+	c := newProxyClient(t, fake, keyFile, kh)
+
+	if _, err := c.Ensure(ctx); err == nil {
+		t.Fatal("Ensure with failing real ProxyCommand: want error, got nil")
+	} else {
+		msg := err.Error()
+		if !strings.Contains(msg, "proxycommand handshake") {
+			t.Errorf("error = %v, want proxycommand handshake context", err)
+		}
+		if !strings.Contains(msg, "helper-diag") {
+			t.Errorf("error = %v, want helper stderr", err)
+		}
+	}
 	assertNothingStored(t, c)
 }
 

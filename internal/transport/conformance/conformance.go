@@ -84,6 +84,25 @@ func runCore(t *testing.T, newT func(t *testing.T) transport.Transport) {
 		}
 	})
 
+	t.Run("exit_code_typed", func(t *testing.T) {
+		tr := newT(t)
+		_, _, err := tr.Exec(ctx, nil, "sh", "-c", shellQuote("exit 3"))
+		if err == nil {
+			t.Fatal("Exec exit 3: want error, got nil")
+		}
+		code, ok := transport.ExitCode(err)
+		if !ok || code != 3 {
+			t.Errorf("ExitCode(err) = (%d, %v), want (3, true)", code, ok)
+		}
+		_, _, err2 := tr.Exec(ctx, nil, "true")
+		if err2 != nil {
+			t.Fatalf("Exec true: %v", err2)
+		}
+		if c2, ok2 := transport.ExitCode(err2); ok2 {
+			t.Errorf("ExitCode(nil err) = (%d, %v), want (0, false)", c2, ok2)
+		}
+	})
+
 	t.Run("exec_binary_stdin", func(t *testing.T) {
 		tr := newT(t)
 		payload := []byte{0x00, 0x01, 0xff, 0xfe, 0x0a, 0x7f, 0x80}
@@ -124,6 +143,38 @@ func runCore(t *testing.T, newT func(t *testing.T) transport.Transport) {
 		}
 		if err := wait(); err != nil {
 			t.Errorf("wait: %v", err)
+		}
+	})
+
+	t.Run("stream_nonzero_exit_typed", func(t *testing.T) {
+		tr := newT(t)
+		stdin, stdout, stderr, wait, err := tr.Stream(ctx, "sh", "-c", shellQuote("exit 3"))
+		if err != nil {
+			t.Fatalf("Stream exit 3: %v", err)
+		}
+		if err := stdin.Close(); err != nil {
+			t.Fatalf("close stdin: %v", err)
+		}
+		if out, err := io.ReadAll(stdout); err != nil {
+			t.Fatalf("drain stdout: %v", err)
+		} else if len(out) != 0 {
+			t.Errorf("stdout = %q, want empty", out)
+		}
+		if errOut, err := io.ReadAll(stderr); err != nil {
+			t.Fatalf("drain stderr: %v", err)
+		} else if len(errOut) != 0 {
+			t.Errorf("stderr = %q, want empty", errOut)
+		}
+		werr := wait()
+		if werr == nil {
+			t.Fatal("wait exit 3: want error, got nil")
+		}
+		code, ok := transport.ExitCode(werr)
+		if !ok || code != 3 {
+			t.Errorf("ExitCode(wait err) = (%d, %v), want (3, true)", code, ok)
+		}
+		if msg := werr.Error(); msg == "" || !strings.Contains(msg, "3") {
+			t.Errorf("wait error = %q, want non-empty message mentioning 3", msg)
 		}
 	})
 

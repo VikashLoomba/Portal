@@ -1,5 +1,5 @@
-# Portal build orchestration. Two binaries:
-#   portald (linux-amd64) — embedded into portal via go:embed
+# Portal build orchestration. Three binaries:
+#   portald (linux-amd64/linux-arm64) — embedded into portal via go:embed
 #   portal  (host-native) — the user-facing CLI
 #
 # Both binaries are stamped with the SAME git SHA at build time:
@@ -14,7 +14,8 @@ GIT_SHA       := $(shell git rev-parse HEAD 2>/dev/null || echo dev-$(shell date
 # suffixes for untagged or modified trees. Falls back to "dev" with no git.
 VERSION       := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 AGENT_DIR     := internal/bootstrap/agent
-AGENT_PATH    := $(AGENT_DIR)/portald-linux-amd64
+AGENT_AMD64   := $(AGENT_DIR)/portald-linux-amd64
+AGENT_ARM64   := $(AGENT_DIR)/portald-linux-arm64
 SHA_PATH      := $(AGENT_DIR)/sha.txt
 
 MODULE         := github.com/VikashLoomba/Portal
@@ -24,7 +25,7 @@ LDFLAGS_AGENT  := -s -w -X main.gitSHA=$(GIT_SHA)
 LDFLAGS_PORTAL := -X main.version=$(VERSION) -X $(MODULE)/internal/bootstrap.gitSHA=$(GIT_SHA)
 
 # Cross-compilation target for the Mac client binary.
-# The agent is always linux-amd64 (it runs on the dev box).
+# The agent is built for supported Linux dev-box architectures.
 # The Mac client ships as darwin-arm64 (Apple Silicon only).
 PORTAL_DARWIN_ARM64  := portal-darwin-arm64
 
@@ -36,9 +37,13 @@ agent:
 	@mkdir -p $(AGENT_DIR)
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
 		go build -trimpath -ldflags "$(LDFLAGS_AGENT)" \
-		-o $(AGENT_PATH) ./cmd/portald
+		-o $(AGENT_AMD64) ./cmd/portald
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+		go build -trimpath -ldflags "$(LDFLAGS_AGENT)" \
+		-o $(AGENT_ARM64) ./cmd/portald
 	@printf "%s" "$(GIT_SHA)" > $(SHA_PATH)
-	@echo "built agent $(AGENT_PATH) (sha=$(GIT_SHA), $$(stat -f%z $(AGENT_PATH) 2>/dev/null || stat -c%s $(AGENT_PATH)) bytes)"
+	@echo "built agent $(AGENT_AMD64) (sha=$(GIT_SHA), $$(stat -f%z $(AGENT_AMD64) 2>/dev/null || stat -c%s $(AGENT_AMD64)) bytes)"
+	@echo "built agent $(AGENT_ARM64) (sha=$(GIT_SHA), $$(stat -f%z $(AGENT_ARM64) 2>/dev/null || stat -c%s $(AGENT_ARM64)) bytes)"
 
 portal: agent
 	go build -trimpath -ldflags "$(LDFLAGS_PORTAL)" -o portal ./cmd/portal
@@ -56,7 +61,7 @@ test: agent
 	go test ./...
 
 clean:
-	rm -f portal $(AGENT_PATH) $(SHA_PATH)
+	rm -f portal $(AGENT_AMD64) $(AGENT_ARM64) $(SHA_PATH)
 
 print-sha:
 	@echo $(GIT_SHA)

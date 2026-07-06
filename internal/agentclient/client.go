@@ -501,6 +501,7 @@ func (c *Client) runOnce(ctx context.Context) error {
 
 	c.snapMu.Lock()
 	c.helloAck = first.HelloAck
+	c.cfg.Bootstrap.SetBootID(first.HelloAck.BootID)
 	c.snapMu.Unlock()
 
 	// Record the agent's advertised services (DESIGN S4). A registered handler

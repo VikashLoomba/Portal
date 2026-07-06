@@ -118,7 +118,10 @@ func (integProbeTransport) Ensure(context.Context) (bool, error) { return false,
 func (integProbeTransport) Health(context.Context) (transport.Health, error) {
 	return transport.Health{Up: true, Pid: 1, Detail: "pid=1"}, nil
 }
-func (integProbeTransport) Exec(_ context.Context, stdin []byte, _ ...string) (string, string, error) {
+func (integProbeTransport) Exec(_ context.Context, stdin []byte, argv ...string) (string, string, error) {
+	if len(argv) > 0 && argv[0] == "uname" {
+		return "Linux x86_64\n", "", nil
+	}
 	if len(stdin) > 0 {
 		// The upload path (byte stdin) — never reached because the probe below
 		// short-circuits, but honor the shape.
@@ -302,6 +305,9 @@ func TestIntegration_StatusAgentIdentity(t *testing.T) {
 	}
 	if !st.Master.Up {
 		t.Error("Master.Up = false, want true (fake MasterPID is live)")
+	}
+	if !st.Features[config.FeatureExec] {
+		t.Error("status Features[exec] = false/missing, want default enabled")
 	}
 }
 

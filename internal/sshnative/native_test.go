@@ -1,6 +1,7 @@
 package sshnative
 
 import (
+	"context"
 	"testing"
 )
 
@@ -35,7 +36,7 @@ func TestNewNoDial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	h, err := c.Health(nil)
+	h, err := c.Health(context.Background())
 	if err != nil {
 		t.Fatalf("Health: %v", err)
 	}

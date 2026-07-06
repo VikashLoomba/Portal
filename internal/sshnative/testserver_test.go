@@ -56,6 +56,10 @@ type testServer struct {
 	// ProxyCommand test.
 	cfg *ssh.ServerConfig
 
+	// omitSessionExitStatus closes exec sessions without exit-status so clients
+	// exercise x/crypto/ssh's ExitMissingError path.
+	omitSessionExitStatus bool
+
 	mu    sync.Mutex
 	conns []net.Conn // every accepted TCP conn, so dropConns can sever them
 	dials []string   // direct-tcpip dest addrs, so ProxyJump tests can assert the jump was traversed
@@ -69,6 +73,10 @@ type serverOption func(*testServer)
 // hits its own reply deadline.
 func withSwallowGlobalRequests() serverOption {
 	return func(s *testServer) { s.swallowGlobalRequests = true }
+}
+
+func withMissingSessionExitStatus() serverOption {
+	return func(s *testServer) { s.omitSessionExitStatus = true }
 }
 
 // newTestServer starts a server whose publickey callback accepts exactly
@@ -245,6 +253,10 @@ func (s *testServer) handleSession(newChan ssh.NewChannel) {
 				return
 			}
 			req.Reply(true, nil)
+			if s.omitSessionExitStatus {
+				ch.Close()
+				return
+			}
 			s.runCommand(ch, payload.Command)
 			return
 		default:

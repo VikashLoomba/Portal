@@ -308,7 +308,7 @@ func TestHandleStatus_NoAgent(t *testing.T) {
 		t.Errorf("Agent = %+v, want nil without a handshake", *got.Agent)
 	}
 	// Default feature gates are surfaced even without an agent.
-	for _, f := range []string{config.FeatureClipImage, config.FeatureClipText, config.FeatureNotify} {
+	for _, f := range []string{config.FeatureClipImage, config.FeatureClipText, config.FeatureNotify, config.FeatureExec} {
 		if _, ok := got.Features[f]; !ok {
 			t.Errorf("feature %q missing from status", f)
 		}
