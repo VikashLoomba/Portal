@@ -34,8 +34,11 @@ exec bridge needs it to report the remote process's exit status to the WebSocket
 
 **Explicitly out of scope (v1):** supervised agents / process supervisor (portald reattachable sessions) — that
 is design-doc-only this stage (`DESIGN-supervised-agents.md`, not written here); a PTY/allocated-tty on the
-remote (exec bridges `Transport.Stream`'s pipe model — line/byte streams, no termios, no window-size
-propagation — a follow-up capability); authenticating exec to anything beyond the existing peer-uid + single-
+remote — Stage 5 deliberately bridges `Transport.Stream`'s pipe model (line/byte streams, no termios, no
+window-size propagation, and — because a tty-less channel close does not signal the remote — no
+process-kill-on-disconnect; see §8.3). **FULL PTY is a planned, documented Stage 6 capability** (RequestPty +
+termios + window-size + signal-on-disconnect), not an indefinite "someday"; this scoping was a Stage-5
+drafting decision, ratified 2026-07-06. Also out of scope: authenticating exec to anything beyond the existing peer-uid + single-
 instance UDS guard; multiplexing many exec sessions over one WebSocket (one session per connection);
 non-`linux` dev boxes (the matrix adds `linux-arm64` only — `darwin`/`windows` agents are not built).
 
@@ -144,6 +147,30 @@ Implementers: start in-tree (u4). Escalate to the fallback only with a concrete 
 
 ---
 
+## 6.1 Principal fast-follows (non-blocking — address in Stage 6)
+
+Recorded by the Fable principal (verdict: approve) — minor edge findings, none merge-blocking:
+
+1. **`localclient.Exec` stdin-pump ctx honor:** after the exit frame, `Exec` sets a stdin read deadline only
+   if the reader implements `SetReadDeadline`, then blocks unconditionally on `<-stdinDone`. A deadline-less
+   blocking reader (e.g. an embedding UI's `io.Pipe`) can hang past ctx cancellation. Fix: select on
+   `ctx.Done()` alongside `stdinDone`.
+2. **Exec audit correlation:** `exec-open` logs host+uid+argv; `exec-close` logs host+code+err+dur but no argv
+   and no session id, so two concurrent same-host sessions can't be paired by an operator. Fix: a per-session
+   id on both lines (or repeat argv on close).
+3. **`EnsureArtifact` name validation (do BEFORE Stage 6 exports it):** `remotePath = remoteDir + name +
+   digest` is spliced unquoted into the remote `bash -c` probe/upload/`ln -sf` scripts. In-process callers are
+   trusted today, but a `name` with spaces/`../`/`$(...)` would break or inject. Validate `name` (charset +
+   no path separators) before it reaches a shell — mandatory before the seam is exported to app authors.
+4. **Non-PTY disconnect orphan (§8.3):** a tty-less remote process ignoring stdio survives client disconnect
+   (standard ssh behavior, reproduced by plain ssh — see §8.3). Resolved by the **documented Stage 6 full-PTY
+   capability** (RequestPty gives SIGHUP-on-close for free); not a Stage-5 defect.
+
+Stage-6 watch items (principal): ~180 LOC of WS client framing is duplicated in `localclient` rather than
+shared with `localapi`'s codec — consolidate at extraction; `openapi.yaml` documents `/v1/exec` as prose only
+(no frame schema), so the generated TS client needs a hand-written WS/CBOR layer; dual-arch embed adds ~4MB to
+the `portal` binary (acceptable now).
+
 ## 7. Risks
 
 | Risk | Mitigation |
@@ -162,7 +189,17 @@ Implementers: start in-tree (u4). Escalate to the fallback only with a concrete 
 1. `portal exec -- uname -sm` over the real box returns the box's arch and exit 0; `portal exec -- false` exits 1.
 2. An interactive-ish stream (`portal exec -- sh -c 'echo hi; cat'` with piped stdin) round-trips stdout and
    propagates stdin EOF (process exits when stdin closes).
-3. Disconnect mid-exec (Ctrl-C the client): the remote process is torn down (verify no orphan on the box).
+3. Disconnect mid-exec (Ctrl-C the client): the bridge tears down its side (local ssh subprocess exits,
+   goroutines joined). **KNOWN LIMITATION (validated 2026-07-06):** a NON-PTY remote process that ignores
+   stdio (e.g. `sleep`) SURVIVES client disconnect — sshd closes the channel's stdio but does not signal a
+   tty-less remote command, so it runs to completion. This is standard OpenSSH behavior, reproduced
+   IDENTICALLY by a plain `ssh -S <master> 'sleep 200'` with the local ssh killed (zero portal code
+   involved). That control test — not the scope statement in §1 — is the evidence it is standard OpenSSH
+   behavior and NOT a bridge defect (the bridge's own teardown is correct: local ssh subprocess exits,
+   goroutines join). A remote process that DOES touch stdio (reads stdin / writes stdout) dies promptly on
+   disconnect via EPIPE/EOF, which the §8.2 stdin-EOF case exercises. Killing a tty-less remote process on
+   disconnect requires a PTY (SIGHUP on channel close) or an explicit remote signal — both land with the
+   **documented Stage 6 full-PTY capability**.
 4. Arch matrix: on the amd64 box, status/doctor unchanged and the agent SHA is the amd64 artifact; the probe
    is cached (logs show one `uname` per connect, not per reconcile). (arm64 box validation is best-effort/N/A
    without an arm64 dev box.)
