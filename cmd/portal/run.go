@@ -14,7 +14,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/VikashLoomba/Portal/internal/agentclient"
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/bootstrap"
 	"github.com/VikashLoomba/Portal/internal/clip"
@@ -22,6 +21,7 @@ import (
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/localapi"
 	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/pkg/agentclient"
 	"github.com/VikashLoomba/Portal/pkg/doctor"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 )

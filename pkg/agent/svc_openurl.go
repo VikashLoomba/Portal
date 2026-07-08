@@ -19,15 +19,15 @@ import (
 // Msg down the pipe. URLs are tiny, so MaxPayload is small; OutboxCap mirrors the
 // legacy openURLCh buffer (8).
 type openURLService struct {
-	reg *registry
-	log *slog.Logger
+	host ServiceHost
+	log  *slog.Logger
 }
 
-// newOpenURLService constructs the service bound to reg. reg.emit()/hasClient()
+// newOpenURLService constructs the service bound to host. host.Emit()/HasClient()
 // give it a frame sink and subscription view without ever handing it an
 // *Encoder (structural sole-writer, DESIGN S5).
-func newOpenURLService(reg *registry, log *slog.Logger) *openURLService {
-	return &openURLService{reg: reg, log: log}
+func newOpenURLService(host ServiceHost, log *slog.Logger) *openURLService {
+	return &openURLService{host: host, log: log}
 }
 
 func (o *openURLService) Name() string    { return "openurl" }
@@ -64,7 +64,7 @@ func (o *openURLService) handleOpen(ctx context.Context, conn net.Conn, rest str
 	}
 	// Gate on both a subscribed client AND that client advertising openurl@1
 	// (DESIGN S4). Either missing ⇒ answer exactly as the legacy !hasClient path.
-	if !(o.reg.hasClient() && o.reg.clientHas("openurl")) {
+	if !(o.host.HasClient() && o.host.ClientHas("openurl")) {
 		_, _ = conn.Write([]byte("no-client\n"))
 		return
 	}
@@ -76,7 +76,7 @@ func (o *openURLService) handleOpen(ctx context.Context, conn net.Conn, rest str
 		_, _ = conn.Write([]byte("dropped\n"))
 		return
 	}
-	if o.reg.emit("openurl", "open", payload) {
+	if o.host.Emit("openurl", "open", payload) {
 		_, _ = conn.Write([]byte("ok\n"))
 	} else {
 		// Full outbox — DropNewest (S5). Report the drop rather than claim success.

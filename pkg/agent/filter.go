@@ -5,7 +5,7 @@ package agent
 import (
 	"sync"
 
-	"github.com/VikashLoomba/Portal/internal/agent/watcher"
+	"github.com/VikashLoomba/Portal/pkg/agent/watcher"
 )
 
 // Filter applies the deny / ephemeral-range / allow-override pipeline to a

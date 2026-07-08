@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/VikashLoomba/Portal/internal/agent/watcher"
+	"github.com/VikashLoomba/Portal/pkg/agent/watcher"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
 
@@ -39,6 +39,8 @@ type Config struct {
 	// connects to relay URLs back to the Mac client. Empty = disabled.
 	// The socket is only active while a Mac client is subscribed.
 	CmdSockPath string
+	// Services are registered AFTER the built-ins, in order.
+	Services []ServiceFactory
 }
 
 // Server is the agent's RPC top loop. One Server per ssh-exec lifetime.
@@ -114,10 +116,14 @@ func New(cfg Config) *Server {
 	// carries any clip-specific state.
 	s.reg = newRegistry(cfg.Log)
 	s.reg.bindHasClient(func() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.hasClient })
-	s.reg.register(newOpenURLService(s.reg, cfg.Log))
-	s.reg.register(newNotifyService(s.reg, cfg.Log))
-	s.clip = newClipService(s.reg, cfg.Log)
+	host := &serviceHost{r: s.reg}
+	s.reg.register(newOpenURLService(host, cfg.Log))
+	s.reg.register(newNotifyService(host, cfg.Log))
+	s.clip = newClipService(host, cfg.Log)
 	s.reg.register(s.clip)
+	for _, f := range cfg.Services {
+		s.reg.register(f(host, cfg.Log))
+	}
 	return s
 }
 

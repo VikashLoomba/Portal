@@ -42,15 +42,15 @@ type notifyWire struct {
 // notify Msg down the pipe. The notification surface is tiny, so MaxPayload is
 // small; OutboxCap mirrors the legacy notifyCh buffer (8).
 type notifyService struct {
-	reg *registry
-	log *slog.Logger
+	host ServiceHost
+	log  *slog.Logger
 }
 
-// newNotifyService constructs the service bound to reg. reg.emit()/hasClient()
+// newNotifyService constructs the service bound to host. host.Emit()/HasClient()
 // give it a frame sink and subscription view without ever handing it an
 // *Encoder (structural sole-writer, DESIGN S5).
-func newNotifyService(reg *registry, log *slog.Logger) *notifyService {
-	return &notifyService{reg: reg, log: log}
+func newNotifyService(host ServiceHost, log *slog.Logger) *notifyService {
+	return &notifyService{host: host, log: log}
 }
 
 func (n *notifyService) Name() string    { return "notify" }
@@ -98,7 +98,7 @@ func (n *notifyService) handleNotify(ctx context.Context, conn net.Conn, rest st
 	}
 	// Gate on both a subscribed client AND that client advertising notify@1
 	// (DESIGN S4). Either missing ⇒ answer exactly as the legacy !hasClient path.
-	if !(n.reg.hasClient() && n.reg.clientHas("notify")) {
+	if !(n.host.HasClient() && n.host.ClientHas("notify")) {
 		_, _ = conn.Write([]byte("no-client\n"))
 		return
 	}
@@ -120,7 +120,7 @@ func (n *notifyService) handleNotify(ctx context.Context, conn net.Conn, rest st
 		_, _ = conn.Write([]byte("dropped\n"))
 		return
 	}
-	if n.reg.emit("notify", "event", payload) {
+	if n.host.Emit("notify", "event", payload) {
 		_, _ = conn.Write([]byte("ok\n"))
 	} else {
 		// Full outbox — DropNewest (S5). Report the drop rather than claim success.

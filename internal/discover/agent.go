@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/VikashLoomba/Portal/internal/agentclient"
+	"github.com/VikashLoomba/Portal/pkg/agentclient"
 )
 
 // ErrAgentNotReady is returned by AgentDiscoverer.DesiredPorts before the

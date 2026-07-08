@@ -14,8 +14,6 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"github.com/VikashLoomba/Portal/internal/bootstrap"
-	"github.com/VikashLoomba/Portal/internal/clipshim"
 	"github.com/VikashLoomba/Portal/pkg/hub"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 	"github.com/VikashLoomba/Portal/pkg/transport"
@@ -26,10 +24,22 @@ import (
 // "agent empty".
 var ErrNoSnapshot = errors.New("agentclient: no snapshot yet")
 
+// Bootstrapper owns this product's agent upload and embedded SHA source.
+type Bootstrapper interface {
+	EnsureUploaded(ctx context.Context) (string, error)
+	SetBootID(id string)
+	EmbeddedSHA() string
+}
+
+// ClipShim deploys the remote clipboard read shim after a verified agent upload.
+type ClipShim interface {
+	Ensure(ctx context.Context, t transport.Transport) error
+}
+
 // Config bundles dependencies. Defaults are filled in by New.
 type Config struct {
 	Transport transport.Transport
-	Bootstrap *bootstrap.Manager
+	Bootstrap Bootstrapper
 	Log       *slog.Logger
 	// StderrSink is where the agent's stderr lines go (typically
 	// os.Stderr; launchd routes that to ~/Library/Logs/portal.log).
@@ -49,6 +59,10 @@ type Config struct {
 	// hub can never become a second event-ordering authority: the engine, clip
 	// handler, and notify handler keep their dedicated channels (DESIGN §3/§10).
 	Hub *hub.Hub
+	// ClipShim runs after a verified agent upload; nil skips shim deploy.
+	ClipShim ClipShim
+	// Handlers are registered after the built-ins.
+	Handlers []HandlerSpec
 }
 
 // Client speaks the protocol with the remote portald. One Client per portal
@@ -197,6 +211,9 @@ func New(cfg Config) *Client {
 		},
 		Deliver: c.publishClip,
 	})
+	for _, h := range cfg.Handlers {
+		c.registry.register(h)
+	}
 	return c
 }
 
@@ -233,6 +250,14 @@ func (c *Client) SendClipResponse(resp *protocol.ClipResponse) error {
 		return err
 	}
 	return c.registry.send(enc, "clip", "resp", payload)
+}
+
+// Send writes a client→agent service frame on the current pipe.
+func (c *Client) Send(service, kind string, payload cbor.RawMessage) error {
+	c.streamMu.Lock()
+	enc := c.enc
+	c.streamMu.Unlock()
+	return c.registry.send(enc, service, kind, payload)
 }
 
 // Snapshot returns the cached desired-set as the wire reports it.
@@ -469,7 +494,7 @@ func (c *Client) runOnce(ctx context.Context) error {
 	// 4. Hello → HelloAck.
 	if err := enc.Write(&protocol.Envelope{Hello: &protocol.Hello{
 		ProtoVersion:  protocol.ProtoVersion,
-		ClientGitSHA:  bootstrap.EmbeddedSHA(),
+		ClientGitSHA:  c.cfg.Bootstrap.EmbeddedSHA(),
 		ClientPID:     os.Getpid(),
 		WantDestroyMC: true,
 		Services:      c.registry.services(),
@@ -486,17 +511,17 @@ func (c *Client) runOnce(ctx context.Context) error {
 	if first.HelloAck == nil {
 		return fmt.Errorf("expected HelloAck, got %v", envType(first))
 	}
-	if first.HelloAck.AgentGitSHA != bootstrap.EmbeddedSHA() {
+	if first.HelloAck.AgentGitSHA != c.cfg.Bootstrap.EmbeddedSHA() {
 		// SHA mismatch: the running agent is stale (e.g. upload was
 		// interrupted or the binary at that path is corrupted). Force-delete
 		// the remote file so EnsureUploaded re-uploads on the next connect.
 		c.cfg.Log.Error("agent SHA mismatch — forcing re-upload",
-			"agent", first.HelloAck.AgentGitSHA, "embedded", bootstrap.EmbeddedSHA())
+			"agent", first.HelloAck.AgentGitSHA, "embedded", c.cfg.Bootstrap.EmbeddedSHA())
 		rmPath := fmt.Sprintf("~/.cache/portal/agent-%s", first.HelloAck.AgentGitSHA)
 		_, _, _ = c.cfg.Transport.Exec(context.Background(), nil, "bash", "-c",
 			"rm -f "+rmPath)
 		return fmt.Errorf("agent SHA mismatch: agent=%s embedded=%s",
-			first.HelloAck.AgentGitSHA, bootstrap.EmbeddedSHA())
+			first.HelloAck.AgentGitSHA, c.cfg.Bootstrap.EmbeddedSHA())
 	}
 
 	c.snapMu.Lock()
@@ -513,13 +538,15 @@ func (c *Client) runOnce(ctx context.Context) error {
 	// succeeded AND the HelloAck SHA matches (so the portald symlink points at
 	// THIS agent). This is what makes shim deploy DAEMON-DRIVEN (DESIGN §9.1):
 	// a Mac-binary upgrade that changes the embedded shim text re-converges on
-	// reconnect without a manual `portal install`. clipshim.Ensure is a cheap
+	// reconnect without a manual `portal install`. ClipShim.Ensure is a cheap
 	// grep in the steady state (the content marker already matches). Failure is
 	// non-fatal to the session — port forwarding must not be held hostage to a
 	// shim write — but it is logged loudly so the headline feature's breakage
 	// is visible (DESIGN §9.6).
-	if err := clipshim.Ensure(ctx, c.cfg.Transport); err != nil {
-		c.cfg.Log.Error("clip shim deploy failed — clipboard paste will not work until this succeeds", "err", err)
+	if c.cfg.ClipShim != nil {
+		if err := c.cfg.ClipShim.Ensure(ctx, c.cfg.Transport); err != nil {
+			c.cfg.Log.Error("clip shim deploy failed — clipboard paste will not work until this succeeds", "err", err)
+		}
 	}
 
 	// 5. Latch the encoder so external Subscribe/Shutdown calls go to it.

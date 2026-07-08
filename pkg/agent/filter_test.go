@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/VikashLoomba/Portal/internal/agent/watcher"
+	"github.com/VikashLoomba/Portal/pkg/agent/watcher"
 )
 
 func L(port uint16, fam uint8, addr string) watcher.Listen {

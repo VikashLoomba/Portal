@@ -47,24 +47,24 @@ const (
 // clipTimeout, clipSockDeadline, and maxInflight are FIELDS (initialized from
 // the package const defaults at newClipService), NOT consts, and all three are
 // read LIVE at request time: clipTimeout and maxInflight inside handleClip's
-// reg.call, clipSockDeadline via Verbs()→routeVerb (which reads Verb.Deadline
+// host.Call, clipSockDeadline via Verbs()→routeVerb (which reads Verb.Deadline
 // live per connection). Production never mutates them; a white-box test may
 // shorten them on a specific instance to exercise the timeout budget (EC9).
 type clipService struct {
-	reg              *registry
+	host             ServiceHost
 	log              *slog.Logger
 	clipTimeout      time.Duration
 	clipSockDeadline time.Duration
 	maxInflight      int
 }
 
-// newClipService constructs the service bound to reg with the production default
-// timeout budget. reg.call()/hasClient()/epoch()/nextNonce() give it the
+// newClipService constructs the service bound to host with the production default
+// timeout budget. host.Call()/HasClient()/Complete() give it the
 // correlation machinery and subscription view without ever handing it an
 // *Encoder (structural sole-writer, DESIGN S5).
-func newClipService(reg *registry, log *slog.Logger) *clipService {
+func newClipService(host ServiceHost, log *slog.Logger) *clipService {
 	return &clipService{
-		reg:              reg,
+		host:             host,
 		log:              log,
 		clipTimeout:      defaultClipTimeout,
 		clipSockDeadline: defaultClipSockDeadline,
@@ -88,7 +88,7 @@ func (c *clipService) Verbs() []Verb {
 
 // HandleMsg processes an inbound client→agent clip Msg. Only "resp" is expected
 // (the client answering a ClipRequest). It decodes the ClipResponse and hands it
-// to reg.completeCall, where the stale-epoch drop and non-blocking waiter
+// to host.Complete, where the stale-epoch drop and non-blocking waiter
 // delivery live (DESIGN S9). The raw payload is forwarded to the waiter verbatim
 // so handleClip re-decodes it into a typed ClipResponse.
 func (c *clipService) HandleMsg(kind string, payload cbor.RawMessage) {
@@ -100,7 +100,7 @@ func (c *clipService) HandleMsg(kind string, payload cbor.RawMessage) {
 		c.log.Warn("clip response decode failed; dropping", "err", err)
 		return
 	}
-	c.reg.completeCall(resp.Nonce, resp.Epoch, payload)
+	c.host.Complete(resp.Nonce, resp.Epoch, payload)
 }
 
 // handleClip services a `clip <kind> [fmt]` verb. It carries the legacy
@@ -112,7 +112,7 @@ func (c *clipService) HandleMsg(kind string, payload cbor.RawMessage) {
 // (no client, inflight cap hit, outbox full, timeout, ctx cancel) so the shim
 // falls through cleanly to the real binary. The image/text bytes themselves
 // cross out-of-band (clipupload); this socket only carries the SHA. ctx is
-// threaded from handleCmdConn into reg.call for the adverse-path handling.
+// threaded from handleCmdConn into host.Call for the adverse-path handling.
 func (c *clipService) handleClip(ctx context.Context, conn net.Conn, rest string) {
 	// Parse the kind/format off the tab-framed remainder. Reject unknown shapes
 	// to preserve default-deny.
@@ -132,19 +132,7 @@ func (c *clipService) handleClip(ctx context.Context, conn net.Conn, rest string
 	// Gate on both a subscribed client AND that client advertising clip@1
 	// (DESIGN S4). Either missing ⇒ answer "none\n" immediately rather than
 	// making the shim eat the full timeout.
-	if !(c.reg.hasClient() && c.reg.clientHas("clip")) {
-		_, _ = conn.Write([]byte("none\n"))
-		return
-	}
-
-	nonce := c.reg.nextNonce()
-	payload, err := protocol.MarshalPayload(protocol.ClipRequest{
-		Nonce: nonce, Epoch: c.reg.epoch(), Kind: kind, Format: format,
-	})
-	if err != nil {
-		// A tiny nonce/kind struct never fails to marshal; treat the impossible
-		// as an adverse path rather than a crash.
-		c.log.Warn("clip request marshal failed", "err", err)
+	if !(c.host.HasClient() && c.host.ClientHas("clip")) {
 		_, _ = conn.Write([]byte("none\n"))
 		return
 	}
@@ -152,7 +140,18 @@ func (c *clipService) handleClip(ctx context.Context, conn net.Conn, rest string
 	// call mints the waiter, emits the request via the Serve loop (the sole frame
 	// writer), and waits. ErrNoWaiterCapacity (cap hit), ErrCallTimeout (outbox
 	// full or no response before clipTimeout), or ctx cancel ⇒ "none\n".
-	respRaw, err := c.reg.call(ctx, "clip", "req", c.clipTimeout, c.maxInflight, nonce, payload)
+	respRaw, err := c.host.Call(ctx, "clip", "req", c.clipTimeout, c.maxInflight, func(nonce, epoch uint64) cbor.RawMessage {
+		payload, err := protocol.MarshalPayload(protocol.ClipRequest{
+			Nonce: nonce, Epoch: epoch, Kind: kind, Format: format,
+		})
+		if err != nil {
+			// A tiny nonce/kind struct never fails to marshal; treat the impossible
+			// as an adverse path rather than a crash.
+			c.log.Warn("clip request marshal failed", "err", err)
+			return nil
+		}
+		return payload
+	})
 	if err != nil {
 		_, _ = conn.Write([]byte("none\n"))
 		return

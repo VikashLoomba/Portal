@@ -40,14 +40,12 @@ type fakeService struct {
 	handled       []handledMsg
 	lastHandleCtx context.Context
 	lastRest      string
-	boundReg      *registry
 }
 
-func (f *fakeService) Name() string             { return f.name }
-func (f *fakeService) Version() uint32          { return f.version }
-func (f *fakeService) MaxPayload() int          { return f.maxPayload }
-func (f *fakeService) OutboxCap() int           { return f.outboxCap }
-func (f *fakeService) bindRegistry(r *registry) { f.boundReg = r }
+func (f *fakeService) Name() string    { return f.name }
+func (f *fakeService) Version() uint32 { return f.version }
+func (f *fakeService) MaxPayload() int { return f.maxPayload }
+func (f *fakeService) OutboxCap() int  { return f.outboxCap }
 
 // Verbs constructs the verb from CURRENT fields on each call, so Deadline
 // reflects the live sockDeadline value (never a registration snapshot).
@@ -202,15 +200,11 @@ func TestRegistry_DupVerbPanics(t *testing.T) {
 	r.register(s2)
 }
 
-// (b) dispatch decodes/routes a well-formed Msg to HandleMsg. Also proves the
-// registry binds itself back into the service at registration.
+// (b) dispatch decodes/routes a well-formed Msg to HandleMsg.
 func TestRegistry_DispatchRoutes(t *testing.T) {
 	r := newRegistry(nil)
 	s := &fakeService{name: "svc", version: 1, maxPayload: 1024, outboxCap: 2, verbName: "v"}
 	r.register(s)
-	if s.boundReg != r {
-		t.Fatal("register did not bind the registry back into the service")
-	}
 	pl, err := protocol.MarshalPayload(protocol.OpenURL{URL: "http://x"})
 	if err != nil {
 		t.Fatal(err)

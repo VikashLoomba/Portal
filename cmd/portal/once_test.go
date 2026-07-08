@@ -11,14 +11,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VikashLoomba/Portal/internal/agent"
-	"github.com/VikashLoomba/Portal/internal/agent/watcher"
-	"github.com/VikashLoomba/Portal/internal/agentclient"
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/bootstrap"
 	"github.com/VikashLoomba/Portal/internal/clock"
 	"github.com/VikashLoomba/Portal/internal/forward"
 	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/pkg/agent"
+	"github.com/VikashLoomba/Portal/pkg/agent/watcher"
+	"github.com/VikashLoomba/Portal/pkg/agentclient"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 	"github.com/VikashLoomba/Portal/pkg/transport"
 )

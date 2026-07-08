@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VikashLoomba/Portal/internal/agent/watcher"
+	"github.com/VikashLoomba/Portal/pkg/agent/watcher"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
 

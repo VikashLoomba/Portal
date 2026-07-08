@@ -59,12 +59,24 @@ type Service interface {
 	HandleMsg(kind string, payload cbor.RawMessage)
 }
 
-// registryBinder is the optional hook a Service implements to receive its
-// registry back at registration, so its cmd-verb handlers can emit()/call()
-// without the registry ever handing out an *Encoder (structural sole-writer).
-type registryBinder interface {
-	bindRegistry(r *registry)
+// ServiceHost is the exported facade over the registry passed to service
+// factories. The registry stamps per-service Seq itself (S3 sole-writer
+// invariant), so the facade exposes NO seq parameter anywhere. Emit mirrors
+// registry.emit's admission bool: false means the service outbox was full and
+// the frame was dropped.
+type ServiceHost interface {
+	Emit(service, kind string, payload cbor.RawMessage) bool
+	// Call mints a nonce, passes it with the registry epoch to payload, emits the
+	// returned frame, and waits for Complete. If payload returns nil, Call aborts
+	// immediately with ErrCallTimeout and emits no frame.
+	Call(ctx context.Context, service, kind string, timeout time.Duration, maxInflight int, payload func(nonce, epoch uint64) cbor.RawMessage) (cbor.RawMessage, error)
+	Complete(nonce, epoch uint64, payload cbor.RawMessage)
+	HasClient() bool
+	ClientHas(service string) bool
 }
+
+// ServiceFactory constructs an agent-side service after the built-ins.
+type ServiceFactory func(host ServiceHost, log *slog.Logger) Service
 
 // serviceEntry is the registry's per-service bookkeeping: the Service itself,
 // its declared version and outbox capacity, the per-service admission budget
@@ -129,6 +141,31 @@ func newRegistry(log *slog.Logger) *registry {
 	}
 }
 
+type serviceHost struct {
+	r *registry
+}
+
+func (h *serviceHost) Emit(service, kind string, payload cbor.RawMessage) bool {
+	return h.r.emit(service, kind, payload)
+}
+
+func (h *serviceHost) Call(ctx context.Context, service, kind string, timeout time.Duration, maxInflight int, payload func(nonce, epoch uint64) cbor.RawMessage) (cbor.RawMessage, error) {
+	nonce := h.r.nextNonce()
+	pl := payload(nonce, h.r.epoch())
+	if pl == nil {
+		return nil, ErrCallTimeout
+	}
+	return h.r.call(ctx, service, kind, timeout, maxInflight, nonce, pl)
+}
+
+func (h *serviceHost) Complete(nonce, epoch uint64, payload cbor.RawMessage) {
+	h.r.completeCall(nonce, epoch, payload)
+}
+
+func (h *serviceHost) HasClient() bool { return h.r.hasClient() }
+
+func (h *serviceHost) ClientHas(service string) bool { return h.r.clientHas(service) }
+
 // newEpoch returns a non-zero random clip epoch — the permanent home of the
 // per-process clip identity (server.go's randEpoch is deleted with the legacy
 // clip machinery in u5). Semantics are identical to randEpoch: a zero draw is
@@ -164,10 +201,10 @@ func (r *registry) hasClient() bool {
 
 // register records svc by Name, claims its verbs (a duplicate claim across
 // services PANICS — programmer error, DESIGN S8), allocates its (initially
-// empty) outbox admission budget, binds the registry back into the service, and
-// resizes the merged outbox to the sum of all services' capacities. It calls
-// svc.Verbs() ONCE HERE ONLY to extract verb names — it does NOT snapshot
-// Verb.Deadline/Handle (those are read live in routeVerb).
+// empty) outbox admission budget, and resizes the merged outbox to the sum of
+// all services' capacities. It calls svc.Verbs() ONCE HERE ONLY to extract verb
+// names — it does NOT snapshot Verb.Deadline/Handle (those are read live in
+// routeVerb).
 func (r *registry) register(svc Service) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -191,11 +228,6 @@ func (r *registry) register(svc Service) {
 		r.claims[v.Name] = entry
 	}
 	r.svcs[name] = entry
-
-	// Bind the registry back so the service can emit()/call() (never an encoder).
-	if b, ok := svc.(registryBinder); ok {
-		b.bindRegistry(r)
-	}
 
 	// The merged outbox capacity == the SUM of per-service caps, so an admitted
 	// emit() always has a free slot to push into.

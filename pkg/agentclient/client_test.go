@@ -15,9 +15,9 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"github.com/VikashLoomba/Portal/internal/agent"
-	"github.com/VikashLoomba/Portal/internal/agent/watcher"
 	"github.com/VikashLoomba/Portal/internal/bootstrap"
+	"github.com/VikashLoomba/Portal/pkg/agent"
+	"github.com/VikashLoomba/Portal/pkg/agent/watcher"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 	"github.com/VikashLoomba/Portal/pkg/transport"
 )

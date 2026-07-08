@@ -9,15 +9,16 @@ import (
 	"os/user"
 	"strconv"
 
-	"github.com/VikashLoomba/Portal/internal/agentclient"
 	"github.com/VikashLoomba/Portal/internal/audit"
 	"github.com/VikashLoomba/Portal/internal/bootstrap"
+	"github.com/VikashLoomba/Portal/internal/clipshim"
 	"github.com/VikashLoomba/Portal/internal/clock"
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/discover"
 	"github.com/VikashLoomba/Portal/internal/forward"
 	"github.com/VikashLoomba/Portal/internal/proc"
 	"github.com/VikashLoomba/Portal/internal/service"
+	"github.com/VikashLoomba/Portal/pkg/agentclient"
 	"github.com/VikashLoomba/Portal/pkg/hub"
 	"github.com/VikashLoomba/Portal/pkg/run"
 	"github.com/VikashLoomba/Portal/pkg/transport"
@@ -115,6 +116,7 @@ func NewProd() (*App, error) {
 		Log:        slogger,
 		StderrSink: os.Stderr,
 		Hub:        h,
+		ClipShim:   clipShimAdapter{},
 	})
 	rd := discover.NewAgent(ac)
 
@@ -229,6 +231,12 @@ func (e errTransport) Forward(context.Context, int, int) error        { return e
 func (e errTransport) Cancel(context.Context, int, int) error         { return e.err }
 func (e errTransport) ListForwards(context.Context) ([]int, error)    { return nil, e.err }
 func (e errTransport) ForwardLines(context.Context) ([]string, error) { return nil, e.err }
+
+type clipShimAdapter struct{}
+
+func (clipShimAdapter) Ensure(ctx context.Context, t transport.Transport) error {
+	return clipshim.Ensure(ctx, t)
+}
 
 // Engine constructs a fresh forward.Engine using the App's wiring. The
 // engine is event-driven via AgentClient.Events(). Callers that want to
