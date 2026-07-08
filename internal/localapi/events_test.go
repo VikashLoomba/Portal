@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/VikashLoomba/Portal/internal/config"
-	"github.com/VikashLoomba/Portal/internal/hub"
+	"github.com/VikashLoomba/Portal/pkg/hub"
 )
 
 // newEventsServer serves a Server with a real hub.Hub on a real unix socket in a

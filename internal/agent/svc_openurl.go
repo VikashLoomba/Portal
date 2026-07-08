@@ -9,7 +9,7 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
 
 // openURLService is the compiled-in openurl service (DESIGN §4.1): it relays

@@ -22,7 +22,7 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 
-	"github.com/VikashLoomba/Portal/internal/ptyx"
+	"github.com/VikashLoomba/Portal/pkg/transport/ptyx"
 )
 
 // passthroughResolver is the hermetic ConfigResolver every server-backed New

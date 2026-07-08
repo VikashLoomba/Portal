@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 func TestStreamPtySttySize(t *testing.T) {

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // dialedTestClient starts an in-process T6 server, points a native Client at it

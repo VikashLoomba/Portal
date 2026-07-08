@@ -20,9 +20,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/VikashLoomba/Portal/internal/doctor"
-	"github.com/VikashLoomba/Portal/internal/hub"
 	"github.com/VikashLoomba/Portal/internal/localapi"
+	"github.com/VikashLoomba/Portal/pkg/doctor"
+	"github.com/VikashLoomba/Portal/pkg/hub"
 )
 
 // Per-call default timeouts, exposed as vars so tests can shrink them. Status/

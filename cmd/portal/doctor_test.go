@@ -11,10 +11,10 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/clipshim"
-	"github.com/VikashLoomba/Portal/internal/doctor"
-	"github.com/VikashLoomba/Portal/internal/run"
-	"github.com/VikashLoomba/Portal/internal/sshnative"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/doctor"
+	"github.com/VikashLoomba/Portal/pkg/run"
+	"github.com/VikashLoomba/Portal/pkg/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport/sshnative"
 )
 
 // doctorFakeTransport implements transport.Transport for the doctor tests. It

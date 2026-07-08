@@ -21,8 +21,8 @@ import (
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/execws"
 	"github.com/VikashLoomba/Portal/internal/localapi"
-	"github.com/VikashLoomba/Portal/internal/protocol"
-	"github.com/VikashLoomba/Portal/internal/transport/localexec"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
+	"github.com/VikashLoomba/Portal/pkg/transport/localexec"
 )
 
 func TestExec(t *testing.T) {

@@ -16,13 +16,13 @@ import (
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/discover"
 	"github.com/VikashLoomba/Portal/internal/forward"
-	"github.com/VikashLoomba/Portal/internal/hub"
 	"github.com/VikashLoomba/Portal/internal/proc"
-	"github.com/VikashLoomba/Portal/internal/run"
 	"github.com/VikashLoomba/Portal/internal/service"
-	"github.com/VikashLoomba/Portal/internal/sshctl"
-	"github.com/VikashLoomba/Portal/internal/sshnative"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/hub"
+	"github.com/VikashLoomba/Portal/pkg/run"
+	"github.com/VikashLoomba/Portal/pkg/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport/sshctl"
+	"github.com/VikashLoomba/Portal/pkg/transport/sshnative"
 )
 
 // App is the dependency container. NewProd wires real adapters; tests build

@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/VikashLoomba/Portal/internal/app"
-	"github.com/VikashLoomba/Portal/internal/hub"
 	"github.com/VikashLoomba/Portal/internal/localapi"
 	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/pkg/hub"
 )
 
 // syncBuffer is a mutex-guarded bytes.Buffer so the test goroutine polling the

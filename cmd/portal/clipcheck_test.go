@@ -5,7 +5,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // nativeHealthTransport is a transport.Transport whose Health is fully

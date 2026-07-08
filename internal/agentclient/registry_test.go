@@ -9,7 +9,7 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
 
 // countHandler is a slog.Handler that counts warn-level records, for asserting

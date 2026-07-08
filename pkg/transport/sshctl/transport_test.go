@@ -6,8 +6,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/VikashLoomba/Portal/internal/run"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/run"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // Real OpenSSH writes "Master running (pid=12345)\r\n" to STDERR. The

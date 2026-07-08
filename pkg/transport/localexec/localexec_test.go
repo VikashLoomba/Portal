@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // shQuote mirrors the install/doctor/conformance single-quote wrap so the

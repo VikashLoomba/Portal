@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // recordTransport implements transport.Transport, capturing every script Ensure

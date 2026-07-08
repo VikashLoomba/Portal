@@ -13,7 +13,7 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/clipshim"
-	"github.com/VikashLoomba/Portal/internal/sshctl"
+	"github.com/VikashLoomba/Portal/pkg/transport/sshctl"
 )
 
 func filepathDir(p string) string { return filepath.Dir(p) }

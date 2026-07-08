@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VikashLoomba/Portal/internal/run"
-	"github.com/VikashLoomba/Portal/internal/sshctl"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/run"
+	"github.com/VikashLoomba/Portal/pkg/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport/sshctl"
 )
 
 func TestStreamPtyPathShimTTYResizeAndArgs(t *testing.T) {

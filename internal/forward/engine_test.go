@@ -11,7 +11,7 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/clock"
 	"github.com/VikashLoomba/Portal/internal/config"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // fakeTransport implements BOTH transport.Transport and transport.PortForwarder

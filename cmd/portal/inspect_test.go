@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/VikashLoomba/Portal/internal/app"
-	"github.com/VikashLoomba/Portal/internal/protocol"
 	"github.com/VikashLoomba/Portal/internal/service"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
 
 // EC1: status sourced over the socket includes the agent line plus the master/

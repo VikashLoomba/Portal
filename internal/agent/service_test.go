@@ -15,7 +15,7 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
 
 // handledMsg records one HandleMsg delivery.

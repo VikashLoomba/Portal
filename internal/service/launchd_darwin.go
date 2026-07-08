@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/VikashLoomba/Portal/internal/clock"
-	"github.com/VikashLoomba/Portal/internal/run"
+	"github.com/VikashLoomba/Portal/pkg/run"
 )
 
 //go:embed plist.tmpl

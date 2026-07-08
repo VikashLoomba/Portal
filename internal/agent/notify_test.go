@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/VikashLoomba/Portal/internal/agent/watcher"
-	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
 
 // notifyHarness drives a Server with a real cmd socket and a connected client

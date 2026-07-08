@@ -22,8 +22,8 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/VikashLoomba/Portal/internal/ptyx"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport/ptyx"
 )
 
 // Local runs commands on the local machine via `sh -c`.

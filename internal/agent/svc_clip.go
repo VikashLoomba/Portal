@@ -8,7 +8,7 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
 
 // Clip timeout budget (DESIGN §4.5). These keep the whole paste round trip well

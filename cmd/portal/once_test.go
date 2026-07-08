@@ -19,8 +19,8 @@ import (
 	"github.com/VikashLoomba/Portal/internal/clock"
 	"github.com/VikashLoomba/Portal/internal/forward"
 	"github.com/VikashLoomba/Portal/internal/localclient"
-	"github.com/VikashLoomba/Portal/internal/protocol"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // onceStreamTransport wires each ExecStream to a REAL agent.Server over io.Pipe

@@ -18,8 +18,8 @@ import (
 	"github.com/VikashLoomba/Portal/internal/agent"
 	"github.com/VikashLoomba/Portal/internal/agent/watcher"
 	"github.com/VikashLoomba/Portal/internal/bootstrap"
-	"github.com/VikashLoomba/Portal/internal/protocol"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // fakeStreamTransport implements transport.Transport for the client test. It

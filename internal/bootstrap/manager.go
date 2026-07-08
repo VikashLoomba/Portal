@@ -13,7 +13,7 @@ import (
 	"sync"
 
 	"github.com/VikashLoomba/Portal/internal/clipshim"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // shellQuoted wraps a shell script in single quotes, escaping any embedded

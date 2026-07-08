@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/VikashLoomba/Portal/internal/agent/watcher"
-	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
 
 // tempSockPath returns a Unix-socket path under a freshly-created short temp

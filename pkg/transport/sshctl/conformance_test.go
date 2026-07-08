@@ -5,10 +5,10 @@ import (
 	"testing"
 
 	"github.com/VikashLoomba/Portal/internal/proc"
-	"github.com/VikashLoomba/Portal/internal/run"
-	"github.com/VikashLoomba/Portal/internal/sshctl"
-	"github.com/VikashLoomba/Portal/internal/transport"
-	"github.com/VikashLoomba/Portal/internal/transport/conformance"
+	"github.com/VikashLoomba/Portal/pkg/run"
+	"github.com/VikashLoomba/Portal/pkg/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport/conformance"
+	"github.com/VikashLoomba/Portal/pkg/transport/sshctl"
 )
 
 // TestConformance runs the shared transport conformance suite against a real

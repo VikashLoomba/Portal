@@ -16,9 +16,9 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/bootstrap"
 	"github.com/VikashLoomba/Portal/internal/clipshim"
-	"github.com/VikashLoomba/Portal/internal/hub"
-	"github.com/VikashLoomba/Portal/internal/protocol"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/hub"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // ErrNoSnapshot is returned by Snapshot() before the first SubscribeAck has

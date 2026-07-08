@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VikashLoomba/Portal/internal/ptyx"
+	"github.com/VikashLoomba/Portal/pkg/transport/ptyx"
 	"golang.org/x/sys/unix"
 )
 

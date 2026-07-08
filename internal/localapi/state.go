@@ -10,11 +10,11 @@ import (
 	"io"
 
 	"github.com/VikashLoomba/Portal/internal/audit"
-	"github.com/VikashLoomba/Portal/internal/doctor"
-	"github.com/VikashLoomba/Portal/internal/hub"
-	"github.com/VikashLoomba/Portal/internal/protocol"
 	"github.com/VikashLoomba/Portal/internal/service"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/doctor"
+	"github.com/VikashLoomba/Portal/pkg/hub"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // VersionInfo is the payload of GET /v1/version: portal version, embedded git

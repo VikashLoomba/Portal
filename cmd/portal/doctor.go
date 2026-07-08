@@ -10,10 +10,10 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/clipshim"
-	"github.com/VikashLoomba/Portal/internal/doctor"
 	"github.com/VikashLoomba/Portal/internal/localclient"
-	"github.com/VikashLoomba/Portal/internal/sshnative"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/doctor"
+	"github.com/VikashLoomba/Portal/pkg/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport/sshnative"
 )
 
 // newDoctorCmd self-tests the clipboard + notification path end to end over ssh

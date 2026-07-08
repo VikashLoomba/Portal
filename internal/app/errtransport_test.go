@@ -6,7 +6,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // errTransport is the graceful-degradation placeholder NewProd installs when the

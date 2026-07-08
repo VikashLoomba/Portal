@@ -20,10 +20,10 @@ import (
 	"github.com/VikashLoomba/Portal/internal/clip"
 	"github.com/VikashLoomba/Portal/internal/clipupload"
 	"github.com/VikashLoomba/Portal/internal/config"
-	"github.com/VikashLoomba/Portal/internal/doctor"
 	"github.com/VikashLoomba/Portal/internal/localapi"
 	"github.com/VikashLoomba/Portal/internal/localclient"
-	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/pkg/doctor"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
 
 func newRunCmd(a *app.App) *cobra.Command {

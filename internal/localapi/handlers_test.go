@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	"github.com/VikashLoomba/Portal/internal/config"
-	"github.com/VikashLoomba/Portal/internal/doctor"
-	"github.com/VikashLoomba/Portal/internal/hub"
+	"github.com/VikashLoomba/Portal/pkg/doctor"
+	"github.com/VikashLoomba/Portal/pkg/hub"
 )
 
 // recordingPushAllow records the allowlists pushed to the AgentClient so a test

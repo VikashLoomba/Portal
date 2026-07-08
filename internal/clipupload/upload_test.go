@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // fakeTransport returns canned stdout/stderr/err from Exec so we can drive

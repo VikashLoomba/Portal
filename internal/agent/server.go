@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/VikashLoomba/Portal/internal/agent/watcher"
-	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
 
 // Config bundles the constructor inputs. Everything is injected so the

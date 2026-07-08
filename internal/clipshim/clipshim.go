@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // Version is the content-version marker embedded in every shim. Ensure

@@ -10,7 +10,7 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"github.com/VikashLoomba/Portal/internal/protocol"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
 
 // notifyBodyMax bounds the inbound `notify` body on the cmd socket. The notify

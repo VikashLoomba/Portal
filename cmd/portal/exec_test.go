@@ -19,9 +19,9 @@ import (
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/localapi"
 	"github.com/VikashLoomba/Portal/internal/localclient"
-	"github.com/VikashLoomba/Portal/internal/protocol"
-	"github.com/VikashLoomba/Portal/internal/ptyx"
-	"github.com/VikashLoomba/Portal/internal/transport/localexec"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
+	"github.com/VikashLoomba/Portal/pkg/transport/localexec"
+	"github.com/VikashLoomba/Portal/pkg/transport/ptyx"
 	"golang.org/x/sys/unix"
 )
 

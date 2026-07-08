@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/VikashLoomba/Portal/internal/config"
-	"github.com/VikashLoomba/Portal/internal/sshnative"
+	"github.com/VikashLoomba/Portal/pkg/transport/sshnative"
 )
 
 // stderrRunner is a run.Runner that returns a fixed stderr on a code-0 Exec, so

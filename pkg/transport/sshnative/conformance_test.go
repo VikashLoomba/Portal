@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/VikashLoomba/Portal/internal/transport"
-	"github.com/VikashLoomba/Portal/internal/transport/conformance"
+	"github.com/VikashLoomba/Portal/pkg/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport/conformance"
 )
 
 // TestConformance runs the shared T7 suite against the in-process T6 server via

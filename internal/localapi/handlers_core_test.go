@@ -10,10 +10,10 @@ import (
 	"testing"
 
 	"github.com/VikashLoomba/Portal/internal/config"
-	"github.com/VikashLoomba/Portal/internal/hub"
-	"github.com/VikashLoomba/Portal/internal/protocol"
 	"github.com/VikashLoomba/Portal/internal/service"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/hub"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // fakeAgent is a function-level AgentSource fake (no wire, no goroutines).
