@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -99,6 +101,156 @@ func TestExecFeatureOff(t *testing.T) {
 	}
 	if apiErr.Code != "feature_disabled" {
 		t.Fatalf("APIError.Code = %q, want feature_disabled", apiErr.Code)
+	}
+}
+
+func TestExecWithOptionsPTYSkewRequiresGrantedHeader(t *testing.T) {
+	path := filepath.Join(shortExecClientTempDir(t), "api.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+
+		br := bufio.NewReader(conn)
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if got := req.URL.Query().Get("pty"); got != "1" {
+			serverDone <- fmt.Errorf("pty query = %q, want 1", got)
+			return
+		}
+		key := strings.TrimSpace(req.Header.Get("Sec-WebSocket-Key"))
+		if _, err := fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", execws.AcceptKey(key)); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+			serverDone <- err
+			return
+		}
+		if b, err := br.ReadByte(); err == nil {
+			serverDone <- fmt.Errorf("client sent frame byte %#x after missing PTY grant", b)
+			return
+		} else if !errors.Is(err, io.EOF) {
+			serverDone <- err
+			return
+		}
+		serverDone <- nil
+	}()
+	defer func() {
+		_ = ln.Close()
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Fatalf("fake exec server: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("fake exec server did not stop")
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	code, err := New(path).ExecWithOptions(ctx, []string{"cat"}, strings.NewReader("payload"), io.Discard, io.Discard, ExecOptions{PTY: true})
+	if !errors.Is(err, ErrPTYUnsupported) {
+		t.Fatalf("ExecWithOptions error = %v, want ErrPTYUnsupported", err)
+	}
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+}
+
+func TestExecWithOptionsPTYFullStackSttySize(t *testing.T) {
+	path, _ := startExecClientServer(t, config.New(t.TempDir()))
+
+	var out bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	code, err := New(path).ExecWithOptions(ctx, []string{"stty", "size"}, nil, &out, nil, ExecOptions{PTY: true, Rows: 40, Cols: 100})
+	if err != nil {
+		t.Fatalf("ExecWithOptions returned error: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(out.String(), "40 100") {
+		t.Fatalf("stdout = %q, want stty size 40 100", out.String())
+	}
+}
+
+func TestExecWithOptionsPTYFullStackResize(t *testing.T) {
+	path, _ := startExecClientServer(t, config.New(t.TempDir()))
+
+	winch := make(chan [2]uint16, 1)
+	var out bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	time.AfterFunc(100*time.Millisecond, func() {
+		select {
+		case winch <- [2]uint16{30, 90}:
+		default:
+		}
+	})
+
+	script := "sleep 0.2; i=0; while [ $i -lt 20 ]; do stty size; i=$((i+1)); sleep 0.1; done"
+	code, err := New(path).ExecWithOptions(ctx, []string{"sh", "-c", shellSingleQuoteExecTest(script)}, nil, &out, nil, ExecOptions{
+		PTY:   true,
+		Rows:  40,
+		Cols:  100,
+		Winch: winch,
+	})
+	if err != nil {
+		t.Fatalf("ExecWithOptions returned error: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(out.String(), "30 90") {
+		t.Fatalf("stdout = %q, want resized stty size 30 90", out.String())
+	}
+}
+
+func TestExecWithOptionsPTYDisconnectKillsForegroundProcess(t *testing.T) {
+	path, _ := startExecClientServer(t, config.New(t.TempDir()))
+	pidfile := filepath.Join(t.TempDir(), "pid")
+	argv := []string{"sh", "-c", shellSingleQuoteExecTest("echo $$ >" + pidfile + "; exec sleep 300")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct {
+		code int
+		err  error
+	}, 1)
+	go func() {
+		code, err := New(path).ExecWithOptions(ctx, argv, nil, io.Discard, io.Discard, ExecOptions{PTY: true, Rows: 24, Cols: 80})
+		done <- struct {
+			code int
+			err  error
+		}{code: code, err: err}
+	}()
+
+	pid := waitExecPIDFile(t, pidfile)
+	cancel()
+	if !waitExecNoProcess(pid, 5*time.Second) {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		t.Fatalf("process %d still existed after PTY client disconnect", pid)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ExecWithOptions did not return after context cancellation")
 	}
 }
 
@@ -239,4 +391,48 @@ func shortExecClientTempDir(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return dir
+}
+
+func shellSingleQuoteExecTest(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func waitExecPIDFile(t *testing.T, path string) int {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(path)
+		if err == nil {
+			text := strings.TrimSpace(string(b))
+			if text == "" {
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+			pid, err := strconv.Atoi(text)
+			if err != nil {
+				t.Fatalf("pidfile %s contains %q: %v", path, text, err)
+			}
+			return pid
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read pidfile %s: %v", path, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for pidfile %s", path)
+	return 0
+}
+
+func waitExecNoProcess(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		err := syscall.Kill(pid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
 }

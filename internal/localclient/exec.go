@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,9 +23,27 @@ type readDeadlineSetter interface {
 	SetReadDeadline(time.Time) error
 }
 
+// ErrPTYUnsupported means a PTY was requested but the upgraded daemon did not
+// confirm PTY support. Restart the daemon so the CLI and daemon versions match.
+var ErrPTYUnsupported = errors.New("daemon does not support PTY (restart the daemon after upgrading)")
+
+type ExecOptions struct {
+	PTY   bool
+	Term  string
+	Rows  uint16
+	Cols  uint16
+	Winch <-chan [2]uint16
+}
+
 // Exec opens POST /v1/exec as an in-tree WebSocket client, pumps std streams,
 // and returns the remote process exit code.
 func (c *Client) Exec(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	return c.ExecWithOptions(ctx, argv, stdin, stdout, stderr, ExecOptions{})
+}
+
+// ExecWithOptions opens POST /v1/exec as an in-tree WebSocket client, pumps std
+// streams, and returns the remote process exit code.
+func (c *Client) ExecWithOptions(ctx context.Context, argv []string, stdin io.Reader, stdout, stderr io.Writer, opts ExecOptions) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -60,7 +79,7 @@ func (c *Client) Exec(ctx context.Context, argv []string, stdin io.Reader, stdou
 	if err != nil {
 		return 0, err
 	}
-	target := execPath(argv)
+	target := execPath(argv, opts)
 	req, err := http.NewRequest(http.MethodPost, "http://unix"+target, nil)
 	if err != nil {
 		return 0, err
@@ -84,9 +103,17 @@ func (c *Client) Exec(ctx context.Context, argv []string, stdin io.Reader, stdou
 	if got, want := strings.TrimSpace(resp.Header.Get("Sec-WebSocket-Accept")), execWSAccept(key); got != want {
 		return 0, fmt.Errorf("websocket: Sec-WebSocket-Accept mismatch")
 	}
+	if opts.PTY && resp.Header.Get("X-Portal-Exec-Pty") != "1" {
+		return 0, ErrPTYUnsupported
+	}
 
 	writeMu := &sync.Mutex{}
-	stdinDone := pumpExecStdin(conn, writeMu, stdin)
+	stdinDone := pumpExecStdin(conn, writeMu, stdin, opts.PTY)
+	sessionDone := make(chan struct{})
+	var winchDone <-chan error
+	if opts.PTY {
+		winchDone = pumpExecWinch(conn, writeMu, opts.Winch, sessionDone)
+	}
 	var pumpErr error
 
 	exitCode := 0
@@ -149,6 +176,7 @@ readLoop:
 		}
 	}
 
+	close(sessionDone)
 	// A terminal stdin read can block after the remote command has already
 	// exited; doc §8.1 requires `portal exec -- uname -sm` to return promptly.
 	if stdin != nil {
@@ -157,6 +185,9 @@ readLoop:
 		}
 	}
 	_ = conn.Close()
+	if winchDone != nil {
+		<-winchDone
+	}
 	if stdinDone != nil {
 		select {
 		case pumpErr = <-stdinDone:
@@ -191,7 +222,7 @@ readLoop:
 	return 0, io.ErrUnexpectedEOF
 }
 
-func execPath(argv []string) string {
+func execPath(argv []string, opts ExecOptions) string {
 	var b strings.Builder
 	b.WriteString("/v1/exec")
 	for i, arg := range argv {
@@ -203,7 +234,24 @@ func execPath(argv []string) string {
 		b.WriteString("arg=")
 		b.WriteString(url.QueryEscape(arg))
 	}
+	if opts.PTY {
+		appendExecQuery(&b, len(argv) == 0, "pty", "1")
+		appendExecQuery(&b, false, "term", opts.Term)
+		appendExecQuery(&b, false, "rows", strconv.FormatUint(uint64(opts.Rows), 10))
+		appendExecQuery(&b, false, "cols", strconv.FormatUint(uint64(opts.Cols), 10))
+	}
 	return b.String()
+}
+
+func appendExecQuery(b *strings.Builder, first bool, key, value string) {
+	if first {
+		b.WriteByte('?')
+	} else {
+		b.WriteByte('&')
+	}
+	b.WriteString(key)
+	b.WriteByte('=')
+	b.WriteString(url.QueryEscape(value))
 }
 
 func execUpgradeRequest(target, key string) string {
@@ -229,9 +277,12 @@ func execWSAccept(key string) string {
 	return execws.AcceptKey(key)
 }
 
-func pumpExecStdin(w net.Conn, writeMu *sync.Mutex, stdin io.Reader) <-chan error {
+func pumpExecStdin(w net.Conn, writeMu *sync.Mutex, stdin io.Reader, pty bool) <-chan error {
 	done := make(chan error, 1)
 	if stdin == nil {
+		if pty {
+			return nil
+		}
 		go func() { done <- writeExecStdinFrame(w, writeMu, nil) }()
 		return done
 	}
@@ -247,6 +298,10 @@ func pumpExecStdin(w net.Conn, writeMu *sync.Mutex, stdin io.Reader) <-chan erro
 			}
 			if rerr != nil {
 				if errors.Is(rerr, io.EOF) {
+					if pty {
+						done <- nil
+						return
+					}
 					done <- writeExecStdinFrame(w, writeMu, nil)
 					return
 				}
@@ -257,6 +312,44 @@ func pumpExecStdin(w net.Conn, writeMu *sync.Mutex, stdin io.Reader) <-chan erro
 		}
 	}()
 	return done
+}
+
+func pumpExecWinch(w io.Writer, writeMu *sync.Mutex, winch <-chan [2]uint16, done <-chan struct{}) <-chan error {
+	if winch == nil {
+		return nil
+	}
+	errc := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-done:
+				errc <- nil
+				return
+			case size, ok := <-winch:
+				if !ok {
+					errc <- nil
+					return
+				}
+				payload, err := execws.EncodeExecFrame(execws.ExecFrame{
+					Stream: execws.ExecStreamWinch,
+					Rows:   size[0],
+					Cols:   size[1],
+				})
+				if err != nil {
+					errc <- err
+					return
+				}
+				writeMu.Lock()
+				err = execws.WriteFrame(w, execws.OpBinary, payload, true)
+				writeMu.Unlock()
+				if err != nil {
+					errc <- err
+					return
+				}
+			}
+		}
+	}()
+	return errc
 }
 
 func writeExecStdinFrame(w io.Writer, writeMu *sync.Mutex, data []byte) error {
