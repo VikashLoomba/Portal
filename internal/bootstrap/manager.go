@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +34,11 @@ func (m *Manager) EmbeddedSHA() string { return EmbeddedSHA() }
 // ~/.cache/portal/ rather than /tmp/ so they survive reboots — saves the
 // ~3MB upload after every reboot. The dir is created mode 0700.
 const remoteDir = "~/.cache/portal"
+
+var (
+	errInvalidArtifactName = errors.New("bootstrap: invalid artifact name")
+	artifactNameRE         = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
+)
 
 // Manager handles the embedded-agent → remote-cache lifecycle:
 //  1. Probe for the right SHA already at ~/.cache/portal/agent-<sha>.
@@ -106,6 +113,15 @@ func (m *Manager) selectArtifactCached(ctx context.Context) (artifact, error) {
 // half-close, ctx cancel, kill). The previous canonical binary is left
 // intact until the final mv lands, so a partial transfer never produces
 // a corrupt agent at the canonical path.
+//
+// Deliberate split from EnsureArtifact: EnsureUploaded keys the remote path
+// by the 40-hex git commit SHA returned by EmbeddedSHA(), which is
+// arch-independent, and maintains the stable `portald` symlink resolved by
+// the remote xdg-open wrapper. EnsureArtifact is content-addressed by the
+// 64-hex sha256 of its content, per-arch when callers pass per-arch bytes,
+// with a stable `<name>` symlink. Both paths share uploadVerified; forcing
+// delegation would change provisioned boxes' paths, cause probe misses and
+// spurious re-uploads, and rename the portald symlink.
 func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
 	sha := EmbeddedSHA()
 	if sha == "" {
@@ -149,7 +165,20 @@ func (m *Manager) EnsureUploaded(ctx context.Context) (string, error) {
 }
 
 // EnsureArtifact uploads content to a content-addressed path and points name at it.
+//
+// Deliberate split from EnsureUploaded: EnsureArtifact keys the remote path
+// by the 64-hex sha256 of its content, per-arch when callers pass per-arch
+// bytes, and maintains a stable `<name>` symlink. EnsureUploaded is keyed by
+// the 40-hex git commit SHA returned by EmbeddedSHA(), which is
+// arch-independent, and owns the stable `portald` symlink resolved by the
+// remote xdg-open wrapper. Both paths share uploadVerified; forcing delegation
+// would change provisioned boxes' paths, cause probe misses and spurious
+// re-uploads, and rename the portald symlink.
 func (m *Manager) EnsureArtifact(ctx context.Context, name string, content []byte) (remotePath string, err error) {
+	if err := validArtifactName(name); err != nil {
+		return "", err
+	}
+
 	sum := sha256.Sum256(content)
 	digest := hex.EncodeToString(sum[:])
 	remotePath = remoteDir + "/" + name + "-" + digest
@@ -161,6 +190,13 @@ func (m *Manager) EnsureArtifact(ctx context.Context, name string, content []byt
 	symlink := fmt.Sprintf(`ln -sf %s %s/%s`, remotePath, remoteDir, name)
 	_, _, _ = m.T.Exec(ctx, nil, "bash", "-c", shellQuoted(symlink))
 	return remotePath, nil
+}
+
+func validArtifactName(name string) error {
+	if artifactNameRE.MatchString(name) {
+		return nil
+	}
+	return fmt.Errorf("%w %q: must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}", errInvalidArtifactName, name)
 }
 
 func (m *Manager) uploadVerified(ctx context.Context, remotePath string, content []byte, digest string) (present bool, err error) {
