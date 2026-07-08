@@ -126,6 +126,9 @@ func TestExecAuditOpenCloseOnce(t *testing.T) {
 			if !strings.Contains(line, "\thost=local\tsid=") {
 				t.Fatalf("exec-open sid is not immediately after host: %s", line)
 			}
+			if strings.Contains(line, "\tpty=1") {
+				t.Fatalf("non-pty exec-open unexpectedly carries pty=1: %s", line)
+			}
 		}
 		if strings.Contains(line, "\texec-close\t") {
 			closes++
@@ -143,6 +146,34 @@ func TestExecAuditOpenCloseOnce(t *testing.T) {
 	}
 	if opens != 1 || closes != 1 {
 		t.Fatalf("audit exec-open=%d exec-close=%d, want 1 each\n%s", opens, closes, strings.Join(lines, "\n"))
+	}
+	if openSID == "" || closeSID == "" || openSID != closeSID {
+		t.Fatalf("audit sid open=%q close=%q, want same non-empty\n%s", openSID, closeSID, strings.Join(lines, "\n"))
+	}
+}
+
+func TestExecAuditPtyOpenFlagAndSID(t *testing.T) {
+	a := audit.New(t.TempDir())
+	path, _ := startExecServer(t, config.New(t.TempDir()), a, localexec.New())
+	c := dialExecWSWithQuery(t, path, []string{"printf", "hello"}, url.Values{"pty": {"1"}})
+	defer c.Close()
+
+	_ = readExecFramesUntilExit(t, c, 2*time.Second)
+	lines := waitAuditLines(t, a.Path(), 2, 2*time.Second)
+	var openSID, closeSID string
+	for _, line := range lines {
+		fields := auditFields(line)
+		switch {
+		case strings.Contains(line, "\texec-open\t"):
+			openSID = fields["sid"]
+			for _, token := range []string{"host=local", "sid=", "argv=printf hello", "pty=1"} {
+				if !strings.Contains(line, token) {
+					t.Fatalf("pty exec-open missing %q: %s", token, line)
+				}
+			}
+		case strings.Contains(line, "\texec-close\t"):
+			closeSID = fields["sid"]
+		}
 	}
 	if openSID == "" || closeSID == "" || openSID != closeSID {
 		t.Fatalf("audit sid open=%q close=%q, want same non-empty\n%s", openSID, closeSID, strings.Join(lines, "\n"))
@@ -202,6 +233,103 @@ func TestExecEmptyArgvReturnsInvalidRequestWithoutUpgrade(t *testing.T) {
 	}
 	if eb.Error.Code != "invalid_request" {
 		t.Fatalf("error code = %q, want invalid_request", eb.Error.Code)
+	}
+}
+
+func TestExecPtyUnsupportedNoUpgrade(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), unsupportedPtyExecStreamer{})
+
+	status, _, body := rawExecHTTPWithQuery(t, path, nil, url.Values{"pty": {"1"}})
+	if !strings.Contains(status, "409") {
+		t.Fatalf("status = %q, want 409", status)
+	}
+	if strings.Contains(status, "101") {
+		t.Fatalf("unsupported pty upgraded unexpectedly: %q", status)
+	}
+	var eb errorBody
+	if err := json.Unmarshal(body, &eb); err != nil {
+		t.Fatalf("decode error body %q: %v", string(body), err)
+	}
+	if eb.Error.Code != "pty_unsupported" {
+		t.Fatalf("error code = %q, want pty_unsupported", eb.Error.Code)
+	}
+}
+
+func TestExecPtyCapabilityHeaderConfirm(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+
+	ptyConn := dialExecWSWithQuery(t, path, []string{"printf", "hello"}, url.Values{"pty": {"1"}})
+	if got := ptyConn.headers.Get("X-Portal-Exec-Pty"); got != "1" {
+		ptyConn.Close()
+		t.Fatalf("X-Portal-Exec-Pty = %q, want 1", got)
+	}
+	ptyConn.Close()
+
+	plainConn := dialExecWS(t, path, []string{"printf", "hello"})
+	defer plainConn.Close()
+	if got := plainConn.headers.Get("X-Portal-Exec-Pty"); got != "" {
+		t.Fatalf("non-pty X-Portal-Exec-Pty = %q, want absent", got)
+	}
+}
+
+func TestExecPtySttySize(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	c := dialExecWSWithQuery(t, path, []string{"stty", "size"}, url.Values{
+		"pty":  {"1"},
+		"rows": {"40"},
+		"cols": {"100"},
+	})
+	defer c.Close()
+
+	frames := readExecFramesUntilExit(t, c, 2*time.Second)
+	stdout := cleanPtyOutput(joinFrameData(frames, execws.ExecStreamStdout))
+	if !strings.Contains(stdout, "40 100") {
+		t.Fatalf("stdout = %q, want stty size 40 100", stdout)
+	}
+	if got := countFrames(frames, execws.ExecStreamStderr); got != 0 {
+		t.Fatalf("stderr frames = %d, want 0 for pty", got)
+	}
+}
+
+func TestExecPtyWinchResizesSession(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	c := dialExecWSWithQuery(t, path, []string{"sh", "-c", "'stty size; read _; stty size'"}, url.Values{
+		"pty":  {"1"},
+		"rows": {"40"},
+		"cols": {"100"},
+	})
+	defer c.Close()
+
+	initial := readExecFramesUntilStdoutContains(t, c, "40 100", 2*time.Second)
+	writeExecClientFrame(t, c, execws.ExecFrame{Stream: execws.ExecStreamWinch, Rows: 50, Cols: 120})
+	writeExecClientFrame(t, c, execws.ExecFrame{Stream: execws.ExecStreamStdin, Data: []byte("go\n")})
+	rest := readExecFramesUntilExit(t, c, 2*time.Second)
+
+	frames := append(initial, rest...)
+	stdout := cleanPtyOutput(joinFrameData(frames, execws.ExecStreamStdout))
+	for _, want := range []string{"40 100", "50 120"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout = %q, want %q", stdout, want)
+		}
+	}
+	if got := countFrames(frames, execws.ExecStreamStderr); got != 0 {
+		t.Fatalf("stderr frames = %d, want 0 for pty", got)
+	}
+}
+
+func TestExecPtyZeroLengthStdinNoOp(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	c := dialExecWSWithQuery(t, path, []string{"sh", "-c", "'read line; printf \"%s\\n\" \"$line\"'"}, url.Values{"pty": {"1"}})
+	defer c.Close()
+
+	writeExecClientFrame(t, c, execws.ExecFrame{Stream: execws.ExecStreamStdin, Data: []byte{}})
+	assertNoTerminalFrameWithin(t, c, 200*time.Millisecond)
+	writeExecClientFrame(t, c, execws.ExecFrame{Stream: execws.ExecStreamStdin, Data: []byte("alive\n")})
+
+	frames := readExecFramesUntilExit(t, c, 2*time.Second)
+	stdout := cleanPtyOutput(joinFrameData(frames, execws.ExecStreamStdout))
+	if !strings.Contains(stdout, "alive") {
+		t.Fatalf("stdout = %q, want subsequent stdin to reach pty process", stdout)
 	}
 }
 
@@ -464,9 +592,21 @@ func (infiniteReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
+type unsupportedPtyExecStreamer struct{}
+
+func (unsupportedPtyExecStreamer) Stream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+	return nil, nil, nil, nil, fmt.Errorf("unexpected Stream call")
+}
+
+func (unsupportedPtyExecStreamer) Describe() transport.Desc {
+	return transport.Desc{Impl: "test", Host: "pipe-only", Endpoint: "net.Pipe"}
+}
+
 type wsTestConn struct {
 	net.Conn
-	br *bufio.Reader
+	br      *bufio.Reader
+	status  string
+	headers textproto.MIMEHeader
 }
 
 func startExecServer(t *testing.T, cfg *config.Store, a *audit.Log, streamer ExecStreamer) (string, *Server) {
@@ -499,16 +639,26 @@ func startExecServer(t *testing.T, cfg *config.Store, a *audit.Log, streamer Exe
 
 func dialExecWS(t *testing.T, path string, argv []string) *wsTestConn {
 	t.Helper()
+	return dialExecWSWithQuery(t, path, argv, nil)
+}
+
+func dialExecWSWithQuery(t *testing.T, path string, argv []string, query url.Values) *wsTestConn {
+	t.Helper()
 	c, err := net.Dial("unix", path)
 	if err != nil {
 		t.Fatalf("dial unix: %v", err)
 	}
 	q := url.Values{}
+	for key, values := range query {
+		for _, value := range values {
+			q.Add(key, value)
+		}
+	}
 	for _, arg := range argv {
 		q.Add("arg", arg)
 	}
 	key := "dGhlIHNhbXBsZSBub25jZQ=="
-	target := "/v1/exec?" + q.Encode()
+	target := execTarget(q)
 	if _, err := fmt.Fprintf(c, "POST %s HTTP/1.1\r\nHost: unix\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n", target, key); err != nil {
 		c.Close()
 		t.Fatalf("write upgrade request: %v", err)
@@ -533,10 +683,15 @@ func dialExecWS(t *testing.T, path string, argv []string) *wsTestConn {
 		c.Close()
 		t.Fatalf("Sec-WebSocket-Accept = %q, want %q", got, want)
 	}
-	return &wsTestConn{Conn: c, br: br}
+	return &wsTestConn{Conn: c, br: br, status: status, headers: hdr}
 }
 
 func rawExecHTTP(t *testing.T, path string, argv []string) (string, textproto.MIMEHeader, []byte) {
+	t.Helper()
+	return rawExecHTTPWithQuery(t, path, argv, nil)
+}
+
+func rawExecHTTPWithQuery(t *testing.T, path string, argv []string, query url.Values) (string, textproto.MIMEHeader, []byte) {
 	t.Helper()
 	c, err := net.Dial("unix", path)
 	if err != nil {
@@ -544,10 +699,15 @@ func rawExecHTTP(t *testing.T, path string, argv []string) (string, textproto.MI
 	}
 	defer c.Close()
 	q := url.Values{}
+	for key, values := range query {
+		for _, value := range values {
+			q.Add(key, value)
+		}
+	}
 	for _, arg := range argv {
 		q.Add("arg", arg)
 	}
-	target := "/v1/exec?" + q.Encode()
+	target := execTarget(q)
 	if _, err := fmt.Fprintf(c, "POST %s HTTP/1.1\r\nHost: unix\r\nUpgrade: websocket\r\nConnection: close, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", target); err != nil {
 		t.Fatalf("write request: %v", err)
 	}
@@ -566,6 +726,13 @@ func rawExecHTTP(t *testing.T, path string, argv []string) (string, textproto.MI
 		t.Fatalf("read body: %v", err)
 	}
 	return resp.Status, textproto.MIMEHeader(resp.Header), body
+}
+
+func execTarget(q url.Values) string {
+	if len(q) == 0 {
+		return "/v1/exec"
+	}
+	return "/v1/exec?" + q.Encode()
 }
 
 func writeExecClientFrame(t *testing.T, c *wsTestConn, f execws.ExecFrame) {
@@ -628,6 +795,56 @@ func readExecFramesUntilExit(t *testing.T, c *wsTestConn, timeout time.Duration)
 	}
 }
 
+func readExecFramesUntilStdoutContains(t *testing.T, c *wsTestConn, want string, timeout time.Duration) []execws.ExecFrame {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var frames []execws.ExecFrame
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("timed out waiting for stdout containing %q; got %+v", want, frames)
+		}
+		f := readExecFrame(t, c, remaining)
+		frames = append(frames, f)
+		switch f.Stream {
+		case execws.ExecStreamStdout:
+			if strings.Contains(cleanPtyOutput(joinFrameData(frames, execws.ExecStreamStdout)), want) {
+				return frames
+			}
+		case execws.ExecStreamExit, execws.ExecStreamError:
+			t.Fatalf("terminal frame before stdout contained %q: %+v", want, f)
+		}
+	}
+}
+
+func assertNoTerminalFrameWithin(t *testing.T, c *wsTestConn, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		op, payload, err := readServerFrame(c, remaining)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				return
+			}
+			t.Fatalf("read server frame: %v", err)
+		}
+		if op != execws.OpBinary {
+			continue
+		}
+		f, err := execws.DecodeExecFrame(payload)
+		if err != nil {
+			t.Fatalf("execws.DecodeExecFrame: %v", err)
+		}
+		if f.Stream == execws.ExecStreamExit || f.Stream == execws.ExecStreamError {
+			t.Fatalf("terminal frame arrived during no-op window: %+v", f)
+		}
+	}
+}
+
 func readExecFrame(t *testing.T, c *wsTestConn, timeout time.Duration) execws.ExecFrame {
 	t.Helper()
 	for {
@@ -664,6 +881,20 @@ func joinFrameData(frames []execws.ExecFrame, stream string) string {
 		}
 	}
 	return b.String()
+}
+
+func cleanPtyOutput(s string) string {
+	return strings.ReplaceAll(s, "\r", "")
+}
+
+func countFrames(frames []execws.ExecFrame, stream string) int {
+	var n int
+	for _, f := range frames {
+		if f.Stream == stream {
+			n++
+		}
+	}
+	return n
 }
 
 func lastExitCode(frames []execws.ExecFrame) int {

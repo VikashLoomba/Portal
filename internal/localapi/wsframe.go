@@ -18,7 +18,7 @@ import (
 // envelopeWriter only promotes http.ResponseWriter's interface method set;
 // direct http.Hijacker assertions fail there, while ResponseController follows
 // Unwrap like events.go's Flush path.
-func wsUpgrade(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.ReadWriter, error) {
+func wsUpgrade(w http.ResponseWriter, r *http.Request, extraHeaders ...string) (net.Conn, *bufio.ReadWriter, error) {
 	key := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
 	if !headerContainsToken(r.Header.Values("Connection"), "upgrade") {
 		return nil, nil, errors.New("websocket: missing Connection upgrade")
@@ -37,7 +37,17 @@ func wsUpgrade(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.ReadWri
 	if err != nil {
 		return nil, nil, err
 	}
-	if _, err := fmt.Fprintf(brw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", execws.AcceptKey(key)); err != nil {
+	if _, err := fmt.Fprintf(brw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n", execws.AcceptKey(key)); err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	for _, hdr := range extraHeaders {
+		if _, err := fmt.Fprintf(brw, "%s\r\n", hdr); err != nil {
+			_ = conn.Close()
+			return nil, nil, err
+		}
+	}
+	if _, err := fmt.Fprint(brw, "\r\n"); err != nil {
 		_ = conn.Close()
 		return nil, nil, err
 	}
