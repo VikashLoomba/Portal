@@ -1,10 +1,14 @@
 package localclient
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +17,7 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/audit"
 	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/execws"
 	"github.com/VikashLoomba/Portal/internal/localapi"
 	"github.com/VikashLoomba/Portal/internal/protocol"
 	"github.com/VikashLoomba/Portal/internal/transport/localexec"
@@ -94,6 +99,93 @@ func TestExecFeatureOff(t *testing.T) {
 	}
 	if apiErr.Code != "feature_disabled" {
 		t.Fatalf("APIError.Code = %q, want feature_disabled", apiErr.Code)
+	}
+}
+
+func TestExecPreservesExitWhenContextCancelsBeforeBlockedStdinDone(t *testing.T) {
+	path := filepath.Join(shortExecClientTempDir(t), "api.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+
+	clientClosed := make(chan struct{})
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+
+		br := bufio.NewReader(conn)
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		key := strings.TrimSpace(req.Header.Get("Sec-WebSocket-Key"))
+		if _, err := fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", execws.AcceptKey(key)); err != nil {
+			serverDone <- err
+			return
+		}
+		payload, err := execws.EncodeExecFrame(execws.ExecFrame{Stream: execws.ExecStreamExit, Code: 17})
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if err := execws.WriteFrame(conn, execws.OpBinary, payload, false); err != nil {
+			serverDone <- err
+			return
+		}
+		_, _ = br.ReadByte()
+		close(clientClosed)
+		serverDone <- nil
+	}()
+	defer func() {
+		_ = ln.Close()
+		select {
+		case <-serverDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("fake exec server did not stop")
+		}
+	}()
+
+	stdin, stdinWriter := io.Pipe()
+	defer stdin.Close()
+	defer stdinWriter.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct {
+		code int
+		err  error
+	}, 1)
+	go func() {
+		code, err := New(path).Exec(ctx, []string{"printf", "ignored"}, stdin, io.Discard, io.Discard)
+		done <- struct {
+			code int
+			err  error
+		}{code: code, err: err}
+	}()
+
+	select {
+	case <-clientClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client did not close after exit frame")
+	}
+	cancel()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Exec error = %v, want nil", got.err)
+		}
+		if got.code != 17 {
+			t.Fatalf("exit code = %d, want 17", got.code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Exec did not return after context cancellation")
 	}
 }
 

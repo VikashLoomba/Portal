@@ -4,9 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"crypto/sha1"
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -17,23 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/VikashLoomba/Portal/internal/localapi"
-)
-
-const (
-	execWSGUID       = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	execWSMaxPayload = 16 << 20
-)
-
-type execWSOpcode byte
-
-const (
-	execOpContinuation execWSOpcode = 0x0
-	execOpText         execWSOpcode = 0x1
-	execOpBinary       execWSOpcode = 0x2
-	execOpClose        execWSOpcode = 0x8
-	execOpPing         execWSOpcode = 0x9
-	execOpPong         execWSOpcode = 0xA
+	"github.com/VikashLoomba/Portal/internal/execws"
 )
 
 type readDeadlineSetter interface {
@@ -114,7 +96,7 @@ func (c *Client) Exec(ctx context.Context, argv []string, stdin io.Reader, stdou
 
 readLoop:
 	for {
-		op, payload, err := readExecServerMessage(br)
+		op, payload, err := execws.ReadFrame(br, false)
 		if err != nil {
 			if ctx.Err() != nil {
 				transportErr = ctx.Err()
@@ -124,28 +106,28 @@ readLoop:
 			break
 		}
 		switch op {
-		case execOpBinary:
-			f, err := localapi.DecodeExecFrame(payload)
+		case execws.OpBinary:
+			f, err := execws.DecodeExecFrame(payload)
 			if err != nil {
 				transportErr = err
 				break readLoop
 			}
 			switch f.Stream {
-			case localapi.ExecStreamStdout:
+			case execws.ExecStreamStdout:
 				if err := writeAll(stdout, f.Data); err != nil {
 					transportErr = err
 					break readLoop
 				}
-			case localapi.ExecStreamStderr:
+			case execws.ExecStreamStderr:
 				if err := writeAll(stderr, f.Data); err != nil {
 					transportErr = err
 					break readLoop
 				}
-			case localapi.ExecStreamExit:
+			case execws.ExecStreamExit:
 				exitCode = f.Code
 				gotExit = true
 				break readLoop
-			case localapi.ExecStreamError:
+			case execws.ExecStreamError:
 				msg := string(f.Data)
 				if msg == "" {
 					msg = "exec stream error"
@@ -153,15 +135,15 @@ readLoop:
 				terminalErr = errors.New(msg)
 				break readLoop
 			}
-		case execOpPing:
+		case execws.OpPing:
 			writeMu.Lock()
-			err := writeMaskedFrame(conn, execOpPong, payload)
+			err := execws.WriteFrame(conn, execws.OpPong, payload, true)
 			writeMu.Unlock()
 			if err != nil {
 				transportErr = err
 				break readLoop
 			}
-		case execOpClose:
+		case execws.OpClose:
 			transportErr = errors.New("websocket: close before exec terminal frame")
 			break readLoop
 		}
@@ -176,7 +158,16 @@ readLoop:
 	}
 	_ = conn.Close()
 	if stdinDone != nil {
-		pumpErr = <-stdinDone
+		select {
+		case pumpErr = <-stdinDone:
+		case <-ctx.Done():
+			// A non-deadline-aware stdin reader can remain blocked after the
+			// connection closes; that pump exits only when its Read unblocks.
+			if gotExit {
+				return exitCode, nil
+			}
+			return 0, ctx.Err()
+		}
 	}
 
 	if gotExit {
@@ -235,8 +226,7 @@ func execWSKey() (string, error) {
 }
 
 func execWSAccept(key string) string {
-	sum := sha1.Sum([]byte(key + execWSGUID))
-	return base64.StdEncoding.EncodeToString(sum[:])
+	return execws.AcceptKey(key)
 }
 
 func pumpExecStdin(w net.Conn, writeMu *sync.Mutex, stdin io.Reader) <-chan error {
@@ -270,112 +260,13 @@ func pumpExecStdin(w net.Conn, writeMu *sync.Mutex, stdin io.Reader) <-chan erro
 }
 
 func writeExecStdinFrame(w io.Writer, writeMu *sync.Mutex, data []byte) error {
-	payload, err := localapi.EncodeExecFrame(localapi.ExecFrame{Stream: localapi.ExecStreamStdin, Data: data})
+	payload, err := execws.EncodeExecFrame(execws.ExecFrame{Stream: execws.ExecStreamStdin, Data: data})
 	if err != nil {
 		return err
 	}
 	writeMu.Lock()
 	defer writeMu.Unlock()
-	return writeMaskedBinary(w, payload)
-}
-
-func writeMaskedBinary(w io.Writer, payload []byte) error {
-	return writeMaskedFrame(w, execOpBinary, payload)
-}
-
-func writeMaskedFrame(w io.Writer, op execWSOpcode, payload []byte) error {
-	header := []byte{0x80 | byte(op)}
-	n := len(payload)
-	switch {
-	case n <= 125:
-		header = append(header, 0x80|byte(n))
-	case n <= 0xffff:
-		header = append(header, 0x80|126, 0, 0)
-		binary.BigEndian.PutUint16(header[2:4], uint16(n))
-	default:
-		header = append(header, 0x80|127, 0, 0, 0, 0, 0, 0, 0, 0)
-		binary.BigEndian.PutUint64(header[2:10], uint64(n))
-	}
-
-	var mask [4]byte
-	if _, err := io.ReadFull(rand.Reader, mask[:]); err != nil {
-		return err
-	}
-
-	frame := make([]byte, 0, len(header)+len(mask)+len(payload))
-	frame = append(frame, header...)
-	frame = append(frame, mask[:]...)
-	for i, b := range payload {
-		frame = append(frame, b^mask[i%4])
-	}
-	return writeAll(w, frame)
-}
-
-func readExecServerMessage(r *bufio.Reader) (execWSOpcode, []byte, error) {
-	var header [2]byte
-	if _, err := io.ReadFull(r, header[:]); err != nil {
-		return 0, nil, err
-	}
-
-	fin := header[0]&0x80 != 0
-	if header[0]&0x70 != 0 {
-		return 0, nil, errors.New("websocket: reserved bits set")
-	}
-	op := execWSOpcode(header[0] & 0x0f)
-	if !validExecWSOpcode(op) {
-		return 0, nil, fmt.Errorf("websocket: reserved opcode 0x%x", byte(op))
-	}
-	if op == execOpContinuation {
-		return 0, nil, errors.New("websocket: continuation frames are unsupported")
-	}
-	if !fin {
-		return 0, nil, errors.New("websocket: fragmented messages are unsupported")
-	}
-	if header[1]&0x80 != 0 {
-		return 0, nil, errors.New("websocket: server frame is masked")
-	}
-
-	n, err := readExecWSPayloadLen(r, header[1]&0x7f)
-	if err != nil {
-		return 0, nil, err
-	}
-	if n > execWSMaxPayload {
-		return 0, nil, fmt.Errorf("websocket: payload length %d exceeds limit", n)
-	}
-
-	payload := make([]byte, int(n))
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return 0, nil, err
-	}
-	return op, payload, nil
-}
-
-func validExecWSOpcode(op execWSOpcode) bool {
-	switch op {
-	case execOpContinuation, execOpText, execOpBinary, execOpClose, execOpPing, execOpPong:
-		return true
-	default:
-		return false
-	}
-}
-
-func readExecWSPayloadLen(r io.Reader, len7 byte) (uint64, error) {
-	switch len7 {
-	case 126:
-		var b [2]byte
-		if _, err := io.ReadFull(r, b[:]); err != nil {
-			return 0, err
-		}
-		return uint64(binary.BigEndian.Uint16(b[:])), nil
-	case 127:
-		var b [8]byte
-		if _, err := io.ReadFull(r, b[:]); err != nil {
-			return 0, err
-		}
-		return binary.BigEndian.Uint64(b[:]), nil
-	default:
-		return uint64(len7), nil
-	}
+	return execws.WriteFrame(w, execws.OpBinary, payload, true)
 }
 
 func writeAll(w io.Writer, p []byte) error {

@@ -82,13 +82,17 @@ func (l *Log) OpenURL(host, url string) {
 }
 
 // ExecOpen records that an exec WebSocket session was opened by peer uid.
-func (l *Log) ExecOpen(host, argv string, uid int) {
-	l.write("exec-open", "host="+host, "uid="+strconv.Itoa(uid), "argv="+oneLine(argv))
+func (l *Log) ExecOpen(host, sid, argv string, uid int, pty bool) {
+	fields := []string{"host=" + host, "sid=" + sid, "uid=" + strconv.Itoa(uid), "argv=" + oneLine(argv)}
+	if pty {
+		fields = append(fields, "pty=1")
+	}
+	l.write("exec-open", fields...)
 }
 
 // ExecClose records the exec session result exactly once at stream teardown.
-func (l *Log) ExecClose(host string, code int, errStr string, dur time.Duration) {
-	l.write("exec-close", "host="+host, fmt.Sprintf("code=%d", code), "err="+oneLine(errStr), "dur="+dur.String())
+func (l *Log) ExecClose(host, sid string, code int, errStr string, dur time.Duration) {
+	l.write("exec-close", "host="+host, "sid="+sid, fmt.Sprintf("code=%d", code), "err="+oneLine(errStr), "dur="+dur.String())
 }
 
 // write appends one tab-separated, timestamped line. Best-effort: on any error
