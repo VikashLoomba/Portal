@@ -21,6 +21,8 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
+
+	"github.com/VikashLoomba/Portal/internal/ptyx"
 )
 
 // passthroughResolver is the hermetic ConfigResolver every server-backed New
@@ -243,14 +245,86 @@ func (s *testServer) handleSession(newChan ssh.NewChannel) {
 	if err != nil {
 		return
 	}
+	var (
+		ptyRequested bool
+		rows         uint16 = 24
+		cols         uint16 = 80
+		masterMu     sync.Mutex
+		master       *os.File
+		started      bool
+		done         <-chan struct{}
+	)
+	setMaster := func(f *os.File) {
+		masterMu.Lock()
+		master = f
+		masterMu.Unlock()
+	}
+	closeMaster := func() {
+		masterMu.Lock()
+		if master != nil {
+			_ = master.Close()
+			master = nil
+		}
+		masterMu.Unlock()
+	}
+	resizeMaster := func(r, c uint16) {
+		masterMu.Lock()
+		defer masterMu.Unlock()
+		if master != nil {
+			_ = ptyx.Setsize(master, r, c)
+			return
+		}
+		rows, cols = r, c
+	}
+
 	for req := range reqs {
 		switch req.Type {
+		case "pty-req":
+			var payload ptyReqPayload
+			if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
+				req.Reply(false, nil)
+				ch.Close()
+				return
+			}
+			ptyRequested = true
+			rows, cols = uint16(payload.Rows), uint16(payload.Cols)
+			req.Reply(true, nil)
+		case "window-change":
+			var payload windowChangePayload
+			if err := ssh.Unmarshal(req.Payload, &payload); err == nil {
+				resizeMaster(uint16(payload.Rows), uint16(payload.Cols))
+			}
+			if req.WantReply {
+				req.Reply(true, nil)
+			}
+		case "shell":
+			if !ptyRequested || started {
+				req.Reply(false, nil)
+				continue
+			}
+			req.Reply(true, nil)
+			shell := os.Getenv("SHELL")
+			if shell == "" {
+				shell = "/bin/sh"
+			}
+			started = true
+			done = s.runPtyCommand(ch, exec.Command(shell), rows, cols, setMaster, closeMaster)
 		case "exec":
 			var payload struct{ Command string }
 			if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
 				req.Reply(false, nil)
 				ch.Close()
 				return
+			}
+			if ptyRequested {
+				if started {
+					req.Reply(false, nil)
+					continue
+				}
+				req.Reply(true, nil)
+				started = true
+				done = s.runPtyCommand(ch, exec.Command("sh", "-c", payload.Command), rows, cols, setMaster, closeMaster)
+				continue
 			}
 			req.Reply(true, nil)
 			if s.omitSessionExitStatus {
@@ -264,6 +338,16 @@ func (s *testServer) handleSession(newChan ssh.NewChannel) {
 				req.Reply(false, nil)
 			}
 		}
+		if started && done != nil {
+			select {
+			case <-done:
+				return
+			default:
+			}
+		}
+	}
+	if started && done != nil {
+		<-done
 	}
 }
 
@@ -286,6 +370,73 @@ func (s *testServer) runCommand(ch ssh.Channel, command string) {
 	}
 	ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
 	ch.Close()
+}
+
+type ptyReqPayload struct {
+	Term     string
+	Cols     uint32
+	Rows     uint32
+	WidthPx  uint32
+	HeightPx uint32
+	Modes    string
+}
+
+type windowChangePayload struct {
+	Cols     uint32
+	Rows     uint32
+	WidthPx  uint32
+	HeightPx uint32
+}
+
+func (s *testServer) runPtyCommand(ch ssh.Channel, cmd *exec.Cmd, rows, cols uint16, setMaster func(*os.File), closeMaster func()) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+
+		master, err := ptyx.Start(cmd, rows, cols)
+		if err != nil {
+			ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{1}))
+			ch.Close()
+			return
+		}
+		setMaster(master)
+
+		outputDone := make(chan struct{})
+		go func() {
+			defer close(outputDone)
+			_, _ = io.Copy(ch, master)
+			_ = ch.CloseWrite()
+		}()
+
+		inputDone := make(chan struct{})
+		go func() {
+			defer close(inputDone)
+			_, _ = io.Copy(master, ch)
+			closeMaster()
+		}()
+
+		status := commandExitStatus(cmd.Wait())
+		<-outputDone
+		closeMaster()
+		ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
+		ch.Close()
+		<-inputDone
+	}()
+	return done
+}
+
+func commandExitStatus(err error) uint32 {
+	if err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		code := ee.ExitCode()
+		if code >= 0 {
+			return uint32(code)
+		}
+	}
+	return 1
 }
 
 // knownHostsLine renders the server's real host key as a known_hosts entry for

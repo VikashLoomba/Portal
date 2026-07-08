@@ -1,11 +1,11 @@
 // Package transport owns the seam between portal's command/forwarding logic
 // and the concrete mechanism that reaches the dev box. It declares the core
-// Transport interface (transport-agnostic primitives), the optional
-// PortForwarder capability, and the value types (Health, Desc, ForwardError)
-// they exchange. Three implementations satisfy it: internal/sshctl (the
-// system ssh binary, default, behavior-identical), internal/sshnative
-// (x/crypto/ssh), and internal/transport/localexec (local subprocess, used by
-// the shared conformance suite and dev mode).
+// Transport interface (transport-agnostic primitives), optional capabilities
+// (PortForwarder, PtyStreamer), and the value types (Health, Desc,
+// ForwardError) they exchange. Three implementations satisfy it:
+// internal/sshctl (the system ssh binary, default, behavior-identical),
+// internal/sshnative (x/crypto/ssh), and internal/transport/localexec (local
+// subprocess, used by the shared conformance suite and dev mode).
 //
 // Composition rules (enforced by convention + the compiler, not runtime
 // checks):
@@ -116,6 +116,46 @@ type PortForwarder interface {
 	Cancel(ctx context.Context, local, remote int) error
 	ListForwards(ctx context.Context) ([]int, error)
 	ForwardLines(ctx context.Context) ([]string, error)
+}
+
+// PtyRequest configures the pseudo-terminal requested by StreamPty. An empty
+// Term defaults to "xterm"; a zero Rows or Cols value defaults to 24x80.
+type PtyRequest struct {
+	Term string
+	Rows uint16
+	Cols uint16
+}
+
+// PtySession is one live pseudo-terminal. Read returns merged terminal output
+// (PTYs combine stdout and stderr); Write sends keystrokes/stdin bytes.
+type PtySession interface {
+	io.Reader
+	io.Writer
+
+	// Resize changes the terminal size. After the session has ended it returns
+	// a descriptive error and must never panic.
+	Resize(rows, cols uint16) error
+
+	// Wait returns the terminal status. Non-zero exits are reported as
+	// *ExitError, matching Stream.
+	Wait() error
+
+	// Close is idempotent teardown. Calling Close without Wait must not leak;
+	// Wait after Close returns the session status or a teardown error.
+	Close() error
+}
+
+// PtyStreamer is the optional pseudo-terminal streaming capability. It is
+// acquired by type assertion at the composition root, like PortForwarder.
+type PtyStreamer interface {
+	// StreamPty runs argv under a pseudo-terminal. Empty argv starts an
+	// interactive login shell, matching ssh's no-command behavior. Non-empty
+	// argv follows the same single-space shell-join contract as Stream.
+	//
+	// Canceling ctx tears the session down, and Wait after cancellation returns
+	// promptly. Close and Wait are both legal terminal call orders; Resize after
+	// teardown returns a descriptive error.
+	StreamPty(ctx context.Context, req PtyRequest, argv ...string) (PtySession, error)
 }
 
 // ForwardError reports a forward/cancel failure surfaced via stderr. This is

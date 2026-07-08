@@ -159,9 +159,13 @@ type Client struct {
 	// daemon exit) drops every forward. See forward.go.
 	fwdMu    sync.Mutex
 	forwards map[int]net.Listener
+
+	ptyMu       sync.Mutex
+	ptySessions map[*nativePtySession]struct{}
 }
 
 var _ transport.Transport = (*Client)(nil)
+var _ transport.PtyStreamer = (*Client)(nil)
 
 // New builds a ready-to-Ensure Client for target by RESOLVING it through the
 // ConfigResolver (default DefaultConfigResolver, i.e. `ssh -G`) at construction —
@@ -465,9 +469,14 @@ func keepaliveProbe(client *ssh.Client, timeout time.Duration, stop <-chan struc
 // next Ensure re-dials. It does not close the client — Ensure/Close own that.
 func (c *Client) markDead(client *ssh.Client) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	closePTYs := false
 	if c.client == client {
 		c.dead = true
+		closePTYs = true
+	}
+	c.mu.Unlock()
+	if closePTYs {
+		c.closeRegisteredPtySessions()
 	}
 }
 
@@ -642,6 +651,7 @@ func (c *Client) Close(ctx context.Context) (bool, error) {
 	// Native forwards die with the daemon (no ControlPersist analogue), so a
 	// graceful Close drops every live forward before tearing down the client.
 	c.closeAllForwards()
+	c.closeRegisteredPtySessions()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	had := c.client != nil

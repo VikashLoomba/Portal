@@ -14,10 +14,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"syscall"
 
+	"github.com/VikashLoomba/Portal/internal/ptyx"
 	"github.com/VikashLoomba/Portal/internal/transport"
 )
 
@@ -94,6 +99,115 @@ func (l *Local) Stream(ctx context.Context, argv ...string) (io.WriteCloser, io.
 	return stdin, stdout, stderr, wait, nil
 }
 
+// StreamPty runs the shell-joined command under a local pseudo-terminal.
+func (l *Local) StreamPty(ctx context.Context, req transport.PtyRequest, argv ...string) (transport.PtySession, error) {
+	var cmd *exec.Cmd
+	if len(argv) == 0 {
+		shell := os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/sh"
+		}
+		cmd = exec.CommandContext(ctx, shell, "-i")
+	} else {
+		cmd = exec.CommandContext(ctx, "sh", "-c", join(argv))
+	}
+	master, err := ptyx.Start(cmd, req.Rows, req.Cols)
+	if err != nil {
+		return nil, err
+	}
+	return &localexecPtySession{
+		master:   master,
+		cmd:      cmd,
+		waitDone: make(chan struct{}),
+	}, nil
+}
+
+type localexecPtySession struct {
+	master *os.File
+	cmd    *exec.Cmd
+
+	mu     sync.Mutex
+	closed bool
+	ended  bool
+
+	closeOnce sync.Once
+	closeErr  error
+
+	waitOnce sync.Once
+	waitDone chan struct{}
+	waitErr  error
+}
+
+func (s *localexecPtySession) Read(p []byte) (int, error) {
+	n, err := s.master.Read(p)
+	if errors.Is(err, syscall.EIO) {
+		return n, io.EOF
+	}
+	return n, err
+}
+
+func (s *localexecPtySession) Write(p []byte) (int, error) {
+	return s.master.Write(p)
+}
+
+func (s *localexecPtySession) Resize(rows, cols uint16) error {
+	s.mu.Lock()
+	closed, ended := s.closed, s.ended
+	s.mu.Unlock()
+	switch {
+	case ended:
+		return errors.New("localexec: resize pty after session ended")
+	case closed:
+		return errors.New("localexec: resize pty after session closed")
+	}
+	if err := ptyx.Setsize(s.master, rows, cols); err != nil {
+		return fmt.Errorf("localexec: resize pty: %w", err)
+	}
+	return nil
+}
+
+func (s *localexecPtySession) Wait() error {
+	s.waitOnce.Do(func() {
+		defer close(s.waitDone)
+		werr := s.cmd.Wait()
+		s.closeOnce.Do(func() {
+			_ = s.master.Close()
+		})
+		s.markEnded()
+		var ee *exec.ExitError
+		if errors.As(werr, &ee) {
+			s.waitErr = &transport.ExitError{Code: ee.ExitCode()}
+			return
+		}
+		s.waitErr = werr
+	})
+	<-s.waitDone
+	return s.waitErr
+}
+
+func (s *localexecPtySession) Close() error {
+	s.closeOnce.Do(func() {
+		s.markClosed()
+		s.closeErr = s.master.Close()
+		if s.cmd.Process != nil {
+			_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
+		}
+	})
+	return s.closeErr
+}
+
+func (s *localexecPtySession) markClosed() {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+}
+
+func (s *localexecPtySession) markEnded() {
+	s.mu.Lock()
+	s.ended = true
+	s.mu.Unlock()
+}
+
 // Close is a no-op: there is no persistent resource to stop.
 func (l *Local) Close(ctx context.Context) (bool, error) { return false, nil }
 
@@ -103,3 +217,4 @@ func (l *Local) Describe() transport.Desc {
 }
 
 var _ transport.Transport = (*Local)(nil)
+var _ transport.PtyStreamer = (*Local)(nil)

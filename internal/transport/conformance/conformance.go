@@ -31,12 +31,14 @@ func shellQuote(s string) string {
 }
 
 // Run executes the full conformance suite against a fresh transport produced
-// by newT. name is used to label the top-level subtest. The PortForwarder
-// section runs only when the transport asserts the capability.
+// by newT. name is used to label the top-level subtest. Optional sections run
+// only when the transport asserts transport.PortForwarder or
+// transport.PtyStreamer.
 func Run(t *testing.T, name string, newT func(t *testing.T) transport.Transport) {
 	t.Run(name, func(t *testing.T) {
 		t.Run("core", func(t *testing.T) { runCore(t, newT) })
 		t.Run("portforward", func(t *testing.T) { runPortForward(t, newT) })
+		t.Run("pty", func(t *testing.T) { runPty(t, newT) })
 	})
 }
 
