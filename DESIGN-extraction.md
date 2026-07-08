@@ -15,8 +15,8 @@ example shell) proving a desktop app can drive the core daemon end-to-end.
 
 In scope:
 - Pre-export hardening owed from Stage 5 §6.1: WS-framing consolidation, exec audit session
-  ids, `localclient.Exec` ctx honor, `EnsureArtifact` name validation + `EnsureUploaded`
-  delegation.
+  ids, `localclient.Exec` ctx honor, `EnsureArtifact` name validation (+ a deliberate verdict
+  on the X5 consolidation forward-note — see E4).
 - Full PTY: RequestPty + window-size changes + hangup-on-disconnect semantics, on all three
   transports, threaded through `/v1/exec` and `portal exec`.
 - Extraction: `pkg/` promotion of the platform packages, exported service registration on both
@@ -36,6 +36,9 @@ Out of scope (documented, not silently dropped):
   tagging) — the spec + vectors are the escape hatch, per Option A.
 - Windows anything.
 - CLI-side caching of `ssh -G` resolution (E16.3 documents the deliberate keep).
+- Hop-level ProxyCommand support in native ProxyJump chains — stays the clear error shipped in
+  Stage 5 (`DESIGN-transport.md` §6.1.2 recorded full support as a later-stage candidate;
+  still deferred, unchanged).
 
 Compatibility guarantees (regression-tested, not aspirational):
 - `go.mod`/`go.sum` stay byte-identical (third consecutive stage; E7 documents the
@@ -43,8 +46,9 @@ Compatibility guarantees (regression-tested, not aspirational):
 - Mac↔Linux ProtoVersion stays 4 — Stage 6 changes NO `PF` frame. portald recompiles because
   packages move, so exactly one SHA-keyed agent re-upload occurs after upgrade (expected,
   same as every stage).
-- Remote artifact paths (`~/.cache/portal/agent-<sha>`, symlinks) stay byte-identical (E4) —
-  an already-provisioned box must NOT re-upload just because `EnsureUploaded` now delegates.
+- Remote artifact paths (`~/.cache/portal/agent-<gitsha>`, the `portald` symlink) stay
+  byte-identical (E4) — an already-provisioned box must NOT re-upload or lose its wrapper
+  symlink because of the quoting hardening.
 - `portal status` output on the system transport stays byte-identical; non-PTY `portal exec`
   behavior is unchanged (§8.4).
 - Module path stays `github.com/VikashLoomba/Portal`.
@@ -99,21 +103,29 @@ for `readDeadlineSetter` readers stays. Regression test: `Exec` with an `io.Pipe
 never delivers data returns promptly after the exit frame + ctx cancel (EC5; this hangs
 forever today).
 
-### E4. `EnsureArtifact` validates `name`; `EnsureUploaded` delegates to it
+### E4. `EnsureArtifact` validates `name`; the two addressing schemes stay deliberately split
 
 - Validation, before anything touches a shell: `name` must match `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`
   (must start alphanumeric; no `/`, no spaces, no shell metacharacters by construction; max 64).
   Violations return a typed error naming the rule. Applied in `EnsureArtifact` itself so every
   future caller inherits it.
-- Defense in depth: the three script templates (`ln -sf`, probe, upload/rename —
-  `internal/bootstrap/manager.go:161,175-178,190-195`) single-quote every spliced path
-  (`'"'"'`-escape helper on the path value) even though validation already excludes quotes.
-- Consolidation (the X5 intent that never landed): `EnsureUploaded` becomes a thin caller of
-  `EnsureArtifact(ctx, "agent", art.bytes)` after `selectArtifactCached`. Remote path
-  compatibility is a hard requirement: `remoteDir + "/agent-" + sha256hex(content)` must come
-  out byte-identical to today's construction, proven by a golden-path unit test (EC6), so
-  existing boxes see a probe HIT, not a re-upload. Symlink behavior (`agent` → versioned file)
-  and prune behavior stay as today.
+- Defense in depth: ALL bootstrap script templates that splice a path (`ln -sf`, probe,
+  upload/rename — `internal/bootstrap/manager.go:134,161,175-178,190-195`, both the
+  `EnsureUploaded` and `EnsureArtifact` paths) single-quote every spliced path value via one
+  shared `'"'"'`-escape helper, even though validation already excludes quotes.
+- Consolidation VERDICT (closes the X5 "EnsureUploaded becomes a thin EnsureArtifact caller"
+  forward-note): REJECTED, deliberately. The two paths use different addressing schemes ON
+  PURPOSE and cannot unify without breaking provisioned boxes: `EnsureUploaded` keys the
+  remote path by the 40-hex git commit SHA (`EmbeddedSHA()`, arch-independent — one path
+  serves both arches) and maintains the **`portald`** stable symlink that the remote xdg-open
+  wrapper resolves; `EnsureArtifact` is content-addressed (64-hex sha256 of content, per-arch
+  by nature) with a `<name>` symlink. Forcing delegation would change every provisioned box's
+  path (probe MISS → spurious re-upload) and rename the `portald` symlink. They already share
+  `uploadVerified`; after this stage they also share the quoting helper. The split is
+  documented at both functions.
+- Compatibility proof (EC6): a golden test pins `EnsureUploaded`'s remote path + symlink
+  construction byte-identical to today (gitSHA path, `portald` symlink), and the validation
+  matrix covers `EnsureArtifact`.
 
 ### E5. PTY capability shape: optional interface, merged output, session object
 
@@ -151,7 +163,9 @@ type PtyStreamer interface {
   subprocess), and hangup-on-disconnect — the ratified requirement — is teardown semantics
   (E8/E9), not an API method. Recorded as the natural v2 extension point.
 - ctx semantics match `Stream`: ctx cancel tears the session down (kills local child / closes
-  ssh session). `Wait` after cancel returns promptly.
+  ssh session). `Wait` after cancel returns promptly. `Resize` after the session has ended
+  returns an error (any descriptive error; never panics); `Wait` after `Close` returns the
+  session's terminal status or a teardown error — both are legal call orders.
 
 ### E6. Termios stance: fixed default mode table, not local mirroring
 
@@ -206,9 +220,12 @@ E9 allocates — closest to OpenSSH fidelity of the three); localexec inherits t
   zero-length `stdin` still means EOF (closes the write side), `exit`/`error` terminal frames
   and the WS close are unchanged.
 - New client→server frame: `Stream: "winch"` with `Rows`/`Cols` set (`cbor:"rs"`/`cbor:"cs"`,
-  omitempty — additive fields on `ExecFrame`, invisible to non-PTY sessions). Server calls
-  `PtySession.Resize`. Unknown-to-old-daemons is a non-issue: old daemons never grant the
-  header, so a correct client never sends `winch` to one.
+  omitempty — additive fields on `ExecFrame`, invisible to non-PTY sessions; VERIFIED against
+  fxamacker/cbor v2.9.2: zero uint16 omitted, unknown keys ignored by the default decoder AND
+  by `DupMapKeyEnforcedAPF`). Constraint: the `ExecFrame` decoder (here and after its u9 move
+  to `pkg/api`) must NEVER enable `ExtraDecErrorUnknownField` — additivity depends on it.
+  Server calls `PtySession.Resize`. Unknown-to-old-daemons is a non-issue: old daemons never
+  grant the header, so a correct client never sends `winch` to one.
 - Audit: `exec-open` gains `pty=1` when granted (E2's sid on both lines regardless).
 - Hangup-on-disconnect (THE §8.3 fix): client disconnect cancels the bridge ctx (existing X8
   behavior) → `PtySession` teardown closes the remote pty → kernel delivers SIGHUP to the
@@ -274,7 +291,8 @@ Stays internal (portal-the-product, not platform): `internal/app` (composition r
 `internal/localapi` (server), `internal/bootstrap` (embeds THIS product's portald binaries),
 `internal/clipshim`, `internal/config`, `internal/audit`, `internal/service`, `internal/proc`,
 `internal/forward`, `internal/discover`, `internal/clip`, `internal/notify`, `internal/clock`,
-`internal/logfile`, `internal/execws` (E1), `internal/ptyx`, `internal/termx`, `cmd/*`.
+`internal/logfile`, `internal/ptyx`, `internal/termx`, `cmd/*`. (`internal/execws` exists only
+between u1 and u9 — see the signature rule below; it is NOT a final artifact.)
 
 Rules:
 - **Signature rule (enforced by a test, EC10):** no `pkg/*` package imports `internal/*` at
@@ -303,8 +321,11 @@ Rules:
 Agent side (`pkg/agent`):
 ```go
 // ServiceHost is the exported facade over the registry, passed to service factories.
+// NOTE: the registry stamps per-service Seq itself (S3 sole-writer invariant) — the
+// facade exposes NO seq parameter anywhere; Emit mirrors registry.emit's admission
+// bool (false = outbox full, frame dropped).
 type ServiceHost interface {
-    Emit(service, kind string, seq uint64, payload cbor.RawMessage) error // wraps registry.emit
+    Emit(service, kind string, payload cbor.RawMessage) bool // wraps registry.emit verbatim
     Call(ctx context.Context, service, kind string, timeout time.Duration,
          maxInflight int, payload func(nonce, epoch uint64) cbor.RawMessage) (cbor.RawMessage, error) // wraps registry.call
     HasClient() bool
@@ -334,14 +355,20 @@ type Config struct {
     Handlers []HandlerSpec // registered after the built-ins; HandlerSpec is already exported
 }
 ```
-plus an exported `(*Client).Send(service, kind string, seq uint64, payload cbor.RawMessage)
-error` wrapping the unexported `registry.send` (custom services need the client→agent
-direction; today only clip's response path uses it internally).
+plus an exported `(*Client).Send(service, kind string, payload cbor.RawMessage) error`
+wrapping the unexported `registry.send` (which threads the encoder and stamps Seq itself;
+custom services need the client→agent direction — today only clip's response path uses it
+internally).
 
 Black-box proof (EC11): a test in a `_test` package (external test package, public API only)
 registers a toy `echo` service on both sides via `Config.Services`/`Config.Handlers`, runs
 agent+client over an in-process pipe transport, and round-trips a frame each direction —
 including version-mismatch dormancy (client advertises v2, agent v1 → dormant, no error).
+The harness pattern already exists: `e2eTransport`/`newE2ESession`
+(`internal/agentclient/client_test.go:256-339`) wires a fake `Transport.Stream` over
+`io.Pipe` into a real `agent.Server.Serve` with no portald; the EC11 test reuses that shape
+through the PUBLIC surface (note: requires `make agent` first — the embedded-SHA handshake
+gate skips otherwise, same as today's e2e tests).
 
 ### E13. Conformance suite: loopback becomes factory-declared
 
@@ -357,10 +384,13 @@ type ForwardTarget struct {
 }
 func RunWithForward(t *testing.T, name string, newT func(*testing.T) transport.Transport, fw *ForwardTarget)
 ```
-`Run` delegates to `RunWithForward(..., nil)`. Each transport's conformance test declares its
-own target (localexec/sshnative: in-process loopback listener; sshctl real-host: a listener the
-remote can reach, or nil to keep today's skip behavior). The suite contains ZERO
-`Describe().Impl` comparisons afterward (EC12). A new PTY section runs for transports
+`Run` delegates to `RunWithForward(..., nil)`. NO COVERAGE REGRESSION: today localexec and
+sshnative get the loopback port-forward suite automatically via the Impl-string branch, so u7
+MUST update both call sites (`internal/transport/localexec/conformance_test.go`,
+`internal/sshnative/conformance_test.go`) to declare an in-process loopback echo factory —
+they continue running the port-forward suite, now explicitly. sshctl's real-host test may pass
+a remote-reachable listener factory or nil (nil preserves today's effective skip). The suite
+contains ZERO `Describe().Impl` comparisons afterward (EC12). A new PTY section runs for transports
 asserting `PtyStreamer` (all three): `stty size` reports the requested size, resize observed
 (`stty size` re-read after `Resize`), exit-code fidelity under pty, merged-output sanity,
 EOF/teardown leaves no goroutines.
@@ -392,11 +422,15 @@ EOF/teardown leaves no goroutines.
 Every route gets `parameters`/`requestBody`/`responses` with `components/schemas` matching
 `pkg/api` structs field-for-field (json tags = property names; required vs omitempty honored).
 `/v1/exec` documents the upgrade: query params (incl. E8 pty params), 101 + headers (incl.
-`X-Portal-Exec-Pty`), and a description pointing at `docs/wire.cddl` for frames. The
-`spec_test.go` route-conformance test is preserved as-is (its strict-format scanner must still
-pass — schema blocks live under `components:`, path entries keep the 2/4-space contract);
-plus a new assertion: every route's method entry carries a `responses:` key (schema-presence
-smoke, not full validation — the TS client + vectors are the deep check).
+`X-Portal-Exec-Pty`), and a description pointing at `docs/wire.cddl` for frames. Formatting
+contract (the strict line-scanner in `spec_test.go` depends on it): path entries stay 2-space,
+method entries 4-space, method bodies (`summary`/`parameters`/`requestBody`/`responses`) at
+6-space, `components:` at column 0, and no 4-space key under `components:` may be named
+`get/put/post/delete` (schema names are PascalCase, so safe by convention — but it's now a
+stated rule). The scanner is extended into a small state machine: a `paths:`-section guard
+(so `components:` sub-keys are never misread as operations) plus a per-operation flag
+asserting every method entry carries a `responses:` key (schema-presence smoke, not full
+validation — the TS client + vectors are the deep check).
 
 ### E16. Deliberate public-shape calls (watch items closed)
 
@@ -415,7 +449,9 @@ smoke, not full validation — the TS client + vectors are the deep check).
 ## 3. Units
 
 Sequential; each unit = codex implements → full gate (`make build && go vet ./... && gofmt -l
-cmd internal pkg clients && make test && go test -race ./...`) → gate agent commits. Move-only
+cmd internal && make test && go test -race ./...`) → gate agent commits. The gofmt target list
+grows with the tree: `pkg` joins at u7, and u11 adds the TS checks (`tsc --noEmit` +
+`node --test` under `clients/ts`) to the gate for that unit and every later one. Move-only
 commits precede seam-edit commits inside u7–u9 (E11).
 
 - **u1 — execws consolidation + audit sid + ctx fix (E1, E2, E3).** Create `internal/execws`
@@ -423,9 +459,10 @@ commits precede seam-edit commits inside u7–u9 (E11).
   sides, delete both duplicated copies; add sid to audit lines + tests; fix the stdin join.
   All existing exec/ws tests move and pass; new: pairing test, io.Pipe ctx test, one-opcode-
   table grep test.
-- **u2 — bootstrap hardening + delegation (E4).** Name validation + typed error + quoting
-  helper; `EnsureUploaded` → `EnsureArtifact` delegation with byte-identical remote paths
-  (golden test); validation-matrix tests (spaces, `../`, `$(...)`, quotes, 65 chars, leading
+- **u2 — bootstrap hardening (E4).** Name validation + typed error; shared quoting helper
+  applied to every path splice in BOTH upload paths; the two-scheme split documented at both
+  functions; golden test pinning `EnsureUploaded`'s path + `portald` symlink construction
+  unchanged; validation-matrix tests (spaces, `../`, `$(...)`, quotes, 65 chars, leading
   `-`/`.`, empty).
 - **u3 — ptyx + termx primitives (E7).** Both packages, darwin+linux paths (linux
   compile-tagged; darwin fully tested locally), REAL-pty unit tests incl. SIGHUP-on-master-
@@ -434,14 +471,24 @@ commits precede seam-edit commits inside u7–u9 (E11).
   E13-pty-section).** `PtyRequest/PtySession/PtyStreamer` in `internal/transport`; sshnative
   impl (RequestPty, WindowChange, Shell for empty argv, dead-client prompt close with
   registration/deregistration tests against the in-process ssh server); localexec impl via
-  ptyx; conformance PTY section green for both.
+  ptyx; conformance PTY section green for both. The in-process ssh test server today handles
+  ONLY `exec` requests and replies false to everything else — u4 extends it: accept `pty-req`
+  (parse the RFC 4254 payload), `window-change`, and `shell`, run the command under a REAL
+  server-side pty (allocate via `internal/ptyx` — a test-only internal import, permitted
+  because EC10 scopes to non-test imports), bridge channel↔master, send `exit-status`.
+  `stty size` reads the TTY driver, so emulation without a real pty is insufficient.
 - **u5 — sshctl PTY (E9-sshctl).** Local-pty + `-tt` mechanics with PATH-stubbed fake ssh
-  unit tests (argv placement, tty-ness of the child, resize→SIGWINCH observed, exit-code map,
-  ctx-cancel kill+SIGHUP) + env-gated real-host conformance wiring.
+  unit tests (the `stream_test.go` fake-ssh pattern; sshctl sets no `cmd.Env`, so `t.Setenv`
+  PATH injection is honored): argv placement, tty-ness of the child, resize→SIGWINCH observed
+  (initial size then resize to a DIFFERENT size — the kernel only signals on change),
+  exit-code map (255 passthrough preserved), ctx-cancel kill+SIGHUP; + env-gated real-host
+  conformance wiring.
 - **u6 — exec bridge + client + CLI PTY (E8, E10).** Server: pty params, 409 pty_unsupported,
   101 header, PtySession bridging, winch handling, pty=1 audit; client (`localclient`): pty
   request path, header check with the hard skew error, winch sending; CLI: `-t`/`-T`/auto,
-  raw mode + restore, WINCH pump, empty-argv shell. Hermetic end-to-end test over localexec:
+  raw mode + restore, WINCH pump, empty-argv shell (cobra: keep the default `ArbitraryArgs` —
+  do NOT add a MinimumNArgs validator; `portal exec -t` with no `--` must reach RunE with
+  empty argv). Hermetic end-to-end test over localexec:
   run `stty size` through the FULL stack (CLI client lib → UDS → bridge → pty) and assert the
   size; resize mid-session; disconnect-kills-remote test (start `sleep`, drop the client conn,
   assert the process group dies — THE §8.3 regression, now in-gate).
@@ -461,12 +508,23 @@ commits precede seam-edit commits inside u7–u9 (E11).
   schema enrichment + spec-test extension.
 - **u10 — wire spec (E14).** `docs/wire.cddl`, `docs/vectors/`, the Go golden generator/
   verifier test.
-- **u11 — clients/ts (E15-client, E14-TS-verification).** Zero-runtime-dep TypeScript library:
+- **u11 — clients/ts (E15-client, E14-TS-verification).** Zero-RUNTIME-dep TypeScript library:
   UDS HTTP (node:http socketPath), typed DTOs mirroring pkg/api, ndjson events iterator,
   exec WS client (hand-rolled framing + minimal CBOR codec for ExecFrame incl. pty/winch),
-  version check helper. Tests: vector decode/encode suite + a mocked-socket protocol test.
-  Gate additions: `tsc --noEmit` + `node --test` (Node ≥24 assumed present; gate asserts
-  `node --version` ≥ 24 with a clear failure).
+  version check helper, and a small `examples/smoke.ts` script (status + one events line +
+  exec echo against a live daemon — the §8.7 manual artifact). Tests: vector decode/encode
+  suite + a mocked-socket protocol test. Toolchain contract (probed on Node 25.6.1 +
+  tsc 5.9.3): `package.json` declares `"type": "module"`, EMPTY/absent `dependencies`, and
+  devDependencies ONLY `@types/node` + a pinned `typescript` (tsc cannot type `node:*`
+  imports without `@types/node` — this is the one `npm ci` the gate runs; runtime stays
+  zero-dep, which is what EC14 asserts). tsconfig pins: `module`/`moduleResolution`
+  `"nodenext"`, `verbatimModuleSyntax: true`, `erasableSyntaxOnly: true`, `types: ["node"]`,
+  `strict: true`, `noEmit: true`, `skipLibCheck: true`. BANNED (non-erasable, break node's
+  type-stripping): enums (incl. const enums), `namespace`/`module` bodies, constructor
+  parameter properties — `erasableSyntaxOnly` enforces the ban statically. Gate additions
+  (a `test-ts` make target used from u11 on): assert `node --version` ≥ 24 with a clear
+  failure, `npm ci` in `clients/ts`, `npx tsc --noEmit -p clients/ts`, `node --test` the
+  `.ts` tests directly.
 - **u12 — examples/shell-electron (E15-shell).** Thin Electron app consuming `clients/ts`:
   status panel, live events/notifications feed, exec terminal (xterm.js) with PTY + resize.
   Has its own `package.json` (electron + xterm devDeps); NOT built in the gate — gate runs
@@ -483,8 +541,9 @@ commits precede seam-edit commits inside u7–u9 (E11).
 - **EC4** `exec-open`/`exec-close` lines carry matching `sid=`; concurrent-session pairing test.
 - **EC5** `localclient/pkg-client Exec` with never-yielding `io.Pipe` stdin returns promptly on
   ctx cancel after exit frame (regression test; hangs pre-Stage-6).
-- **EC6** `EnsureArtifact` rejects the invalid-name matrix; `EnsureUploaded` delegates and
-  produces byte-identical remote paths (golden test) and identical probe-hit behavior.
+- **EC6** `EnsureArtifact` rejects the invalid-name matrix; golden test pins
+  `EnsureUploaded`'s remote path + `portald` symlink construction byte-identical to today
+  (identical probe-hit behavior on provisioned boxes).
 - **EC7** All three transports assert `transport.PtyStreamer`; conformance PTY section passes
   hermetically for native (in-process sshd) + localexec, and for sshctl via PATH-stub tests
   (+ env-gated real host).
@@ -493,8 +552,13 @@ commits precede seam-edit commits inside u7–u9 (E11).
   (in-gate §8.3 regression).
 - **EC9** PTY capability skew: pty request without granted header → hard client error; daemon
   without PtyStreamer transport → 409 `pty_unsupported` pre-upgrade (both tested).
-- **EC10** Checker test: no `pkg/*` package imports `internal/*`; no exported `pkg/*`
-  identifier references an internal type. (`go list`-based, runs in the normal gate.)
+- **EC10** Checker test: no `pkg/*` package imports `internal/*` in its NON-TEST imports
+  (`go list -json ./pkg/...`, fail on any `.Imports` entry with the
+  `github.com/VikashLoomba/Portal/internal/` prefix — std-lib only, ~30 lines, runs in the
+  normal gate). Test files (`.TestImports`/`.XTestImports`) MAY import internal packages
+  (same-module tests; external consumers never run them) — this is what permits u4's
+  test-server ptyx use. The import check subsumes the exported-identifier check: Go cannot
+  name an internal type without importing its package.
 - **EC11** Black-box custom-service test registers `echo` via public API on both sides and
   round-trips both directions + dormancy case — using ONLY `pkg/agent` + `pkg/agentclient`
   exported surface.
@@ -504,8 +568,9 @@ commits precede seam-edit commits inside u7–u9 (E11).
 - **EC13** `docs/wire.cddl` covers every `Envelope` arm + `ExecFrame` (incl. pty extension);
   golden vectors round-trip in Go.
 - **EC14** `clients/ts` decodes every golden vector to the expected semantics; `tsc --noEmit`
-  and `node --test` run in the gate and pass; `package.json` declares zero runtime
-  dependencies.
+  and `node --test` run in the gate and pass; `package.json` declares zero RUNTIME
+  dependencies (`dependencies` absent/empty; devDependencies limited to `@types/node` +
+  `typescript`).
 - **EC15** `openapi.yaml` has schemas for every route; route-conformance + responses-presence
   tests pass.
 - **EC16** Byte-identical regressions: `portal status` (system transport) output unchanged;
