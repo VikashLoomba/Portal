@@ -109,10 +109,21 @@ forever today).
   (must start alphanumeric; no `/`, no spaces, no shell metacharacters by construction; max 64).
   Violations return a typed error naming the rule. Applied in `EnsureArtifact` itself so every
   future caller inherits it.
-- Defense in depth: ALL bootstrap script templates that splice a path (`ln -sf`, probe,
-  upload/rename — `internal/bootstrap/manager.go:134,161,175-178,190-195`, both the
-  `EnsureUploaded` and `EnsureArtifact` paths) single-quote every spliced path value via one
-  shared `'"'"'`-escape helper, even though validation already excludes quotes.
+- Defense in depth — interior-quoting VERDICT (principal-ratified amendment): interior
+  single-quoting of the TILDE-LEADING path values is REJECTED because it defeats `bash -c`
+  tilde expansion. `remoteDir` is the constant `~/.cache/portal` (`manager.go:34`);
+  `remotePath` = `remoteDir+"/agent-"+sha` (`manager.go:122`) and
+  `remoteDir+"/"+name+"-"+digest` (`manager.go:155`); these sit UNQUOTED inside the outer
+  `shellQuoted` script so the remote shell tilde-expands them. Wrapping them in single quotes
+  makes the probe `test -x '~/.cache/portal/agent-<sha>'` test a LITERAL `~` dir → always
+  MISSING → spurious re-upload on EVERY connect, and the `ln -sf` portald symlink target
+  becomes a literal `~/...` path → the remote xdg-open wrapper breaks (EC6/EC16 regression,
+  INVISIBLE to the hermetic recording fake which never runs a shell). Corrected contract:
+  name-validation (E4's regex `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`) is the SOLE injection
+  boundary; the OUTER `shellQuoted` wrapping of each whole `bash -c` script is RETAINED; the
+  interior byte layout is UNCHANGED so the EC6 golden equals current HEAD exactly (the digest
+  is hex-by-construction and the gitSHA is 40-hex-by-construction, so no path value can carry a
+  metacharacter).
 - Consolidation VERDICT (closes the X5 "EnsureUploaded becomes a thin EnsureArtifact caller"
   forward-note): REJECTED, deliberately. The two paths use different addressing schemes ON
   PURPOSE and cannot unify without breaking provisioned boxes: `EnsureUploaded` keys the
@@ -178,9 +189,9 @@ edge-case interactive programs that re-read their termios assumptions may differ
 OpenSSH behavior. sshctl inherits whatever the system ssh sends (it mirrors the LOCAL pty that
 E9 allocates — closest to OpenSSH fidelity of the three); localexec inherits the ptyx defaults.
 
-### E7. PTY primitives are in-tree: `internal/ptyx` + `internal/termx` (zero new deps)
+### E7. PTY primitives are in-tree: `pkg/transport/ptyx` + `internal/termx` (zero new deps)
 
-- `internal/ptyx`: open a pty pair and start a command on the slave.
+- `pkg/transport/ptyx`: open a pty pair and start a command on the slave.
   - darwin: open `/dev/ptmx`, `TIOCPTYGRANT`/`TIOCPTYUNLK` ioctls, slave name via
     `TIOCPTYGNAME` (the creack/pty darwin approach, via existing direct dep
     `golang.org/x/sys/unix`).
@@ -200,6 +211,15 @@ E9 allocates — closest to OpenSSH fidelity of the three); localexec inherits t
   fallback (same rule as Stage 5 §6): if the darwin pty path hits a real correctness wall in
   implementation, adopt `creack/pty` — but the unit summary must say so and this section must be
   amended before merge, never silently.
+- Path amendment (principal-ratified): `ptyx` lives at `pkg/transport/ptyx`, not
+  `internal/ptyx`, because `pkg/transport/localexec` and `pkg/transport/sshctl` import it in
+  NON-TEST code (`StreamPty`, u4/u5) and EC10 forbids any `pkg/*` non-test import of
+  `internal/*` — leaving ptyx internal is UNBUILDABLE once those transports move to `pkg/`.
+  E7's SUBSTANCE is fully preserved: in-tree, `golang.org/x/sys/unix`-only, zero new
+  `go.mod`/`go.sum` entries (EC2 intact); ONLY the import path changes. `termx` stays
+  `internal/termx` because only `cmd/portal` + internal packages import it. The alternative (a
+  `PtyAllocator` interface injected into localexec/sshctl) is heavier and REJECTED — the
+  primitive is genuinely platform-shaped.
 
 ### E8. `/v1/exec` PTY wire extension (capability-confirmed, fail-closed)
 
@@ -216,9 +236,16 @@ E9 allocates — closest to OpenSSH fidelity of the three); localexec inherits t
   `pty=1` BEFORE upgrading: HTTP 409, code `pty_unsupported` (mirrors the 403 feature-gate
   pattern; still fail-closed, still pre-hijack).
 - In PTY mode the server bridges `PtySession`: output flows as `stdout` frames only (a pty
-  merges streams; no `stderr` frames will be sent), `stdin` frames write keystrokes,
-  zero-length `stdin` still means EOF (closes the write side), `exit`/`error` terminal frames
-  and the WS close are unchanged.
+  merges streams; no `stderr` frames will be sent), `stdin` frames write keystrokes, a
+  zero-length `stdin` frame is a documented NO-OP (principal-ratified amendment) — the E5
+  `PtySession` interface exposes only `Close()` (there is NO `CloseWrite`) and a pty master
+  cannot half-close its write side; interactive pty sessions end via process exit or client
+  disconnect, NOT stdin EOF. Non-PTY zero-length-stdin EOF behavior is UNCHANGED (EC16). This
+  NO-OP is mirrored in u10 (`docs/wire.cddl` stream-tag state machine) and u11 (`clients/ts`
+  `exec.ts` never emits an EOF frame in PTY mode) so no client encodes an EOF-close-under-pty
+  expectation; it matches the standard interactive-tty contract (`ssh -t` likewise does not
+  half-close a remote pty on local stdin EOF — pty programs that read stdin to EOF terminate on
+  process exit / disconnect). `exit`/`error` terminal frames and the WS close are unchanged.
 - New client→server frame: `Stream: "winch"` with `Rows`/`Cols` set (`cbor:"rs"`/`cbor:"cs"`,
   omitempty — additive fields on `ExecFrame`, invisible to non-PTY sessions; VERIFIED against
   fxamacker/cbor v2.9.2: zero uint16 omitted, unknown keys ignored by the default decoder AND
@@ -278,6 +305,7 @@ E9 allocates — closest to OpenSSH fidelity of the three); localexec inherits t
 | `pkg/transport/sshnative` | `internal/sshnative` | " |
 | `pkg/transport/localexec` | `internal/transport/localexec` | " |
 | `pkg/transport/conformance` | `internal/transport/conformance` | + E13 loopback refactor |
+| `pkg/transport/ptyx` | `internal/ptyx` | pty primitives; imported by localexec/sshctl non-test code (E7/E11 amendment) |
 | `pkg/run` | `internal/run` | Runner seam appears in sshctl's public signature |
 | `pkg/hub` | `internal/hub` | Notify/event types appear in client + agentclient surfaces |
 | `pkg/doctor` | `internal/doctor` | report DTOs appear in client signatures |
@@ -285,13 +313,13 @@ E9 allocates — closest to OpenSSH fidelity of the three); localexec inherits t
 | `pkg/client` | `internal/localclient` | the embeddable control-API client (uses `internal/execws` — legal: pkg may import internal within this module, but see the signature rule below) |
 | `pkg/agent` | `internal/agent` | + E12 registration export |
 | `pkg/agent/watcher` | `internal/agent/watcher` | appears in agent construction |
-| `pkg/agentclient` | `internal/agentclient` | + E12; bootstrap/clipshim dependencies become interfaces DECLARED IN `pkg/agentclient` (e.g. `Bootstrapper { EnsureUploaded(ctx) (string, error); SetBootID(string); Invalidate(...) }` matching today's concrete use) — `internal/bootstrap`/`internal/clipshim` implement them |
+| `pkg/agentclient` | `internal/agentclient` | + E12; bootstrap/clipshim dependencies become interfaces DECLARED IN `pkg/agentclient` — principal-ratified correction: the corrected `Bootstrapper` is `Bootstrapper { EnsureUploaded(ctx) (string, error); SetBootID(string); EmbeddedSHA() string }` (the earlier sketch's `Invalidate(...)` does not exist anywhere in the codebase (grep-clean) and was a sketch artifact — NO `Invalidate` is introduced); this matches `agentclient/client.go`'s real use (it needs `EmbeddedSHA()` at `client.go:472/489/494/499` to drop the `internal/bootstrap` import for EC10; `*bootstrap.Manager` already satisfies all three) — `internal/bootstrap`/`internal/clipshim` implement them |
 
 Stays internal (portal-the-product, not platform): `internal/app` (composition root),
 `internal/localapi` (server), `internal/bootstrap` (embeds THIS product's portald binaries),
 `internal/clipshim`, `internal/config`, `internal/audit`, `internal/service`, `internal/proc`,
 `internal/forward`, `internal/discover`, `internal/clip`, `internal/notify`, `internal/clock`,
-`internal/logfile`, `internal/ptyx`, `internal/termx`, `cmd/*`. (`internal/execws` exists only
+`internal/logfile`, `internal/termx`, `cmd/*`. (`internal/execws` exists only
 between u1 and u9 — see the signature rule below; it is NOT a final artifact.)
 
 Rules:
@@ -384,12 +412,16 @@ type ForwardTarget struct {
 }
 func RunWithForward(t *testing.T, name string, newT func(*testing.T) transport.Transport, fw *ForwardTarget)
 ```
-`Run` delegates to `RunWithForward(..., nil)`. NO COVERAGE REGRESSION: today localexec and
-sshnative get the loopback port-forward suite automatically via the Impl-string branch, so u7
-MUST update both call sites (`internal/transport/localexec/conformance_test.go`,
-`internal/sshnative/conformance_test.go`) to declare an in-process loopback echo factory —
-they continue running the port-forward suite, now explicitly. sshctl's real-host test may pass
-a remote-reachable listener factory or nil (nil preserves today's effective skip). The suite
+`Run` delegates to `RunWithForward(..., nil)`. COVERAGE (principal-ratified correction): ONLY
+sshnative (in-process loopback, previously the `Describe().Impl != "system-ssh"` branch at
+`conformance.go:243`) and sshctl's env-gated real-host run get caller-declared `ForwardTarget`s.
+localexec does NOT implement `transport.PortForwarder` (`localexec.go:9` comment; only
+`var _ transport.Transport`), so `conformance.runPortForward` SKIPS at
+`pf, ok := tr.(transport.PortForwarder); if !ok { t.Skip }` (`conformance.go:235-237`) today and
+STAYS skipped — a `ForwardTarget` on localexec would be dead code that never runs. localexec's
+KEPT conformance coverage is the CORE suite + the NEW `PtyStreamer` PTY section (u4), NOT
+port-forward. sshctl's real-host test may pass a remote-reachable listener factory or nil (nil
+preserves today's effective skip). The suite
 contains ZERO `Describe().Impl` comparisons afterward (EC12). A new PTY section runs for transports
 asserting `PtyStreamer` (all three): `stty size` reports the requested size, resize observed
 (`stty size` re-read after `Resize`), exit-code fidelity under pty, merged-output sanity,
@@ -563,8 +595,10 @@ commits precede seam-edit commits inside u7–u9 (E11).
   round-trips both directions + dormancy case — using ONLY `pkg/agent` + `pkg/agentclient`
   exported surface.
 - **EC12** `pkg/transport/conformance` contains zero `Describe().Impl` comparisons; port-
-  forward targets are caller-declared; typed `Impl` constants exist and no bare impl-string
-  literal remains outside `pkg/transport` (grep test).
+  forward targets are caller-declared ONLY for the PortForwarder-implementing transports
+  (sshnative in-process, sshctl real-host), and localexec's pre-existing (skipped) port-forward
+  behavior is unchanged; typed `Impl` constants exist and no bare impl-string literal remains
+  outside `pkg/transport` (grep test).
 - **EC13** `docs/wire.cddl` covers every `Envelope` arm + `ExecFrame` (incl. pty extension);
   golden vectors round-trip in Go.
 - **EC14** `clients/ts` decodes every golden vector to the expected semantics; `tsc --noEmit`
