@@ -284,7 +284,8 @@ func TestExecPtyUnsupportedNoUpgrade(t *testing.T) {
 }
 
 func TestExecPtyCapabilityHeaderConfirm(t *testing.T) {
-	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	a := audit.New(t.TempDir())
+	path, _ := startExecServer(t, config.New(t.TempDir()), a, localexec.New())
 
 	ptyConn := dialExecWSWithQuery(t, path, []string{"printf", "hello"}, url.Values{"pty": {"1"}})
 	if got := ptyConn.headers.Get("X-Portal-Exec-Pty"); got != "1" {
@@ -294,10 +295,17 @@ func TestExecPtyCapabilityHeaderConfirm(t *testing.T) {
 	ptyConn.Close()
 
 	plainConn := dialExecWS(t, path, []string{"printf", "hello"})
-	defer plainConn.Close()
 	if got := plainConn.headers.Get("X-Portal-Exec-Pty"); got != "" {
+		plainConn.Close()
 		t.Fatalf("non-pty X-Portal-Exec-Pty = %q, want absent", got)
 	}
+	plainConn.Close()
+
+	// Both sessions write ExecOpen+ExecClose (4 lines). Wait for them so the
+	// audit writer is quiescent before t.TempDir cleanup runs RemoveAll on its
+	// directory; otherwise a late close-line write races the removal and fails
+	// with "directory not empty".
+	_ = waitAuditLines(t, a.Path(), 4, 5*time.Second)
 }
 
 func TestExecPtySttySize(t *testing.T) {
@@ -399,11 +407,11 @@ func TestExecClientDisconnectCancelsStream(t *testing.T) {
 	path, _ := startExecServer(t, config.New(t.TempDir()), a, localexec.New())
 	baseline := runtime.NumGoroutine()
 
-	c := dialExecWS(t, path, []string{"sh", "-c", "'sleep 5; echo hi'"})
+	c := dialExecWS(t, path, []string{"sh", "-c", "'sleep 30; echo hi'"})
 	_ = c.Close()
 
-	_ = waitAuditLines(t, a.Path(), 2, 2*time.Second)
-	deadline := time.Now().Add(2 * time.Second)
+	_ = waitAuditLines(t, a.Path(), 2, 5*time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	var got int
 	for time.Now().Before(deadline) {
 		got = runtime.NumGoroutine()
@@ -437,10 +445,11 @@ func TestExecBridgeNoGoroutineLeakAcrossOrderings(t *testing.T) {
 		}
 		_ = normal.Close()
 
-		// The process sleeps longer than the settle window below. Passing this
-		// test proves the connection close cancels Stream instead of leaving
-		// bridge goroutines blocked until the remote command exits naturally.
-		disconnected := dialExecWS(t, path, []string{"sh", "-c", "'sleep 5; echo hi'"})
+		// The process sleeps far longer than the settle window below. Passing
+		// this test proves the connection close cancels Stream instead of
+		// leaving bridge goroutines blocked until the remote command exits
+		// naturally (which would need 30s, not the 8s window).
+		disconnected := dialExecWS(t, path, []string{"sh", "-c", "'sleep 30; echo hi'"})
 		_ = disconnected.Close()
 
 		nonZero := dialExecWS(t, path, []string{"sh", "-c", "'exit 4'"})
@@ -452,7 +461,7 @@ func TestExecBridgeNoGoroutineLeakAcrossOrderings(t *testing.T) {
 		_ = nonZero.Close()
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(8 * time.Second)
 	var got int
 	for time.Now().Before(deadline) {
 		got = runtime.NumGoroutine()
