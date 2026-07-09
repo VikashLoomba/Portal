@@ -751,3 +751,57 @@ func execGetTermiosReq() uint {
 		return 0x5401
 	}
 }
+
+// TestForwardWinchKeepsLatestUnderBurst proves the winch producer coalesces a
+// burst to the LATEST size rather than dropping the newest (fast-follow #1). A
+// pre-Stage-6-fast-follow drop-newest send would leave the stale first size in
+// the buffer; drain-then-send keeps the final size.
+func TestForwardWinchKeepsLatestUnderBurst(t *testing.T) {
+	const n = 8
+	ticks := make(chan struct{})
+	out := make(chan [2]uint16, 1)
+	// getSize returns a distinct, increasing size per tick; the consumer never
+	// reads until every tick is processed, so the 1-buffer stays full.
+	var call int
+	getSize := func(int) (uint16, uint16, error) {
+		call++
+		return uint16(10 + call), uint16(100 + call), nil
+	}
+	done := make(chan struct{})
+	go func() {
+		forwardWinch(ticks, getSize, 0, out)
+		close(done)
+	}()
+	for i := 0; i < n; i++ {
+		ticks <- struct{}{}
+	}
+	close(ticks)
+	<-done
+	select {
+	case got := <-out:
+		want := [2]uint16{uint16(10 + n), uint16(100 + n)}
+		if got != want {
+			t.Fatalf("winch kept %v, want latest %v", got, want)
+		}
+	default:
+		t.Fatal("winch buffer empty; expected the latest size")
+	}
+}
+
+// TestForwardWinchSkipsGetSizeErrors confirms a getSize error is skipped, not
+// forwarded as a zero size.
+func TestForwardWinchSkipsGetSizeErrors(t *testing.T) {
+	ticks := make(chan struct{})
+	out := make(chan [2]uint16, 1)
+	getSize := func(int) (uint16, uint16, error) { return 0, 0, errors.New("size probe failed") }
+	done := make(chan struct{})
+	go func() { forwardWinch(ticks, getSize, 0, out); close(done) }()
+	ticks <- struct{}{}
+	close(ticks)
+	<-done
+	select {
+	case got := <-out:
+		t.Fatalf("forwarded %v on getSize error; want nothing", got)
+	default:
+	}
+}

@@ -82,18 +82,7 @@ func newExecCmd(a *app.App) *cobra.Command {
 				winch := make(chan [2]uint16, 1)
 				winchCtx, stopWinch := context.WithCancel(cmd.Context())
 				defer stopWinch()
-				go func() {
-					for range watchWinch(winchCtx) {
-						r, c, err := getSize(stdinFD)
-						if err != nil {
-							continue
-						}
-						select {
-						case winch <- [2]uint16{r, c}:
-						default:
-						}
-					}
-				}()
+				go forwardWinch(watchWinch(winchCtx), getSize, stdinFD, winch)
 
 				term := os.Getenv("TERM")
 				if term == "" {
@@ -130,6 +119,34 @@ func newExecCmd(a *app.App) *cobra.Command {
 	cmd.Flags().BoolP("tty", "t", false, "allocate a pseudo-terminal")
 	cmd.Flags().BoolP("no-tty", "T", false, "disable pseudo-terminal allocation")
 	return cmd
+}
+
+// forwardWinch reads terminal-size ticks and forwards the LATEST size to out,
+// coalescing bursts so a full buffer never strands the newest size. The winch
+// channel is size 1: a plain non-blocking send drops the NEW value when the
+// buffer is full, leaving the remote pty a generation behind after a burst;
+// here a full buffer is drained of its stale size and the current one enqueued
+// instead. This goroutine is the sole producer, so the final send always lands.
+func forwardWinch(ticks <-chan struct{}, getSize func(int) (uint16, uint16, error), fd int, out chan [2]uint16) {
+	for range ticks {
+		r, c, err := getSize(fd)
+		if err != nil {
+			continue
+		}
+		sz := [2]uint16{r, c}
+		select {
+		case out <- sz:
+		default:
+			select {
+			case <-out:
+			default:
+			}
+			select {
+			case out <- sz:
+			default:
+			}
+		}
+	}
 }
 
 func execRawRestoreWithSignals(restore func() error) (func() error, func()) {
