@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -212,11 +211,11 @@ func mustProtocolPayload[T any](t *testing.T, v T) cbor.RawMessage {
 
 func protocolVectorDir(t *testing.T) string {
 	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
 	}
-	root := findModuleRoot(t, filepath.Dir(file))
+	root := findModuleRoot(t, dir)
 	return filepath.Join(root, "docs", "vectors")
 }
 
