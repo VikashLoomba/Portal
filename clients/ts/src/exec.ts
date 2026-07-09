@@ -20,6 +20,7 @@ export const PTY_UNSUPPORTED_MESSAGE = "daemon does not support PTY (restart the
 
 const responseHeadLimit = 64 * 1024;
 const errorBodyLimit = 1 << 20;
+const maxUint16 = 0xffff;
 const crlfcrlf = Uint8Array.of(13, 10, 13, 10);
 const textDecoder = new TextDecoder();
 
@@ -139,7 +140,7 @@ export function exec(socketPath: string, options: ExecOptions): ExecSession {
         throw new Error("exec: resize requires PTY mode");
       }
       await started;
-      await sendExecFrame({ stream: ExecStreamWinch, rows, cols });
+      await sendExecFrame({ stream: ExecStreamWinch, rows: clampUint16(rows), cols: clampUint16(cols) });
     },
     close(): void {
       closeSession();
@@ -309,11 +310,29 @@ async function pumpWinch(
       if (next.done === true) {
         return;
       }
-      await sendExecFrame({ stream: ExecStreamWinch, rows: next.value.rows, cols: next.value.cols });
+      await sendExecFrame({
+        stream: ExecStreamWinch,
+        rows: clampUint16(next.value.rows),
+        cols: clampUint16(next.value.cols),
+      });
     }
   } finally {
     await returnIterator(iterator);
   }
+}
+
+function clampUint16(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  const truncated = Math.trunc(value);
+  if (truncated < 0) {
+    return 0;
+  }
+  if (truncated > maxUint16) {
+    return maxUint16;
+  }
+  return truncated;
 }
 
 function mustSocket(hooks: SessionHooks): Socket {

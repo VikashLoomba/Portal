@@ -29,6 +29,7 @@ import (
 	"github.com/VikashLoomba/Portal/pkg/transport"
 	"github.com/VikashLoomba/Portal/pkg/transport/localexec"
 	"github.com/VikashLoomba/Portal/pkg/wsbits"
+	"github.com/fxamacker/cbor/v2"
 )
 
 func TestExecUpgradeReaches101(t *testing.T) {
@@ -73,6 +74,32 @@ func TestExecStdinHalfClose(t *testing.T) {
 		t.Fatalf("stdout = %q, want ping newline", string(stdout.Data))
 	}
 
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte{}})
+	frames := readExecFramesUntilExit(t, c, 2*time.Second)
+	if got := lastExitCode(frames); got != 0 {
+		t.Fatalf("exit code = %d, want 0", got)
+	}
+}
+
+func TestExecMalformedApplicationFrameDoesNotTearDownSession(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	c := dialExecWS(t, path, []string{"cat"})
+	defer c.Close()
+
+	payload := oversizedWinchExecFramePayload(t)
+	if _, err := api.DecodeExecFrame(payload); err == nil {
+		t.Fatal("api.DecodeExecFrame accepted oversized winch rows; regression test no longer covers malformed app frames")
+	}
+	if err := writeClientFrame(c, wsbits.OpBinary, payload); err != nil {
+		t.Fatalf("write malformed client frame: %v", err)
+	}
+	assertNoTerminalFrameWithin(t, c, 200*time.Millisecond)
+
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte("alive\n")})
+	stdout := readExecFrameMatching(t, c, api.ExecStreamStdout, 2*time.Second)
+	if string(stdout.Data) != "alive\n" {
+		t.Fatalf("stdout = %q, want alive newline", string(stdout.Data))
+	}
 	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte{}})
 	frames := readExecFramesUntilExit(t, c, 2*time.Second)
 	if got := lastExitCode(frames); got != 0 {
@@ -315,6 +342,39 @@ func TestExecPtyWinchResizesSession(t *testing.T) {
 	}
 	if got := countFrames(frames, api.ExecStreamStderr); got != 0 {
 		t.Fatalf("stderr frames = %d, want 0 for pty", got)
+	}
+}
+
+func TestExecPtyMalformedWinchFrameDoesNotTearDownSession(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	c := dialExecWSWithQuery(t, path, []string{"sh", "-c", "'stty size; read _; stty size'"}, url.Values{
+		"pty":  {"1"},
+		"rows": {"40"},
+		"cols": {"100"},
+	})
+	defer c.Close()
+
+	initial := readExecFramesUntilStdoutContains(t, c, "40 100", 2*time.Second)
+	payload := oversizedWinchExecFramePayload(t)
+	if _, err := api.DecodeExecFrame(payload); err == nil {
+		t.Fatal("api.DecodeExecFrame accepted oversized winch rows; regression test no longer covers malformed app frames")
+	}
+	if err := writeClientFrame(c, wsbits.OpBinary, payload); err != nil {
+		t.Fatalf("write malformed client frame: %v", err)
+	}
+	assertNoTerminalFrameWithin(t, c, 200*time.Millisecond)
+
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamWinch, Rows: 50, Cols: 120})
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte("go\n")})
+	rest := readExecFramesUntilExit(t, c, 2*time.Second)
+
+	frames := append(initial, rest...)
+	stdout := cleanPtyOutput(joinFrameData(frames, api.ExecStreamStdout))
+	if !strings.Contains(stdout, "50 120") {
+		t.Fatalf("stdout = %q, want valid winch size 50 120 after malformed frame", stdout)
+	}
+	if got := lastExitCode(frames); got != 0 {
+		t.Fatalf("exit code = %d, want 0", got)
 	}
 }
 
@@ -745,6 +805,23 @@ func writeExecClientFrame(t *testing.T, c *wsTestConn, f api.ExecFrame) {
 	if err := writeClientFrame(c, wsbits.OpBinary, payload); err != nil {
 		t.Fatalf("write client frame: %v", err)
 	}
+}
+
+func oversizedWinchExecFramePayload(t *testing.T) []byte {
+	t.Helper()
+	payload, err := cbor.Marshal(struct {
+		Stream string `cbor:"s"`
+		Rows   uint32 `cbor:"rs"`
+		Cols   uint16 `cbor:"cs"`
+	}{
+		Stream: api.ExecStreamWinch,
+		Rows:   70000,
+		Cols:   100,
+	})
+	if err != nil {
+		t.Fatalf("marshal oversized winch frame: %v", err)
+	}
+	return payload
 }
 
 func writeClientFrame(c net.Conn, op wsbits.Opcode, payload []byte) error {

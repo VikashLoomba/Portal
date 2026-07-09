@@ -267,8 +267,8 @@ func readExecPtyWS(conn io.Writer, rw *bufio.ReadWriter, writeMu *sync.Mutex, wg
 		case wsbits.OpBinary:
 			f, err := api.DecodeExecFrame(payload)
 			if err != nil {
-				cancel()
-				return
+				// Malformed client frames are ignored; only transport failures tear down the session.
+				continue
 			}
 			switch f.Stream {
 			case api.ExecStreamStdin:
@@ -331,8 +331,8 @@ func readExecWS(conn io.Writer, rw *bufio.ReadWriter, writeMu *sync.Mutex, wg *s
 		case wsbits.OpBinary:
 			f, err := api.DecodeExecFrame(payload)
 			if err != nil {
-				cancel()
-				return
+				// Malformed client frames are ignored; only transport failures tear down the session.
+				continue
 			}
 			if f.Stream != api.ExecStreamStdin {
 				continue

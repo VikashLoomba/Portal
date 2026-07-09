@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { decode, decodeExecFrame, encodeExecFrame } from "../src/cbor.ts";
+import { ExecStreamWinch, decode, decodeExecFrame, encodeExecFrame } from "../src/cbor.ts";
 import type { CborMap, CborValue, ExecFrame } from "../src/cbor.ts";
 
 const vectorDir = fileURLToPath(new URL("../../../docs/vectors/", import.meta.url));
@@ -23,6 +23,26 @@ for (const name of execVectors) {
     assertExecFrame(redecoded, expected);
   });
 }
+
+test("encodeExecFrame enforces uint16 winch dimensions", () => {
+  const cases = [
+    { name: "rows over uint16", frame: { stream: ExecStreamWinch, rows: 70000 } },
+    { name: "cols over uint16", frame: { stream: ExecStreamWinch, cols: 70000 } },
+    { name: "rows negative", frame: { stream: ExecStreamWinch, rows: -1 } },
+    { name: "rows fractional", frame: { stream: ExecStreamWinch, rows: 1.5 } },
+  ];
+  for (const tt of cases) {
+    assert.throws(
+      () => encodeExecFrame(tt.frame),
+      /cbor: exec frame (rs|cs) must be an integer in \[0, 65535\]/,
+      tt.name,
+    );
+  }
+
+  const decoded = decodeExecFrame(encodeExecFrame({ stream: ExecStreamWinch, rows: 65535, cols: 65535 }));
+  assert.equal(decoded.rows, 65535);
+  assert.equal(decoded.cols, 65535);
+});
 
 const protocolMappings: ProtocolMapping[] = [
   {

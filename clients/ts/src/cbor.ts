@@ -1,5 +1,6 @@
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
+const maxUint16 = 0xffff;
 
 export const ExecStreamStdin = "stdin";
 export const ExecStreamStdout = "stdout";
@@ -71,10 +72,10 @@ export function encodeExecFrame(frame: ExecFrame | ExecFrameInit): Uint8Array {
     entries.push(["c", encodeInteger(frame.code)]);
   }
   if (frame.rows !== undefined && frame.rows !== 0) {
-    entries.push(["rs", encodeUnsigned(frame.rows)]);
+    entries.push(["rs", encodeUint16Field("rs", frame.rows)]);
   }
   if (frame.cols !== undefined && frame.cols !== 0) {
-    entries.push(["cs", encodeUnsigned(frame.cols)]);
+    entries.push(["cs", encodeUint16Field("cs", frame.cols)]);
   }
   return encodeMap(entries);
 }
@@ -333,6 +334,13 @@ function encodeUnsigned(value: number): Uint8Array {
     throw new Error("cbor: unsigned integers must be non-negative whole numbers");
   }
   return encodeHead(0, value);
+}
+
+function encodeUint16Field(key: string, value: number): Uint8Array {
+  if (!Number.isInteger(value) || value < 0 || value > maxUint16) {
+    throw new Error(`cbor: exec frame ${key} must be an integer in [0, 65535]`);
+  }
+  return encodeUnsigned(value);
 }
 
 function encodeHead(major: number, value: number | bigint): Uint8Array {

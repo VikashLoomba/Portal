@@ -135,6 +135,47 @@ test("PTY resize sends winch frame", async (t) => {
   await fake.done;
 });
 
+test("PTY resize clamps winch dimensions to uint16 wire range", async (t) => {
+  const fake = await FakeExecServer.start(t, async (conn) => {
+    const reader = new WebSocketFrameReader(conn);
+    const req = await readUpgradeRequest(reader);
+    assert.equal(req.target, "/v1/exec?arg=sh&pty=1&term=&rows=24&cols=80");
+    await write101(conn, header(req, "sec-websocket-key") ?? "", true);
+    const winch = decodeExecFrame((await reader.readFrame(true)).payload);
+    assert.equal(winch.stream, ExecStreamWinch);
+    assert.equal(winch.rows, 65535);
+    assert.equal(winch.cols, 100);
+    await sendExecFrame(conn, { stream: ExecStreamExit, code: 0 });
+  });
+
+  const session = exec(fake.path, { argv: ["sh"], pty: { rows: 24, cols: 80 } });
+  await session.resize(70000, 100);
+  assert.equal((await session.result).code, 0);
+  await fake.done;
+});
+
+test("PTY winch source clamps dimensions to uint16 wire range", async (t) => {
+  const fake = await FakeExecServer.start(t, async (conn) => {
+    const reader = new WebSocketFrameReader(conn);
+    const req = await readUpgradeRequest(reader);
+    assert.equal(req.target, "/v1/exec?arg=sh&pty=1&term=&rows=24&cols=80");
+    await write101(conn, header(req, "sec-websocket-key") ?? "", true);
+    const winch = decodeExecFrame((await reader.readFrame(true)).payload);
+    assert.equal(winch.stream, ExecStreamWinch);
+    assert.equal(winch.rows, 65535);
+    assert.equal(winch.cols, 100);
+    await sendExecFrame(conn, { stream: ExecStreamExit, code: 0 });
+  });
+
+  const result = await runExec(fake.path, {
+    argv: ["sh"],
+    pty: { rows: 24, cols: 80 },
+    winch: [{ rows: 70000, cols: 100 }],
+  });
+  assert.equal(result.code, 0);
+  await fake.done;
+});
+
 test("PTY skew hard-fails before sending frames", async (t) => {
   const fake = await FakeExecServer.start(t, async (conn) => {
     const reader = new WebSocketFrameReader(conn);
