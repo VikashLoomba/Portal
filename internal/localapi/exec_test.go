@@ -596,14 +596,13 @@ func TestExecReaderCloseReleasesBlockedOutputWriter(t *testing.T) {
 		t.Fatalf("read upgrade headers: %v", err)
 	}
 
+	// handleExec may synchronously close the net.Pipe after reading OpClose;
+	// no further client writes follow, so leave this deadline in place.
 	if err := client.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatalf("set write deadline: %v", err)
 	}
 	if err := writeClientFrame(client, wsbits.OpClose, []byte{0x03, 0xe8}); err != nil {
 		t.Fatalf("write close frame: %v", err)
-	}
-	if err := client.SetWriteDeadline(time.Time{}); err != nil {
-		t.Fatalf("clear write deadline: %v", err)
 	}
 
 	select {
