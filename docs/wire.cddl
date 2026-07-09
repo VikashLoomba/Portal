@@ -4,8 +4,17 @@
 ; Envelope and the exec WebSocket subprotocol. Raw PF frame and WebSocket bytes
 ; are documented in comments because CDDL describes CBOR data items.
 ;
-; Manual validation command (Ruby cddl gem, review-only; not in the gate):
-;   cddl docs/wire.cddl validate /tmp/portal-wire-examples.cbor
+; Manual validation (Ruby cddl gem, review-only; not in the gate). This rule set
+; describes the BARE CBOR data item, so a PF-framed protocol vector must have its
+; 6-byte header (2-byte "PF" magic + 4-byte big-endian length) stripped before
+; validation; exec-frame vectors are bare CBOR already. To validate every golden
+; vector in docs/vectors/*.hex:
+;   for hx in docs/vectors/*.hex; do
+;     h=$(tr -d '[:space:]' < "$hx"); case "$h" in 5046*) h=${h:12};; esac
+;     printf '%s' "$h" | xxd -r -p > /tmp/v.cbor
+;     cddl docs/wire.cddl validate /tmp/v.cbor || echo "FAIL: $hx"
+;   done
+; Last run 2026-07-09 (cddl 0.12.14): all 21 vectors conform.
 
 portal-cbor = envelope / exec-frame / msg-payload
 
