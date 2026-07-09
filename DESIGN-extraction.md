@@ -656,15 +656,23 @@ Live-box validation (2026-07-09, staging harness vs vikash@vikash-system, system
   never delivers the remote SIGHUP. The localexec transport (direct pty, no mux) kills the
   orphan correctly (EC8 hermetic PASS). This is the mux-ssh analog of the Stage-5 §8.3 finding.
 
-Fast-follows (non-blocking, record for a later stage):
-1. **CLI winch pump can drop the final resize:** `cmd/portal/exec.go` sends sizes through a
-   1-buffered drop-newest channel; a resize burst ending in a drop leaves the remote pty one
-   size stale until the next WINCH. Fix: drain-then-send (keep latest, not oldest).
-2. **System-transport disconnect-kill is mux-bounded:** `sshctlPtySession.Close` SIGKILLs its
-   `ssh -tt` mux child, which cannot propagate a remote SIGHUP (see live-box note). To match
-   localexec's clean orphan-kill, close the local pty master and give ssh a brief SIGHUP/SIGTERM
-   window to close the channel before SIGKILL, or send an explicit remote signal. Native/localexec
-   are unaffected.
+Fast-follows:
+1. **CLI winch pump can drop the final resize** — ✅ DONE (`e843f52`): extracted `forwardWinch`
+   in `cmd/portal/exec.go` and switched to drain-then-send so a burst keeps the latest size.
+   Unit-tested (keep-latest-under-burst, getSize-error-skip).
+3. **Go-side EOF-frame count untested** — ✅ DONE (`78ead45`): `pkg/client` now asserts non-PTY
+   stdin EOF sends exactly one zero-length frame and PTY sends none.
+4. **CDDL never machine-validated** — ✅ DONE (`f412c48`): validated with cddl 0.12.14 — grammar
+   parses and all 21 golden vectors conform (PF header stripped for framed protocol vectors);
+   the strip-then-validate procedure is now recorded in `docs/wire.cddl`.
+2. **System-transport disconnect-kill is mux-bounded** — ⬜ DEFERRED (needs a live mux-ssh
+   mechanism experiment). `sshctlPtySession.Close` SIGKILLs its `ssh -tt` mux child, which cannot
+   propagate a remote SIGHUP. The candidate fix (close the master, give ssh a SIGHUP/close window
+   before SIGKILL) is only worth shipping if a live test confirms a cleanly-exiting mux client
+   actually kills the remote orphan — and that could NOT be verified this session: vikash-system
+   needs a Tailscale browser re-auth to establish a fresh master, and localhost sshd has no key
+   auth configured. Do NOT ship a speculative version. Native/localexec are unaffected (localexec
+   orphan-kill is EC8-proven).
 2. **Zero-length-stdin single-frame count untested in Go:** the exactly-one-EOF-frame
    behavior is asserted by the TS suite only; a Go-side frame-count test would pin it against
    client refactors.
