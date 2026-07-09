@@ -409,6 +409,97 @@ func TestExecPreservesExitWhenContextCancelsBeforeBlockedStdinDone(t *testing.T)
 	}
 }
 
+func TestExecReturnsContextCanceledWhenTransportClosesBeforeBlockedStdinDone(t *testing.T) {
+	path := filepath.Join(shortExecClientTempDir(t), "api.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+
+	serverClosed := make(chan struct{})
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+
+		br := bufio.NewReader(conn)
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		key := strings.TrimSpace(req.Header.Get("Sec-WebSocket-Key"))
+		if _, err := fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", wsbits.AcceptKey(key)); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := wsbits.WriteFrame(conn, wsbits.OpClose, nil, false); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := conn.Close(); err != nil {
+			serverDone <- err
+			return
+		}
+		close(serverClosed)
+		serverDone <- nil
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Fatalf("fake exec server: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("fake exec server did not stop")
+		}
+	})
+
+	stdin, stdinWriter := io.Pipe()
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		_ = stdinWriter.Close()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := make(chan struct {
+		code int
+		err  error
+	}, 1)
+	go func() {
+		code, err := New(path).Exec(ctx, []string{"cat"}, stdin, io.Discard, io.Discard)
+		done <- struct {
+			code int
+			err  error
+		}{code: code, err: err}
+	}()
+
+	select {
+	case <-serverClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fake exec server did not close upgraded connection")
+	}
+	cancel()
+
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("Exec error = %v, want context.Canceled", got.err)
+		}
+		if got.code != 0 {
+			t.Fatalf("exit code = %d, want 0", got.code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Exec did not return after context cancellation")
+	}
+}
+
 type blockingExecReader struct {
 	once    sync.Once
 	started chan struct{}

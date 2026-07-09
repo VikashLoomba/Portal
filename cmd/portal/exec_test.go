@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -263,6 +264,93 @@ func TestExecCmdAutoTTYEmptyArgvSelectsPTY(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("ExecuteContext returned %v", err)
+	}
+}
+
+func TestExecCmdTTYWinchPumpSendsCurrentSize(t *testing.T) {
+	t.Setenv("TERM", "xterm-256color")
+
+	path := serveExecDaemon(t)
+	var sizeCalls atomic.Int64
+	var resizeFD atomic.Int64
+	resizeFD.Store(-1)
+	setExecTermSeams(t,
+		func(int) bool { return true },
+		func(int) (func() error, error) { return func() error { return nil }, nil },
+		func(fd int) (uint16, uint16, error) {
+			if sizeCalls.Add(1) == 1 {
+				return 40, 100, nil
+			}
+			resizeFD.Store(int64(fd))
+			return 31, 97, nil
+		},
+		func(context.Context) <-chan struct{} {
+			ch := make(chan struct{}, 1)
+			ch <- struct{}{}
+			close(ch)
+			return ch
+		},
+	)
+
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdin pipe: %v", err)
+	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		_ = inR.Close()
+		_ = inW.Close()
+		t.Fatalf("stdout pipe: %v", err)
+	}
+
+	oldStdin, oldStdout := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = inR, outW
+	stdinFD := int(os.Stdin.Fd())
+	t.Cleanup(func() {
+		os.Stdin, os.Stdout = oldStdin, oldStdout
+		_ = inR.Close()
+		_ = inW.Close()
+		_ = outR.Close()
+		_ = outW.Close()
+	})
+	if err := inW.Close(); err != nil {
+		t.Fatalf("close stdin writer: %v", err)
+	}
+
+	var out bytes.Buffer
+	outputDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(&out, outR)
+		close(outputDone)
+	}()
+
+	a := &app.App{Paths: app.Paths{APISock: path}}
+	cmd := newExecCmd(a)
+	script := `i=0; while [ $i -lt 30 ]; do size=$(stty size); echo "$size"; [ "$size" = "31 97" ] && exit 0; i=$((i+1)); sleep 0.1; done`
+	cmd.SetArgs([]string{"-t", "--", "sh", "-c", shQuote(script)})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = cmd.ExecuteContext(ctx)
+	_ = outW.Close()
+	select {
+	case <-outputDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stdout pipe reader did not stop")
+	}
+	if err != nil {
+		t.Fatalf("ExecuteContext returned %v", err)
+	}
+
+	gotOut := out.String()
+	if strings.Contains(gotOut, "97 31") {
+		t.Fatalf("stdout = %q, contains swapped stty size 97 31", gotOut)
+	}
+	if !strings.Contains(gotOut, "31 97") {
+		t.Fatalf("stdout = %q, want resized stty size 31 97", gotOut)
+	}
+	if got := int(resizeFD.Load()); got != stdinFD {
+		t.Fatalf("resize getSize fd = %d, want current stdin fd %d", got, stdinFD)
 	}
 }
 
