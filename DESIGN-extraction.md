@@ -665,14 +665,24 @@ Fast-follows:
 4. **CDDL never machine-validated** — ✅ DONE (`f412c48`): validated with cddl 0.12.14 — grammar
    parses and all 21 golden vectors conform (PF header stripped for framed protocol vectors);
    the strip-then-validate procedure is now recorded in `docs/wire.cddl`.
-2. **System-transport disconnect-kill is mux-bounded** — ⬜ DEFERRED (needs a live mux-ssh
-   mechanism experiment). `sshctlPtySession.Close` SIGKILLs its `ssh -tt` mux child, which cannot
-   propagate a remote SIGHUP. The candidate fix (close the master, give ssh a SIGHUP/close window
-   before SIGKILL) is only worth shipping if a live test confirms a cleanly-exiting mux client
-   actually kills the remote orphan — and that could NOT be verified this session: vikash-system
-   needs a Tailscale browser re-auth to establish a fresh master, and localhost sshd has no key
-   auth configured. Do NOT ship a speculative version. Native/localexec are unaffected (localexec
-   orphan-kill is EC8-proven).
+2. **System-transport disconnect-kill is mux-bounded** — ⬜ WON'T-FIX as a small change; the
+   candidate fix is REFUTED by live experiment (2026-07-09, vs vikash-system). Tested four
+   teardowns of a `ssh -tt … 'exec sleep 300'` client, polling the exact remote PID:
+   | Teardown | Remote orphan |
+   |---|---|
+   | A. SIGKILL the `-S` mux client (current `sshctlPtySession.Close`) | SURVIVES |
+   | B. close the local pty master → clean ssh SIGHUP exit (the *candidate fix*) | SURVIVES |
+   | C. SIGTERM the mux client (clean shutdown) | SURVIVES |
+   | D. **direct** `ssh -tt` (no ControlMaster), SIGKILL client | **DIES** |
+   Root cause: the ControlMaster keeps the transport connection alive, so tearing down one muxed
+   pty *channel* — by any means, including a clean exit — never hangs up the remote pty. Only
+   dropping the whole connection (D) delivers the remote SIGHUP. So the graceful-teardown fix
+   would add latency for zero benefit; do NOT ship it. A real system-transport fix is a larger
+   design choice: either (a) capture the remote PID/PGID and send an explicit `kill` over a
+   separate mux channel on disconnect, or (b) use a dedicated non-muxed connection for PTY exec
+   (re-auths per session — for Tailscale SSH that re-triggers browser auth). Native (direct
+   x/crypto conn + `markDead`→`closeRegisteredPtySessions`) and localexec (direct pty, EC8-proven)
+   are unaffected — this is strictly a ControlMaster-mux limitation.
 2. **Zero-length-stdin single-frame count untested in Go:** the exactly-one-EOF-frame
    behavior is asserted by the TS suite only; a Go-side frame-count test would pin it against
    client refactors.
