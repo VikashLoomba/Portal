@@ -2,9 +2,12 @@
 # GET /v1/openapi.yaml. This is the D2 spec-first source of truth.
 #
 # FORMATTING CONTRACT (the spec_test.go mini-parser depends on this EXACTLY):
-#   - 2-space indentation throughout.
-#   - path keys are indented 2 spaces and look like `  /v1/foo:`.
-#   - method keys are indented 4 spaces and look like `    get:`.
+#   - path entries are indented exactly 2 spaces and look like `  /v1/foo:`.
+#   - method entries are indented exactly 4 spaces and look like `    get:`.
+#   - method body keys (`summary`/`parameters`/`requestBody`/`responses`) are
+#     indented exactly 6 spaces.
+#   - `components:` is at column 0.
+#   - no 4-space key under `components:` may be named get/put/post/delete.
 # The conformance test extracts (METHOD, path) pairs from these keys and asserts
 # set equality with the mux route table in BOTH directions. Later units append
 # paths/methods here IN LOCKSTEP with server.go's registerRoutes so the test
@@ -17,35 +20,456 @@ paths:
   /v1/version:
     get:
       summary: Portal version, embedded git SHA, and wire ProtoVersion.
+      responses:
+        "200":
+          description: Version information.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VersionInfo"
   /v1/openapi.yaml:
     get:
       summary: This embedded OpenAPI spec.
+      responses:
+        "200":
+          description: The committed OpenAPI document served verbatim.
+          content:
+            text/yaml:
+              schema:
+                type: string
   /v1/status:
     get:
       summary: The full Status aggregate.
+      responses:
+        "200":
+          description: Current daemon state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
   /v1/events:
     get:
       summary: ndjson event stream (snapshot-first, coalesced state, notify, tick).
+      responses:
+        "200":
+          description: Newline-delimited event stream; each line is a snapshot, state, notify, or tick event.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
   /v1/ports:
     get:
       summary: Remote loopback listeners from the cached Snapshot (503 before the first).
+      responses:
+        "200":
+          description: Cached remote loopback listeners.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PortStatus"
+        "503":
+          description: No cached Snapshot has arrived from the agent yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
   /v1/allow/{port}:
     put:
       summary: Add a port to the allowlist and push it; returns the new allowlist.
+      parameters:
+        - name: port
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 65535
+      responses:
+        "200":
+          description: Updated allowlist.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AllowlistResponse"
+        "400":
+          description: Invalid port path parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
     delete:
       summary: Remove a port from the allowlist and push it; returns the new allowlist.
+      parameters:
+        - name: port
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 65535
+      responses:
+        "200":
+          description: Updated allowlist.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AllowlistResponse"
+        "400":
+          description: Invalid port path parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
   /v1/features:
     get:
       summary: The capability gates as a name to enabled map.
+      responses:
+        "200":
+          description: Feature name to enabled flag.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: boolean
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
   /v1/features/{name}:
     put:
       summary: Toggle one capability gate; unknown name is 404.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FeatureUpdate"
+      responses:
+        "200":
+          description: Updated feature map.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: boolean
+        "400":
+          description: Malformed request body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "404":
+          description: Unknown feature.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
   /v1/reconcile:
     post:
       summary: Kick the forward engine reconcile; returns 202.
+      responses:
+        "202":
+          description: Reconcile was accepted and scheduled.
   /v1/doctor:
     post:
       summary: Run the doctor self-test; returns the structured report.
+      responses:
+        "200":
+          description: Doctor report object; the precise doctor.Report shape is not part of pkg/api.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
   /v1/exec:
     post:
-      summary: Upgrade to a WebSocket exec stream over the local Unix socket; argv is carried as repeated arg query parameters and binary messages are CBOR ExecFrame envelopes with stdin/stdout/stderr/exit/error stream kinds, where zero-length stdin means EOF and 403 feature_disabled is returned when the exec gate is off.
+      summary: Upgrade to a WebSocket exec stream over the local Unix socket.
+      description: On success this upgrades to the exec WebSocket subprotocol. Binary WebSocket messages carry CBOR ExecFrame envelopes; docs/wire.cddl documents the frame shapes.
+      parameters:
+        - name: arg
+          in: query
+          description: Command argv element; repeat once per argument. Empty argv is allowed only with pty=1.
+          required: false
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - name: pty
+          in: query
+          description: Set to "1" to request a pseudo-terminal.
+          required: false
+          schema:
+            type: string
+            enum: ["1"]
+        - name: term
+          in: query
+          description: TERM value for PTY sessions.
+          required: false
+          schema:
+            type: string
+        - name: rows
+          in: query
+          description: Initial PTY row count.
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 65535
+        - name: cols
+          in: query
+          description: Initial PTY column count.
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 65535
+      responses:
+        "101":
+          description: Switching Protocols; WebSocket exec stream established.
+          headers:
+            X-Portal-Exec-Pty:
+              description: Present with value "1" only when PTY was requested and granted.
+              schema:
+                type: string
+                enum: ["1"]
+        "400":
+          description: Invalid request or bad WebSocket upgrade headers (invalid_request or bad_upgrade).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "403":
+          description: Exec feature gate is disabled (feature_disabled).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "409":
+          description: The active transport does not support PTY (pty_unsupported).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+components:
+  schemas:
+    Status:
+      type: object
+      required:
+        - version
+        - host
+        - service
+        - master
+        - agent
+        - ports
+        - forwards
+        - allowed
+        - features
+        - health
+      properties:
+        version:
+          $ref: "#/components/schemas/VersionInfo"
+        host:
+          type: string
+        service:
+          $ref: "#/components/schemas/ServiceStatus"
+        master:
+          $ref: "#/components/schemas/MasterStatus"
+        agent:
+          nullable: true
+          $ref: "#/components/schemas/AgentStatus"
+        ports:
+          type: array
+          nullable: true
+          items:
+            $ref: "#/components/schemas/PortStatus"
+        forwards:
+          type: array
+          nullable: true
+          items:
+            $ref: "#/components/schemas/ForwardStatus"
+        allowed:
+          type: array
+          nullable: true
+          items:
+            type: integer
+        features:
+          type: object
+          nullable: true
+          additionalProperties:
+            type: boolean
+        health:
+          $ref: "#/components/schemas/Health"
+    VersionInfo:
+      type: object
+      required:
+        - version
+        - gitSha
+        - protoVersion
+      properties:
+        version:
+          type: string
+        gitSha:
+          type: string
+        protoVersion:
+          type: integer
+          format: uint32
+    PortStatus:
+      type: object
+      required:
+        - port
+      properties:
+        port:
+          type: integer
+    ForwardStatus:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+    AgentStatus:
+      type: object
+      required:
+        - pid
+        - sha
+        - kernel
+        - bootId
+      properties:
+        pid:
+          type: integer
+        sha:
+          type: string
+        kernel:
+          type: string
+        bootId:
+          type: string
+    MasterStatus:
+      type: object
+      required:
+        - up
+        - pid
+        - transport
+        - detail
+      properties:
+        up:
+          type: boolean
+        pid:
+          type: integer
+        transport:
+          type: string
+        detail:
+          type: string
+    ServiceStatus:
+      type: object
+      required:
+        - loaded
+        - stateLines
+      properties:
+        loaded:
+          type: boolean
+        stateLines:
+          type: array
+          nullable: true
+          items:
+            type: string
+    Health:
+      type: object
+      required:
+        - droppedNotifyCount
+        - eventsSubscribers
+        - reconcileCount
+      properties:
+        lastDisconnectErr:
+          type: string
+        droppedNotifyCount:
+          type: integer
+          format: uint64
+        eventsSubscribers:
+          type: integer
+        reconcileCount:
+          type: integer
+          format: uint64
+    ErrorBody:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          $ref: "#/components/schemas/ErrorDetail"
+    ErrorDetail:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+    AllowlistResponse:
+      type: object
+      required:
+        - allowed
+      properties:
+        allowed:
+          type: array
+          nullable: true
+          items:
+            type: integer
+    FeatureUpdate:
+      type: object
+      required:
+        - enabled
+      properties:
+        enabled:
+          type: boolean

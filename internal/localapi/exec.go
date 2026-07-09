@@ -13,8 +13,9 @@ import (
 	"time"
 
 	"github.com/VikashLoomba/Portal/internal/config"
-	"github.com/VikashLoomba/Portal/internal/execws"
+	"github.com/VikashLoomba/Portal/pkg/api"
 	"github.com/VikashLoomba/Portal/pkg/transport"
+	"github.com/VikashLoomba/Portal/pkg/wsbits"
 )
 
 // handleExec enforces the exec feature gate and argv rules before any
@@ -109,9 +110,9 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	readDone := make(chan struct{})
 
 	wg.Add(3)
-	go copyExecOutput(conn, writeMu, &wg, copyOneDone, cancel, stdout, execws.ExecStreamStdout)
+	go copyExecOutput(conn, writeMu, &wg, copyOneDone, cancel, stdout, api.ExecStreamStdout)
 	go readExecWS(conn, rw, writeMu, &wg, readDone, cancel, stdin)
-	go copyExecOutput(conn, writeMu, &wg, copyOneDone, cancel, stderr, execws.ExecStreamStderr)
+	go copyExecOutput(conn, writeMu, &wg, copyOneDone, cancel, stderr, api.ExecStreamStderr)
 
 	copiesDone := 0
 	readClosed := false
@@ -147,9 +148,9 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if errStr == "" {
-		_ = writeExecFrame(conn, writeMu, execws.ExecFrame{Stream: execws.ExecStreamExit, Code: code})
+		_ = writeExecFrame(conn, writeMu, api.ExecFrame{Stream: api.ExecStreamExit, Code: code})
 	} else {
-		_ = writeExecFrame(conn, writeMu, execws.ExecFrame{Stream: execws.ExecStreamError, Data: []byte(errStr)})
+		_ = writeExecFrame(conn, writeMu, api.ExecFrame{Stream: api.ExecStreamError, Data: []byte(errStr)})
 	}
 	_ = writeExecClose(conn, writeMu)
 	_ = conn.Close()
@@ -211,9 +212,9 @@ func (s *Server) bridgeExecPty(conn netConnWriter, rw *bufio.ReadWriter, writeMu
 	}
 
 	if errStr == "" {
-		_ = writeExecFrame(conn, writeMu, execws.ExecFrame{Stream: execws.ExecStreamExit, Code: code})
+		_ = writeExecFrame(conn, writeMu, api.ExecFrame{Stream: api.ExecStreamExit, Code: code})
 	} else {
-		_ = writeExecFrame(conn, writeMu, execws.ExecFrame{Stream: execws.ExecStreamError, Data: []byte(errStr)})
+		_ = writeExecFrame(conn, writeMu, api.ExecFrame{Stream: api.ExecStreamError, Data: []byte(errStr)})
 	}
 	_ = writeExecClose(conn, writeMu)
 	_ = conn.Close()
@@ -241,7 +242,7 @@ func copyExecPtyOutput(conn io.Writer, writeMu *sync.Mutex, wg *sync.WaitGroup, 
 	for {
 		n, err := sess.Read(buf)
 		if n > 0 {
-			if werr := writeExecFrame(conn, writeMu, execws.ExecFrame{Stream: execws.ExecStreamStdout, Data: buf[:n]}); werr != nil {
+			if werr := writeExecFrame(conn, writeMu, api.ExecFrame{Stream: api.ExecStreamStdout, Data: buf[:n]}); werr != nil {
 				cancel()
 				return
 			}
@@ -257,40 +258,40 @@ func readExecPtyWS(conn io.Writer, rw *bufio.ReadWriter, writeMu *sync.Mutex, wg
 	defer close(done)
 
 	for {
-		op, payload, err := execws.ReadFrame(rw, true)
+		op, payload, err := wsbits.ReadFrame(rw, true)
 		if err != nil {
 			cancel()
 			return
 		}
 		switch op {
-		case execws.OpBinary:
-			f, err := execws.DecodeExecFrame(payload)
+		case wsbits.OpBinary:
+			f, err := api.DecodeExecFrame(payload)
 			if err != nil {
 				cancel()
 				return
 			}
 			switch f.Stream {
-			case execws.ExecStreamStdin:
+			case api.ExecStreamStdin:
 				if len(f.Data) == 0 {
 					// PTY masters cannot half-close; EOF is process exit or disconnect.
 					continue
 				}
-				if err := execws.WriteFull(sess, f.Data); err != nil {
+				if err := wsbits.WriteFull(sess, f.Data); err != nil {
 					cancel()
 					return
 				}
-			case execws.ExecStreamWinch:
+			case api.ExecStreamWinch:
 				if err := sess.Resize(f.Rows, f.Cols); err != nil {
 					cancel()
 					return
 				}
 			}
-		case execws.OpPing:
+		case wsbits.OpPing:
 			if err := writeExecPong(conn, writeMu, payload); err != nil {
 				cancel()
 				return
 			}
-		case execws.OpClose:
+		case wsbits.OpClose:
 			cancel()
 			return
 		}
@@ -305,7 +306,7 @@ func copyExecOutput(conn io.Writer, writeMu *sync.Mutex, wg *sync.WaitGroup, don
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
-			if werr := writeExecFrame(conn, writeMu, execws.ExecFrame{Stream: stream, Data: buf[:n]}); werr != nil {
+			if werr := writeExecFrame(conn, writeMu, api.ExecFrame{Stream: stream, Data: buf[:n]}); werr != nil {
 				cancel()
 				return
 			}
@@ -321,35 +322,35 @@ func readExecWS(conn io.Writer, rw *bufio.ReadWriter, writeMu *sync.Mutex, wg *s
 	defer close(done)
 
 	for {
-		op, payload, err := execws.ReadFrame(rw, true)
+		op, payload, err := wsbits.ReadFrame(rw, true)
 		if err != nil {
 			cancel()
 			return
 		}
 		switch op {
-		case execws.OpBinary:
-			f, err := execws.DecodeExecFrame(payload)
+		case wsbits.OpBinary:
+			f, err := api.DecodeExecFrame(payload)
 			if err != nil {
 				cancel()
 				return
 			}
-			if f.Stream != execws.ExecStreamStdin {
+			if f.Stream != api.ExecStreamStdin {
 				continue
 			}
 			if len(f.Data) == 0 {
 				_ = stdin.Close()
 				continue
 			}
-			if err := execws.WriteFull(stdin, f.Data); err != nil {
+			if err := wsbits.WriteFull(stdin, f.Data); err != nil {
 				cancel()
 				return
 			}
-		case execws.OpPing:
+		case wsbits.OpPing:
 			if err := writeExecPong(conn, writeMu, payload); err != nil {
 				cancel()
 				return
 			}
-		case execws.OpClose:
+		case wsbits.OpClose:
 			cancel()
 			return
 		}
@@ -357,30 +358,30 @@ func readExecWS(conn io.Writer, rw *bufio.ReadWriter, writeMu *sync.Mutex, wg *s
 }
 
 func writeExecError(w io.Writer, writeMu *sync.Mutex, errStr string) {
-	_ = writeExecFrame(w, writeMu, execws.ExecFrame{Stream: execws.ExecStreamError, Data: []byte(errStr)})
+	_ = writeExecFrame(w, writeMu, api.ExecFrame{Stream: api.ExecStreamError, Data: []byte(errStr)})
 	_ = writeExecClose(w, writeMu)
 }
 
-func writeExecFrame(w io.Writer, writeMu *sync.Mutex, f execws.ExecFrame) error {
-	payload, err := execws.EncodeExecFrame(f)
+func writeExecFrame(w io.Writer, writeMu *sync.Mutex, f api.ExecFrame) error {
+	payload, err := api.EncodeExecFrame(f)
 	if err != nil {
 		return err
 	}
 	writeMu.Lock()
 	defer writeMu.Unlock()
-	return execws.WriteFrame(w, execws.OpBinary, payload, false)
+	return wsbits.WriteFrame(w, wsbits.OpBinary, payload, false)
 }
 
 func writeExecPong(w io.Writer, writeMu *sync.Mutex, payload []byte) error {
 	writeMu.Lock()
 	defer writeMu.Unlock()
-	return execws.WriteFrame(w, execws.OpPong, payload, false)
+	return wsbits.WriteFrame(w, wsbits.OpPong, payload, false)
 }
 
 func writeExecClose(w io.Writer, writeMu *sync.Mutex) error {
 	writeMu.Lock()
 	defer writeMu.Unlock()
-	return execws.WriteClose(w, false, 1000, "")
+	return wsbits.WriteClose(w, false, 1000, "")
 }
 
 func execSessionID() (string, error) {

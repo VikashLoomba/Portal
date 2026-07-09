@@ -1,4 +1,4 @@
-package execws
+package wsbits
 
 import (
 	"bytes"

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/VikashLoomba/Portal/internal/execws"
+	"github.com/VikashLoomba/Portal/pkg/wsbits"
 )
 
 func TestWSUpgradeDirectHijackerWritesSwitchingProtocols(t *testing.T) {
@@ -53,7 +53,7 @@ func TestWSUpgradeDirectHijackerWritesSwitchingProtocols(t *testing.T) {
 	if !strings.HasPrefix(got, "HTTP/1.1 101 Switching Protocols\r\n") {
 		t.Fatalf("response = %q, want 101 Switching Protocols", got)
 	}
-	if !strings.Contains(got, "Sec-WebSocket-Accept: "+execws.AcceptKey(key)+"\r\n") {
+	if !strings.Contains(got, "Sec-WebSocket-Accept: "+wsbits.AcceptKey(key)+"\r\n") {
 		t.Fatalf("response missing accept header: %q", got)
 	}
 }

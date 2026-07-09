@@ -1,4 +1,4 @@
-package execws
+package api
 
 import (
 	"bytes"

@@ -15,10 +15,10 @@ import (
 	"github.com/VikashLoomba/Portal/internal/bootstrap"
 	"github.com/VikashLoomba/Portal/internal/clock"
 	"github.com/VikashLoomba/Portal/internal/forward"
-	"github.com/VikashLoomba/Portal/internal/localclient"
 	"github.com/VikashLoomba/Portal/pkg/agent"
 	"github.com/VikashLoomba/Portal/pkg/agent/watcher"
 	"github.com/VikashLoomba/Portal/pkg/agentclient"
+	"github.com/VikashLoomba/Portal/pkg/client"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 	"github.com/VikashLoomba/Portal/pkg/transport"
 )
@@ -179,7 +179,7 @@ func TestPollOnceReconciled_WaitsWhenNoReconcileProgress(t *testing.T) {
 	// Master up so the old Master.Up predicate would fire immediately; the
 	// reconcile counter stays at its baseline (no Kick issued in this test).
 	d := startFakeDaemon(t, cfg, withMasterPID(4242))
-	lc := localclient.New(d.path)
+	lc := client.New(d.path)
 
 	gen0 := reconcileGen(context.Background(), lc)
 	const budget = 250 * time.Millisecond
@@ -196,7 +196,7 @@ func TestPollOnceReconciled_WaitsWhenNoReconcileProgress(t *testing.T) {
 func TestPollOnceReconciled_ReturnsWhenCounterAdvances(t *testing.T) {
 	cfg := newTestConfig(t, "devbox")
 	d := startFakeDaemon(t, cfg, withMasterPID(4242))
-	lc := localclient.New(d.path)
+	lc := client.New(d.path)
 
 	gen0 := reconcileGen(context.Background(), lc)
 	// Model the debounced reconcile completing shortly after the (implicit) kick.

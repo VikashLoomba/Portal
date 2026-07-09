@@ -1,4 +1,4 @@
-package localclient
+package client
 
 import (
 	"context"
@@ -11,6 +11,7 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/localapi"
+	"github.com/VikashLoomba/Portal/pkg/api"
 	"github.com/VikashLoomba/Portal/pkg/doctor"
 	"github.com/VikashLoomba/Portal/pkg/hub"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
@@ -86,7 +87,7 @@ func newHarness(t *testing.T, agent *fakeAgent) *harness {
 	h.sock = filepath.Join(shortTempDir(t), "api.sock")
 
 	srv := localapi.New(localapi.Deps{
-		Version: localapi.VersionInfo{Version: "9.9", GitSHA: "deadbeef", ProtoVersion: 3},
+		Version: api.VersionInfo{Version: "9.9", GitSHA: "deadbeef", ProtoVersion: 3},
 		Host:    func() (string, error) { return "devbox", nil },
 		Agent:   agent,
 		Config:  h.cfg,
@@ -348,7 +349,7 @@ func TestEvents(t *testing.T) {
 }
 
 // recvEvent returns the next event or fails on timeout.
-func recvEvent(t *testing.T, events <-chan Event, timeout time.Duration) Event {
+func recvEvent(t *testing.T, events <-chan api.Event, timeout time.Duration) api.Event {
 	t.Helper()
 	select {
 	case ev, ok := <-events:
@@ -359,12 +360,12 @@ func recvEvent(t *testing.T, events <-chan Event, timeout time.Duration) Event {
 	case <-time.After(timeout):
 		t.Fatal("timed out waiting for an event")
 	}
-	return Event{}
+	return api.Event{}
 }
 
 // waitEventType returns the next event whose Type == typ, skipping others (e.g.
 // ticks), or fails on timeout.
-func waitEventType(t *testing.T, events <-chan Event, typ string, timeout time.Duration) Event {
+func waitEventType(t *testing.T, events <-chan api.Event, typ string, timeout time.Duration) api.Event {
 	t.Helper()
 	deadline := time.After(timeout)
 	for {

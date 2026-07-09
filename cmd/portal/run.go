@@ -20,8 +20,9 @@ import (
 	"github.com/VikashLoomba/Portal/internal/clipupload"
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/localapi"
-	"github.com/VikashLoomba/Portal/internal/localclient"
 	"github.com/VikashLoomba/Portal/pkg/agentclient"
+	"github.com/VikashLoomba/Portal/pkg/api"
+	"github.com/VikashLoomba/Portal/pkg/client"
 	"github.com/VikashLoomba/Portal/pkg/doctor"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
@@ -94,7 +95,7 @@ func newRunCmd(a *app.App) *cobra.Command {
 					return
 				}
 				deps := localapi.Deps{
-					Version: localapi.VersionInfo{
+					Version: api.VersionInfo{
 						Version:      version,
 						GitSHA:       bootstrap.EmbeddedSHA(),
 						ProtoVersion: protocol.ProtoVersion,
@@ -164,7 +165,7 @@ func newOnceCmd(a *app.App) *cobra.Command {
 			// Status is then rendered from GET /v1/status, so the agent line comes
 			// from the live daemon handshake. a.AgentClient.Run/Shutdown are NOT
 			// invoked on this branch.
-			lc := localclient.New(a.Paths.APISock)
+			lc := client.New(a.Paths.APISock)
 			if lc.Available(cmd.Context()) {
 				// Snapshot the reconcile counter BEFORE the kick so the poll below
 				// waits for a pass that ran AFTER our request, not one already in
@@ -217,7 +218,7 @@ const onceConvergeBudget = 1 * time.Second
 // reconcileGen reads the daemon's completed-reconcile-pass counter, or 0 if the
 // status probe fails. A missed baseline only makes pollOnceReconciled wait for
 // the first pass it observes — still correct, and still bounded by the budget.
-func reconcileGen(ctx context.Context, lc *localclient.Client) uint64 {
+func reconcileGen(ctx context.Context, lc *client.Client) uint64 {
 	if st, err := lc.Status(ctx); err == nil {
 		return st.Health.ReconcileCount
 	}
@@ -235,7 +236,7 @@ func reconcileGen(ctx context.Context, lc *localclient.Client) uint64 {
 // queued (every pass re-derives ground truth, so any pass after gen0 reflects the
 // new listener/allow). It calls lc.Status up to `budget` in 50ms steps and never
 // errors — `once` still returns promptly if the daemon never reports progress.
-func pollOnceReconciled(ctx context.Context, lc *localclient.Client, gen0 uint64, budget time.Duration) {
+func pollOnceReconciled(ctx context.Context, lc *client.Client, gen0 uint64, budget time.Duration) {
 	deadline := time.Now().Add(budget)
 	for {
 		if st, err := lc.Status(ctx); err == nil && st.Health.ReconcileCount > gen0 {

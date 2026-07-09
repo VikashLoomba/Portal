@@ -18,7 +18,8 @@ import (
 	"github.com/VikashLoomba/Portal/internal/audit"
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/localapi"
-	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/pkg/api"
+	"github.com/VikashLoomba/Portal/pkg/client"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 	"github.com/VikashLoomba/Portal/pkg/transport/localexec"
 	"github.com/VikashLoomba/Portal/pkg/transport/ptyx"
@@ -284,7 +285,7 @@ func serveExecDaemon(t *testing.T) string {
 	path := filepath.Join(dir, "api.sock")
 
 	srv := localapi.New(localapi.Deps{
-		Version:    localapi.VersionInfo{Version: "test", GitSHA: "exec", ProtoVersion: protocol.ProtoVersion},
+		Version:    api.VersionInfo{Version: "test", GitSHA: "exec", ProtoVersion: protocol.ProtoVersion},
 		Config:     config.New(t.TempDir()),
 		ExecStream: localexec.New(),
 		Audit:      audit.New(t.TempDir()),
@@ -305,7 +306,7 @@ func serveExecDaemon(t *testing.T) string {
 		}
 	})
 
-	lc := localclient.New(path)
+	lc := client.New(path)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if lc.Available(context.Background()) {

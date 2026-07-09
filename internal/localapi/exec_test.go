@@ -25,9 +25,10 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/audit"
 	"github.com/VikashLoomba/Portal/internal/config"
-	"github.com/VikashLoomba/Portal/internal/execws"
+	"github.com/VikashLoomba/Portal/pkg/api"
 	"github.com/VikashLoomba/Portal/pkg/transport"
 	"github.com/VikashLoomba/Portal/pkg/transport/localexec"
+	"github.com/VikashLoomba/Portal/pkg/wsbits"
 )
 
 func TestExecUpgradeReaches101(t *testing.T) {
@@ -42,7 +43,7 @@ func TestExecPrintfStdoutExitZero(t *testing.T) {
 	defer c.Close()
 
 	frames := readExecFramesUntilExit(t, c, 2*time.Second)
-	if got := joinFrameData(frames, execws.ExecStreamStdout); got != "hello" {
+	if got := joinFrameData(frames, api.ExecStreamStdout); got != "hello" {
 		t.Fatalf("stdout = %q, want hello (bridge must pass argv verbatim)", got)
 	}
 	if got := lastExitCode(frames); got != 0 {
@@ -66,13 +67,13 @@ func TestExecStdinHalfClose(t *testing.T) {
 	c := dialExecWS(t, path, []string{"cat"})
 	defer c.Close()
 
-	writeExecClientFrame(t, c, execws.ExecFrame{Stream: execws.ExecStreamStdin, Data: []byte("ping\n")})
-	stdout := readExecFrameMatching(t, c, execws.ExecStreamStdout, 2*time.Second)
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte("ping\n")})
+	stdout := readExecFrameMatching(t, c, api.ExecStreamStdout, 2*time.Second)
 	if string(stdout.Data) != "ping\n" {
 		t.Fatalf("stdout = %q, want ping newline", string(stdout.Data))
 	}
 
-	writeExecClientFrame(t, c, execws.ExecFrame{Stream: execws.ExecStreamStdin, Data: []byte{}})
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte{}})
 	frames := readExecFramesUntilExit(t, c, 2*time.Second)
 	if got := lastExitCode(frames); got != 0 {
 		t.Fatalf("exit code = %d, want 0", got)
@@ -93,7 +94,7 @@ func TestExecFeatureOffNoUpgrade(t *testing.T) {
 	if strings.Contains(status, "101") {
 		t.Fatalf("disabled exec upgraded unexpectedly: %q", status)
 	}
-	var eb errorBody
+	var eb api.ErrorBody
 	if err := json.Unmarshal(body, &eb); err != nil {
 		t.Fatalf("decode error body %q: %v", string(body), err)
 	}
@@ -227,7 +228,7 @@ func TestExecEmptyArgvReturnsInvalidRequestWithoutUpgrade(t *testing.T) {
 	if strings.Contains(status, "101") {
 		t.Fatalf("empty argv upgraded unexpectedly: %q", status)
 	}
-	var eb errorBody
+	var eb api.ErrorBody
 	if err := json.Unmarshal(body, &eb); err != nil {
 		t.Fatalf("decode error body %q: %v", string(body), err)
 	}
@@ -246,7 +247,7 @@ func TestExecPtyUnsupportedNoUpgrade(t *testing.T) {
 	if strings.Contains(status, "101") {
 		t.Fatalf("unsupported pty upgraded unexpectedly: %q", status)
 	}
-	var eb errorBody
+	var eb api.ErrorBody
 	if err := json.Unmarshal(body, &eb); err != nil {
 		t.Fatalf("decode error body %q: %v", string(body), err)
 	}
@@ -282,11 +283,11 @@ func TestExecPtySttySize(t *testing.T) {
 	defer c.Close()
 
 	frames := readExecFramesUntilExit(t, c, 2*time.Second)
-	stdout := cleanPtyOutput(joinFrameData(frames, execws.ExecStreamStdout))
+	stdout := cleanPtyOutput(joinFrameData(frames, api.ExecStreamStdout))
 	if !strings.Contains(stdout, "40 100") {
 		t.Fatalf("stdout = %q, want stty size 40 100", stdout)
 	}
-	if got := countFrames(frames, execws.ExecStreamStderr); got != 0 {
+	if got := countFrames(frames, api.ExecStreamStderr); got != 0 {
 		t.Fatalf("stderr frames = %d, want 0 for pty", got)
 	}
 }
@@ -301,18 +302,18 @@ func TestExecPtyWinchResizesSession(t *testing.T) {
 	defer c.Close()
 
 	initial := readExecFramesUntilStdoutContains(t, c, "40 100", 2*time.Second)
-	writeExecClientFrame(t, c, execws.ExecFrame{Stream: execws.ExecStreamWinch, Rows: 50, Cols: 120})
-	writeExecClientFrame(t, c, execws.ExecFrame{Stream: execws.ExecStreamStdin, Data: []byte("go\n")})
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamWinch, Rows: 50, Cols: 120})
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte("go\n")})
 	rest := readExecFramesUntilExit(t, c, 2*time.Second)
 
 	frames := append(initial, rest...)
-	stdout := cleanPtyOutput(joinFrameData(frames, execws.ExecStreamStdout))
+	stdout := cleanPtyOutput(joinFrameData(frames, api.ExecStreamStdout))
 	for _, want := range []string{"40 100", "50 120"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("stdout = %q, want %q", stdout, want)
 		}
 	}
-	if got := countFrames(frames, execws.ExecStreamStderr); got != 0 {
+	if got := countFrames(frames, api.ExecStreamStderr); got != 0 {
 		t.Fatalf("stderr frames = %d, want 0 for pty", got)
 	}
 }
@@ -322,12 +323,12 @@ func TestExecPtyZeroLengthStdinNoOp(t *testing.T) {
 	c := dialExecWSWithQuery(t, path, []string{"sh", "-c", "'read line; printf \"%s\\n\" \"$line\"'"}, url.Values{"pty": {"1"}})
 	defer c.Close()
 
-	writeExecClientFrame(t, c, execws.ExecFrame{Stream: execws.ExecStreamStdin, Data: []byte{}})
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte{}})
 	assertNoTerminalFrameWithin(t, c, 200*time.Millisecond)
-	writeExecClientFrame(t, c, execws.ExecFrame{Stream: execws.ExecStreamStdin, Data: []byte("alive\n")})
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte("alive\n")})
 
 	frames := readExecFramesUntilExit(t, c, 2*time.Second)
-	stdout := cleanPtyOutput(joinFrameData(frames, execws.ExecStreamStdout))
+	stdout := cleanPtyOutput(joinFrameData(frames, api.ExecStreamStdout))
 	if !strings.Contains(stdout, "alive") {
 		t.Fatalf("stdout = %q, want subsequent stdin to reach pty process", stdout)
 	}
@@ -366,7 +367,7 @@ func TestExecBridgeNoGoroutineLeakAcrossOrderings(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		normal := dialExecWS(t, path, []string{"printf", "hello"})
 		frames := readExecFramesUntilExit(t, normal, 2*time.Second)
-		if got := joinFrameData(frames, execws.ExecStreamStdout); got != "hello" {
+		if got := joinFrameData(frames, api.ExecStreamStdout); got != "hello" {
 			normal.Close()
 			t.Fatalf("normal stdout = %q, want hello", got)
 		}
@@ -424,7 +425,7 @@ func TestNoThirdPartyWebSocketImportsAndGoModPinned(t *testing.T) {
 		"nhooyr.io/websocket":          true,
 		"golang.org/x/net/websocket":   true,
 	}
-	for _, dir := range []string{"internal", "cmd"} {
+	for _, dir := range []string{"internal", "cmd", "pkg"} {
 		err := filepath.WalkDir(filepath.Join(root, dir), func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -477,7 +478,7 @@ func TestExecMalformedInboundFrameTearsDownSession(t *testing.T) {
 	c := dialExecWS(t, path, []string{"cat"})
 	defer c.Close()
 
-	if _, err := c.Write(oversizedMaskedFrameHeader(execws.MaxPayload + 1)); err != nil {
+	if _, err := c.Write(oversizedMaskedFrameHeader(wsbits.MaxPayload + 1)); err != nil {
 		t.Fatalf("write oversized frame header: %v", err)
 	}
 
@@ -490,7 +491,7 @@ func TestExecMalformedInboundFrameTearsDownSession(t *testing.T) {
 			}
 			return
 		}
-		if op == execws.OpClose {
+		if op == wsbits.OpClose {
 			return
 		}
 	}
@@ -501,7 +502,7 @@ func TestExecReaderCloseReleasesBlockedOutputWriter(t *testing.T) {
 	a := audit.New(t.TempDir())
 	streamer := &blockedOutputExecStreamer{waitCalled: make(chan struct{})}
 	s := New(Deps{
-		Version:    VersionInfo{Version: "9.9"},
+		Version:    api.VersionInfo{Version: "9.9"},
 		Config:     config.New(t.TempDir()),
 		ExecStream: streamer,
 		Audit:      a,
@@ -538,7 +539,7 @@ func TestExecReaderCloseReleasesBlockedOutputWriter(t *testing.T) {
 	if err := client.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatalf("set write deadline: %v", err)
 	}
-	if err := writeClientFrame(client, execws.OpClose, []byte{0x03, 0xe8}); err != nil {
+	if err := writeClientFrame(client, wsbits.OpClose, []byte{0x03, 0xe8}); err != nil {
 		t.Fatalf("write close frame: %v", err)
 	}
 	if err := client.SetWriteDeadline(time.Time{}); err != nil {
@@ -613,7 +614,7 @@ func startExecServer(t *testing.T, cfg *config.Store, a *audit.Log, streamer Exe
 	t.Helper()
 	path := filepath.Join(shortTempDir(t), "api.sock")
 	s := New(Deps{
-		Version:    VersionInfo{Version: "9.9"},
+		Version:    api.VersionInfo{Version: "9.9"},
 		Config:     cfg,
 		ExecStream: streamer,
 		Audit:      a,
@@ -679,7 +680,7 @@ func dialExecWSWithQuery(t *testing.T, path string, argv []string, query url.Val
 		c.Close()
 		t.Fatalf("status = %q, want 101", status)
 	}
-	if got, want := hdr.Get("Sec-WebSocket-Accept"), execws.AcceptKey(key); got != want {
+	if got, want := hdr.Get("Sec-WebSocket-Accept"), wsbits.AcceptKey(key); got != want {
 		c.Close()
 		t.Fatalf("Sec-WebSocket-Accept = %q, want %q", got, want)
 	}
@@ -735,29 +736,29 @@ func execTarget(q url.Values) string {
 	return "/v1/exec?" + q.Encode()
 }
 
-func writeExecClientFrame(t *testing.T, c *wsTestConn, f execws.ExecFrame) {
+func writeExecClientFrame(t *testing.T, c *wsTestConn, f api.ExecFrame) {
 	t.Helper()
-	payload, err := execws.EncodeExecFrame(f)
+	payload, err := api.EncodeExecFrame(f)
 	if err != nil {
-		t.Fatalf("execws.EncodeExecFrame: %v", err)
+		t.Fatalf("api.EncodeExecFrame: %v", err)
 	}
-	if err := writeClientFrame(c, execws.OpBinary, payload); err != nil {
+	if err := writeClientFrame(c, wsbits.OpBinary, payload); err != nil {
 		t.Fatalf("write client frame: %v", err)
 	}
 }
 
-func writeClientFrame(c net.Conn, op execws.Opcode, payload []byte) error {
-	return execws.WriteFrame(c, op, payload, true)
+func writeClientFrame(c net.Conn, op wsbits.Opcode, payload []byte) error {
+	return wsbits.WriteFrame(c, op, payload, true)
 }
 
 func oversizedMaskedFrameHeader(n uint64) []byte {
-	frame := []byte{0x80 | byte(execws.OpBinary), 0x80 | 127, 0, 0, 0, 0, 0, 0, 0, 0}
+	frame := []byte{0x80 | byte(wsbits.OpBinary), 0x80 | 127, 0, 0, 0, 0, 0, 0, 0, 0}
 	binary.BigEndian.PutUint64(frame[2:10], n)
 	frame = append(frame, 0, 0, 0, 0)
 	return frame
 }
 
-func readExecFrameMatching(t *testing.T, c *wsTestConn, stream string, timeout time.Duration) execws.ExecFrame {
+func readExecFrameMatching(t *testing.T, c *wsTestConn, stream string, timeout time.Duration) api.ExecFrame {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
@@ -769,16 +770,16 @@ func readExecFrameMatching(t *testing.T, c *wsTestConn, stream string, timeout t
 		if f.Stream == stream {
 			return f
 		}
-		if f.Stream == execws.ExecStreamError || f.Stream == execws.ExecStreamExit {
+		if f.Stream == api.ExecStreamError || f.Stream == api.ExecStreamExit {
 			t.Fatalf("got terminal frame before %s: %+v", stream, f)
 		}
 	}
 }
 
-func readExecFramesUntilExit(t *testing.T, c *wsTestConn, timeout time.Duration) []execws.ExecFrame {
+func readExecFramesUntilExit(t *testing.T, c *wsTestConn, timeout time.Duration) []api.ExecFrame {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
-	var frames []execws.ExecFrame
+	var frames []api.ExecFrame
 	for {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -787,18 +788,18 @@ func readExecFramesUntilExit(t *testing.T, c *wsTestConn, timeout time.Duration)
 		f := readExecFrame(t, c, remaining)
 		frames = append(frames, f)
 		switch f.Stream {
-		case execws.ExecStreamExit:
+		case api.ExecStreamExit:
 			return frames
-		case execws.ExecStreamError:
+		case api.ExecStreamError:
 			t.Fatalf("error frame: %s", string(f.Data))
 		}
 	}
 }
 
-func readExecFramesUntilStdoutContains(t *testing.T, c *wsTestConn, want string, timeout time.Duration) []execws.ExecFrame {
+func readExecFramesUntilStdoutContains(t *testing.T, c *wsTestConn, want string, timeout time.Duration) []api.ExecFrame {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
-	var frames []execws.ExecFrame
+	var frames []api.ExecFrame
 	for {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -807,11 +808,11 @@ func readExecFramesUntilStdoutContains(t *testing.T, c *wsTestConn, want string,
 		f := readExecFrame(t, c, remaining)
 		frames = append(frames, f)
 		switch f.Stream {
-		case execws.ExecStreamStdout:
-			if strings.Contains(cleanPtyOutput(joinFrameData(frames, execws.ExecStreamStdout)), want) {
+		case api.ExecStreamStdout:
+			if strings.Contains(cleanPtyOutput(joinFrameData(frames, api.ExecStreamStdout)), want) {
 				return frames
 			}
-		case execws.ExecStreamExit, execws.ExecStreamError:
+		case api.ExecStreamExit, api.ExecStreamError:
 			t.Fatalf("terminal frame before stdout contained %q: %+v", want, f)
 		}
 	}
@@ -832,48 +833,48 @@ func assertNoTerminalFrameWithin(t *testing.T, c *wsTestConn, timeout time.Durat
 			}
 			t.Fatalf("read server frame: %v", err)
 		}
-		if op != execws.OpBinary {
+		if op != wsbits.OpBinary {
 			continue
 		}
-		f, err := execws.DecodeExecFrame(payload)
+		f, err := api.DecodeExecFrame(payload)
 		if err != nil {
-			t.Fatalf("execws.DecodeExecFrame: %v", err)
+			t.Fatalf("api.DecodeExecFrame: %v", err)
 		}
-		if f.Stream == execws.ExecStreamExit || f.Stream == execws.ExecStreamError {
+		if f.Stream == api.ExecStreamExit || f.Stream == api.ExecStreamError {
 			t.Fatalf("terminal frame arrived during no-op window: %+v", f)
 		}
 	}
 }
 
-func readExecFrame(t *testing.T, c *wsTestConn, timeout time.Duration) execws.ExecFrame {
+func readExecFrame(t *testing.T, c *wsTestConn, timeout time.Duration) api.ExecFrame {
 	t.Helper()
 	for {
 		op, payload, err := readServerFrame(c, timeout)
 		if err != nil {
 			t.Fatalf("read server frame: %v", err)
 		}
-		if op == execws.OpClose {
+		if op == wsbits.OpClose {
 			t.Fatal("server close before exec terminal frame")
 		}
-		if op != execws.OpBinary {
+		if op != wsbits.OpBinary {
 			continue
 		}
-		f, err := execws.DecodeExecFrame(payload)
+		f, err := api.DecodeExecFrame(payload)
 		if err != nil {
-			t.Fatalf("execws.DecodeExecFrame: %v", err)
+			t.Fatalf("api.DecodeExecFrame: %v", err)
 		}
 		return f
 	}
 }
 
-func readServerFrame(c *wsTestConn, timeout time.Duration) (execws.Opcode, []byte, error) {
+func readServerFrame(c *wsTestConn, timeout time.Duration) (wsbits.Opcode, []byte, error) {
 	_ = c.SetReadDeadline(time.Now().Add(timeout))
 	defer c.SetReadDeadline(time.Time{})
 
-	return execws.ReadFrame(c.br, false)
+	return wsbits.ReadFrame(c.br, false)
 }
 
-func joinFrameData(frames []execws.ExecFrame, stream string) string {
+func joinFrameData(frames []api.ExecFrame, stream string) string {
 	var b strings.Builder
 	for _, f := range frames {
 		if f.Stream == stream {
@@ -887,7 +888,7 @@ func cleanPtyOutput(s string) string {
 	return strings.ReplaceAll(s, "\r", "")
 }
 
-func countFrames(frames []execws.ExecFrame, stream string) int {
+func countFrames(frames []api.ExecFrame, stream string) int {
 	var n int
 	for _, f := range frames {
 		if f.Stream == stream {
@@ -897,9 +898,9 @@ func countFrames(frames []execws.ExecFrame, stream string) int {
 	return n
 }
 
-func lastExitCode(frames []execws.ExecFrame) int {
+func lastExitCode(frames []api.ExecFrame) int {
 	for i := len(frames) - 1; i >= 0; i-- {
-		if frames[i].Stream == execws.ExecStreamExit {
+		if frames[i].Stream == api.ExecStreamExit {
 			return frames[i].Code
 		}
 	}

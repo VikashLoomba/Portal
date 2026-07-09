@@ -5,17 +5,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/VikashLoomba/Portal/pkg/api"
 	"github.com/VikashLoomba/Portal/pkg/hub"
 )
-
-// eventLine is the typed envelope for one ndjson line of GET /v1/events. Exactly
-// one shape is populated per Type: snapshot/state carry Status; notify carries
-// Notify; tick carries neither. A typed envelope keeps line encoding off any.
-type eventLine struct {
-	Type   string      `json:"type"`
-	Status *Status     `json:"status,omitempty"`
-	Notify *hub.Notify `json:"notify,omitempty"`
-}
 
 // eventsWriteTimeout bounds each ndjson line write. A slow or dead client that
 // cannot drain a line within this deadline is dropped (the handler returns,
@@ -48,7 +40,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// Snapshot is ALWAYS the first line: a reconnecting client is coherent
 	// before any delta.
 	snap := s.buildStatus(ctx)
-	if s.writeEventLine(rc, w, eventLine{Type: "snapshot", Status: &snap}) != nil {
+	if s.writeEventLine(rc, w, api.Event{Type: "snapshot", Status: &snap}) != nil {
 		return
 	}
 
@@ -63,15 +55,15 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			// Latest-wins coalescing: re-read the full current Status so the
 			// client needs no merge implementation.
 			st := s.buildStatus(ctx)
-			if s.writeEventLine(rc, w, eventLine{Type: "state", Status: &st}) != nil {
+			if s.writeEventLine(rc, w, api.Event{Type: "state", Status: &st}) != nil {
 				return
 			}
 		case ev := <-queued:
-			if s.writeEventLine(rc, w, eventLine{Type: "notify", Notify: ev.Notify}) != nil {
+			if s.writeEventLine(rc, w, api.Event{Type: "notify", Notify: ev.Notify}) != nil {
 				return
 			}
 		case <-ticker.C:
-			if s.writeEventLine(rc, w, eventLine{Type: "tick"}) != nil {
+			if s.writeEventLine(rc, w, api.Event{Type: "tick"}) != nil {
 				return
 			}
 		}
@@ -81,7 +73,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 // writeEventLine marshals line as one compact JSON object plus a trailing
 // newline, writing it under eventsWriteTimeout and flushing. Any marshal/write
 // error or a passed deadline is returned so the caller can drop the client.
-func (s *Server) writeEventLine(rc *http.ResponseController, w http.ResponseWriter, line eventLine) error {
+func (s *Server) writeEventLine(rc *http.ResponseController, w http.ResponseWriter, line api.Event) error {
 	b, err := json.Marshal(line)
 	if err != nil {
 		return err

@@ -1,11 +1,11 @@
-// Package localclient is the thin typed HTTP/1.1+JSON client the CLI (and any
-// future in-process tool) uses to talk to the daemon's internal/localapi server
+// Package client is the thin typed HTTP/1.1+JSON client the CLI (and any
+// future in-process tool) uses to talk to the daemon's local API server
 // over the Unix socket at app.Paths.APISock. It mirrors §4.5's endpoint contract
 // with typed getters/mutators and an ndjson events stream; it is stdlib-only and
 // never decodes into an any-typed payload — every response has a concrete struct
-// (localapi.Status, localapi.PortStatus, hub.Notify, doctor.Report). See
+// (api.Status, api.PortStatus, hub.Notify, doctor.Report). See
 // DESIGN-local-core-api.md §5.1.
-package localclient
+package client
 
 import (
 	"bufio"
@@ -13,16 +13,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/VikashLoomba/Portal/internal/localapi"
+	"github.com/VikashLoomba/Portal/pkg/api"
 	"github.com/VikashLoomba/Portal/pkg/doctor"
-	"github.com/VikashLoomba/Portal/pkg/hub"
 )
 
 // Per-call default timeouts, exposed as vars so tests can shrink them. Status/
@@ -37,36 +35,13 @@ var (
 )
 
 // Sentinels for the two endpoint-specific non-2xx codes callers branch on. Every
-// other non-2xx yields an *APIError.
+// other non-2xx yields an *api.APIError.
 var (
 	// ErrNotConnected maps GET /v1/ports 503 not_connected (no cached Snapshot yet).
 	ErrNotConnected = errors.New("localclient: agent not connected")
 	// ErrFeatureUnknown maps PUT /v1/features/{name} 404 feature_unknown.
 	ErrFeatureUnknown = errors.New("localclient: unknown feature")
 )
-
-// APIError is a decoded D9 error envelope for a non-2xx response the caller does
-// not special-case (everything but Ports 503 and Features 404).
-type APIError struct {
-	Status  int
-	Code    string
-	Message string
-}
-
-func (e *APIError) Error() string {
-	return fmt.Sprintf("localapi %d %s: %s", e.Status, e.Code, e.Message)
-}
-
-// Event is the decode envelope for one ndjson line of GET /v1/events. It mirrors
-// localapi's unexported eventLine and the §4.6 contract: exactly one of Status/
-// Notify is populated per Type (snapshot/state carry Status; notify carries
-// Notify; tick carries neither). It reuses the exported localapi.Status and
-// hub.Notify so nothing is any-typed.
-type Event struct {
-	Type   string           `json:"type"`
-	Status *localapi.Status `json:"status,omitempty"`
-	Notify *hub.Notify      `json:"notify,omitempty"`
-}
 
 // Client is a typed client bound to one API socket path. The zero value is not
 // usable; call New.
@@ -114,18 +89,13 @@ func (c *Client) newReq(ctx context.Context, method, path string, timeout time.D
 	return req, cancel, nil
 }
 
-// apiError reads a non-2xx body as a D9 error envelope and returns an *APIError.
-// A body that is not the envelope still yields an *APIError carrying the status,
+// apiError reads a non-2xx body as a D9 error envelope and returns an *api.APIError.
+// A body that is not the envelope still yields an *api.APIError carrying the status,
 // so a non-2xx is NEVER reported as success.
-func apiError(resp *http.Response) *APIError {
-	var eb struct {
-		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
+func apiError(resp *http.Response) *api.APIError {
+	var eb api.ErrorBody
 	_ = json.NewDecoder(resp.Body).Decode(&eb)
-	return &APIError{Status: resp.StatusCode, Code: eb.Error.Code, Message: eb.Error.Message}
+	return &api.APIError{Status: resp.StatusCode, Code: eb.Error.Code, Message: eb.Error.Message}
 }
 
 // decodeJSON decodes the response body into v (a concrete type — no any).
@@ -152,8 +122,8 @@ func (c *Client) Available(ctx context.Context) bool {
 }
 
 // Status returns the full Status aggregate from GET /v1/status.
-func (c *Client) Status(ctx context.Context) (localapi.Status, error) {
-	var st localapi.Status
+func (c *Client) Status(ctx context.Context) (api.Status, error) {
+	var st api.Status
 	req, cancel, err := c.newReq(ctx, http.MethodGet, "/v1/status", StatusTimeout, nil)
 	if err != nil {
 		return st, err
@@ -174,8 +144,8 @@ func (c *Client) Status(ctx context.Context) (localapi.Status, error) {
 }
 
 // Ports returns remote loopback listeners from GET /v1/ports. A 503 (no cached
-// Snapshot yet) maps to ErrNotConnected; any other non-2xx to *APIError.
-func (c *Client) Ports(ctx context.Context) ([]localapi.PortStatus, error) {
+// Snapshot yet) maps to ErrNotConnected; any other non-2xx to *api.APIError.
+func (c *Client) Ports(ctx context.Context) ([]api.PortStatus, error) {
 	req, cancel, err := c.newReq(ctx, http.MethodGet, "/v1/ports", StatusTimeout, nil)
 	if err != nil {
 		return nil, err
@@ -192,7 +162,7 @@ func (c *Client) Ports(ctx context.Context) ([]localapi.PortStatus, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, apiError(resp)
 	}
-	var ports []localapi.PortStatus
+	var ports []api.PortStatus
 	if err := decodeJSON(resp, &ports); err != nil {
 		return nil, err
 	}
@@ -205,7 +175,7 @@ type allowlistResponse struct {
 }
 
 // Allow adds port to the allowlist via PUT /v1/allow/{port} and returns the new
-// allowlist. An invalid port yields the server's 400 as an *APIError.
+// allowlist. An invalid port yields the server's 400 as an *api.APIError.
 func (c *Client) Allow(ctx context.Context, port int) ([]int, error) {
 	return c.mutateAllow(ctx, http.MethodPut, port)
 }
@@ -262,7 +232,7 @@ func (c *Client) Features(ctx context.Context) (map[string]bool, error) {
 
 // SetFeature toggles one capability gate via PUT /v1/features/{name} with a
 // typed {"enabled":on} body and returns the updated map. An unknown name (404)
-// maps to ErrFeatureUnknown; any other non-2xx to *APIError.
+// maps to ErrFeatureUnknown; any other non-2xx to *api.APIError.
 func (c *Client) SetFeature(ctx context.Context, name string, on bool) (map[string]bool, error) {
 	body, err := json.Marshal(struct {
 		Enabled bool `json:"enabled"`
@@ -362,7 +332,7 @@ const eventsBufCap = 1 << 20
 // errc (nil on a clean EOF — including the daemon closing the stream on its own
 // shutdown, produced by the localapi BaseContext fixup) and closes events. The
 // caller cancels ctx to stop; the goroutine is race-clean under -race.
-func (c *Client) Events(ctx context.Context) (<-chan Event, <-chan error, error) {
+func (c *Client) Events(ctx context.Context) (<-chan api.Event, <-chan error, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://unix/v1/events", nil)
 	if err != nil {
 		return nil, nil, err
@@ -376,7 +346,7 @@ func (c *Client) Events(ctx context.Context) (<-chan Event, <-chan error, error)
 		return nil, nil, apiError(resp)
 	}
 
-	events := make(chan Event, 16)
+	events := make(chan api.Event, 16)
 	errc := make(chan error, 1)
 	go func() {
 		defer resp.Body.Close()
@@ -384,7 +354,7 @@ func (c *Client) Events(ctx context.Context) (<-chan Event, <-chan error, error)
 		sc := bufio.NewScanner(resp.Body)
 		sc.Buffer(make([]byte, 0, 64*1024), eventsBufCap)
 		for sc.Scan() {
-			var ev Event
+			var ev api.Event
 			if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
 				errc <- err
 				return

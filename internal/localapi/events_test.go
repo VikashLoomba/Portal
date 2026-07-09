@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/pkg/api"
 	"github.com/VikashLoomba/Portal/pkg/hub"
 )
 
@@ -24,7 +25,7 @@ func newEventsServer(t *testing.T, tick time.Duration) (*Server, *hub.Hub, strin
 	h := hub.New()
 	path := filepath.Join(shortTempDir(t), "api.sock")
 	s := New(Deps{
-		Version: VersionInfo{Version: "9.9", GitSHA: "deadbeef", ProtoVersion: 3},
+		Version: api.VersionInfo{Version: "9.9", GitSHA: "deadbeef", ProtoVersion: 3},
 		Config:  config.New(t.TempDir()),
 		Hub:     h,
 	})
@@ -64,10 +65,10 @@ func streamingClient(path string) *http.Client {
 // would mask field-name drift (e.g. PascalCase vs. the camelCase §4.6 contract).
 type streamLine struct {
 	raw []byte
-	el  eventLine
+	el  api.Event
 }
 
-// lineReader decodes ndjson eventLines off a stream body on a goroutine so tests
+// lineReader decodes ndjson api.Event values off a stream body on a goroutine so tests
 // can bound each read with a timeout instead of blocking on Scanner.Scan.
 type lineReader struct {
 	lines chan streamLine
@@ -81,7 +82,7 @@ func readLines(body io.Reader) *lineReader {
 		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 		for sc.Scan() {
 			raw := append([]byte(nil), sc.Bytes()...)
-			var el eventLine
+			var el api.Event
 			if err := json.Unmarshal(raw, &el); err != nil {
 				lr.errc <- err
 				return
@@ -94,7 +95,7 @@ func readLines(body io.Reader) *lineReader {
 }
 
 // next returns the next decoded line or fails on timeout.
-func (lr *lineReader) next(t *testing.T, timeout time.Duration) eventLine {
+func (lr *lineReader) next(t *testing.T, timeout time.Duration) api.Event {
 	t.Helper()
 	return lr.nextLine(t, timeout).el
 }
@@ -115,7 +116,7 @@ func (lr *lineReader) nextLine(t *testing.T, timeout time.Duration) streamLine {
 
 // waitType returns the next line whose Type == typ, skipping other lines (e.g.
 // interleaved ticks), or fails on timeout.
-func (lr *lineReader) waitType(t *testing.T, typ string, timeout time.Duration) eventLine {
+func (lr *lineReader) waitType(t *testing.T, typ string, timeout time.Duration) api.Event {
 	t.Helper()
 	return lr.waitTypeLine(t, typ, timeout).el
 }

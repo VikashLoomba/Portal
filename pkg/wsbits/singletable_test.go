@@ -1,4 +1,4 @@
-package execws
+package wsbits
 
 import (
 	"os"
@@ -12,8 +12,16 @@ import (
 func TestSingleWebSocketOpcodeTable(t *testing.T) {
 	root := moduleRoot(t)
 	opConst := regexp.MustCompile(`Op(Continuation|Text|Binary|Close|Ping|Pong)\b.*=\s*0x`)
+	framingPath := filepath.Join(root, "pkg", "wsbits", "framing.go")
+	framingSrc, err := os.ReadFile(framingPath)
+	if err != nil {
+		t.Fatalf("read pkg/wsbits/framing.go: %v", err)
+	}
+	if !opConst.MatchString(string(framingSrc)) {
+		t.Fatal("pkg/wsbits/framing.go does not declare the websocket opcode table")
+	}
 
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -32,7 +40,7 @@ func TestSingleWebSocketOpcodeTable(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if filepath.ToSlash(rel) == "internal/execws/framing.go" {
+		if filepath.ToSlash(rel) == "pkg/wsbits/framing.go" {
 			return nil
 		}
 		b, err := os.ReadFile(path)
@@ -44,7 +52,7 @@ func TestSingleWebSocketOpcodeTable(t *testing.T) {
 			t.Errorf("%s contains a deleted websocket opcode type name", rel)
 		}
 		if opConst.MatchString(src) {
-			t.Errorf("%s declares websocket opcode constants outside internal/execws", rel)
+			t.Errorf("%s declares websocket opcode constants outside pkg/wsbits", rel)
 		}
 		return nil
 	})

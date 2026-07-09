@@ -1,4 +1,4 @@
-package localclient
+package client
 
 import (
 	"bufio"
@@ -16,7 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/VikashLoomba/Portal/internal/execws"
+	"github.com/VikashLoomba/Portal/pkg/api"
+	"github.com/VikashLoomba/Portal/pkg/wsbits"
 )
 
 type readDeadlineSetter interface {
@@ -123,7 +124,7 @@ func (c *Client) ExecWithOptions(ctx context.Context, argv []string, stdin io.Re
 
 readLoop:
 	for {
-		op, payload, err := execws.ReadFrame(br, false)
+		op, payload, err := wsbits.ReadFrame(br, false)
 		if err != nil {
 			if ctx.Err() != nil {
 				transportErr = ctx.Err()
@@ -133,28 +134,28 @@ readLoop:
 			break
 		}
 		switch op {
-		case execws.OpBinary:
-			f, err := execws.DecodeExecFrame(payload)
+		case wsbits.OpBinary:
+			f, err := api.DecodeExecFrame(payload)
 			if err != nil {
 				transportErr = err
 				break readLoop
 			}
 			switch f.Stream {
-			case execws.ExecStreamStdout:
+			case api.ExecStreamStdout:
 				if err := writeAll(stdout, f.Data); err != nil {
 					transportErr = err
 					break readLoop
 				}
-			case execws.ExecStreamStderr:
+			case api.ExecStreamStderr:
 				if err := writeAll(stderr, f.Data); err != nil {
 					transportErr = err
 					break readLoop
 				}
-			case execws.ExecStreamExit:
+			case api.ExecStreamExit:
 				exitCode = f.Code
 				gotExit = true
 				break readLoop
-			case execws.ExecStreamError:
+			case api.ExecStreamError:
 				msg := string(f.Data)
 				if msg == "" {
 					msg = "exec stream error"
@@ -162,15 +163,15 @@ readLoop:
 				terminalErr = errors.New(msg)
 				break readLoop
 			}
-		case execws.OpPing:
+		case wsbits.OpPing:
 			writeMu.Lock()
-			err := execws.WriteFrame(conn, execws.OpPong, payload, true)
+			err := wsbits.WriteFrame(conn, wsbits.OpPong, payload, true)
 			writeMu.Unlock()
 			if err != nil {
 				transportErr = err
 				break readLoop
 			}
-		case execws.OpClose:
+		case wsbits.OpClose:
 			transportErr = errors.New("websocket: close before exec terminal frame")
 			break readLoop
 		}
@@ -274,7 +275,7 @@ func execWSKey() (string, error) {
 }
 
 func execWSAccept(key string) string {
-	return execws.AcceptKey(key)
+	return wsbits.AcceptKey(key)
 }
 
 func pumpExecStdin(w net.Conn, writeMu *sync.Mutex, stdin io.Reader, pty bool) <-chan error {
@@ -330,8 +331,8 @@ func pumpExecWinch(w io.Writer, writeMu *sync.Mutex, winch <-chan [2]uint16, don
 					errc <- nil
 					return
 				}
-				payload, err := execws.EncodeExecFrame(execws.ExecFrame{
-					Stream: execws.ExecStreamWinch,
+				payload, err := api.EncodeExecFrame(api.ExecFrame{
+					Stream: api.ExecStreamWinch,
 					Rows:   size[0],
 					Cols:   size[1],
 				})
@@ -340,7 +341,7 @@ func pumpExecWinch(w io.Writer, writeMu *sync.Mutex, winch <-chan [2]uint16, don
 					return
 				}
 				writeMu.Lock()
-				err = execws.WriteFrame(w, execws.OpBinary, payload, true)
+				err = wsbits.WriteFrame(w, wsbits.OpBinary, payload, true)
 				writeMu.Unlock()
 				if err != nil {
 					errc <- err
@@ -353,13 +354,13 @@ func pumpExecWinch(w io.Writer, writeMu *sync.Mutex, winch <-chan [2]uint16, don
 }
 
 func writeExecStdinFrame(w io.Writer, writeMu *sync.Mutex, data []byte) error {
-	payload, err := execws.EncodeExecFrame(execws.ExecFrame{Stream: execws.ExecStreamStdin, Data: data})
+	payload, err := api.EncodeExecFrame(api.ExecFrame{Stream: api.ExecStreamStdin, Data: data})
 	if err != nil {
 		return err
 	}
 	writeMu.Lock()
 	defer writeMu.Unlock()
-	return execws.WriteFrame(w, execws.OpBinary, payload, true)
+	return wsbits.WriteFrame(w, wsbits.OpBinary, payload, true)
 }
 
 func writeAll(w io.Writer, p []byte) error {

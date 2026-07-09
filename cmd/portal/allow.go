@@ -10,7 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/VikashLoomba/Portal/internal/app"
-	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/pkg/client"
 )
 
 func newAllowCmd(a *app.App) *cobra.Command {
@@ -60,7 +60,7 @@ func runAllow(ctx context.Context, w, errw io.Writer, a *app.App, args []string)
 		// Push each newly-added port to the daemon. A single failed PUT means
 		// the daemon is down, so the ~100ms claim would be a lie — fall back to
 		// the honest reconcile message.
-		lc := localclient.New(a.Paths.APISock)
+		lc := client.New(a.Paths.APISock)
 		up := true
 		for _, p := range added {
 			if _, e := lc.Allow(ctx, p); e != nil {
@@ -110,7 +110,7 @@ func runUnallow(ctx context.Context, w, errw io.Writer, a *app.App, args []strin
 	if err := a.Cfg.Unallow(ports); err != nil {
 		return err
 	}
-	lc := localclient.New(a.Paths.APISock)
+	lc := client.New(a.Paths.APISock)
 	up := true
 	if len(ports) > 0 {
 		for _, p := range ports {

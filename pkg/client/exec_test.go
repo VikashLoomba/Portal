@@ -1,4 +1,4 @@
-package localclient
+package client
 
 import (
 	"bufio"
@@ -19,10 +19,11 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/audit"
 	"github.com/VikashLoomba/Portal/internal/config"
-	"github.com/VikashLoomba/Portal/internal/execws"
 	"github.com/VikashLoomba/Portal/internal/localapi"
+	"github.com/VikashLoomba/Portal/pkg/api"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 	"github.com/VikashLoomba/Portal/pkg/transport/localexec"
+	"github.com/VikashLoomba/Portal/pkg/wsbits"
 )
 
 func TestExec(t *testing.T) {
@@ -95,9 +96,9 @@ func TestExecFeatureOff(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
-	var apiErr *APIError
+	var apiErr *api.APIError
 	if !errors.As(err, &apiErr) {
-		t.Fatalf("error type = %T, want *APIError", err)
+		t.Fatalf("error type = %T, want *api.APIError", err)
 	}
 	if apiErr.Code != "feature_disabled" {
 		t.Fatalf("APIError.Code = %q, want feature_disabled", apiErr.Code)
@@ -131,7 +132,7 @@ func TestExecWithOptionsPTYSkewRequiresGrantedHeader(t *testing.T) {
 			return
 		}
 		key := strings.TrimSpace(req.Header.Get("Sec-WebSocket-Key"))
-		if _, err := fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", execws.AcceptKey(key)); err != nil {
+		if _, err := fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", wsbits.AcceptKey(key)); err != nil {
 			serverDone <- err
 			return
 		}
@@ -278,16 +279,16 @@ func TestExecPreservesExitWhenContextCancelsBeforeBlockedStdinDone(t *testing.T)
 			return
 		}
 		key := strings.TrimSpace(req.Header.Get("Sec-WebSocket-Key"))
-		if _, err := fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", execws.AcceptKey(key)); err != nil {
+		if _, err := fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", wsbits.AcceptKey(key)); err != nil {
 			serverDone <- err
 			return
 		}
-		payload, err := execws.EncodeExecFrame(execws.ExecFrame{Stream: execws.ExecStreamExit, Code: 17})
+		payload, err := api.EncodeExecFrame(api.ExecFrame{Stream: api.ExecStreamExit, Code: 17})
 		if err != nil {
 			serverDone <- err
 			return
 		}
-		if err := execws.WriteFrame(conn, execws.OpBinary, payload, false); err != nil {
+		if err := wsbits.WriteFrame(conn, wsbits.OpBinary, payload, false); err != nil {
 			serverDone <- err
 			return
 		}
@@ -345,7 +346,7 @@ func startExecClientServer(t *testing.T, cfg *config.Store) (string, *localapi.S
 	t.Helper()
 	path := filepath.Join(shortExecClientTempDir(t), "api.sock")
 	srv := localapi.New(localapi.Deps{
-		Version:    localapi.VersionInfo{Version: "test", GitSHA: "exec", ProtoVersion: protocol.ProtoVersion},
+		Version:    api.VersionInfo{Version: "test", GitSHA: "exec", ProtoVersion: protocol.ProtoVersion},
 		Config:     cfg,
 		ExecStream: localexec.New(),
 		Audit:      audit.New(t.TempDir()),

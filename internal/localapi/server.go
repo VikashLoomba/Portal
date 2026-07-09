@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/pkg/api"
 )
 
 // route is one mux entry: a Go 1.22 method-pattern handler. Method + " " +
@@ -272,7 +273,7 @@ func (w *envelopeWriter) WriteHeader(code int) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.ResponseWriter.WriteHeader(code)
-		_ = json.NewEncoder(w.ResponseWriter).Encode(errorBody{Error: errorDetail{Code: machineCode, Message: msg}})
+		_ = json.NewEncoder(w.ResponseWriter).Encode(api.ErrorBody{Error: api.ErrorDetail{Code: machineCode, Message: msg}})
 		w.swallow = true
 		return
 	}
@@ -289,15 +290,15 @@ func (w *envelopeWriter) Write(b []byte) (int, error) {
 
 // buildStatus assembles the Status aggregate from deps. Missing/erroring
 // sources degrade to zero values rather than failing the whole status.
-func (s *Server) buildStatus(ctx context.Context) Status {
+func (s *Server) buildStatus(ctx context.Context) api.Status {
 	// Ports/Forwards/Allowed are initialized to empty non-nil slices so the JSON
 	// fields are ALWAYS arrays, never null — matching GET /v1/ports and letting a
 	// polyglot client iterate them safely even in the disconnected state (§4.4).
-	st := Status{
+	st := api.Status{
 		Version:  s.deps.Version,
 		Features: map[string]bool{},
-		Ports:    []PortStatus{},
-		Forwards: []ForwardStatus{},
+		Ports:    []api.PortStatus{},
+		Forwards: []api.ForwardStatus{},
 		Allowed:  []int{},
 	}
 
@@ -308,7 +309,7 @@ func (s *Server) buildStatus(ctx context.Context) Status {
 	}
 	if s.deps.Service != nil {
 		if svc, err := s.deps.Service.Status(ctx); err == nil {
-			st.Service = ServiceStatus{Loaded: svc.Loaded, StateLines: svc.StateLines}
+			st.Service = api.ServiceStatus{Loaded: svc.Loaded, StateLines: svc.StateLines}
 		}
 	}
 
@@ -317,12 +318,12 @@ func (s *Server) buildStatus(ctx context.Context) Status {
 		h, _ := s.deps.Master.Health(ctx)
 		d := s.deps.Master.Describe()
 		masterUp = h.Up
-		st.Master = MasterStatus{Up: h.Up, Pid: h.Pid, Transport: d.Impl, Detail: h.Detail}
+		st.Master = api.MasterStatus{Up: h.Up, Pid: h.Pid, Transport: d.Impl, Detail: h.Detail}
 	}
 
 	if s.deps.Agent != nil {
 		if ack := s.deps.Agent.HelloAck(); ack != nil {
-			st.Agent = &AgentStatus{
+			st.Agent = &api.AgentStatus{
 				Pid:    ack.AgentPID,
 				SHA:    ack.AgentGitSHA,
 				Kernel: ack.Kernel,
@@ -331,7 +332,7 @@ func (s *Server) buildStatus(ctx context.Context) Status {
 		}
 		if _, ports, ok := s.deps.Agent.Snapshot(); ok {
 			for _, p := range ports {
-				st.Ports = append(st.Ports, PortStatus{Port: int(p)})
+				st.Ports = append(st.Ports, api.PortStatus{Port: int(p)})
 			}
 		}
 	}
@@ -339,7 +340,7 @@ func (s *Server) buildStatus(ctx context.Context) Status {
 	if s.deps.Ports != nil && masterUp {
 		if lines, err := s.deps.Ports.ForwardLines(ctx); err == nil {
 			for _, name := range lines {
-				st.Forwards = append(st.Forwards, ForwardStatus{Name: name})
+				st.Forwards = append(st.Forwards, api.ForwardStatus{Name: name})
 			}
 		}
 	}

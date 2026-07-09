@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/VikashLoomba/Portal/pkg/api"
 )
 
 // shortTempDir returns a short-path temp dir (under /tmp, not the long macOS
@@ -80,7 +82,7 @@ func TestListenPermsAndSingleInstance(t *testing.T) {
 		t.Errorf("parent dir mode = %o, want 0700", got)
 	}
 
-	s := New(Deps{Version: VersionInfo{Version: "test"}})
+	s := New(Deps{Version: api.VersionInfo{Version: "test"}})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(ctx, ln) }()

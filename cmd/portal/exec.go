@@ -9,8 +9,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/VikashLoomba/Portal/internal/app"
-	"github.com/VikashLoomba/Portal/internal/localclient"
 	"github.com/VikashLoomba/Portal/internal/termx"
+	"github.com/VikashLoomba/Portal/pkg/api"
+	"github.com/VikashLoomba/Portal/pkg/client"
 )
 
 var (
@@ -57,7 +58,7 @@ func newExecCmd(a *app.App) *cobra.Command {
 				return usageErr{msg: "usage: portal exec -- <cmd...>"}
 			}
 
-			lc := localclient.New(a.Paths.APISock)
+			lc := client.New(a.Paths.APISock)
 			if pty {
 				restore, err := makeRaw(stdinFD)
 				if err != nil {
@@ -89,7 +90,7 @@ func newExecCmd(a *app.App) *cobra.Command {
 				if term == "" {
 					term = "xterm-256color"
 				}
-				code, err := lc.ExecWithOptions(cmd.Context(), argv, os.Stdin, os.Stdout, os.Stderr, localclient.ExecOptions{
+				code, err := lc.ExecWithOptions(cmd.Context(), argv, os.Stdin, os.Stdout, os.Stderr, client.ExecOptions{
 					PTY:   true,
 					Term:  term,
 					Rows:  rows,
@@ -123,7 +124,7 @@ func newExecCmd(a *app.App) *cobra.Command {
 }
 
 func printExecError(cmd *cobra.Command, err error) {
-	var apiErr *localclient.APIError
+	var apiErr *api.APIError
 	if errors.As(err, &apiErr) && apiErr.Code != "" {
 		fmt.Fprintf(cmd.ErrOrStderr(), "portal exec: %s: %s\n", apiErr.Code, apiErr.Message)
 		return

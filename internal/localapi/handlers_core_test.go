@@ -11,6 +11,7 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/service"
+	"github.com/VikashLoomba/Portal/pkg/api"
 	"github.com/VikashLoomba/Portal/pkg/hub"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 	"github.com/VikashLoomba/Portal/pkg/transport"
@@ -69,7 +70,7 @@ func (f fakeService) Status(context.Context) (service.Status, error) { return f.
 func newTestServer(t *testing.T, agent AgentSource) *Server {
 	t.Helper()
 	return New(Deps{
-		Version: VersionInfo{Version: "9.9", GitSHA: "deadbeef", ProtoVersion: 3},
+		Version: api.VersionInfo{Version: "9.9", GitSHA: "deadbeef", ProtoVersion: 3},
 		Host:    func() (string, error) { return "", nil },
 		Agent:   agent,
 		Master:  fakeMaster{pid: 4321},
@@ -89,11 +90,11 @@ func TestHandleVersion(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	var got VersionInfo
+	var got api.VersionInfo
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	want := VersionInfo{Version: "9.9", GitSHA: "deadbeef", ProtoVersion: 3}
+	want := api.VersionInfo{Version: "9.9", GitSHA: "deadbeef", ProtoVersion: 3}
 	if got != want {
 		t.Errorf("version = %+v, want %+v", got, want)
 	}
@@ -122,7 +123,7 @@ func TestHandleOpenAPI(t *testing.T) {
 // disconnected state — matching GET /v1/ports's always-array shape.
 func TestHandleStatus_EmptyArraysNotNull(t *testing.T) {
 	s := New(Deps{
-		Version: VersionInfo{Version: "9.9"},
+		Version: api.VersionInfo{Version: "9.9"},
 		Agent:   &fakeAgent{ok: false},
 		Config:  config.New(t.TempDir()),
 		Hub:     hub.New(),
@@ -169,7 +170,7 @@ func TestHandleStatus_AgentPresent(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	var got Status
+	var got api.Status
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -208,7 +209,7 @@ func TestHandleStatus_AgentPresent(t *testing.T) {
 // wire-carried fields on the daemon-up path.
 func TestHandleStatus_NativeTransportWireFields(t *testing.T) {
 	s := New(Deps{
-		Version: VersionInfo{Version: "9.9", GitSHA: "deadbeef", ProtoVersion: 4},
+		Version: api.VersionInfo{Version: "9.9", GitSHA: "deadbeef", ProtoVersion: 4},
 		Host:    func() (string, error) { return "box", nil },
 		Master:  nativeFakeMaster{},
 		Config:  config.New(t.TempDir()),
@@ -221,7 +222,7 @@ func TestHandleStatus_NativeTransportWireFields(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	var got Status
+	var got api.Status
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -280,7 +281,7 @@ func TestErrorEnvelope_FrameworkResponses(t *testing.T) {
 			if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 				t.Errorf("Content-Type = %q, want application/json", ct)
 			}
-			var eb errorBody
+			var eb api.ErrorBody
 			if err := json.Unmarshal(rec.Body.Bytes(), &eb); err != nil {
 				t.Fatalf("body %q is not the D9 error envelope: %v", rec.Body.String(), err)
 			}
@@ -300,7 +301,7 @@ func TestHandleStatus_NoAgent(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
 	s.mux.ServeHTTP(rec, req)
 
-	var got Status
+	var got api.Status
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}

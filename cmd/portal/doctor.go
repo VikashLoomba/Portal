@@ -10,7 +10,7 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/clipshim"
-	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/pkg/client"
 	"github.com/VikashLoomba/Portal/pkg/doctor"
 	"github.com/VikashLoomba/Portal/pkg/transport"
 	"github.com/VikashLoomba/Portal/pkg/transport/sshnative"
@@ -59,7 +59,7 @@ func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App, nativeOpts ...ss
 	// is REPORTED, never silently re-run in-process — a silent local fallback here
 	// would double the work (30s+), discard the daemon's live-transport ground
 	// truth, and hide from the user that the daemon path was abandoned.
-	lc := localclient.New(a.Paths.APISock)
+	lc := client.New(a.Paths.APISock)
 	if lc.Available(ctx) {
 		rep, err := lc.Doctor(ctx)
 		if err != nil {

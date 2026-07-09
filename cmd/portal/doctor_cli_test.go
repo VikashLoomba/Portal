@@ -15,7 +15,8 @@ import (
 	"github.com/VikashLoomba/Portal/internal/clipshim"
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/localapi"
-	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/pkg/api"
+	"github.com/VikashLoomba/Portal/pkg/client"
 	"github.com/VikashLoomba/Portal/pkg/doctor"
 	"github.com/VikashLoomba/Portal/pkg/hub"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
@@ -46,7 +47,7 @@ func serveDoctorDaemonFunc(t *testing.T, cfg *config.Store, doctorFn func(contex
 	path := filepath.Join(dir, "api.sock")
 
 	deps := localapi.Deps{
-		Version: localapi.VersionInfo{Version: "test", GitSHA: "deadbeef", ProtoVersion: protocol.ProtoVersion},
+		Version: api.VersionInfo{Version: "test", GitSHA: "deadbeef", ProtoVersion: protocol.ProtoVersion},
 		Host:    cfg.ReadHost,
 		Agent:   &fakeAgentSource{},
 		Master:  &fakeMasterProber{pid: 4242},
@@ -71,7 +72,7 @@ func serveDoctorDaemonFunc(t *testing.T, cfg *config.Store, doctorFn func(contex
 	}()
 	t.Cleanup(func() { cancel(); <-done })
 
-	lc := localclient.New(path)
+	lc := client.New(path)
 	deadline := time.Now().Add(3 * time.Second)
 	for !lc.Available(context.Background()) {
 		if time.Now().After(deadline) {

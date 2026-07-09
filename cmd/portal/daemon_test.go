@@ -15,8 +15,9 @@ import (
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/forward"
 	"github.com/VikashLoomba/Portal/internal/localapi"
-	"github.com/VikashLoomba/Portal/internal/localclient"
 	"github.com/VikashLoomba/Portal/internal/service"
+	"github.com/VikashLoomba/Portal/pkg/api"
+	"github.com/VikashLoomba/Portal/pkg/client"
 	"github.com/VikashLoomba/Portal/pkg/doctor"
 	"github.com/VikashLoomba/Portal/pkg/hub"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
@@ -198,7 +199,7 @@ func startFakeDaemon(t *testing.T, cfg *config.Store, opts ...fakeOpt) *fakeDaem
 	}
 
 	deps := localapi.Deps{
-		Version: localapi.VersionInfo{Version: "test", GitSHA: "deadbeef", ProtoVersion: protocol.ProtoVersion},
+		Version: api.VersionInfo{Version: "test", GitSHA: "deadbeef", ProtoVersion: protocol.ProtoVersion},
 		Host:    cfg.ReadHost,
 		Agent:   d.agent,
 		Master:  d.master,
@@ -231,7 +232,7 @@ func startFakeDaemon(t *testing.T, cfg *config.Store, opts ...fakeOpt) *fakeDaem
 	t.Cleanup(d.Stop)
 
 	// Wait until the socket answers so tests are deterministic.
-	lc := localclient.New(d.path)
+	lc := client.New(d.path)
 	deadline := time.Now().Add(3 * time.Second)
 	for !lc.Available(context.Background()) {
 		if time.Now().After(deadline) {

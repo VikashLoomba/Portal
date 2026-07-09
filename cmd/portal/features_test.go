@@ -151,7 +151,7 @@ func TestFeatures_DaemonDown_Fallback(t *testing.T) {
 		config.FeatureNotify:    true,
 		config.FeatureExec:      true,
 	})
-	// Point APISock at a nonexistent path so localclient dials fail fast.
+	// Point APISock at a nonexistent path so client dials fail fast.
 	a := newDaemonTestApp(t, filepath.Join(t.TempDir(), "nope.sock"), cfg)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

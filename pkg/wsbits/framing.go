@@ -1,4 +1,5 @@
-package execws
+// Package wsbits is not a general WebSocket library — exactly what the exec subprotocol needs.
+package wsbits
 
 import (
 	"crypto/rand"

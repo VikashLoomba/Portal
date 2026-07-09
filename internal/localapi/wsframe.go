@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/VikashLoomba/Portal/internal/execws"
+	"github.com/VikashLoomba/Portal/pkg/wsbits"
 )
 
 // wsUpgrade validates all WebSocket headers before hijack so callers can still
@@ -37,7 +37,7 @@ func wsUpgrade(w http.ResponseWriter, r *http.Request, extraHeaders ...string) (
 	if err != nil {
 		return nil, nil, err
 	}
-	if _, err := fmt.Fprintf(brw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n", execws.AcceptKey(key)); err != nil {
+	if _, err := fmt.Fprintf(brw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n", wsbits.AcceptKey(key)); err != nil {
 		_ = conn.Close()
 		return nil, nil, err
 	}

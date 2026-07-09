@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/pkg/api"
 	"github.com/VikashLoomba/Portal/pkg/doctor"
 	"github.com/VikashLoomba/Portal/pkg/hub"
 )
@@ -56,7 +57,7 @@ func newMutServer(t *testing.T, agent AgentSource) (*Server, *mutDeps) {
 		},
 	}
 	s := New(Deps{
-		Version:   VersionInfo{Version: "9.9", GitSHA: "deadbeef", ProtoVersion: 3},
+		Version:   api.VersionInfo{Version: "9.9", GitSHA: "deadbeef", ProtoVersion: 3},
 		Agent:     agent,
 		Config:    config.New(t.TempDir()),
 		Hub:       hub.New(),
@@ -81,7 +82,7 @@ func doReq(s *Server, method, target string, body string) *httptest.ResponseReco
 
 func decodeErrCode(t *testing.T, rec *httptest.ResponseRecorder) string {
 	t.Helper()
-	var eb errorBody
+	var eb api.ErrorBody
 	if err := json.Unmarshal(rec.Body.Bytes(), &eb); err != nil {
 		t.Fatalf("decode error body %q: %v", rec.Body.String(), err)
 	}
@@ -105,7 +106,7 @@ func TestHandlePorts(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200", rec.Code)
 		}
-		var got []PortStatus
+		var got []api.PortStatus
 		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 			t.Fatalf("decode: %v", err)
 		}

@@ -10,7 +10,7 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/config"
-	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/pkg/client"
 )
 
 // featureNames is the fixed set of capability gates, in the order they render.
@@ -34,7 +34,7 @@ func newFeaturesCmd(a *app.App) *cobra.Command {
 // `portal run` is up. Unknown names fail the same way up or down — validated
 // locally — and a set echoes only the changed line.
 func runFeatures(ctx context.Context, w, errw io.Writer, a *app.App, args []string) error {
-	lc := localclient.New(a.Paths.APISock)
+	lc := client.New(a.Paths.APISock)
 
 	switch len(args) {
 	case 0: // LIST
@@ -63,7 +63,7 @@ func runFeatures(ctx context.Context, w, errw io.Writer, a *app.App, args []stri
 		if _, err := lc.SetFeature(ctx, name, on); err == nil {
 			fmt.Fprintf(w, "%s: %s\n", name, onOff(on))
 			return nil
-		} else if errors.Is(err, localclient.ErrFeatureUnknown) {
+		} else if errors.Is(err, client.ErrFeatureUnknown) {
 			// The daemon considers the name unknown — fail the same way as the
 			// local check rather than writing through the fallback.
 			fmt.Fprintf(errw, "unknown feature: %s (known: clip-image, clip-text, notify, exec)\n", name)
