@@ -643,10 +643,28 @@ The 9-round review loop was stopped by principal judgment after confirm rates co
 (rounds 4/8/9 mostly refuted; final two fixes test-only) — convergence-by-attrition on a
 214-file diff was costing more than it caught.
 
+Live-box validation (2026-07-09, staging harness vs vikash@vikash-system, system transport):
+- §8.4 non-PTY regression PASS: `uname -sm`→0, `false`→1, `sh -c 'exit 7'`→7, piped-stdin `cat`
+  round-trips + EOF; `audit.log` shows sid-paired open/close, `pty=1` only on PTY sessions.
+- PTY headline PASS: local pty master set to 42×137 before the session; `stty size` on the box
+  returned `42 137` — `StreamPty` allocates a real remote pty and propagates dimensions via
+  `-tt`/RequestPty. Interactive shell mode (`portal exec -t`) lands in a remote login shell.
+- §8.2 orphan on the SYSTEM transport: a hard-killed client leaves the remote `sleep` alive.
+  Proven NOT a portal defect by the control test — plain `ssh -tt -S <master> host 'exec sleep
+  300'` with the mux client SIGKILL'd orphans the remote process identically (zero portal code).
+  Root cause: a SIGKILL'd ControlMaster mux client cannot cleanly close its channel, so sshd
+  never delivers the remote SIGHUP. The localexec transport (direct pty, no mux) kills the
+  orphan correctly (EC8 hermetic PASS). This is the mux-ssh analog of the Stage-5 §8.3 finding.
+
 Fast-follows (non-blocking, record for a later stage):
 1. **CLI winch pump can drop the final resize:** `cmd/portal/exec.go` sends sizes through a
    1-buffered drop-newest channel; a resize burst ending in a drop leaves the remote pty one
    size stale until the next WINCH. Fix: drain-then-send (keep latest, not oldest).
+2. **System-transport disconnect-kill is mux-bounded:** `sshctlPtySession.Close` SIGKILLs its
+   `ssh -tt` mux child, which cannot propagate a remote SIGHUP (see live-box note). To match
+   localexec's clean orphan-kill, close the local pty master and give ssh a brief SIGHUP/SIGTERM
+   window to close the channel before SIGKILL, or send an explicit remote signal. Native/localexec
+   are unaffected.
 2. **Zero-length-stdin single-frame count untested in Go:** the exactly-one-EOF-frame
    behavior is asserted by the TS suite only; a Go-side frame-count test would pin it against
    client refactors.
