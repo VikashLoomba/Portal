@@ -6,7 +6,7 @@ import (
 	"context"
 
 	"github.com/VikashLoomba/Portal/internal/clock"
-	"github.com/VikashLoomba/Portal/internal/run"
+	"github.com/VikashLoomba/Portal/pkg/run"
 )
 
 // Stub allows the module to compile on non-darwin (e.g. Linux CI). All ops

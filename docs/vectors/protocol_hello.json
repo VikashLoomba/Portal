@@ -1,0 +1,1 @@
+{"Hello":{"ProtoVersion":4,"ClientGitSHA":"client-sha-u10","ClientPID":4242,"PollIntervalMs":75,"WantDestroyMC":true,"Services":{"notify":1}},"Subscribe":null,"Ping":null,"ReqSnap":null,"Shutdown":null,"HelloAck":null,"SubscribeAck":null,"Snapshot":null,"PortAdded":null,"PortRemoved":null,"Heartbeat":null,"AgentError":null,"Bye":null,"Msg":null}

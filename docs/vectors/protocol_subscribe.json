@@ -1,0 +1,1 @@
+{"Hello":null,"Subscribe":{"Deny":[22,5432],"Allow":[3000,8080],"ExcludeEphemeral":true,"ResubscribeID":99},"Ping":null,"ReqSnap":null,"Shutdown":null,"HelloAck":null,"SubscribeAck":null,"Snapshot":null,"PortAdded":null,"PortRemoved":null,"Heartbeat":null,"AgentError":null,"Bye":null,"Msg":null}

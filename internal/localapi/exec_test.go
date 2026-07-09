@@ -25,54 +25,12 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/audit"
 	"github.com/VikashLoomba/Portal/internal/config"
-	"github.com/VikashLoomba/Portal/internal/transport"
-	"github.com/VikashLoomba/Portal/internal/transport/localexec"
+	"github.com/VikashLoomba/Portal/pkg/api"
+	"github.com/VikashLoomba/Portal/pkg/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport/localexec"
+	"github.com/VikashLoomba/Portal/pkg/wsbits"
+	"github.com/fxamacker/cbor/v2"
 )
-
-func TestExecFrameEncodeDecodeRoundTrip(t *testing.T) {
-	tests := []struct {
-		name string
-		in   ExecFrame
-	}{
-		{name: "stdin data", in: ExecFrame{Stream: ExecStreamStdin, Data: []byte("input")}},
-		{name: "stdout binary data", in: ExecFrame{Stream: ExecStreamStdout, Data: []byte{0x00, 0xff, 'o', 'k'}}},
-		{name: "stderr data", in: ExecFrame{Stream: ExecStreamStderr, Data: []byte("warn")}},
-		{name: "exit code", in: ExecFrame{Stream: ExecStreamExit, Code: 3}},
-		{name: "error data", in: ExecFrame{Stream: ExecStreamError, Data: []byte("boom")}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			encoded, err := EncodeExecFrame(tt.in)
-			if err != nil {
-				t.Fatalf("EncodeExecFrame: %v", err)
-			}
-			got, err := DecodeExecFrame(encoded)
-			if err != nil {
-				t.Fatalf("DecodeExecFrame: %v", err)
-			}
-			if got.Stream != tt.in.Stream {
-				t.Fatalf("Stream = %q, want %q", got.Stream, tt.in.Stream)
-			}
-			if !bytes.Equal(got.Data, tt.in.Data) {
-				t.Fatalf("Data = %v, want %v", got.Data, tt.in.Data)
-			}
-			if got.Code != tt.in.Code {
-				t.Fatalf("Code = %d, want %d", got.Code, tt.in.Code)
-			}
-		})
-	}
-}
-
-func TestDecodeExecFrameMalformedCBOR(t *testing.T) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			t.Fatalf("DecodeExecFrame panicked: %v", rec)
-		}
-	}()
-	if _, err := DecodeExecFrame([]byte{0xa1, 0x61, 's'}); err == nil {
-		t.Fatal("DecodeExecFrame returned nil error")
-	}
-}
 
 func TestExecUpgradeReaches101(t *testing.T) {
 	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
@@ -86,7 +44,7 @@ func TestExecPrintfStdoutExitZero(t *testing.T) {
 	defer c.Close()
 
 	frames := readExecFramesUntilExit(t, c, 2*time.Second)
-	if got := joinFrameData(frames, ExecStreamStdout); got != "hello" {
+	if got := joinFrameData(frames, api.ExecStreamStdout); got != "hello" {
 		t.Fatalf("stdout = %q, want hello (bridge must pass argv verbatim)", got)
 	}
 	if got := lastExitCode(frames); got != 0 {
@@ -110,13 +68,39 @@ func TestExecStdinHalfClose(t *testing.T) {
 	c := dialExecWS(t, path, []string{"cat"})
 	defer c.Close()
 
-	writeExecClientFrame(t, c, ExecFrame{Stream: ExecStreamStdin, Data: []byte("ping\n")})
-	stdout := readExecFrameMatching(t, c, ExecStreamStdout, 2*time.Second)
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte("ping\n")})
+	stdout := readExecFrameMatching(t, c, api.ExecStreamStdout, 2*time.Second)
 	if string(stdout.Data) != "ping\n" {
 		t.Fatalf("stdout = %q, want ping newline", string(stdout.Data))
 	}
 
-	writeExecClientFrame(t, c, ExecFrame{Stream: ExecStreamStdin, Data: []byte{}})
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte{}})
+	frames := readExecFramesUntilExit(t, c, 2*time.Second)
+	if got := lastExitCode(frames); got != 0 {
+		t.Fatalf("exit code = %d, want 0", got)
+	}
+}
+
+func TestExecMalformedApplicationFrameDoesNotTearDownSession(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	c := dialExecWS(t, path, []string{"cat"})
+	defer c.Close()
+
+	payload := oversizedWinchExecFramePayload(t)
+	if _, err := api.DecodeExecFrame(payload); err == nil {
+		t.Fatal("api.DecodeExecFrame accepted oversized winch rows; regression test no longer covers malformed app frames")
+	}
+	if err := writeClientFrame(c, wsbits.OpBinary, payload); err != nil {
+		t.Fatalf("write malformed client frame: %v", err)
+	}
+	assertNoTerminalFrameWithin(t, c, 200*time.Millisecond)
+
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte("alive\n")})
+	stdout := readExecFrameMatching(t, c, api.ExecStreamStdout, 2*time.Second)
+	if string(stdout.Data) != "alive\n" {
+		t.Fatalf("stdout = %q, want alive newline", string(stdout.Data))
+	}
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte{}})
 	frames := readExecFramesUntilExit(t, c, 2*time.Second)
 	if got := lastExitCode(frames); got != 0 {
 		t.Fatalf("exit code = %d, want 0", got)
@@ -137,7 +121,7 @@ func TestExecFeatureOffNoUpgrade(t *testing.T) {
 	if strings.Contains(status, "101") {
 		t.Fatalf("disabled exec upgraded unexpectedly: %q", status)
 	}
-	var eb errorBody
+	var eb api.ErrorBody
 	if err := json.Unmarshal(body, &eb); err != nil {
 		t.Fatalf("decode error body %q: %v", string(body), err)
 	}
@@ -156,26 +140,108 @@ func TestExecAuditOpenCloseOnce(t *testing.T) {
 	lines := waitAuditLines(t, a.Path(), 2, 2*time.Second)
 	var opens, closes int
 	wantUIDField := fmt.Sprintf("\tuid=%d\t", os.Getuid())
+	var openSID, closeSID string
 	for _, line := range lines {
 		if strings.Contains(line, "\texec-open\t") {
 			opens++
-			for _, token := range []string{"host=local", wantUIDField, "argv=printf hello"} {
+			fields := auditFields(line)
+			openSID = fields["sid"]
+			for _, token := range []string{"host=local", "sid=", wantUIDField, "argv=printf hello"} {
 				if !strings.Contains(line, token) {
 					t.Fatalf("exec-open missing %q: %s", token, line)
 				}
 			}
+			if !strings.Contains(line, "\thost=local\tsid=") {
+				t.Fatalf("exec-open sid is not immediately after host: %s", line)
+			}
+			if strings.Contains(line, "\tpty=1") {
+				t.Fatalf("non-pty exec-open unexpectedly carries pty=1: %s", line)
+			}
 		}
 		if strings.Contains(line, "\texec-close\t") {
 			closes++
-			for _, token := range []string{"host=local", "code=0", "err=", "dur="} {
+			fields := auditFields(line)
+			closeSID = fields["sid"]
+			for _, token := range []string{"host=local", "sid=", "code=0", "err=", "dur="} {
 				if !strings.Contains(line, token) {
 					t.Fatalf("exec-close missing %q: %s", token, line)
 				}
+			}
+			if !strings.Contains(line, "\thost=local\tsid=") {
+				t.Fatalf("exec-close sid is not immediately after host: %s", line)
 			}
 		}
 	}
 	if opens != 1 || closes != 1 {
 		t.Fatalf("audit exec-open=%d exec-close=%d, want 1 each\n%s", opens, closes, strings.Join(lines, "\n"))
+	}
+	if openSID == "" || closeSID == "" || openSID != closeSID {
+		t.Fatalf("audit sid open=%q close=%q, want same non-empty\n%s", openSID, closeSID, strings.Join(lines, "\n"))
+	}
+}
+
+func TestExecAuditPtyOpenFlagAndSID(t *testing.T) {
+	a := audit.New(t.TempDir())
+	path, _ := startExecServer(t, config.New(t.TempDir()), a, localexec.New())
+	c := dialExecWSWithQuery(t, path, []string{"printf", "hello"}, url.Values{"pty": {"1"}})
+	defer c.Close()
+
+	_ = readExecFramesUntilExit(t, c, 2*time.Second)
+	lines := waitAuditLines(t, a.Path(), 2, 2*time.Second)
+	var openSID, closeSID string
+	for _, line := range lines {
+		fields := auditFields(line)
+		switch {
+		case strings.Contains(line, "\texec-open\t"):
+			openSID = fields["sid"]
+			for _, token := range []string{"host=local", "sid=", "argv=printf hello", "pty=1"} {
+				if !strings.Contains(line, token) {
+					t.Fatalf("pty exec-open missing %q: %s", token, line)
+				}
+			}
+		case strings.Contains(line, "\texec-close\t"):
+			closeSID = fields["sid"]
+		}
+	}
+	if openSID == "" || closeSID == "" || openSID != closeSID {
+		t.Fatalf("audit sid open=%q close=%q, want same non-empty\n%s", openSID, closeSID, strings.Join(lines, "\n"))
+	}
+}
+
+func TestExecAuditConcurrentSessionsPairBySID(t *testing.T) {
+	a := audit.New(t.TempDir())
+	path, _ := startExecServer(t, config.New(t.TempDir()), a, localexec.New())
+
+	one := dialExecWS(t, path, []string{"sh", "-c", "'sleep 0.1; printf one'"})
+	defer one.Close()
+	two := dialExecWS(t, path, []string{"sh", "-c", "'sleep 0.1; printf two'"})
+	defer two.Close()
+
+	_ = readExecFramesUntilExit(t, one, 2*time.Second)
+	_ = readExecFramesUntilExit(t, two, 2*time.Second)
+
+	lines := waitAuditLines(t, a.Path(), 4, 2*time.Second)
+	opens := make(map[string]string)
+	closes := make(map[string]string)
+	for _, line := range lines {
+		fields := auditFields(line)
+		switch {
+		case strings.Contains(line, "\texec-open\t"):
+			opens[fields["sid"]] = line
+		case strings.Contains(line, "\texec-close\t"):
+			closes[fields["sid"]] = line
+		}
+	}
+	if len(opens) != 2 || len(closes) != 2 {
+		t.Fatalf("open/close counts = %d/%d, want 2/2\n%s", len(opens), len(closes), strings.Join(lines, "\n"))
+	}
+	for sid, openLine := range opens {
+		if sid == "" {
+			t.Fatalf("open missing sid: %s", openLine)
+		}
+		if _, ok := closes[sid]; !ok {
+			t.Fatalf("open sid %q has no matching close\n%s", sid, strings.Join(lines, "\n"))
+		}
 	}
 }
 
@@ -189,12 +255,142 @@ func TestExecEmptyArgvReturnsInvalidRequestWithoutUpgrade(t *testing.T) {
 	if strings.Contains(status, "101") {
 		t.Fatalf("empty argv upgraded unexpectedly: %q", status)
 	}
-	var eb errorBody
+	var eb api.ErrorBody
 	if err := json.Unmarshal(body, &eb); err != nil {
 		t.Fatalf("decode error body %q: %v", string(body), err)
 	}
 	if eb.Error.Code != "invalid_request" {
 		t.Fatalf("error code = %q, want invalid_request", eb.Error.Code)
+	}
+}
+
+func TestExecPtyUnsupportedNoUpgrade(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), unsupportedPtyExecStreamer{})
+
+	status, _, body := rawExecHTTPWithQuery(t, path, nil, url.Values{"pty": {"1"}})
+	if !strings.Contains(status, "409") {
+		t.Fatalf("status = %q, want 409", status)
+	}
+	if strings.Contains(status, "101") {
+		t.Fatalf("unsupported pty upgraded unexpectedly: %q", status)
+	}
+	var eb api.ErrorBody
+	if err := json.Unmarshal(body, &eb); err != nil {
+		t.Fatalf("decode error body %q: %v", string(body), err)
+	}
+	if eb.Error.Code != "pty_unsupported" {
+		t.Fatalf("error code = %q, want pty_unsupported", eb.Error.Code)
+	}
+}
+
+func TestExecPtyCapabilityHeaderConfirm(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+
+	ptyConn := dialExecWSWithQuery(t, path, []string{"printf", "hello"}, url.Values{"pty": {"1"}})
+	if got := ptyConn.headers.Get("X-Portal-Exec-Pty"); got != "1" {
+		ptyConn.Close()
+		t.Fatalf("X-Portal-Exec-Pty = %q, want 1", got)
+	}
+	ptyConn.Close()
+
+	plainConn := dialExecWS(t, path, []string{"printf", "hello"})
+	defer plainConn.Close()
+	if got := plainConn.headers.Get("X-Portal-Exec-Pty"); got != "" {
+		t.Fatalf("non-pty X-Portal-Exec-Pty = %q, want absent", got)
+	}
+}
+
+func TestExecPtySttySize(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	c := dialExecWSWithQuery(t, path, []string{"stty", "size"}, url.Values{
+		"pty":  {"1"},
+		"rows": {"40"},
+		"cols": {"100"},
+	})
+	defer c.Close()
+
+	frames := readExecFramesUntilExit(t, c, 2*time.Second)
+	stdout := cleanPtyOutput(joinFrameData(frames, api.ExecStreamStdout))
+	if !strings.Contains(stdout, "40 100") {
+		t.Fatalf("stdout = %q, want stty size 40 100", stdout)
+	}
+	if got := countFrames(frames, api.ExecStreamStderr); got != 0 {
+		t.Fatalf("stderr frames = %d, want 0 for pty", got)
+	}
+}
+
+func TestExecPtyWinchResizesSession(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	c := dialExecWSWithQuery(t, path, []string{"sh", "-c", "'stty size; read _; stty size'"}, url.Values{
+		"pty":  {"1"},
+		"rows": {"40"},
+		"cols": {"100"},
+	})
+	defer c.Close()
+
+	initial := readExecFramesUntilStdoutContains(t, c, "40 100", 2*time.Second)
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamWinch, Rows: 50, Cols: 120})
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte("go\n")})
+	rest := readExecFramesUntilExit(t, c, 2*time.Second)
+
+	frames := append(initial, rest...)
+	stdout := cleanPtyOutput(joinFrameData(frames, api.ExecStreamStdout))
+	for _, want := range []string{"40 100", "50 120"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout = %q, want %q", stdout, want)
+		}
+	}
+	if got := countFrames(frames, api.ExecStreamStderr); got != 0 {
+		t.Fatalf("stderr frames = %d, want 0 for pty", got)
+	}
+}
+
+func TestExecPtyMalformedWinchFrameDoesNotTearDownSession(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	c := dialExecWSWithQuery(t, path, []string{"sh", "-c", "'stty size; read _; stty size'"}, url.Values{
+		"pty":  {"1"},
+		"rows": {"40"},
+		"cols": {"100"},
+	})
+	defer c.Close()
+
+	initial := readExecFramesUntilStdoutContains(t, c, "40 100", 2*time.Second)
+	payload := oversizedWinchExecFramePayload(t)
+	if _, err := api.DecodeExecFrame(payload); err == nil {
+		t.Fatal("api.DecodeExecFrame accepted oversized winch rows; regression test no longer covers malformed app frames")
+	}
+	if err := writeClientFrame(c, wsbits.OpBinary, payload); err != nil {
+		t.Fatalf("write malformed client frame: %v", err)
+	}
+	assertNoTerminalFrameWithin(t, c, 200*time.Millisecond)
+
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamWinch, Rows: 50, Cols: 120})
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte("go\n")})
+	rest := readExecFramesUntilExit(t, c, 2*time.Second)
+
+	frames := append(initial, rest...)
+	stdout := cleanPtyOutput(joinFrameData(frames, api.ExecStreamStdout))
+	if !strings.Contains(stdout, "50 120") {
+		t.Fatalf("stdout = %q, want valid winch size 50 120 after malformed frame", stdout)
+	}
+	if got := lastExitCode(frames); got != 0 {
+		t.Fatalf("exit code = %d, want 0", got)
+	}
+}
+
+func TestExecPtyZeroLengthStdinNoOp(t *testing.T) {
+	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	c := dialExecWSWithQuery(t, path, []string{"sh", "-c", "'read line; printf \"%s\\n\" \"$line\"'"}, url.Values{"pty": {"1"}})
+	defer c.Close()
+
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte{}})
+	assertNoTerminalFrameWithin(t, c, 200*time.Millisecond)
+	writeExecClientFrame(t, c, api.ExecFrame{Stream: api.ExecStreamStdin, Data: []byte("alive\n")})
+
+	frames := readExecFramesUntilExit(t, c, 2*time.Second)
+	stdout := cleanPtyOutput(joinFrameData(frames, api.ExecStreamStdout))
+	if !strings.Contains(stdout, "alive") {
+		t.Fatalf("stdout = %q, want subsequent stdin to reach pty process", stdout)
 	}
 }
 
@@ -231,7 +427,7 @@ func TestExecBridgeNoGoroutineLeakAcrossOrderings(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		normal := dialExecWS(t, path, []string{"printf", "hello"})
 		frames := readExecFramesUntilExit(t, normal, 2*time.Second)
-		if got := joinFrameData(frames, ExecStreamStdout); got != "hello" {
+		if got := joinFrameData(frames, api.ExecStreamStdout); got != "hello" {
 			normal.Close()
 			t.Fatalf("normal stdout = %q, want hello", got)
 		}
@@ -289,7 +485,7 @@ func TestNoThirdPartyWebSocketImportsAndGoModPinned(t *testing.T) {
 		"nhooyr.io/websocket":          true,
 		"golang.org/x/net/websocket":   true,
 	}
-	for _, dir := range []string{"internal", "cmd"} {
+	for _, dir := range []string{"internal", "cmd", "pkg"} {
 		err := filepath.WalkDir(filepath.Join(root, dir), func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -342,7 +538,7 @@ func TestExecMalformedInboundFrameTearsDownSession(t *testing.T) {
 	c := dialExecWS(t, path, []string{"cat"})
 	defer c.Close()
 
-	if _, err := c.Write(oversizedMaskedFrameHeader(wsMaxPayload + 1)); err != nil {
+	if _, err := c.Write(oversizedMaskedFrameHeader(wsbits.MaxPayload + 1)); err != nil {
 		t.Fatalf("write oversized frame header: %v", err)
 	}
 
@@ -355,7 +551,7 @@ func TestExecMalformedInboundFrameTearsDownSession(t *testing.T) {
 			}
 			return
 		}
-		if op == opClose {
+		if op == wsbits.OpClose {
 			return
 		}
 	}
@@ -366,7 +562,7 @@ func TestExecReaderCloseReleasesBlockedOutputWriter(t *testing.T) {
 	a := audit.New(t.TempDir())
 	streamer := &blockedOutputExecStreamer{waitCalled: make(chan struct{})}
 	s := New(Deps{
-		Version:    VersionInfo{Version: "9.9"},
+		Version:    api.VersionInfo{Version: "9.9"},
 		Config:     config.New(t.TempDir()),
 		ExecStream: streamer,
 		Audit:      a,
@@ -400,14 +596,13 @@ func TestExecReaderCloseReleasesBlockedOutputWriter(t *testing.T) {
 		t.Fatalf("read upgrade headers: %v", err)
 	}
 
+	// handleExec may synchronously close the net.Pipe after reading OpClose;
+	// no further client writes follow, so leave this deadline in place.
 	if err := client.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatalf("set write deadline: %v", err)
 	}
-	if err := writeClientFrame(client, opClose, []byte{0x03, 0xe8}); err != nil {
+	if err := writeClientFrame(client, wsbits.OpClose, []byte{0x03, 0xe8}); err != nil {
 		t.Fatalf("write close frame: %v", err)
-	}
-	if err := client.SetWriteDeadline(time.Time{}); err != nil {
-		t.Fatalf("clear write deadline: %v", err)
 	}
 
 	select {
@@ -457,16 +652,28 @@ func (infiniteReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
+type unsupportedPtyExecStreamer struct{}
+
+func (unsupportedPtyExecStreamer) Stream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+	return nil, nil, nil, nil, fmt.Errorf("unexpected Stream call")
+}
+
+func (unsupportedPtyExecStreamer) Describe() transport.Desc {
+	return transport.Desc{Impl: "test", Host: "pipe-only", Endpoint: "net.Pipe"}
+}
+
 type wsTestConn struct {
 	net.Conn
-	br *bufio.Reader
+	br      *bufio.Reader
+	status  string
+	headers textproto.MIMEHeader
 }
 
 func startExecServer(t *testing.T, cfg *config.Store, a *audit.Log, streamer ExecStreamer) (string, *Server) {
 	t.Helper()
 	path := filepath.Join(shortTempDir(t), "api.sock")
 	s := New(Deps{
-		Version:    VersionInfo{Version: "9.9"},
+		Version:    api.VersionInfo{Version: "9.9"},
 		Config:     cfg,
 		ExecStream: streamer,
 		Audit:      a,
@@ -492,16 +699,26 @@ func startExecServer(t *testing.T, cfg *config.Store, a *audit.Log, streamer Exe
 
 func dialExecWS(t *testing.T, path string, argv []string) *wsTestConn {
 	t.Helper()
+	return dialExecWSWithQuery(t, path, argv, nil)
+}
+
+func dialExecWSWithQuery(t *testing.T, path string, argv []string, query url.Values) *wsTestConn {
+	t.Helper()
 	c, err := net.Dial("unix", path)
 	if err != nil {
 		t.Fatalf("dial unix: %v", err)
 	}
 	q := url.Values{}
+	for key, values := range query {
+		for _, value := range values {
+			q.Add(key, value)
+		}
+	}
 	for _, arg := range argv {
 		q.Add("arg", arg)
 	}
 	key := "dGhlIHNhbXBsZSBub25jZQ=="
-	target := "/v1/exec?" + q.Encode()
+	target := execTarget(q)
 	if _, err := fmt.Fprintf(c, "POST %s HTTP/1.1\r\nHost: unix\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n", target, key); err != nil {
 		c.Close()
 		t.Fatalf("write upgrade request: %v", err)
@@ -522,14 +739,19 @@ func dialExecWS(t *testing.T, path string, argv []string) *wsTestConn {
 		c.Close()
 		t.Fatalf("status = %q, want 101", status)
 	}
-	if got, want := hdr.Get("Sec-WebSocket-Accept"), wsAccept(key); got != want {
+	if got, want := hdr.Get("Sec-WebSocket-Accept"), wsbits.AcceptKey(key); got != want {
 		c.Close()
 		t.Fatalf("Sec-WebSocket-Accept = %q, want %q", got, want)
 	}
-	return &wsTestConn{Conn: c, br: br}
+	return &wsTestConn{Conn: c, br: br, status: status, headers: hdr}
 }
 
 func rawExecHTTP(t *testing.T, path string, argv []string) (string, textproto.MIMEHeader, []byte) {
+	t.Helper()
+	return rawExecHTTPWithQuery(t, path, argv, nil)
+}
+
+func rawExecHTTPWithQuery(t *testing.T, path string, argv []string, query url.Values) (string, textproto.MIMEHeader, []byte) {
 	t.Helper()
 	c, err := net.Dial("unix", path)
 	if err != nil {
@@ -537,10 +759,15 @@ func rawExecHTTP(t *testing.T, path string, argv []string) (string, textproto.MI
 	}
 	defer c.Close()
 	q := url.Values{}
+	for key, values := range query {
+		for _, value := range values {
+			q.Add(key, value)
+		}
+	}
 	for _, arg := range argv {
 		q.Add("arg", arg)
 	}
-	target := "/v1/exec?" + q.Encode()
+	target := execTarget(q)
 	if _, err := fmt.Fprintf(c, "POST %s HTTP/1.1\r\nHost: unix\r\nUpgrade: websocket\r\nConnection: close, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", target); err != nil {
 		t.Fatalf("write request: %v", err)
 	}
@@ -561,46 +788,53 @@ func rawExecHTTP(t *testing.T, path string, argv []string) (string, textproto.MI
 	return resp.Status, textproto.MIMEHeader(resp.Header), body
 }
 
-func writeExecClientFrame(t *testing.T, c *wsTestConn, f ExecFrame) {
-	t.Helper()
-	payload, err := EncodeExecFrame(f)
-	if err != nil {
-		t.Fatalf("EncodeExecFrame: %v", err)
+func execTarget(q url.Values) string {
+	if len(q) == 0 {
+		return "/v1/exec"
 	}
-	if err := writeClientFrame(c, opBinary, payload); err != nil {
+	return "/v1/exec?" + q.Encode()
+}
+
+func writeExecClientFrame(t *testing.T, c *wsTestConn, f api.ExecFrame) {
+	t.Helper()
+	payload, err := api.EncodeExecFrame(f)
+	if err != nil {
+		t.Fatalf("api.EncodeExecFrame: %v", err)
+	}
+	if err := writeClientFrame(c, wsbits.OpBinary, payload); err != nil {
 		t.Fatalf("write client frame: %v", err)
 	}
 }
 
-func writeClientFrame(c net.Conn, op wsOpcode, payload []byte) error {
-	header := []byte{0x80 | byte(op)}
-	n := len(payload)
-	switch {
-	case n <= 125:
-		header = append(header, 0x80|byte(n))
-	case n <= 0xffff:
-		header = append(header, 0x80|126, 0, 0)
-		binary.BigEndian.PutUint16(header[2:4], uint16(n))
-	default:
-		header = append(header, 0x80|127, 0, 0, 0, 0, 0, 0, 0, 0)
-		binary.BigEndian.PutUint64(header[2:10], uint64(n))
+func oversizedWinchExecFramePayload(t *testing.T) []byte {
+	t.Helper()
+	payload, err := cbor.Marshal(struct {
+		Stream string `cbor:"s"`
+		Rows   uint32 `cbor:"rs"`
+		Cols   uint16 `cbor:"cs"`
+	}{
+		Stream: api.ExecStreamWinch,
+		Rows:   70000,
+		Cols:   100,
+	})
+	if err != nil {
+		t.Fatalf("marshal oversized winch frame: %v", err)
 	}
-	mask := [4]byte{0x11, 0x22, 0x33, 0x44}
-	masked := append([]byte(nil), payload...)
-	for i := range masked {
-		masked[i] ^= mask[i%4]
-	}
-	if _, err := c.Write(header); err != nil {
-		return err
-	}
-	if _, err := c.Write(mask[:]); err != nil {
-		return err
-	}
-	_, err := c.Write(masked)
-	return err
+	return payload
 }
 
-func readExecFrameMatching(t *testing.T, c *wsTestConn, stream string, timeout time.Duration) ExecFrame {
+func writeClientFrame(c net.Conn, op wsbits.Opcode, payload []byte) error {
+	return wsbits.WriteFrame(c, op, payload, true)
+}
+
+func oversizedMaskedFrameHeader(n uint64) []byte {
+	frame := []byte{0x80 | byte(wsbits.OpBinary), 0x80 | 127, 0, 0, 0, 0, 0, 0, 0, 0}
+	binary.BigEndian.PutUint64(frame[2:10], n)
+	frame = append(frame, 0, 0, 0, 0)
+	return frame
+}
+
+func readExecFrameMatching(t *testing.T, c *wsTestConn, stream string, timeout time.Duration) api.ExecFrame {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
@@ -612,16 +846,16 @@ func readExecFrameMatching(t *testing.T, c *wsTestConn, stream string, timeout t
 		if f.Stream == stream {
 			return f
 		}
-		if f.Stream == ExecStreamError || f.Stream == ExecStreamExit {
+		if f.Stream == api.ExecStreamError || f.Stream == api.ExecStreamExit {
 			t.Fatalf("got terminal frame before %s: %+v", stream, f)
 		}
 	}
 }
 
-func readExecFramesUntilExit(t *testing.T, c *wsTestConn, timeout time.Duration) []ExecFrame {
+func readExecFramesUntilExit(t *testing.T, c *wsTestConn, timeout time.Duration) []api.ExecFrame {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
-	var frames []ExecFrame
+	var frames []api.ExecFrame
 	for {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -630,87 +864,93 @@ func readExecFramesUntilExit(t *testing.T, c *wsTestConn, timeout time.Duration)
 		f := readExecFrame(t, c, remaining)
 		frames = append(frames, f)
 		switch f.Stream {
-		case ExecStreamExit:
+		case api.ExecStreamExit:
 			return frames
-		case ExecStreamError:
+		case api.ExecStreamError:
 			t.Fatalf("error frame: %s", string(f.Data))
 		}
 	}
 }
 
-func readExecFrame(t *testing.T, c *wsTestConn, timeout time.Duration) ExecFrame {
+func readExecFramesUntilStdoutContains(t *testing.T, c *wsTestConn, want string, timeout time.Duration) []api.ExecFrame {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var frames []api.ExecFrame
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("timed out waiting for stdout containing %q; got %+v", want, frames)
+		}
+		f := readExecFrame(t, c, remaining)
+		frames = append(frames, f)
+		switch f.Stream {
+		case api.ExecStreamStdout:
+			if strings.Contains(cleanPtyOutput(joinFrameData(frames, api.ExecStreamStdout)), want) {
+				return frames
+			}
+		case api.ExecStreamExit, api.ExecStreamError:
+			t.Fatalf("terminal frame before stdout contained %q: %+v", want, f)
+		}
+	}
+}
+
+func assertNoTerminalFrameWithin(t *testing.T, c *wsTestConn, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		op, payload, err := readServerFrame(c, remaining)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				return
+			}
+			t.Fatalf("read server frame: %v", err)
+		}
+		if op != wsbits.OpBinary {
+			continue
+		}
+		f, err := api.DecodeExecFrame(payload)
+		if err != nil {
+			t.Fatalf("api.DecodeExecFrame: %v", err)
+		}
+		if f.Stream == api.ExecStreamExit || f.Stream == api.ExecStreamError {
+			t.Fatalf("terminal frame arrived during no-op window: %+v", f)
+		}
+	}
+}
+
+func readExecFrame(t *testing.T, c *wsTestConn, timeout time.Duration) api.ExecFrame {
 	t.Helper()
 	for {
 		op, payload, err := readServerFrame(c, timeout)
 		if err != nil {
 			t.Fatalf("read server frame: %v", err)
 		}
-		if op == opClose {
+		if op == wsbits.OpClose {
 			t.Fatal("server close before exec terminal frame")
 		}
-		if op != opBinary {
+		if op != wsbits.OpBinary {
 			continue
 		}
-		f, err := DecodeExecFrame(payload)
+		f, err := api.DecodeExecFrame(payload)
 		if err != nil {
-			t.Fatalf("DecodeExecFrame: %v", err)
+			t.Fatalf("api.DecodeExecFrame: %v", err)
 		}
 		return f
 	}
 }
 
-func readServerFrame(c *wsTestConn, timeout time.Duration) (wsOpcode, []byte, error) {
+func readServerFrame(c *wsTestConn, timeout time.Duration) (wsbits.Opcode, []byte, error) {
 	_ = c.SetReadDeadline(time.Now().Add(timeout))
 	defer c.SetReadDeadline(time.Time{})
 
-	var header [2]byte
-	if _, err := io.ReadFull(c.br, header[:]); err != nil {
-		return 0, nil, err
-	}
-	op := wsOpcode(header[0] & 0x0f)
-	n, err := readServerPayloadLen(c.br, header[1]&0x7f)
-	if err != nil {
-		return 0, nil, err
-	}
-	masked := header[1]&0x80 != 0
-	var mask [4]byte
-	if masked {
-		if _, err := io.ReadFull(c.br, mask[:]); err != nil {
-			return 0, nil, err
-		}
-	}
-	payload := make([]byte, int(n))
-	if _, err := io.ReadFull(c.br, payload); err != nil {
-		return 0, nil, err
-	}
-	if masked {
-		for i := range payload {
-			payload[i] ^= mask[i%4]
-		}
-	}
-	return op, payload, nil
+	return wsbits.ReadFrame(c.br, false)
 }
 
-func readServerPayloadLen(r io.Reader, len7 byte) (uint64, error) {
-	switch len7 {
-	case 126:
-		var b [2]byte
-		if _, err := io.ReadFull(r, b[:]); err != nil {
-			return 0, err
-		}
-		return uint64(binary.BigEndian.Uint16(b[:])), nil
-	case 127:
-		var b [8]byte
-		if _, err := io.ReadFull(r, b[:]); err != nil {
-			return 0, err
-		}
-		return binary.BigEndian.Uint64(b[:]), nil
-	default:
-		return uint64(len7), nil
-	}
-}
-
-func joinFrameData(frames []ExecFrame, stream string) string {
+func joinFrameData(frames []api.ExecFrame, stream string) string {
 	var b strings.Builder
 	for _, f := range frames {
 		if f.Stream == stream {
@@ -720,9 +960,23 @@ func joinFrameData(frames []ExecFrame, stream string) string {
 	return b.String()
 }
 
-func lastExitCode(frames []ExecFrame) int {
+func cleanPtyOutput(s string) string {
+	return strings.ReplaceAll(s, "\r", "")
+}
+
+func countFrames(frames []api.ExecFrame, stream string) int {
+	var n int
+	for _, f := range frames {
+		if f.Stream == stream {
+			n++
+		}
+	}
+	return n
+}
+
+func lastExitCode(frames []api.ExecFrame) int {
 	for i := len(frames) - 1; i >= 0; i-- {
-		if frames[i].Stream == ExecStreamExit {
+		if frames[i].Stream == api.ExecStreamExit {
 			return frames[i].Code
 		}
 	}
@@ -745,6 +999,17 @@ func waitAuditLines(t *testing.T, path string, want int, timeout time.Duration) 
 	b, _ := os.ReadFile(path)
 	t.Fatalf("audit log did not reach %d lines:\n%s", want, string(b))
 	return nil
+}
+
+func auditFields(line string) map[string]string {
+	fields := make(map[string]string)
+	for _, col := range strings.Split(line, "\t") {
+		k, v, ok := strings.Cut(col, "=")
+		if ok {
+			fields[k] = v
+		}
+	}
+	return fields
 }
 
 func settledGoroutines() int {

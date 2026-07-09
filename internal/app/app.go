@@ -9,20 +9,21 @@ import (
 	"os/user"
 	"strconv"
 
-	"github.com/VikashLoomba/Portal/internal/agentclient"
 	"github.com/VikashLoomba/Portal/internal/audit"
 	"github.com/VikashLoomba/Portal/internal/bootstrap"
+	"github.com/VikashLoomba/Portal/internal/clipshim"
 	"github.com/VikashLoomba/Portal/internal/clock"
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/discover"
 	"github.com/VikashLoomba/Portal/internal/forward"
-	"github.com/VikashLoomba/Portal/internal/hub"
 	"github.com/VikashLoomba/Portal/internal/proc"
-	"github.com/VikashLoomba/Portal/internal/run"
 	"github.com/VikashLoomba/Portal/internal/service"
-	"github.com/VikashLoomba/Portal/internal/sshctl"
-	"github.com/VikashLoomba/Portal/internal/sshnative"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/agentclient"
+	"github.com/VikashLoomba/Portal/pkg/hub"
+	"github.com/VikashLoomba/Portal/pkg/run"
+	"github.com/VikashLoomba/Portal/pkg/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport/sshctl"
+	"github.com/VikashLoomba/Portal/pkg/transport/sshnative"
 )
 
 // App is the dependency container. NewProd wires real adapters; tests build
@@ -115,6 +116,7 @@ func NewProd() (*App, error) {
 		Log:        slogger,
 		StderrSink: os.Stderr,
 		Hub:        h,
+		ClipShim:   clipShimAdapter{},
 	})
 	rd := discover.NewAgent(ac)
 
@@ -222,13 +224,19 @@ func (e errTransport) Stream(context.Context, ...string) (io.WriteCloser, io.Rea
 func (e errTransport) Close(context.Context) (bool, error) { return false, nil }
 
 func (e errTransport) Describe() transport.Desc {
-	return transport.Desc{Impl: "unavailable", Endpoint: e.err.Error()}
+	return transport.Desc{Impl: transport.ImplUnavailable, Endpoint: e.err.Error()}
 }
 
 func (e errTransport) Forward(context.Context, int, int) error        { return e.err }
 func (e errTransport) Cancel(context.Context, int, int) error         { return e.err }
 func (e errTransport) ListForwards(context.Context) ([]int, error)    { return nil, e.err }
 func (e errTransport) ForwardLines(context.Context) ([]string, error) { return nil, e.err }
+
+type clipShimAdapter struct{}
+
+func (clipShimAdapter) Ensure(ctx context.Context, t transport.Transport) error {
+	return clipshim.Ensure(ctx, t)
+}
 
 // Engine constructs a fresh forward.Engine using the App's wiring. The
 // engine is event-driven via AgentClient.Events(). Callers that want to

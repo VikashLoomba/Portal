@@ -10,7 +10,7 @@ import (
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/clip"
 	"github.com/VikashLoomba/Portal/internal/clipupload"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // clipUploadReachable gates the live clip upload on transport liveness: Ensure

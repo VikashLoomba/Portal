@@ -13,7 +13,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 type execRecord struct {

@@ -13,9 +13,8 @@ import (
 	"time"
 
 	"github.com/VikashLoomba/Portal/internal/app"
-	"github.com/VikashLoomba/Portal/internal/hub"
-	"github.com/VikashLoomba/Portal/internal/localapi"
-	"github.com/VikashLoomba/Portal/internal/localclient"
+	"github.com/VikashLoomba/Portal/pkg/api"
+	"github.com/VikashLoomba/Portal/pkg/hub"
 )
 
 // syncBuffer is a mutex-guarded bytes.Buffer so the test goroutine polling the
@@ -90,11 +89,11 @@ func TestRunStatusWatch_RerenderThenShutdown(t *testing.T) {
 func TestWatchLoop_DrainsFinalStateOnStreamEnd(t *testing.T) {
 	cfg := newTestConfig(t, "devbox")
 	a := newDaemonTestApp(t, filepath.Join(t.TempDir(), "unused.sock"), cfg)
-	st := localapi.Status{Host: "devbox"}
+	st := api.Status{Host: "devbox"}
 
 	for i := 0; i < 200; i++ {
-		events := make(chan localclient.Event, 16)
-		events <- localclient.Event{Type: "state", Status: &st}
+		events := make(chan api.Event, 16)
+		events <- api.Event{Type: "state", Status: &st}
 		errc := make(chan error, 1)
 		errc <- nil // clean EOF terminal, ready simultaneously with the buffered state
 

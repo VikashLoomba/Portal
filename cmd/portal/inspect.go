@@ -12,9 +12,10 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/VikashLoomba/Portal/internal/app"
-	"github.com/VikashLoomba/Portal/internal/localapi"
-	"github.com/VikashLoomba/Portal/internal/localclient"
 	"github.com/VikashLoomba/Portal/internal/logfile"
+	"github.com/VikashLoomba/Portal/pkg/api"
+	"github.com/VikashLoomba/Portal/pkg/client"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 func newStatusCmd(a *app.App) *cobra.Command {
@@ -40,7 +41,7 @@ func newStatusCmd(a *app.App) *cobra.Command {
 // and EOFs the stream (§5.2). A watch has nothing to watch when the daemon is
 // down, so an unreachable daemon prints one polite line and exits non-zero.
 func runStatusWatch(ctx context.Context, w, errw io.Writer, a *app.App) error {
-	lc := localclient.New(a.Paths.APISock)
+	lc := client.New(a.Paths.APISock)
 	if !lc.Available(ctx) {
 		fmt.Fprintf(errw, "%s status --watch needs the running daemon; run `%s status` instead\n", app.Tool, app.Tool)
 		return errSilent
@@ -55,7 +56,7 @@ func runStatusWatch(ctx context.Context, w, errw io.Writer, a *app.App) error {
 
 // renderEvent renders a snapshot/state event's Status; notify/tick carry no
 // Status and are ignored.
-func renderEvent(w io.Writer, a *app.App, ev localclient.Event) {
+func renderEvent(w io.Writer, a *app.App, ev api.Event) {
 	if ev.Type == "snapshot" || ev.Type == "state" {
 		if ev.Status != nil {
 			renderStatus(w, viewFromStatus(a, *ev.Status))
@@ -71,7 +72,7 @@ func renderEvent(w io.Writer, a *app.App, ev localclient.Event) {
 // terminal can be ready simultaneously; a bare `return nil` on `errc` would let
 // select drop that last state render (daemon publishes a final state, then
 // shuts down immediately). Draining guarantees the last truth is rendered.
-func watchLoop(ctx context.Context, w io.Writer, a *app.App, events <-chan localclient.Event, errc <-chan error) error {
+func watchLoop(ctx context.Context, w io.Writer, a *app.App, events <-chan api.Event, errc <-chan error) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -121,9 +122,9 @@ type statusView struct {
 	masterPID  int
 	sock       string
 	// impl is the active transport's Describe().Impl. renderStatus prints an
-	// extra `transport: <impl>` line IFF impl is non-empty AND != "system-ssh",
+	// extra `transport: <impl>` line IFF impl is non-empty AND non-system,
 	// so the default (system) path stays byte-identical (T8/T9).
-	impl     string
+	impl     transport.Impl
 	agent    *statusAgentView
 	forwards []string
 }
@@ -157,7 +158,7 @@ func renderStatus(w io.Writer, v statusView) {
 		// system ssh. Omit it and surface the active transport unconditionally
 		// (mirroring runDoctor), so a DOWN native connection still says which
 		// transport is failing (T8). System-ssh stays byte-identical (T8/T9).
-		if v.impl != "" && v.impl != "system-ssh" {
+		if v.impl != "" && v.impl != transport.ImplSystemSSH {
 			fmt.Fprintf(w, "ssh master: DOWN (host=%s)\n", v.host)
 			fmt.Fprintf(w, "transport: %s\n", v.impl)
 		} else {
@@ -168,7 +169,7 @@ func renderStatus(w io.Writer, v statusView) {
 	fmt.Fprintf(w, "ssh master: UP (pid=%d) host=%s\n", v.masterPID, v.host)
 	// Surface the active transport only when it is NOT the default system ssh —
 	// the system path stays byte-identical (T8/T9).
-	if v.impl != "" && v.impl != "system-ssh" {
+	if v.impl != "" && v.impl != transport.ImplSystemSSH {
 		fmt.Fprintf(w, "transport: %s\n", v.impl)
 	}
 	if v.agent != nil {
@@ -193,7 +194,7 @@ func truncSHA(sha string) string {
 
 // viewFromStatus builds a statusView from the daemon's Status aggregate. The
 // agent line is present iff the daemon reported a handshaked agent.
-func viewFromStatus(a *app.App, st localapi.Status) statusView {
+func viewFromStatus(a *app.App, st api.Status) statusView {
 	v := statusView{
 		host:       st.Host,
 		label:      a.Paths.Label,
@@ -203,7 +204,7 @@ func viewFromStatus(a *app.App, st localapi.Status) statusView {
 		masterUp:   st.Master.Up,
 		masterPID:  st.Master.Pid,
 		sock:       a.Paths.Sock,
-		impl:       st.Master.Transport, // carried over the wire by localapi (u2).
+		impl:       transport.Impl(st.Master.Transport), // carried over the wire by localapi (u2).
 	}
 	for _, f := range st.Forwards {
 		v.forwards = append(v.forwards, f.Name)
@@ -267,10 +268,10 @@ func runStatus(ctx context.Context, a *app.App) error {
 
 // runStatusTo renders `portal status` to w. It sources from the daemon over
 // Paths.APISock when it answers, else falls back to the local file/lsof view.
-// Any localclient error (no socket / dead socket / hung server) silently takes
+// Any client error (no socket / dead socket / hung server) silently takes
 // the local branch — a status invocation never spams stderr (§5.2).
 func runStatusTo(ctx context.Context, w io.Writer, a *app.App) error {
-	lc := localclient.New(a.Paths.APISock)
+	lc := client.New(a.Paths.APISock)
 	if st, err := lc.Status(ctx); err == nil {
 		renderStatus(w, viewFromStatus(a, st))
 		return nil
@@ -296,7 +297,7 @@ func newPortsCmd(a *app.App) *cobra.Command {
 // the header only — we deliberately do NOT spin a CLI-side agent alongside the
 // daemon's. Any dial/transport error falls through to today's exact behavior.
 func runPorts(ctx context.Context, w, errw io.Writer, a *app.App) error {
-	lc := localclient.New(a.Paths.APISock)
+	lc := client.New(a.Paths.APISock)
 	ports, err := lc.Ports(ctx)
 	if err == nil {
 		host, _ := a.Cfg.ReadHost()
@@ -306,7 +307,7 @@ func runPorts(ctx context.Context, w, errw io.Writer, a *app.App) error {
 		}
 		return nil
 	}
-	if errors.Is(err, localclient.ErrNotConnected) {
+	if errors.Is(err, client.ErrNotConnected) {
 		host, _ := a.Cfg.ReadHost()
 		fmt.Fprintf(w, "loopback dev ports listening on %s (will be forwarded):\n", host)
 		return nil

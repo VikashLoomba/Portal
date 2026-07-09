@@ -8,15 +8,15 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/VikashLoomba/Portal/internal/agentclient"
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/audit"
 	"github.com/VikashLoomba/Portal/internal/clip"
 	"github.com/VikashLoomba/Portal/internal/clipupload"
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/forward"
-	"github.com/VikashLoomba/Portal/internal/protocol"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/agentclient"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // errFake is an injectable read failure so a test can drive the

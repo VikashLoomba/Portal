@@ -10,7 +10,7 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/config"
-	"github.com/VikashLoomba/Portal/internal/sshnative"
+	"github.com/VikashLoomba/Portal/pkg/transport/sshnative"
 )
 
 // The no-arg form prints the ACTIVE transport's Describe().Impl unconditionally

@@ -8,7 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/VikashLoomba/Portal/internal/app"
-	"github.com/VikashLoomba/Portal/internal/sshnative"
+	"github.com/VikashLoomba/Portal/pkg/transport/sshnative"
 )
 
 // validateNativeHost reports whether host RESOLVES via ssh_config to a native

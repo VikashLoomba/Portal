@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // RemoteDir is where uploaded clipboard images land on the dev box.

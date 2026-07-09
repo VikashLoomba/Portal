@@ -16,7 +16,7 @@ import (
 	"github.com/VikashLoomba/Portal/internal/clock"
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/discover"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // LocalPorts is the narrow LOCAL-port query surface the engine keeps for its

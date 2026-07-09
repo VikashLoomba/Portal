@@ -14,15 +14,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VikashLoomba/Portal/internal/agent"
-	"github.com/VikashLoomba/Portal/internal/agent/watcher"
-	"github.com/VikashLoomba/Portal/internal/agentclient"
 	"github.com/VikashLoomba/Portal/internal/bootstrap"
 	"github.com/VikashLoomba/Portal/internal/config"
-	"github.com/VikashLoomba/Portal/internal/doctor"
-	"github.com/VikashLoomba/Portal/internal/hub"
-	"github.com/VikashLoomba/Portal/internal/protocol"
-	"github.com/VikashLoomba/Portal/internal/transport"
+	"github.com/VikashLoomba/Portal/pkg/agent"
+	"github.com/VikashLoomba/Portal/pkg/agent/watcher"
+	"github.com/VikashLoomba/Portal/pkg/agentclient"
+	"github.com/VikashLoomba/Portal/pkg/api"
+	"github.com/VikashLoomba/Portal/pkg/doctor"
+	"github.com/VikashLoomba/Portal/pkg/hub"
+	"github.com/VikashLoomba/Portal/pkg/protocol"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 // integStreamTransport is the transport.Transport for the full-stack integration
@@ -191,7 +192,7 @@ func startIntegDaemon(t *testing.T, snapshot []watcher.Listen, tick time.Duratio
 	go func() { defer close(clientDone); _ = c.Run(ctx) }()
 
 	deps := Deps{
-		Version: VersionInfo{Version: "9.9", GitSHA: sha, ProtoVersion: protocol.ProtoVersion},
+		Version: api.VersionInfo{Version: "9.9", GitSHA: sha, ProtoVersion: protocol.ProtoVersion},
 		Host:    func() (string, error) { return "testhost", nil },
 		Agent:   c,
 		Master:  tr,
@@ -270,7 +271,7 @@ func waitSnapshot(t *testing.T, c *agentclient.Client) {
 }
 
 // getStatus fetches and decodes GET /v1/status over the socket.
-func getStatus(t *testing.T, path string) Status {
+func getStatus(t *testing.T, path string) api.Status {
 	t.Helper()
 	resp, err := unixClient(path).Get("http://unix/v1/status")
 	if err != nil {
@@ -280,7 +281,7 @@ func getStatus(t *testing.T, path string) Status {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /v1/status = %d, want 200", resp.StatusCode)
 	}
-	var st Status
+	var st api.Status
 	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
 		t.Fatalf("decode Status: %v", err)
 	}
@@ -407,7 +408,7 @@ func TestIntegration_SingleInstanceLive(t *testing.T) {
 	}
 }
 
-func hasPort(ports []PortStatus, port int) bool {
+func hasPort(ports []api.PortStatus, port int) bool {
 	for _, p := range ports {
 		if p.Port == port {
 			return true
