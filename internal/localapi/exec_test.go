@@ -407,7 +407,12 @@ func TestExecClientDisconnectCancelsStream(t *testing.T) {
 	path, _ := startExecServer(t, config.New(t.TempDir()), a, localexec.New())
 	baseline := runtime.NumGoroutine()
 
-	c := dialExecWS(t, path, []string{"sh", "-c", "'sleep 30; echo hi'"})
+	// `exec sleep` (not `sleep; echo`) so the shell execs into sleep and sleep
+	// becomes the process cancel()'s SIGKILL directly reaches. A forked child
+	// would be orphaned on disconnect and hold the stdout pipe open until it
+	// exits 30s later, delaying ExecClose past any sane audit-wait (this is the
+	// exact shape that failed on Linux CI).
+	c := dialExecWS(t, path, []string{"exec", "sleep", "30"})
 	_ = c.Close()
 
 	_ = waitAuditLines(t, a.Path(), 2, 5*time.Second)
@@ -448,8 +453,10 @@ func TestExecBridgeNoGoroutineLeakAcrossOrderings(t *testing.T) {
 		// The process sleeps far longer than the settle window below. Passing
 		// this test proves the connection close cancels Stream instead of
 		// leaving bridge goroutines blocked until the remote command exits
-		// naturally (which would need 30s, not the 8s window).
-		disconnected := dialExecWS(t, path, []string{"sh", "-c", "'sleep 30; echo hi'"})
+		// naturally (which would need 30s, not the 8s window). `exec sleep` so
+		// the shell execs into sleep and cancel()'s SIGKILL reaches it directly
+		// rather than orphaning a forked child that holds the pipe open.
+		disconnected := dialExecWS(t, path, []string{"exec", "sleep", "30"})
 		_ = disconnected.Close()
 
 		nonZero := dialExecWS(t, path, []string{"sh", "-c", "'exit 4'"})
