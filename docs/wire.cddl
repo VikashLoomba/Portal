@@ -1,0 +1,313 @@
+; Portal wire format, Stage 6 extraction unit u10.
+;
+; This file is the language-neutral CBOR contract for the protocol package
+; Envelope and the exec WebSocket subprotocol. Raw PF frame and WebSocket bytes
+; are documented in comments because CDDL describes CBOR data items.
+;
+; Manual validation command (Ruby cddl gem, review-only; not in the gate):
+;   cddl docs/wire.cddl validate /tmp/portal-wire-examples.cbor
+
+portal-cbor = envelope / exec-frame / msg-payload
+
+; PF frame:
+;   byte 0..1: 0x50 0x46 ("PF")
+;   byte 2..5: uint32 big-endian payload length
+;   bytes 6..: CBOR envelope
+;
+; The length is capped at 1048576 bytes (protocol.MaxFrameBytes, 1 MiB).
+; The protocol version is Hello.pv / HelloAck.pv and is currently 4.
+; ProtoVersion mismatch is fatal: v4 is the generic Msg service-frame wire
+; shape and peers must negotiate exactly that version during Hello/HelloAck.
+; Envelope is a tagged union: exactly one of the 14 one-key maps below is
+; present per PF frame.
+; The Go protocol encoder uses fxamacker/cbor SortNone: map order is not part
+; of the language-neutral contract, but the committed Go vectors pin this
+; encoder's stable byte output as a codec-drift guard.
+
+envelope = hello-envelope
+         / subscribe-envelope
+         / ping-envelope
+         / req-snap-envelope
+         / shutdown-envelope
+         / hello-ack-envelope
+         / subscribe-ack-envelope
+         / snapshot-envelope
+         / port-added-envelope
+         / port-removed-envelope
+         / heartbeat-envelope
+         / agent-error-envelope
+         / bye-envelope
+         / msg-envelope
+
+; client-to-agent Envelope arms
+
+hello-envelope = {
+  "hello" => hello
+}
+
+subscribe-envelope = {
+  "subscribe" => subscribe
+}
+
+ping-envelope = {
+  "ping" => ping
+}
+
+req-snap-envelope = {
+  "req_snap" => req-snap
+}
+
+shutdown-envelope = {
+  "shutdown" => shutdown
+}
+
+; agent-to-client Envelope arms
+
+hello-ack-envelope = {
+  "hello_ack" => hello-ack
+}
+
+subscribe-ack-envelope = {
+  "subscribe_ack" => subscribe-ack
+}
+
+snapshot-envelope = {
+  "snapshot" => snapshot
+}
+
+port-added-envelope = {
+  "port_added" => port-added
+}
+
+port-removed-envelope = {
+  "port_removed" => port-removed
+}
+
+heartbeat-envelope = {
+  "heartbeat" => heartbeat
+}
+
+agent-error-envelope = {
+  "agent_error" => agent-error
+}
+
+bye-envelope = {
+  "bye" => bye
+}
+
+; v4 generic service Envelope arm, either direction.
+
+msg-envelope = {
+  "msg" => msg
+}
+
+hello = {
+  "pv" => uint32,
+  "sha" => tstr,
+  "pid" => int,
+  "poll_ms" => uint32,
+  "destroy_mc" => bool,
+  ? "services" => service-versions
+}
+
+hello-ack = {
+  "pv" => uint32,
+  "sha" => tstr,
+  "pid" => int,
+  "kern" => tstr,
+  "boot" => tstr,
+  "emin" => uint16,
+  "emax" => uint16,
+  "now" => int64,
+  ? "services" => service-versions
+}
+
+service-versions = {
+  * service-name => uint32
+}
+
+service-name = tstr
+
+subscribe = {
+  "deny" => [* uint16],
+  "allow" => [* uint16],
+  "exc_eph" => bool,
+  "rsid" => uint64
+}
+
+subscribe-ack = {
+  "rsid" => uint64
+}
+
+snapshot = {
+  "seq" => uint64,
+  "ts" => int64,
+  "ports" => [* port]
+}
+
+port-added = {
+  "seq" => uint64,
+  "p" => port,
+  "ts" => int64
+}
+
+port-removed = {
+  "seq" => uint64,
+  "port" => uint16,
+  "fam" => uint8,
+  "ts" => int64,
+  "src" => uint8
+}
+
+heartbeat = {
+  "seq" => uint64,
+  "up" => int64,
+  "now" => int64,
+  ? "n" => uint64
+}
+
+ping = {
+  "n" => uint64
+}
+
+req-snap = {}
+
+shutdown = {
+  ? "reason" => tstr
+}
+
+bye = {
+  ? "reason" => tstr
+}
+
+agent-error = {
+  "code" => uint16,
+  "msg" => tstr,
+  "fatal" => bool
+}
+
+msg = {
+  "svc" => tstr,
+  "k" => tstr,
+  ? "seq" => uint64,
+  ? "p" => msg-payload
+}
+
+port = {
+  "port" => uint16,
+  "fam" => uint8,
+  "addr" => tstr,
+  "ns" => uint32
+}
+
+; Service payload structs embedded as Msg.p CBOR items. Msg.p is
+; cbor.RawMessage on the Go side, so these maps are nested directly, not bstr.
+
+msg-payload = open-url / clip-request / clip-response / notify
+
+open-url = {
+  "url" => tstr,
+  "seq" => uint64
+}
+
+clip-request = {
+  "n" => uint64,
+  "e" => uint64,
+  "kind" => tstr,
+  ? "fmt" => tstr
+}
+
+clip-response = {
+  "n" => uint64,
+  "e" => uint64,
+  "ok" => bool,
+  ? "has" => bool,
+  ? "k" => tstr,
+  ? "sha" => tstr,
+  ? "err" => tstr
+}
+
+notify = {
+  "title" => tstr,
+  ? "body" => tstr,
+  ? "sub" => tstr,
+  ? "urg" => uint8,
+  ? "verified" => bool,
+  ? "src" => tstr,
+  ? "sound" => tstr
+}
+
+; Exec WebSocket subprotocol:
+;
+; Client opens HTTP over the local Unix domain socket:
+;   POST /v1/exec?arg=...&pty=1&term=<name>&rows=<n>&cols=<n> HTTP/1.1
+;   Host: unix
+;   Upgrade: websocket
+;   Connection: Upgrade
+;   Sec-WebSocket-Version: 13
+;   Sec-WebSocket-Key: <base64 16-byte nonce>
+;   Content-Length: 0
+;
+; The daemon validates the WebSocket headers before hijack and responds:
+;   HTTP/1.1 101 Switching Protocols
+;   Upgrade: websocket
+;   Connection: Upgrade
+;   Sec-WebSocket-Accept: base64(sha1(Sec-WebSocket-Key || RFC6455-GUID))
+;   X-Portal-Exec-Pty: 1
+;
+; X-Portal-Exec-Pty is present only when PTY mode was requested and granted.
+; If pty=1 cannot be served by the active transport, the daemon returns HTTP
+; 409 with JSON code "pty_unsupported" before upgrading.
+;
+; Binary WebSocket messages carry one bare exec-frame CBOR item. There is no PF
+; prefix inside the WebSocket. Max WebSocket payload is 16777216 bytes
+; (wsbits.MaxPayload, 16 MiB). Fragmented messages are rejected. Client-to-
+; server WebSocket frames MUST be masked; server-to-client frames MUST be
+; unmasked.
+
+exec-frame = {
+  "s" => exec-stream,
+  ? "d" => bstr,
+  ? "c" => int,
+  ? "rs" => uint16,
+  ? "cs" => uint16
+}
+
+exec-stream = "stdin"
+            / "stdout"
+            / "stderr"
+            / "exit"
+            / "error"
+            / "winch"
+
+; Exec stream-tag state machine:
+;
+; client-to-server:
+;   stdin: d carries bytes to remote stdin.
+;   winch: rs/cs carry terminal rows/cols in PTY mode.
+;
+; server-to-client:
+;   stdout: stdout bytes. In PTY mode this is the only output stream because a
+;     pty merges stdout and stderr.
+;   stderr: stderr bytes in non-PTY mode only.
+;   exit: terminal success/status frame; c is the remote process exit code.
+;   error: terminal error frame; d is a UTF-8 diagnostic string.
+;
+; EOF semantics:
+;   In non-PTY mode, a zero-length stdin frame closes the remote stdin write
+;   side. In PTY mode, a zero-length stdin frame is a documented no-op: a pty
+;   master cannot half-close its write side, so interactive PTY sessions end by
+;   process exit or client disconnect, not stdin EOF.
+;
+; ExecFrame decoding intentionally uses default CBOR unmarshal and MUST NOT
+; enable unknown-field errors; additive fields such as rs/cs depend on unknown
+; key tolerance.
+;
+; The local HTTP+JSON API is specified by internal/localapi/openapi.yaml.
+; Local API auth is peer uid over the Unix socket; there are no bearer tokens.
+
+uint8 = 0..255
+uint16 = 0..65535
+uint32 = 0..4294967295
+uint64 = 0..18446744073709551615
+int64 = -9223372036854775808..9223372036854775807

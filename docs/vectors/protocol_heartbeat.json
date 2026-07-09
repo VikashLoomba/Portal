@@ -1,0 +1,1 @@
+{"Hello":null,"Subscribe":null,"Ping":null,"ReqSnap":null,"Shutdown":null,"HelloAck":null,"SubscribeAck":null,"Snapshot":null,"PortAdded":null,"PortRemoved":null,"Heartbeat":{"Seq":1004,"UptimeNano":9876543210,"Now":1720000000555666777,"Nonce":1234605616436508552},"AgentError":null,"Bye":null,"Msg":null}
