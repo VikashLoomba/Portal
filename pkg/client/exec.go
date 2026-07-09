@@ -189,25 +189,27 @@ readLoop:
 	if winchDone != nil {
 		<-winchDone
 	}
+	if gotExit {
+		// Non-deadline terminal readers can remain blocked after a terminal
+		// frame. The pump's done channel is buffered, so abandoning it cannot
+		// strand a sender; the goroutine exits when the Read eventually unblocks.
+		return exitCode, nil
+	}
+	if terminalErr != nil {
+		// Same blocked-reader constraint as clean exit: the remote terminal
+		// frame is authoritative, so return it without waiting for stdin.
+		return 0, terminalErr
+	}
 	if stdinDone != nil {
 		select {
 		case pumpErr = <-stdinDone:
 		case <-ctx.Done():
 			// A non-deadline-aware stdin reader can remain blocked after the
 			// connection closes; that pump exits only when its Read unblocks.
-			if gotExit {
-				return exitCode, nil
-			}
 			return 0, ctx.Err()
 		}
 	}
 
-	if gotExit {
-		return exitCode, nil
-	}
-	if terminalErr != nil {
-		return 0, terminalErr
-	}
 	if ctx.Err() != nil {
 		return 0, ctx.Err()
 	}

@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -33,11 +36,12 @@ func newExecCmd(a *app.App) *cobra.Command {
 			if dash >= 0 {
 				argv = args[dash:]
 			}
+			if dash < 0 && len(args) > 0 {
+				return usageErr{msg: "usage: portal exec -- <cmd...>"}
+			}
 
 			forceTTY, _ := cmd.Flags().GetBool("tty")
 			noTTY, _ := cmd.Flags().GetBool("no-tty")
-			stdinFD := int(os.Stdin.Fd())
-			stdoutFD := int(os.Stdout.Fd())
 			isTerminal := execIsTerminal
 			makeRaw := execMakeRaw
 			getSize := execGetSize
@@ -47,12 +51,12 @@ func newExecCmd(a *app.App) *cobra.Command {
 			switch {
 			case noTTY:
 			case forceTTY:
-				if !isTerminal(stdinFD) || !isTerminal(stdoutFD) {
+				if !isTerminal(syscall.Stdin) || !isTerminal(syscall.Stdout) {
 					return fmt.Errorf("cannot allocate tty: stdin/stdout is not a terminal")
 				}
 				pty = true
 			default:
-				pty = len(argv) == 0 && isTerminal(stdinFD) && isTerminal(stdoutFD)
+				pty = len(argv) == 0 && isTerminal(syscall.Stdin) && isTerminal(syscall.Stdout)
 			}
 			if !pty && len(argv) == 0 {
 				return usageErr{msg: "usage: portal exec -- <cmd...>"}
@@ -60,11 +64,16 @@ func newExecCmd(a *app.App) *cobra.Command {
 
 			lc := client.New(a.Paths.APISock)
 			if pty {
+				stdinFD := int(os.Stdin.Fd())
 				restore, err := makeRaw(stdinFD)
 				if err != nil {
 					return err
 				}
-				defer func() { _ = restore() }()
+				restoreOnce, stopSignalRestore := execRawRestoreWithSignals(restore)
+				defer func() {
+					stopSignalRestore()
+					_ = restoreOnce()
+				}()
 
 				rows, cols, err := getSize(stdinFD)
 				if err != nil {
@@ -121,6 +130,38 @@ func newExecCmd(a *app.App) *cobra.Command {
 	cmd.Flags().BoolP("tty", "t", false, "allocate a pseudo-terminal")
 	cmd.Flags().BoolP("no-tty", "T", false, "disable pseudo-terminal allocation")
 	return cmd
+}
+
+func execRawRestoreWithSignals(restore func() error) (func() error, func()) {
+	var once sync.Once
+	var restoreErr error
+	restoreOnce := func() error {
+		once.Do(func() { restoreErr = restore() })
+		return restoreErr
+	}
+
+	sigc := make(chan os.Signal, 1)
+	done := make(chan struct{})
+	signal.Notify(sigc, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		select {
+		case sig := <-sigc:
+			// Raw mode clears ISIG, so keyboard Ctrl-C is sent to the remote;
+			// this path restores only for externally delivered process signals.
+			_ = restoreOnce()
+			signal.Reset(sig)
+			if s, ok := sig.(syscall.Signal); ok {
+				_ = syscall.Kill(os.Getpid(), s)
+			}
+		case <-done:
+		}
+	}()
+
+	stop := func() {
+		signal.Stop(sigc)
+		close(done)
+	}
+	return restoreOnce, stop
 }
 
 func printExecError(cmd *cobra.Command, err error) {

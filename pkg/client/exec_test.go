@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -255,6 +256,72 @@ func TestExecWithOptionsPTYDisconnectKillsForegroundProcess(t *testing.T) {
 	}
 }
 
+func TestExecWithOptionsTerminalFrameReturnsWithBlockedStdin(t *testing.T) {
+	tests := []struct {
+		name       string
+		frames     []api.ExecFrame
+		wantCode   int
+		wantErr    string
+		wantStdout string
+	}{
+		{
+			name: "clean exit",
+			frames: []api.ExecFrame{
+				{Stream: api.ExecStreamStdout, Data: []byte("done\n")},
+				{Stream: api.ExecStreamExit, Code: 17},
+			},
+			wantCode:   17,
+			wantStdout: "done\n",
+		},
+		{
+			name: "terminal error",
+			frames: []api.ExecFrame{
+				{Stream: api.ExecStreamError, Data: []byte("remote failed")},
+			},
+			wantErr: "remote failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stdin := &blockingExecReader{started: make(chan struct{})}
+			path := startExecTerminalFrameServer(t, stdin.started, tt.frames)
+			var out bytes.Buffer
+			done := make(chan struct {
+				code int
+				err  error
+			}, 1)
+
+			go func() {
+				code, err := New(path).Exec(context.Background(), []string{"ignored"}, stdin, &out, io.Discard)
+				done <- struct {
+					code int
+					err  error
+				}{code: code, err: err}
+			}()
+
+			select {
+			case got := <-done:
+				if tt.wantErr != "" {
+					if got.err == nil || got.err.Error() != tt.wantErr {
+						t.Fatalf("Exec error = %v, want %q", got.err, tt.wantErr)
+					}
+				} else if got.err != nil {
+					t.Fatalf("Exec error = %v, want nil", got.err)
+				}
+				if got.code != tt.wantCode {
+					t.Fatalf("exit code = %d, want %d", got.code, tt.wantCode)
+				}
+				if out.String() != tt.wantStdout {
+					t.Fatalf("stdout = %q, want %q", out.String(), tt.wantStdout)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Exec did not return after terminal frame with blocked stdin")
+			}
+		})
+	}
+}
+
 func TestExecPreservesExitWhenContextCancelsBeforeBlockedStdinDone(t *testing.T) {
 	path := filepath.Join(shortExecClientTempDir(t), "api.sock")
 	ln, err := net.Listen("unix", path)
@@ -340,6 +407,79 @@ func TestExecPreservesExitWhenContextCancelsBeforeBlockedStdinDone(t *testing.T)
 	case <-time.After(2 * time.Second):
 		t.Fatal("Exec did not return after context cancellation")
 	}
+}
+
+type blockingExecReader struct {
+	once    sync.Once
+	started chan struct{}
+}
+
+func (r *blockingExecReader) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	select {}
+}
+
+func startExecTerminalFrameServer(t *testing.T, stdinStarted <-chan struct{}, frames []api.ExecFrame) string {
+	t.Helper()
+
+	path := filepath.Join(shortExecClientTempDir(t), "api.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+
+		br := bufio.NewReader(conn)
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		key := strings.TrimSpace(req.Header.Get("Sec-WebSocket-Key"))
+		if _, err := fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", wsbits.AcceptKey(key)); err != nil {
+			serverDone <- err
+			return
+		}
+		select {
+		case <-stdinStarted:
+		case <-time.After(2 * time.Second):
+			serverDone <- errors.New("stdin reader did not block")
+			return
+		}
+		for _, frame := range frames {
+			payload, err := api.EncodeExecFrame(frame)
+			if err != nil {
+				serverDone <- err
+				return
+			}
+			if err := wsbits.WriteFrame(conn, wsbits.OpBinary, payload, false); err != nil {
+				serverDone <- err
+				return
+			}
+		}
+		serverDone <- nil
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Fatalf("fake exec server: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("fake exec server did not stop")
+		}
+	})
+
+	return path
 }
 
 func startExecClientServer(t *testing.T, cfg *config.Store) (string, *localapi.Server) {

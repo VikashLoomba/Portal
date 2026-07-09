@@ -1,16 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,6 +27,7 @@ import (
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 	"github.com/VikashLoomba/Portal/pkg/transport/localexec"
 	"github.com/VikashLoomba/Portal/pkg/transport/ptyx"
+	"github.com/VikashLoomba/Portal/pkg/wsbits"
 	"golang.org/x/sys/unix"
 )
 
@@ -31,11 +36,17 @@ const (
 	execTTYRestoreSockEnv   = "PORTAL_EXEC_TTY_RESTORE_SOCK"
 	execTTYRestoreTTYEnv    = "PORTAL_EXEC_TTY_RESTORE_TTY_FILE"
 	execTTYRestoreGoEnv     = "PORTAL_EXEC_TTY_RESTORE_GO_FILE"
+	execTTYSignalHelperEnv  = "PORTAL_EXEC_TTY_SIGNAL_HELPER"
+	execTTYSignalSockEnv    = "PORTAL_EXEC_TTY_SIGNAL_SOCK"
+	execTTYSignalMarkerEnv  = "PORTAL_EXEC_TTY_SIGNAL_MARKER"
 )
 
 func TestMain(m *testing.M) {
 	if os.Getenv(execTTYRestoreHelperEnv) == "1" {
 		os.Exit(runExecTTYRestoreHelper())
+	}
+	if os.Getenv(execTTYSignalHelperEnv) == "1" {
+		os.Exit(runExecTTYSignalHelper())
 	}
 	os.Exit(m.Run())
 }
@@ -142,6 +153,48 @@ func TestExecCmdTTYRequiresTerminal(t *testing.T) {
 	}
 	if err.Error() != "cannot allocate tty: stdin/stdout is not a terminal" {
 		t.Fatalf("error = %q, want terminal allocation error", err.Error())
+	}
+}
+
+func TestExecCmdMissingDashRejectsTerminalArgs(t *testing.T) {
+	makeRawCalled := false
+	setExecTermSeams(t,
+		func(int) bool { return true },
+		func(int) (func() error, error) {
+			makeRawCalled = true
+			return func() error { return nil }, nil
+		},
+		func(int) (uint16, uint16, error) { return 24, 80, nil },
+		func(context.Context) <-chan struct{} {
+			ch := make(chan struct{})
+			close(ch)
+			return ch
+		},
+	)
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "auto tty", args: []string{"true"}},
+		{name: "forced tty", args: []string{"-t", "true"}},
+		{name: "no tty", args: []string{"-T", "true"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := &app.App{Paths: app.Paths{APISock: filepath.Join(t.TempDir(), "missing.sock")}}
+			cmd := newExecCmd(a)
+			cmd.SetArgs(tt.args)
+
+			err := cmd.ExecuteContext(context.Background())
+			var ue usageErr
+			if !errors.As(err, &ue) {
+				t.Fatalf("error = %v, want usageErr", err)
+			}
+			if makeRawCalled {
+				t.Fatal("MakeRaw called before missing-separator usage check")
+			}
+		})
 	}
 }
 
@@ -275,6 +328,61 @@ func TestExecCmdTTYRestoresTermios(t *testing.T) {
 	}
 }
 
+func TestExecCmdTTYSignalRestoresAndReraises(t *testing.T) {
+	sock, ready := serveExecPTYUpgradeHang(t)
+	marker := filepath.Join(t.TempDir(), "restore.log")
+
+	helper := exec.Command(os.Args[0])
+	var out, errb bytes.Buffer
+	helper.Stdout = &out
+	helper.Stderr = &errb
+	helper.Env = append(os.Environ(),
+		execTTYSignalHelperEnv+"=1",
+		execTTYSignalSockEnv+"="+sock,
+		execTTYSignalMarkerEnv+"="+marker,
+		"TERM=xterm-256color",
+	)
+	if err := helper.Start(); err != nil {
+		t.Fatalf("start helper: %v", err)
+	}
+
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		_ = helper.Process.Kill()
+		_ = waitExecCommand(t, helper, 2*time.Second)
+		t.Fatalf("helper did not enter raw-mode exec window\nstdout:\n%s\nstderr:\n%s", out.String(), errb.String())
+	}
+
+	if err := helper.Process.Signal(syscall.SIGTERM); err != nil {
+		_ = helper.Process.Kill()
+		t.Fatalf("send SIGTERM: %v", err)
+	}
+	err := waitExecCommand(t, helper, 5*time.Second)
+	if err == nil {
+		t.Fatal("helper exited cleanly, want SIGTERM")
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("helper error = %T %v, want *exec.ExitError", err, err)
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok {
+		t.Fatalf("helper wait status = %T, want syscall.WaitStatus", exitErr.Sys())
+	}
+	if !status.Signaled() || status.Signal() != syscall.SIGTERM {
+		t.Fatalf("helper wait status = %v, want signaled SIGTERM\nstdout:\n%s\nstderr:\n%s", status, out.String(), errb.String())
+	}
+
+	b, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read restore marker: %v", err)
+	}
+	if count := strings.Count(string(b), "restore\n"); count != 1 {
+		t.Fatalf("restore marker count = %d in %q, want 1", count, string(b))
+	}
+}
+
 func serveExecDaemon(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "portal-exec-api-")
@@ -316,6 +424,64 @@ func serveExecDaemon(t *testing.T) string {
 	}
 	t.Fatal("exec daemon did not come up")
 	return path
+}
+
+func serveExecPTYUpgradeHang(t *testing.T) (string, <-chan struct{}) {
+	t.Helper()
+
+	dir, err := os.MkdirTemp("/tmp", "portal-exec-signal-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "api.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+
+	ready := make(chan struct{})
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+
+		br := bufio.NewReader(conn)
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if got := req.URL.Query().Get("pty"); got != "1" {
+			serverDone <- fmt.Errorf("pty query = %q, want 1", got)
+			return
+		}
+		key := strings.TrimSpace(req.Header.Get("Sec-WebSocket-Key"))
+		if _, err := fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\nX-Portal-Exec-Pty: 1\r\n\r\n", wsbits.AcceptKey(key)); err != nil {
+			serverDone <- err
+			return
+		}
+		close(ready)
+		_, _ = io.Copy(io.Discard, br)
+		serverDone <- nil
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		select {
+		case err := <-serverDone:
+			if err != nil && !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("fake exec signal server: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("fake exec signal server did not stop")
+		}
+	})
+
+	return path, ready
 }
 
 func setExecTermSeams(t *testing.T, isTerminal func(int) bool, makeRaw func(int) (func() error, error), getSize func(int) (uint16, uint16, error), watchWinch func(context.Context) <-chan struct{}) {
@@ -394,6 +560,50 @@ func runExecTTYRestoreHelper() int {
 		return 1
 	}
 	return 0
+}
+
+func runExecTTYSignalHelper() int {
+	sock := os.Getenv(execTTYSignalSockEnv)
+	marker := os.Getenv(execTTYSignalMarkerEnv)
+	if sock == "" || marker == "" {
+		fmt.Fprintln(os.Stderr, "exec tty signal helper: missing environment")
+		return 1
+	}
+
+	execIsTerminal = func(int) bool { return true }
+	execMakeRaw = func(int) (func() error, error) {
+		return func() error {
+			return appendExecTTYSignalMarker(marker)
+		}, nil
+	}
+	execGetSize = func(int) (uint16, uint16, error) { return 24, 80, nil }
+	execWatchWinch = func(ctx context.Context) <-chan struct{} {
+		ch := make(chan struct{})
+		go func() {
+			<-ctx.Done()
+			close(ch)
+		}()
+		return ch
+	}
+
+	a := &app.App{Paths: app.Paths{APISock: sock}}
+	cmd := newExecCmd(a)
+	cmd.SetArgs([]string{"-t", "--", "sleep", "60"})
+	if err := cmd.ExecuteContext(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr, "exec tty signal helper:", err)
+		return 1
+	}
+	return 0
+}
+
+func appendExecTTYSignalMarker(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString("restore\n")
+	return err
 }
 
 func waitExecTextFile(t *testing.T, path string) string {
