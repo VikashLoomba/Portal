@@ -72,3 +72,6 @@ test-ts:
 	npm_config_cache=$$PWD/clients/ts/.npm-cache npm ci --prefix clients/ts
 	npm_config_cache=$$PWD/clients/ts/.npm-cache npx --prefix clients/ts tsc --noEmit -p clients/ts
 	cd clients/ts && node --test test/*.test.ts
+	node --check examples/shell-electron/main.js
+	node --check examples/shell-electron/preload.js
+	npm_config_cache=$$PWD/clients/ts/.npm-cache npx --prefix clients/ts tsc --noEmit -p examples/shell-electron
