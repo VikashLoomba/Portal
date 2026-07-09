@@ -668,3 +668,110 @@ func waitExecNoProcess(pid int, timeout time.Duration) bool {
 	}
 	return false
 }
+
+// execCaptureConn is a non-blocking net.Conn that records everything written to
+// it, for asserting exactly which frames a pump emits. Reads return EOF.
+type execCaptureConn struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	closed bool
+}
+
+func (c *execCaptureConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return 0, net.ErrClosed
+	}
+	return c.buf.Write(p)
+}
+func (c *execCaptureConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+func (c *execCaptureConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (c *execCaptureConn) LocalAddr() net.Addr              { return nil }
+func (c *execCaptureConn) RemoteAddr() net.Addr             { return nil }
+func (c *execCaptureConn) SetDeadline(time.Time) error      { return nil }
+func (c *execCaptureConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *execCaptureConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *execCaptureConn) bytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.buf.Bytes()...)
+}
+
+func decodeClientStdinFrames(t *testing.T, raw []byte) (data, zeroLen int) {
+	t.Helper()
+	r := bytes.NewReader(raw)
+	for r.Len() > 0 {
+		op, payload, err := wsbits.ReadFrame(r, true) // client frames are masked
+		if err != nil {
+			t.Fatalf("read client frame: %v", err)
+		}
+		if op != wsbits.OpBinary {
+			continue
+		}
+		f, err := api.DecodeExecFrame(payload)
+		if err != nil {
+			t.Fatalf("decode exec frame: %v", err)
+		}
+		if f.Stream == api.ExecStreamStdin {
+			if len(f.Data) == 0 {
+				zeroLen++
+			} else {
+				data++
+			}
+		}
+	}
+	return data, zeroLen
+}
+
+// TestPumpExecStdinNonPTYSendsExactlyOneEOFFrame pins the Go-side EOF contract
+// (fast-follow #3): a non-PTY stdin pump sends exactly ONE zero-length stdin
+// frame after the data, signalling EOF. Previously only the TS client asserted
+// this count.
+func TestPumpExecStdinNonPTYSendsExactlyOneEOFFrame(t *testing.T) {
+	cc := &execCaptureConn{}
+	done := pumpExecStdin(cc, &sync.Mutex{}, strings.NewReader("hello"), false)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("pump: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pump did not finish")
+	}
+	data, zeroLen := decodeClientStdinFrames(t, cc.bytes())
+	if data != 1 {
+		t.Errorf("data stdin frames = %d, want 1", data)
+	}
+	if zeroLen != 1 {
+		t.Errorf("zero-length (EOF) stdin frames = %d, want exactly 1", zeroLen)
+	}
+}
+
+// TestPumpExecStdinPTYSendsNoEOFFrame confirms a PTY session sends NO
+// zero-length stdin frame on EOF (matches ssh -t; the remote pty ends on
+// process exit / disconnect, not a stdin half-close).
+func TestPumpExecStdinPTYSendsNoEOFFrame(t *testing.T) {
+	cc := &execCaptureConn{}
+	done := pumpExecStdin(cc, &sync.Mutex{}, strings.NewReader("hi"), true)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("pump: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pump did not finish")
+	}
+	data, zeroLen := decodeClientStdinFrames(t, cc.bytes())
+	if data != 1 {
+		t.Errorf("data stdin frames = %d, want 1", data)
+	}
+	if zeroLen != 0 {
+		t.Errorf("zero-length stdin frames = %d, want 0 under PTY", zeroLen)
+	}
+}
