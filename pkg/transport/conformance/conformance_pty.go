@@ -35,8 +35,22 @@ func runPty(t *testing.T, newT func(*testing.T) transport.Transport) {
 	})
 
 	t.Run("resize_observed", func(t *testing.T) {
+		const resizePollScript = `stty size
+read _
+i=0
+while [ "$i" -lt 100 ]; do
+	s=$(stty size)
+	echo "$s"
+	if [ "$s" = "13 57" ]; then
+		exit 0
+	fi
+	i=$((i + 1))
+	sleep 0.05
+done
+exit 1`
+
 		sess := startPty(t, ctx, ps, transport.PtyRequest{Rows: 32, Cols: 96},
-			"sh", "-c", shellQuote("stty size; read _; stty size"))
+			"sh", "-c", shellQuote(resizePollScript))
 		defer sess.Close()
 
 		first := readPtyUntil(t, sess, "32 96", 5*time.Second)
