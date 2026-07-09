@@ -12,6 +12,13 @@ finishes or needs your approval, a native macOS notification pops on your Mac.
 No special `ssh` wrapper, no second daemon, no reverse tunnel: it all rides the
 same SSH connection portal already maintains.
 
+That connection is also yours to use: `portal exec` runs commands on the box
+with faithful exit codes and streamed stdio — or drops you into a fully
+interactive shell under a real PTY. Under the hood portal is a daemon exposing
+a local control API on a Unix socket, with pluggable SSH transports and a
+[public Go + TypeScript surface](#building-on-portal) for building your own
+"local shell, remote brain" apps on top.
+
 ## Installation
 
 ### Recommended: download the latest release
@@ -70,9 +77,23 @@ portal <command>
                     down the ssh master.
     reload          Re-apply config/plist changes.
     host [newhost]  Show the configured dev box, or switch to a new one.
+    transport [system|native]
+                    Show or set how portal reaches the box: system ssh
+                    (ControlMaster) or native built-in ssh (resolves
+                    ~/.ssh/config incl. ProxyJump). Restart to apply.
 
   Control
     start / stop / restart   Control the forwarding service.
+
+  Sessions
+    exec [-t|-T] [-- <cmd...>]
+                    Run a command on the box over the daemon's existing
+                    connection: faithful exit code, streamed stdio, audit log.
+                    With a terminal and no command it opens an interactive
+                    shell under a full PTY (resize and job control work);
+                    -t forces a PTY for a command, -T disables it.
+    ssh <host> ...  Deprecated alias for plain `ssh` (clipboard paste now works
+                    over plain ssh; kept so muscle memory and scripts don't break).
 
   Inspect
     status          Show box, service state, ssh master, active forwards. (default)
@@ -85,12 +106,46 @@ portal <command>
   Allowlist
     allow / unallow / allowed   Manage force-forwarded ports.
 
-  Sessions
-    ssh <host> ...  Deprecated alias for plain `ssh` (clipboard paste now works
-                    over plain ssh; kept so muscle memory and scripts don't break).
+  Capabilities
+    features [name on|off]      Show or toggle the clip-image / clip-text /
+                                notify / exec gates (picked up live).
 ```
 
-Run `portal help` for the full command reference.
+Run `portal help` for the full command reference, or `portal <command> --help`
+for a command's flags.
+
+## Remote commands and shells
+
+`portal exec` rides the same authenticated connection the daemon already
+maintains — no extra ssh handshake, no password prompt:
+
+```sh
+portal exec -- ls -la              # exit code, stdout, stderr all faithful
+portal exec -- make test           # stream a long build; Ctrl+C propagates
+portal exec                        # interactive shell on the box, full PTY
+portal exec -t -- htop             # force a PTY for a specific command
+```
+
+Interactive sessions get a real pseudo-terminal: raw mode, window-resize
+propagation (SIGWINCH), job control, and clean terminal restore even when
+killed by a signal. Every exec session is recorded (argv, uid, exit code,
+duration, session id) in the append-only audit log, and the whole feature can
+be switched off with `portal features exec off`.
+
+## Transports
+
+portal reaches the dev box through a pluggable transport, selectable with
+`portal transport`:
+
+- **system** (default) — drives your system `ssh` via a `ControlMaster`
+  multiplexed connection. Uses your existing ssh setup exactly as-is.
+- **native** — a built-in pure-Go SSH client (`golang.org/x/crypto/ssh`). It
+  resolves hosts through `~/.ssh/config` (via `ssh -G`), dials `ProxyJump` /
+  `ProxyCommand` chains itself, and enforces strict `known_hosts` checking.
+  No `ssh` processes are spawned for the connection.
+
+Both implement the same transport contract (as does a third, `localexec`, used
+for same-machine development), verified by a shared conformance suite.
 
 ## How clipboard paste works
 
@@ -128,16 +183,18 @@ is rendered with an `[unverified]` prefix.
 
 ## Capability gates
 
-Clipboard-read and notifications are **on by default** (matching the install
-experience you'd expect) but are individually gated on the Mac. Each is a file
-under `~/.config/portal/`; write `off` to disable, `rm` (or `on`) to re-enable —
-the running daemon picks it up with no restart:
+Clipboard-read, notifications, and exec are **on by default** (matching the
+install experience you'd expect) but are individually gated on the Mac. Toggle
+them with `portal features <name> on|off` (or edit the file under
+`~/.config/portal/` directly); the running daemon picks changes up with no
+restart:
 
-| File | Gates |
-|---|---|
-| `feature.clip-image` | serving the Mac clipboard **image** to the dev box |
-| `feature.clip-text`  | serving the Mac clipboard **text** to the dev box |
-| `feature.notify`     | raising notifications relayed from the dev box |
+| Gate | File | Gates |
+|---|---|---|
+| `clip-image` | `feature.clip-image` | serving the Mac clipboard **image** to the dev box |
+| `clip-text`  | `feature.clip-text`  | serving the Mac clipboard **text** to the dev box |
+| `notify`     | `feature.notify`     | raising notifications relayed from the dev box |
+| `exec`       | `feature.exec`       | running commands on the box via `portal exec` / the control API |
 
 Clipboard **text** marked secret by a password manager (the macOS
 `org.nspasteboard.ConcealedType` hint) is never served, regardless of the
@@ -148,6 +205,30 @@ There is no bearer token (cc-clip needs one because it serves clipboard over a
 loopback HTTP server any local process can reach). portal's transport is the
 authenticated SSH `ControlMaster` pipe plus an owner-only (`0600`) Unix socket,
 which together are the network and local trust boundary the token stood in for.
+
+## Building on portal
+
+portal doubles as a platform for "local shell, remote brain" desktop apps: the
+daemon exposes everything it can do over a local control API, and the pieces it
+is built from are public packages.
+
+- **Control API** — a Unix socket at `~/.config/portal/api.sock` (owner-only,
+  `0600`) serving versioned HTTP + WebSocket endpoints: status, ports, feature
+  gates, and `/v1/exec` (streamed exec with optional PTY). Schemas live in
+  [`internal/localapi/openapi.yaml`](internal/localapi/openapi.yaml).
+- **Go packages** — the public surface under [`pkg/`](pkg/): `protocol` (CBOR
+  wire codec), `transport` (+ `sshctl`, `sshnative`, `localexec`, a shared
+  conformance suite, and `ptyx` for PTY allocation), `run` (daemon host),
+  `client` (control-API client), `agent`/`agentclient` (dev-box side), and
+  more. `pkg/` never imports `internal/` — enforced by a test.
+- **Wire spec** — the Mac↔box protocol is specified in
+  [`docs/wire.cddl`](docs/wire.cddl) with golden vectors under
+  [`docs/vectors/`](docs/vectors/), verified from both Go and TypeScript, so a
+  client in any language can prove itself conformant.
+- **TypeScript client** — [`clients/ts`](clients/ts) is a zero-runtime-dependency
+  client for the control API, and
+  [`examples/shell-electron`](examples/shell-electron) is a minimal Electron
+  app driving a remote PTY session through it.
 
 ## Requirements
 
