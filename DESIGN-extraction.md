@@ -628,7 +628,32 @@ commits precede seam-edit commits inside u7–u9 (E11).
 | Electron example rots ungated | explicitly documented as manually-validated (§8.7); `node --check`/tsc smoke in gate; it consumes only `clients/ts`'s public API. |
 | PTY dead-client close races Wait/Close (double-close, leaked registration) | u4 registration/deregistration tests + `-race` gate; Close idempotency in the E5 contract. |
 
-## 6. (reserved — principal fast-follows recorded here post-review)
+## 6. Principal review (2026-07-09): APPROVE
+
+Reviewed by the main-loop Fable session (per the user's Stage-6 direction: no in-workflow
+principal). Basis: full read of the judgment-bearing surfaces (transport PTY types +
+`PtySession` contracts, sshnative/sshctl/ptyx internals, the exec bridge PTY path,
+`cmd/portal/exec.go` raw-mode/signal handling, `pkg/client` post-exit paths + skew check,
+`ServiceHost` facade, `EnsureArtifact` validation, `wire.cddl`, TS codec bounds), adjudication
+of the two late test-only fix commits the review loop never re-reviewed (`2fbbbf6`,
+`aaebc69` — both sound), and an independent Opus exit audit that verified EC1–EC17 with the
+full gate green at HEAD (`make test-ts`: 39/39; all 21 golden vectors decoded from TS).
+
+The 9-round review loop was stopped by principal judgment after confirm rates collapsed
+(rounds 4/8/9 mostly refuted; final two fixes test-only) — convergence-by-attrition on a
+214-file diff was costing more than it caught.
+
+Fast-follows (non-blocking, record for a later stage):
+1. **CLI winch pump can drop the final resize:** `cmd/portal/exec.go` sends sizes through a
+   1-buffered drop-newest channel; a resize burst ending in a drop leaves the remote pty one
+   size stale until the next WINCH. Fix: drain-then-send (keep latest, not oldest).
+2. **Zero-length-stdin single-frame count untested in Go:** the exactly-one-EOF-frame
+   behavior is asserted by the TS suite only; a Go-side frame-count test would pin it against
+   client refactors.
+3. **CDDL never machine-validated:** per E14 the `cddl` CLI invocation recorded in
+   `docs/wire.cddl` should be run once by a human before publishing the spec externally.
+4. **E6 termios gap** (already documented): fixed mode table, no local-termios mirroring —
+   revisit if an interactive tool misbehaves in a way OpenSSH handles.
 
 ## 7. Workflow notes
 
