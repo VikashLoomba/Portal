@@ -42,7 +42,18 @@ func newRootCmd(a *app.App) *cobra.Command {
 	// (version + build commit) instead of Cobra's default "tool version X".
 	root.Version = version
 	root.SetVersionTemplate(versionLine() + "\n")
-	root.SetHelpTemplate(helpText(a))
+	// Root help is the hand-written reference below; subcommands keep Cobra's
+	// default help so their own flags stay discoverable (`portal exec --help`
+	// must show -t/-T, not the root reference). A help TEMPLATE would be
+	// inherited by every child, so scope via the help func instead.
+	defaultHelp := root.HelpFunc()
+	root.SetHelpFunc(func(c *cobra.Command, args []string) {
+		if c == root {
+			fmt.Fprint(c.OutOrStdout(), helpText(a))
+			return
+		}
+		defaultHelp(c, args)
+	})
 
 	root.AddCommand(newRunCmd(a))
 	root.AddCommand(newOnceCmd(a))
@@ -70,10 +81,10 @@ func newRootCmd(a *app.App) *cobra.Command {
 	return root
 }
 
-// helpText reproduces the bash cmd_help block: configured-host header,
-// Setup/Control/Inspect/Allowlist/Advanced sections, Files: footer. We use
-// a literal template (no Cobra flag/section auto-rendering) so the output
-// is byte-identical to the bash version regardless of Cobra's defaults.
+// helpText is the hand-written command reference: configured-host header,
+// grouped sections, Files: footer. It is a literal (no Cobra flag/section
+// auto-rendering) so grouping and wording stay deliberate; keep it in sync
+// with the commands registered in newRootCmd.
 func helpText(a *app.App) string {
 	host, _ := a.Cfg.ReadHost()
 	if host == "" {
@@ -90,6 +101,10 @@ Usage: %[1]s <command>
     uninstall       Stop, remove the agent, and tear down the ssh master.
     reload          Re-apply config/plist changes (after editing this script).
     host [newhost]  Show the configured dev box, or switch to a new one.
+    transport [system|native]
+                    Show or set how portal reaches the box: system ssh
+                    (ControlMaster) or native built-in ssh (resolves
+                    ~/.ssh/config incl. ProxyJump). Restart to apply.
 
   Control
     start           Start (load) the forwarding service.
@@ -97,6 +112,12 @@ Usage: %[1]s <command>
     restart         Force-restart the running service.
 
   Sessions
+    exec [-t|-T] [-- <cmd...>]
+                    Run a command on the box over the daemon's existing
+                    connection: faithful exit code, streamed stdio, audit log.
+                    With a terminal and no command it opens an interactive
+                    shell under a full PTY (resize and job control work);
+                    -t forces a PTY for a command, -T disables it.
     ssh <host> ...  Deprecated alias for plain ssh (forwards all args verbatim).
                     Clipboard-image paste now works over PLAIN ssh: the daemon
                     deploys xclip/wl-paste read shims so a coding agent's own
@@ -109,12 +130,19 @@ Usage: %[1]s <command>
     doctor          Self-test the clipboard/notify path over ssh: verifies the
                     xclip/wl-paste shims win PATH, the agent supports the verbs,
                     and runs an end-to-end clip-targets smoke.
+    clip-check      Diagnose Mac clipboard image detection (--upload to test).
+    version         Print the portal version and build commit (also -v/--version).
 
   Allowlist (forward ports the auto-filter would otherwise skip)
     allow <port>... Force-forward a port even if it's in the ephemeral range
                     (32768-60999) or denylist — e.g. a real service on 40085.
     unallow <port>. Remove ports from the allowlist.
     allowed         Show the current allowlist.
+
+  Capabilities
+    features [name on|off]
+                    Show or toggle the clip-image / clip-text / notify / exec
+                    gates; the running daemon picks changes up live.
 
   Advanced
     run             Run the forwarding loop in the foreground (used by launchd).

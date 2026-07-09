@@ -1,7 +1,10 @@
-# portal release — runs only on version tags (v*): build the Apple Silicon
-# binary and publish it as a GitHub release asset. Unlike the old GitLab
-# pipeline, no package-registry hop is needed — GitHub release assets are
-# directly downloadable via /releases/latest/download/<asset>.
+# portal release — runs only on version tags (v*): gate on the full test
+# suite, build the Apple Silicon binary, and publish it as a GitHub release
+# asset (directly downloadable via /releases/latest/download/<asset>).
+#
+# Release notes: if docs/releases/<tag>.md exists at the tagged commit it is
+# used verbatim (write it before tagging); otherwise a boilerplate install
+# snippet is generated.
 name: Release
 
 on:
@@ -27,18 +30,27 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Gate on the full test suite
+        run: make test
       - name: Build the Apple Silicon binary
         run: make portal-all
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          NOTES="Apple Silicon (arm64) Mac build. Download the latest with:
+          NOTES_FILE="docs/releases/${GITHUB_REF_NAME}.md"
+          if [ -f "$NOTES_FILE" ]; then
+            gh release create "$GITHUB_REF_NAME" portal-darwin-arm64 \
+              --title "portal $GITHUB_REF_NAME" \
+              --notes-file "$NOTES_FILE"
+          else
+            NOTES="Apple Silicon (arm64) Mac build. Download the latest with:
 
-              curl -fL -o portal-darwin-arm64 \\
-                https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/portal-darwin-arm64
-              chmod +x portal-darwin-arm64
-              ./portal-darwin-arm64 install <ssh-host>"
-          gh release create "$GITHUB_REF_NAME" portal-darwin-arm64 \
-            --title "portal $GITHUB_REF_NAME" \
-            --notes "$NOTES"
+                curl -fL -o portal-darwin-arm64 \\
+                  https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/portal-darwin-arm64
+                chmod +x portal-darwin-arm64
+                ./portal-darwin-arm64 install <ssh-host>"
+            gh release create "$GITHUB_REF_NAME" portal-darwin-arm64 \
+              --title "portal $GITHUB_REF_NAME" \
+              --notes "$NOTES"
+          fi
