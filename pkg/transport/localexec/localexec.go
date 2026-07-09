@@ -152,12 +152,11 @@ func (s *localexecPtySession) Write(p []byte) (int, error) {
 
 func (s *localexecPtySession) Resize(rows, cols uint16) error {
 	s.mu.Lock()
-	closed, ended := s.closed, s.ended
-	s.mu.Unlock()
+	defer s.mu.Unlock()
 	switch {
-	case ended:
+	case s.ended:
 		return errors.New("localexec: resize pty after session ended")
-	case closed:
+	case s.closed:
 		return errors.New("localexec: resize pty after session closed")
 	}
 	if err := ptyx.Setsize(s.master, rows, cols); err != nil {
@@ -170,10 +169,12 @@ func (s *localexecPtySession) Wait() error {
 	s.waitOnce.Do(func() {
 		defer close(s.waitDone)
 		werr := s.cmd.Wait()
+		s.mu.Lock()
 		s.closeOnce.Do(func() {
 			_ = s.master.Close()
 		})
-		s.markEnded()
+		s.ended = true
+		s.mu.Unlock()
 		var ee *exec.ExitError
 		if errors.As(werr, &ee) {
 			s.waitErr = &transport.ExitError{Code: ee.ExitCode()}
@@ -186,26 +187,16 @@ func (s *localexecPtySession) Wait() error {
 }
 
 func (s *localexecPtySession) Close() error {
+	s.mu.Lock()
 	s.closeOnce.Do(func() {
-		s.markClosed()
+		s.closed = true
 		s.closeErr = s.master.Close()
 		if s.cmd.Process != nil {
 			_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
 		}
 	})
+	s.mu.Unlock()
 	return s.closeErr
-}
-
-func (s *localexecPtySession) markClosed() {
-	s.mu.Lock()
-	s.closed = true
-	s.mu.Unlock()
-}
-
-func (s *localexecPtySession) markEnded() {
-	s.mu.Lock()
-	s.ended = true
-	s.mu.Unlock()
 }
 
 // Close is a no-op: there is no persistent resource to stop.
@@ -213,7 +204,7 @@ func (l *Local) Close(ctx context.Context) (bool, error) { return false, nil }
 
 // Describe identifies this transport.
 func (l *Local) Describe() transport.Desc {
-	return transport.Desc{Impl: "localexec", Host: "local", Endpoint: ""}
+	return transport.Desc{Impl: transport.ImplLocalExec, Host: "local", Endpoint: ""}
 }
 
 var _ transport.Transport = (*Local)(nil)

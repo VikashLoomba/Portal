@@ -14,9 +14,9 @@ import (
 // TestConformance runs the shared transport conformance suite against a real
 // system-ssh master. It requires a reachable host and so is gated on
 // PORTAL_TEST_SSH_HOST — when unset it skips (naming the variable) rather than
-// failing on a machine with no dev box. Because Describe().Impl == "system-ssh",
-// the PortForwarder section runs its lifecycle-only path (Forward/ListForwards/
-// Cancel/dial-refused) and skips the cross-machine loopback echo round-trip.
+// failing on a machine with no dev box. With no ForwardTarget, the PortForwarder
+// section runs its lifecycle-only path (Forward/ListForwards/Cancel/dial-refused)
+// and skips the cross-machine echo round-trip.
 func TestConformance(t *testing.T) {
 	host := os.Getenv("PORTAL_TEST_SSH_HOST")
 	if host == "" {

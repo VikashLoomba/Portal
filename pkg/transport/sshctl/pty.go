@@ -67,12 +67,11 @@ func (s *sshctlPtySession) Write(p []byte) (int, error) {
 
 func (s *sshctlPtySession) Resize(rows, cols uint16) error {
 	s.mu.Lock()
-	closed, ended := s.closed, s.ended
-	s.mu.Unlock()
+	defer s.mu.Unlock()
 	switch {
-	case ended:
+	case s.ended:
 		return errors.New("sshctl: resize pty after session ended")
-	case closed:
+	case s.closed:
 		return errors.New("sshctl: resize pty after session closed")
 	}
 	if err := ptyx.Setsize(s.master, rows, cols); err != nil {
@@ -85,10 +84,12 @@ func (s *sshctlPtySession) Wait() error {
 	s.waitOnce.Do(func() {
 		defer close(s.waitDone)
 		werr := s.cmd.Wait()
+		s.mu.Lock()
 		s.closeOnce.Do(func() {
 			_ = s.master.Close()
 		})
-		s.markEnded()
+		s.ended = true
+		s.mu.Unlock()
 		var ee *exec.ExitError
 		if errors.As(werr, &ee) {
 			s.waitErr = &transport.ExitError{Code: ee.ExitCode()}
@@ -101,8 +102,9 @@ func (s *sshctlPtySession) Wait() error {
 }
 
 func (s *sshctlPtySession) Close() error {
+	s.mu.Lock()
 	s.closeOnce.Do(func() {
-		s.markClosed()
+		s.closed = true
 		s.closeErr = s.master.Close()
 		if s.cmd.Process != nil {
 			// ptyx.Start makes ssh a session leader. Killing the ssh process is
@@ -111,19 +113,8 @@ func (s *sshctlPtySession) Close() error {
 			_ = s.cmd.Process.Kill()
 		}
 	})
+	s.mu.Unlock()
 	return s.closeErr
-}
-
-func (s *sshctlPtySession) markClosed() {
-	s.mu.Lock()
-	s.closed = true
-	s.mu.Unlock()
-}
-
-func (s *sshctlPtySession) markEnded() {
-	s.mu.Lock()
-	s.ended = true
-	s.mu.Unlock()
 }
 
 var _ transport.PtyStreamer = (*SSH)(nil)

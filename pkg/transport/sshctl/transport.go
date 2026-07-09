@@ -182,7 +182,7 @@ func (s *SSH) Close(ctx context.Context) (bool, error) {
 
 // Describe identifies the system ssh transport.
 func (s *SSH) Describe() transport.Desc {
-	return transport.Desc{Impl: "system-ssh", Host: s.HostID, Endpoint: s.SockPath}
+	return transport.Desc{Impl: transport.ImplSystemSSH, Host: s.HostID, Endpoint: s.SockPath}
 }
 
 func (s *SSH) teeStderr(stderr string) {

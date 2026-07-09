@@ -15,6 +15,7 @@ import (
 	"github.com/VikashLoomba/Portal/internal/logfile"
 	"github.com/VikashLoomba/Portal/pkg/api"
 	"github.com/VikashLoomba/Portal/pkg/client"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 func newStatusCmd(a *app.App) *cobra.Command {
@@ -121,9 +122,9 @@ type statusView struct {
 	masterPID  int
 	sock       string
 	// impl is the active transport's Describe().Impl. renderStatus prints an
-	// extra `transport: <impl>` line IFF impl is non-empty AND != "system-ssh",
+	// extra `transport: <impl>` line IFF impl is non-empty AND non-system,
 	// so the default (system) path stays byte-identical (T8/T9).
-	impl     string
+	impl     transport.Impl
 	agent    *statusAgentView
 	forwards []string
 }
@@ -157,7 +158,7 @@ func renderStatus(w io.Writer, v statusView) {
 		// system ssh. Omit it and surface the active transport unconditionally
 		// (mirroring runDoctor), so a DOWN native connection still says which
 		// transport is failing (T8). System-ssh stays byte-identical (T8/T9).
-		if v.impl != "" && v.impl != "system-ssh" {
+		if v.impl != "" && v.impl != transport.ImplSystemSSH {
 			fmt.Fprintf(w, "ssh master: DOWN (host=%s)\n", v.host)
 			fmt.Fprintf(w, "transport: %s\n", v.impl)
 		} else {
@@ -168,7 +169,7 @@ func renderStatus(w io.Writer, v statusView) {
 	fmt.Fprintf(w, "ssh master: UP (pid=%d) host=%s\n", v.masterPID, v.host)
 	// Surface the active transport only when it is NOT the default system ssh —
 	// the system path stays byte-identical (T8/T9).
-	if v.impl != "" && v.impl != "system-ssh" {
+	if v.impl != "" && v.impl != transport.ImplSystemSSH {
 		fmt.Fprintf(w, "transport: %s\n", v.impl)
 	}
 	if v.agent != nil {
@@ -203,7 +204,7 @@ func viewFromStatus(a *app.App, st api.Status) statusView {
 		masterUp:   st.Master.Up,
 		masterPID:  st.Master.Pid,
 		sock:       a.Paths.Sock,
-		impl:       st.Master.Transport, // carried over the wire by localapi (u2).
+		impl:       transport.Impl(st.Master.Transport), // carried over the wire by localapi (u2).
 	}
 	for _, f := range st.Forwards {
 		v.forwards = append(v.forwards, f.Name)

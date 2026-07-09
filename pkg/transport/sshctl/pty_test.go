@@ -24,8 +24,9 @@ func TestStreamPtyPathShimTTYResizeAndArgs(t *testing.T) {
 	t.Setenv("OUT_FILE", outFile)
 
 	installFakeSSH(t, `printf '%s\n' "$@" > "$ARGS_FILE"
-stty size > "$SIZE_FILE" || exit 97
+# Install the trap before the SIZE_FILE sync point or Resize's single SIGWINCH can be lost.
 trap 'stty size > "$OUT_FILE"' WINCH
+stty size > "$SIZE_FILE" || exit 97
 while :; do sleep 0.1; done
 `)
 

@@ -50,15 +50,13 @@ const (
 	proxyCommandStderrLimit = 4 * 1024
 )
 
-// proxyCommandDialer execs a ProxyCommand and adapts its stdio to a net.Conn.
-// It is an injectable seam (WithProxyCommandDialer) so the ProxyCommand round
-// trip is testable over an in-process pipe with no real subprocess. The returned
-// io.Closer tears the process (or fake) down on Close/redial.
-type proxyCommandDialer func(ctx context.Context, command string) (net.Conn, io.Closer, error)
+// ProxyCommandDialer execs a ProxyCommand and adapts its stdio to a net.Conn.
+// The returned io.Closer tears the helper process (or fake) down on Close/redial.
+type ProxyCommandDialer func(ctx context.Context, command string) (net.Conn, io.Closer, error)
 
 // WithProxyCommandDialer overrides the seam used to exec a ProxyCommand. When
 // unset, New installs defaultProxyCommandDialer (real `sh -c` subprocess).
-func WithProxyCommandDialer(d proxyCommandDialer) Option {
+func WithProxyCommandDialer(d ProxyCommandDialer) Option {
 	return func(c *Client) { c.proxyCommandDialer = d }
 }
 

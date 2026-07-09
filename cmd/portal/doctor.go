@@ -108,8 +108,8 @@ func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App, nativeOpts ...ss
 // the persistent ControlMaster and doctor probes it PASSIVELY (never Ensures), so
 // a daemon-down system run already FAILs the master check on its own — adding a
 // line here would break the goldens.
-func markDaemonDown(rep *doctor.Report, impl string) {
-	if impl == "system-ssh" {
+func markDaemonDown(rep *doctor.Report, impl transport.Impl) {
+	if impl == transport.ImplSystemSSH {
 		return
 	}
 	rep.Add("daemon", doctor.Fail,
@@ -183,9 +183,9 @@ func runDoctor(ctx context.Context, host string, tr transport.Transport) *doctor
 	// /v1/doctor closure and the daemon-down fallback both call runDoctor over a
 	// factory-built transport, so Impl reflects the config selection on either
 	// path. Warn is tolerated by Report.OK, so the note keeps RESULT at PASS.
-	if d := tr.Describe(); d.Impl != "system-ssh" {
-		rep.Add("transport", doctor.Pass, d.Impl)
-		if d.Impl == "native-ssh" {
+	if d := tr.Describe(); d.Impl != transport.ImplSystemSSH {
+		rep.Add("transport", doctor.Pass, string(d.Impl))
+		if d.Impl == transport.ImplNativeSSH {
 			rep.Add("forward lifetime", doctor.Warn,
 				"native forwards die with the daemon (no ControlPersist analogue); a daemon restart re-establishes them")
 		}
@@ -211,7 +211,7 @@ func runDoctor(ctx context.Context, host string, tr transport.Transport) *doctor
 	// doctor run still reports `DOWN — start the daemon`, preserving the
 	// byte-compat diagnostic. When the daemon IS up the shared ControlMaster is
 	// already running, so Health sees it without any build.
-	if tr.Describe().Impl == "native-ssh" {
+	if tr.Describe().Impl == transport.ImplNativeSSH {
 		// A dial error is not fatal here; the Health gate below still renders
 		// the DOWN line.
 		_, _ = tr.Ensure(ctx)

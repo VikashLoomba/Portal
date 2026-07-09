@@ -126,9 +126,9 @@ type Client struct {
 	proxyJump    string
 	proxyCommand string
 	// proxyCommandDialer execs a ProxyCommand into a net.Conn (default
-	// defaultProxyCommandDialer, overridable by WithProxyCommandDialer for
-	// hermetic tests). Never dials for a non-ProxyCommand target.
-	proxyCommandDialer proxyCommandDialer
+	// defaultProxyCommandDialer, overridable by WithProxyCommandDialer).
+	// Never dials for a non-ProxyCommand target.
+	proxyCommandDialer ProxyCommandDialer
 
 	// Keepalive cadence: defaults from New (15s/3), overridable by WithKeepalive.
 	// Read once when startKeepaliveLocked launches; never mutated after New.
@@ -660,10 +660,10 @@ func (c *Client) Close(ctx context.Context) (bool, error) {
 	return had, nil
 }
 
-// Describe returns identifying metadata; Impl is always "native-ssh".
+// Describe returns identifying metadata; Impl is always transport.ImplNativeSSH.
 func (c *Client) Describe() transport.Desc {
 	return transport.Desc{
-		Impl:     "native-ssh",
+		Impl:     transport.ImplNativeSSH,
 		Host:     c.host,
 		Endpoint: fmt.Sprintf("%s@%s:%d", c.user, c.host, c.port),
 	}

@@ -30,14 +30,30 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// ForwardTarget declares a remote-reachable echo endpoint for the forwarding
+// suite. The transport factory owns this because only the caller knows whether
+// the remote side can reach a listener stood up by the test process.
+type ForwardTarget struct {
+	// NewEchoServer returns an address (host:port) reachable from the transport's
+	// REMOTE side, plus a cleanup func.
+	NewEchoServer func(t *testing.T) (addr string, cleanup func())
+}
+
 // Run executes the full conformance suite against a fresh transport produced
 // by newT. name is used to label the top-level subtest. Optional sections run
 // only when the transport asserts transport.PortForwarder or
 // transport.PtyStreamer.
 func Run(t *testing.T, name string, newT func(t *testing.T) transport.Transport) {
+	RunWithForward(t, name, newT, nil)
+}
+
+// RunWithForward executes the conformance suite with an optional echo target for
+// the port-forward byte round-trip. A nil target still runs PortForwarder
+// lifecycle coverage but skips the echo and ForwardLines assertions.
+func RunWithForward(t *testing.T, name string, newT func(t *testing.T) transport.Transport, fw *ForwardTarget) {
 	t.Run(name, func(t *testing.T) {
 		t.Run("core", func(t *testing.T) { runCore(t, newT) })
-		t.Run("portforward", func(t *testing.T) { runPortForward(t, newT) })
+		t.Run("portforward", func(t *testing.T) { runPortForward(t, newT, fw) })
 		t.Run("pty", func(t *testing.T) { runPty(t, newT) })
 	})
 }
@@ -219,19 +235,15 @@ func runCore(t *testing.T, newT func(t *testing.T) transport.Transport) {
 	})
 }
 
-// runPortForward runs the PortForwarder section as a single ordered flow. It
-// executes only when the transport asserts transport.PortForwarder (localexec
-// is skipped entirely).
+// runPortForward runs the PortForwarder section as a single ordered flow. It is
+// skipped only when the transport does not assert transport.PortForwarder.
 //
-// The byte-echo step is guarded by a loopback-reachability gate so it is
-// deterministically green for BOTH the in-process native transport and a real
-// system-ssh remote. Reasoning: localexec does not implement PortForwarder, so
-// among PortForwarder impls only native is loopback-reachable — its in-process
-// server's direct-tcpip dials localhost on the SAME host as the test listener;
-// system-ssh forwards to a DIFFERENT machine, so a dial of localhost:remote on
-// that box could never reach a listener stood up here. We therefore compute
-// loopback := Describe().Impl != "system-ssh" and skip the echo for system-ssh.
-func runPortForward(t *testing.T, newT func(t *testing.T) transport.Transport) {
+// When fw is nil, the suite runs lifecycle coverage only: Forward,
+// ListForwards, Cancel, and the post-cancel refused-dial check. When fw is
+// non-nil, its echo address must be reachable from the transport's remote side,
+// so the suite also verifies a byte round-trip and ForwardLines while the
+// forward is alive.
+func runPortForward(t *testing.T, newT func(t *testing.T) transport.Transport, fw *ForwardTarget) {
 	ctx := context.Background()
 	tr := newT(t)
 	pf, ok := tr.(transport.PortForwarder)
@@ -242,10 +254,27 @@ func runPortForward(t *testing.T, newT func(t *testing.T) transport.Transport) {
 		t.Fatalf("Ensure: %v", err)
 	}
 
-	loopback := tr.Describe().Impl != "system-ssh"
-
 	local := freePort(t)
 	remotePort := freePort(t)
+	cleanup := func() {}
+	if fw != nil {
+		if fw.NewEchoServer == nil {
+			t.Fatal("ForwardTarget.NewEchoServer is nil")
+		}
+		addr, cleanupFn := fw.NewEchoServer(t)
+		if cleanupFn != nil {
+			cleanup = cleanupFn
+		}
+		defer func() { cleanup() }()
+		_, portStr, err := net.SplitHostPort(addr)
+		if err != nil {
+			t.Fatalf("parse ForwardTarget addr %q: %v", addr, err)
+		}
+		remotePort, err = strconv.Atoi(portStr)
+		if err != nil {
+			t.Fatalf("parse ForwardTarget port %q: %v", portStr, err)
+		}
+	}
 
 	// Step 1: Forward returns nil.
 	if err := pf.Forward(ctx, local, remotePort); err != nil {
@@ -261,28 +290,12 @@ func runPortForward(t *testing.T, newT func(t *testing.T) transport.Transport) {
 		t.Fatalf("ListForwards = %v, want to contain %d", ports, local)
 	}
 
-	// Step 3 (loopback/native only): full echo round-trip while the forward
-	// is STILL alive, then assert ForwardLines shows the registry-shaped
-	// 127.0.0.1:<local> entry, then tear down the echo dialer + fake remote.
-	if loopback {
-		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", remotePort))
-		if err != nil {
-			t.Fatalf("fake remote listen on %d: %v", remotePort, err)
-		}
-		echoDone := make(chan struct{})
-		go func() {
-			defer close(echoDone)
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			defer c.Close()
-			io.Copy(c, c)
-		}()
-
+	// Step 3 (declared target only): full echo round-trip while the forward is
+	// STILL alive, then assert ForwardLines shows the registry-shaped
+	// 127.0.0.1:<local> entry.
+	if fw != nil {
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", local), 5*time.Second)
 		if err != nil {
-			ln.Close()
 			t.Fatalf("dial forwarded 127.0.0.1:%d: %v", local, err)
 		}
 		msg := []byte("echo-through-forward\n")
@@ -308,8 +321,8 @@ func runPortForward(t *testing.T, newT func(t *testing.T) transport.Transport) {
 		}
 
 		conn.Close()
-		ln.Close()
-		<-echoDone
+		cleanup()
+		cleanup = func() {}
 	}
 
 	// Step 4: Cancel.

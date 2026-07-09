@@ -29,7 +29,7 @@ type doctorFakeTransport struct {
 	forceUp bool
 	// impl overrides Describe().Impl; empty means the default "system-ssh" so the
 	// existing byte-compat fixtures are unaffected.
-	impl string
+	impl transport.Impl
 	// needsEnsure models the native shape: a freshly-built native client has not
 	// dialed, so Health reports DOWN until Ensure connects it. runDoctor MUST
 	// Ensure before the Health gate or a healthy native box wrongly fails the
@@ -63,7 +63,7 @@ func (f *doctorFakeTransport) Close(context.Context) (bool, error) { return true
 func (f *doctorFakeTransport) Describe() transport.Desc {
 	impl := f.impl
 	if impl == "" {
-		impl = "system-ssh"
+		impl = transport.ImplSystemSSH
 	}
 	return transport.Desc{Impl: impl, Host: "fakehost", Endpoint: "/tmp/sock-fake"}
 }

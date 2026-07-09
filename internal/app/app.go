@@ -224,7 +224,7 @@ func (e errTransport) Stream(context.Context, ...string) (io.WriteCloser, io.Rea
 func (e errTransport) Close(context.Context) (bool, error) { return false, nil }
 
 func (e errTransport) Describe() transport.Desc {
-	return transport.Desc{Impl: "unavailable", Endpoint: e.err.Error()}
+	return transport.Desc{Impl: transport.ImplUnavailable, Endpoint: e.err.Error()}
 }
 
 func (e errTransport) Forward(context.Context, int, int) error        { return e.err }

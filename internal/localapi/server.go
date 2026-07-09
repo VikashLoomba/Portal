@@ -318,7 +318,7 @@ func (s *Server) buildStatus(ctx context.Context) api.Status {
 		h, _ := s.deps.Master.Health(ctx)
 		d := s.deps.Master.Describe()
 		masterUp = h.Up
-		st.Master = api.MasterStatus{Up: h.Up, Pid: h.Pid, Transport: d.Impl, Detail: h.Detail}
+		st.Master = api.MasterStatus{Up: h.Up, Pid: h.Pid, Transport: string(d.Impl), Detail: h.Detail}
 	}
 
 	if s.deps.Agent != nil {

@@ -42,10 +42,21 @@ type Health struct {
 	Detail string
 }
 
-// Desc identifies a transport for status/log rendering. Impl is one of
-// "system-ssh", "native-ssh", or "localexec".
+// Impl identifies the concrete transport implementation for status/log rendering.
+type Impl string
+
+const (
+	ImplSystemSSH   Impl = "system-ssh"
+	ImplNativeSSH   Impl = "native-ssh"
+	ImplLocalExec   Impl = "localexec"
+	ImplUnavailable Impl = "unavailable"
+)
+
+// Desc identifies a transport for status/log rendering. Impl describes the
+// concrete implementation; the disjoint "system"/"native" config-selection
+// vocabulary stays internal to internal/config and selects which Impl is built.
 type Desc struct {
-	Impl     string
+	Impl     Impl
 	Host     string
 	Endpoint string
 }
