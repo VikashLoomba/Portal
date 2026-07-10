@@ -17,7 +17,7 @@ import (
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
 
-// Sentinel errors returned by the registry's Call helper (the lifted clip
+// Sentinel errors returned by the registry's Call helper (the generalized
 // request/response machinery, DESIGN S9).
 var (
 	// ErrNoWaiterCapacity is returned by call when the service's waiter count has
@@ -25,7 +25,7 @@ var (
 	ErrNoWaiterCapacity = errors.New("agent: call waiter capacity exceeded")
 	// ErrCallTimeout is returned by call when no matching completeCall arrives
 	// before the per-call timeout (or the request could not be admitted to the
-	// outbox). Adverse-path callers (clip) map it to "none\n".
+	// outbox). Callers map it to their service-specific adverse-path reply.
 	ErrCallTimeout = errors.New("agent: call timed out")
 )
 
@@ -34,7 +34,7 @@ var (
 // connection time (never snapshotted at registration), so a service that stores
 // its socket deadline in a field can shorten it and have the shortened value
 // actually applied. Handle receives the Serve ctx threaded from handleCmdConn:
-// clip's handler needs it for reg.call and its select on ctx.Done(); the
+// clip/cred handlers need it for reg.call and its select on ctx.Done(); the
 // openurl/notify handlers ignore it. routeVerb is the single source of the
 // per-verb socket deadline — handlers do not set their own.
 type Verb struct {
@@ -43,8 +43,9 @@ type Verb struct {
 	Handle   func(ctx context.Context, conn net.Conn, rest string)
 }
 
-// Service is a compiled-in agent-side feature (openurl/notify/clip). HandleMsg
-// processes inbound client→agent Msgs for this service (e.g. clip "resp").
+// Service is a compiled-in agent-side feature (openurl/notify/clip/cred).
+// HandleMsg processes inbound client→agent Msgs for this service (e.g. a
+// clip/cred "resp").
 // Verbs() MUST construct its []Verb from the service's current fields on each
 // call so Deadline reflects live field values; it is invoked at registration
 // (for the verb-name claims) and again per cmd-socket connection (by routeVerb,
@@ -92,8 +93,8 @@ type serviceEntry struct {
 
 // registry is the agent-side service registry. It owns verb claims, inbound Msg
 // dispatch, the bounded per-service outboxes merged into a single drain the
-// Serve select reads, per-service Seq stamping, and the generalized clip
-// Call/epoch/nonce machinery. It hands out NO *Encoder — only channels — so it
+// Serve select reads, per-service Seq stamping, and generalized Call/epoch/
+// nonce machinery. It hands out NO *Encoder — only channels — so it
 // can never become a second writer of agent→client frames (DESIGN S5).
 type registry struct {
 	log *slog.Logger
@@ -113,7 +114,7 @@ type registry struct {
 	// outbox capacities, so an admitted emit()'s push is always non-blocking.
 	outboxCh chan *protocol.Envelope
 
-	// ep is this process's clip identity, seeded in newRegistry via newEpoch.
+	// ep is this process's request/response identity, seeded via newEpoch.
 	// nonce is the dedicated atomic call-nonce counter (the old clipSeq,
 	// separate from every Seq).
 	ep    uint64
@@ -125,7 +126,7 @@ type registry struct {
 }
 
 // newRegistry constructs an empty registry. hasClientFn is left nil (bound
-// later by bindHasClient); the clip epoch is seeded here.
+// later by bindHasClient); the shared call epoch is seeded here.
 func newRegistry(log *slog.Logger) *registry {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -166,11 +167,9 @@ func (h *serviceHost) HasClient() bool { return h.r.hasClient() }
 
 func (h *serviceHost) ClientHas(service string) bool { return h.r.clientHas(service) }
 
-// newEpoch returns a non-zero random clip epoch — the permanent home of the
-// per-process clip identity (server.go's randEpoch is deleted with the legacy
-// clip machinery in u5). Semantics are identical to randEpoch: a zero draw is
-// indistinguishable from an unset field, so on the astronomically unlikely
-// all-zero draw we fall back to 1.
+// newEpoch returns the non-zero per-process identity shared by correlated
+// request/response services. A random-source failure or all-zero draw falls
+// back to 1, which is distinguishable from an unset epoch.
 func newEpoch() uint64 {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -367,14 +366,14 @@ func (r *registry) outbox() <-chan *protocol.Envelope {
 	return r.outboxCh
 }
 
-// epoch returns this process's clip identity (echoed in requests, checked in
-// completeCall). Immutable after newRegistry.
+// epoch returns this process's call identity, echoed in requests and checked in
+// completeCall. It is immutable after newRegistry.
 func (r *registry) epoch() uint64 { return r.ep }
 
 // nextNonce mints a fresh call nonce (the old clipSeq; separate from every Seq).
 func (r *registry) nextNonce() uint64 { return atomic.AddUint64(&r.nonce, 1) }
 
-// call is the lifted clip request/response machinery (DESIGN S9). ctx is the
+// call is the generalized request/response machinery (DESIGN S9). ctx is the
 // Serve ctx threaded through Verb.Handle. If the service's waiters already hit
 // maxInflight it returns ErrNoWaiterCapacity; otherwise it registers a
 // buffered-1 waiter keyed by nonce, emits the request, and waits for the waiter,

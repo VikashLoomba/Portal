@@ -38,8 +38,8 @@ func TestProtocolVectors(t *testing.T) {
 	}
 
 	// SortNone caveat: these hex files pin this Go encoder's byte output.
-	// The JSON sidecars are the semantic contract for foreign encoders; u11's
-	// TypeScript verifier checks semantics, not byte identity.
+	// The JSON sidecars are the semantic contract for foreign encoders; the
+	// TypeScript verifier also re-encodes the bare CBOR byte-identically.
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if *updateProtocolVectors {
@@ -53,6 +53,12 @@ func TestProtocolVectors(t *testing.T) {
 				t.Fatalf("decoded vector = %+v, want %+v", decoded, tt.want)
 			}
 			assertDecodedProtoVersion(t, tt.name, decoded)
+			if tt.assertPayload != nil {
+				if decoded.Msg == nil {
+					t.Fatal("credential vector did not decode as Msg")
+				}
+				tt.assertPayload(t, decoded.Msg.Payload)
+			}
 
 			// EC17: each arm's byte compare fails on Envelope arm, field, or CBOR
 			// tag drift, forcing a deliberate vector update.
@@ -70,8 +76,9 @@ func TestProtocolVectors(t *testing.T) {
 }
 
 type protocolVectorCase struct {
-	name string
-	want *protocol.Envelope
+	name          string
+	want          *protocol.Envelope
+	assertPayload func(*testing.T, cbor.RawMessage)
 }
 
 func protocolVectorCases(t *testing.T) []protocolVectorCase {
@@ -84,6 +91,36 @@ func protocolVectorCases(t *testing.T) []protocolVectorCase {
 		Source:   "claude_hook",
 		Sound:    "Glass",
 	})
+	credRequestFull := protocol.CredRequest{
+		Nonce:     0x0102030405060708,
+		Epoch:     0x1112131415161718,
+		Label:     "staging admin",
+		Requester: "pid 4242: sh -c curl",
+		Mode:      "env",
+		Target:    "PW",
+	}
+	credRequestMinimal := protocol.CredRequest{
+		Nonce: 9,
+		Epoch: 10,
+		Label: "sudo",
+		Mode:  "askpass",
+	}
+	credResponseOK := protocol.CredResponse{
+		Nonce:  0x0102030405060708,
+		Epoch:  0x1112131415161718,
+		OK:     true,
+		Secret: []byte("s3kr3t-vector"),
+	}
+	credResponseDeny := protocol.CredResponse{
+		Nonce: 9,
+		Epoch: 10,
+		OK:    false,
+		Err:   "denied",
+	}
+	credRequestFullPayload := mustProtocolPayload(t, credRequestFull)
+	credRequestMinimalPayload := mustProtocolPayload(t, credRequestMinimal)
+	credResponseOKPayload := mustProtocolPayload(t, credResponseOK)
+	credResponseDenyPayload := mustProtocolPayload(t, credResponseDeny)
 
 	return []protocolVectorCase{
 		{
@@ -197,6 +234,80 @@ func protocolVectorCases(t *testing.T) []protocolVectorCase {
 				Payload: notifyPayload,
 			}},
 		},
+		{
+			name:          "protocol_cred_request_full",
+			assertPayload: assertCredRequestPayload(credRequestFull),
+			want: &protocol.Envelope{Msg: &protocol.Msg{
+				Service: "cred",
+				Kind:    "req",
+				Seq:     1,
+				Payload: credRequestFullPayload,
+			}},
+		},
+		{
+			name:          "protocol_cred_request_minimal",
+			assertPayload: assertCredRequestPayload(credRequestMinimal),
+			want: &protocol.Envelope{Msg: &protocol.Msg{
+				Service: "cred",
+				Kind:    "req",
+				Seq:     2,
+				Payload: credRequestMinimalPayload,
+			}},
+		},
+		{
+			name:          "protocol_cred_response_ok",
+			assertPayload: assertCredResponsePayload(credResponseOK),
+			want: &protocol.Envelope{Msg: &protocol.Msg{
+				Service: "cred",
+				Kind:    "resp",
+				Seq:     1,
+				Payload: credResponseOKPayload,
+			}},
+		},
+		{
+			name:          "protocol_cred_response_deny",
+			assertPayload: assertCredResponsePayload(credResponseDeny),
+			want: &protocol.Envelope{Msg: &protocol.Msg{
+				Service: "cred",
+				Kind:    "resp",
+				Seq:     2,
+				Payload: credResponseDenyPayload,
+			}},
+		},
+	}
+}
+
+func assertCredRequestPayload(want protocol.CredRequest) func(*testing.T, cbor.RawMessage) {
+	return func(t *testing.T, payload cbor.RawMessage) {
+		t.Helper()
+		got, err := protocol.UnmarshalPayload[protocol.CredRequest](payload)
+		if err != nil {
+			t.Fatalf("UnmarshalPayload[CredRequest]: %v", err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("CredRequest payload = %+v, want %+v", got, want)
+		}
+		reencoded := mustProtocolPayload(t, got)
+		if !bytes.Equal(reencoded, payload) {
+			t.Fatal("CredRequest payload did not re-encode byte-identically")
+		}
+	}
+}
+
+func assertCredResponsePayload(want protocol.CredResponse) func(*testing.T, cbor.RawMessage) {
+	return func(t *testing.T, payload cbor.RawMessage) {
+		t.Helper()
+		got, err := protocol.UnmarshalPayload[protocol.CredResponse](payload)
+		if err != nil {
+			t.Fatalf("UnmarshalPayload[CredResponse]: %v", err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("CredResponse payload = %+v, want %+v", got, want)
+		}
+		reencoded := mustProtocolPayload(t, got)
+		if !bytes.Equal(reencoded, payload) {
+			t.Fatal("CredResponse payload did not re-encode byte-identically")
+		}
 	}
 }
 

@@ -1,0 +1,1 @@
+{"Hello":null,"Subscribe":null,"Ping":null,"ReqSnap":null,"Shutdown":null,"HelloAck":null,"SubscribeAck":null,"Snapshot":null,"PortAdded":null,"PortRemoved":null,"Heartbeat":null,"AgentError":null,"Bye":null,"Msg":{"Service":"cred","Kind":"req","Seq":1,"Payload":"pmFuGwECAwQFBgcIYWUbERITFBUWFxhhbG1zdGFnaW5nIGFkbWluYXJ0cGlkIDQyNDI6IHNoIC1jIGN1cmxhbWNlbnZhdGJQVw=="}}

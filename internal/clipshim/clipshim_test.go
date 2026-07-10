@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -31,7 +32,7 @@ func TestShimArgvMatcher(t *testing.T) {
 	// whose second entry holds the fake "real" binaries.
 	home := t.TempDir()
 	shimDir := filepath.Join(home, ".local", "bin")
-	realDir := filepath.Join(home, "realbin")
+	realDir := filepath.Join(home, "real binaries")
 	cacheDir := filepath.Join(home, ".cache", "portal")
 	for _, d := range []string{shimDir, realDir, cacheDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -59,14 +60,9 @@ func TestShimArgvMatcher(t *testing.T) {
 	writeExec(t, filepath.Join(shimDir, "xclip"), "%s", xclipShim)
 	writeExec(t, filepath.Join(shimDir, "wl-paste"), "%s", wlPasteShim)
 
-	// A DELIBERATELY SHORT PATH: shimDir first (so the shim runs), then realDir
-	// (so the fake "real" binary wins the fall-through resolution), then the
-	// standard coreutils dirs so the shim's fallback helpers (dirname/tr/grep/
-	// xargs/head) resolve. We do NOT inherit the test process's PATH — it is
-	// multi-KB on a dev Mac and the fallback's `xargs -I{} sh -c 'PATH={}...'`
-	// embeds the whole PATH into one argv, which overflows ARG_MAX. That is a
-	// test-environment artifact, not a shim defect (real dev boxes have a short
-	// PATH); keeping the test PATH minimal exercises the matcher faithfully.
+	// A deliberately short PATH puts the shim first and the fake real binaries
+	// second. The real-binary directory contains a space to pin that PATH entries
+	// are handled as data rather than reparsed as shell source.
 	path := coreutilsPath(shimDir, realDir)
 	run := func(bin string, args ...string) string {
 		t.Helper()
@@ -147,6 +143,111 @@ func TestShimArgvMatcher(t *testing.T) {
 	}
 }
 
+// TestShimResolversTreatPATHAsData runs every real-binary fallback with PATH
+// entries that would execute command substitutions in the former sh -c
+// resolver. It also pins resolution from a directory containing spaces.
+func TestShimResolversTreatPATHAsData(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shim scripts are /bin/sh")
+	}
+
+	home := t.TempDir()
+	shimDir := filepath.Join(home, "shims")
+	realDir := filepath.Join(home, "real binaries")
+	injectionDirs := []string{
+		filepath.Join(home, "$(touch PATH_SUBSTITUTION_RAN)"),
+		filepath.Join(home, "`touch PATH_BACKTICK_RAN`"),
+	}
+	for _, dir := range append([]string{shimDir, realDir}, injectionDirs...) {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const sentinel = "SAFE_REAL_BINARY"
+	for _, name := range []string{"xdg-open", "xclip", "wl-paste", "sudo"} {
+		writeExec(t, filepath.Join(realDir, name), "#!/bin/sh\nprintf '%s'\n", sentinel)
+	}
+	writeExec(t, filepath.Join(shimDir, "xdg-open"), "%s", XDGOpenWrapper)
+	writeExec(t, filepath.Join(shimDir, "xclip"), "%s", xclipShim)
+	writeExec(t, filepath.Join(shimDir, "wl-paste"), "%s", wlPasteShim)
+	writeExec(t, filepath.Join(shimDir, "sudo"), "%s", sudoShim)
+	askpass := filepath.Join(home, "portal-askpass")
+	writeExec(t, askpass, "#!/bin/sh\nexit 0\n")
+
+	pathParts := append([]string{shimDir}, injectionDirs...)
+	pathParts = append(pathParts, realDir, "/usr/bin", "/bin")
+	path := strings.Join(pathParts, ":")
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "xdg-open", args: []string{"https://example.invalid"}},
+		{name: "xclip", args: []string{"-selection", "clipboard", "-i"}},
+		{name: "wl-paste", args: []string{"--clear"}},
+		{name: "sudo", args: []string{"whoami"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(filepath.Join(shimDir, tc.name), tc.args...)
+			cmd.Dir = home
+			cmd.Env = []string{
+				"HOME=" + home,
+				"PATH=" + path,
+				"SUDO_ASKPASS=" + askpass,
+			}
+			if tc.name == "sudo" {
+				detachFromControllingTerminal(cmd)
+			}
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%s resolver: %v (out=%q)", tc.name, err, out)
+			}
+			if string(out) != sentinel {
+				t.Fatalf("%s resolver output = %q, want %q", tc.name, out, sentinel)
+			}
+		})
+	}
+
+	for _, name := range []string{"PATH_SUBSTITUTION_RAN", "PATH_BACKTICK_RAN"} {
+		if _, err := os.Stat(filepath.Join(home, name)); !os.IsNotExist(err) {
+			t.Fatalf("PATH text executed and created %s", name)
+		}
+	}
+}
+
+func TestShimResolversSkipEmptyEntriesAndRejectSelf(t *testing.T) {
+	tests := []struct {
+		name   string
+		script string
+		tool   string
+	}{
+		{name: "xdg-open", script: XDGOpenWrapper, tool: "xdg-open"},
+		{name: "xclip", script: xclipShim, tool: "xclip"},
+		{name: "wl-paste", script: wlPasteShim, tool: "wl-paste"},
+		{name: "sudo", script: sudoShim, tool: "sudo"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, want := range []string{
+				`for _d in $PATH; do`,
+				`[ -n "$_d" ] || continue`,
+				`[ -x "$_d/` + tc.tool + `" ]`,
+				`[ "$_real" -ef "$0" ]`,
+			} {
+				if !strings.Contains(tc.script, want) {
+					t.Errorf("%s resolver missing %q", tc.name, want)
+				}
+			}
+			for _, forbidden := range []string{"xargs -I", "sh -c 'PATH={}"} {
+				if strings.Contains(tc.script, forbidden) {
+					t.Errorf("%s resolver still contains unsafe %q", tc.name, forbidden)
+				}
+			}
+		})
+	}
+}
+
 // TestShimFallsThroughWhenNoPortald proves a missing/non-executable portald
 // makes the shim fall through to the real binary (the new-shim/old-agent and
 // dangling-symlink windows — DESIGN §9.5), never erroring out.
@@ -181,8 +282,7 @@ func TestShimFallsThroughWhenNoPortald(t *testing.T) {
 }
 
 // coreutilsPath builds a short PATH: the two test dirs first, then the standard
-// coreutils locations, filtered to those that exist on this host. Kept short so
-// the shim's `xargs -I{} sh -c 'PATH={}...'` fallback does not overflow ARG_MAX.
+// coreutils locations, filtered to those that exist on this host.
 func coreutilsPath(first, second string) string {
 	parts := []string{first, second}
 	for _, d := range []string{"/usr/bin", "/bin", "/usr/local/bin"} {
@@ -191,6 +291,10 @@ func coreutilsPath(first, second string) string {
 		}
 	}
 	return strings.Join(parts, ":")
+}
+
+func detachFromControllingTerminal(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 }
 
 // writeExec writes an executable script from a printf-style template.

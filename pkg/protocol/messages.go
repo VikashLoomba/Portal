@@ -4,7 +4,8 @@ import "github.com/fxamacker/cbor/v2"
 
 // Msg is the generic service frame (v4). Payload is the service's own CBOR
 // struct — the v3 payload types (OpenURL/ClipRequest/ClipResponse/Notify),
-// their tags unchanged — marshalled via MarshalPayload and carried opaquely.
+// their tags unchanged, and later additive payloads such as CredRequest and
+// CredResponse — marshalled via MarshalPayload and carried opaquely.
 // Seq is per-(service, direction) monotonic within one agent process, stamped
 // by the registry for LOG CORRELATION ONLY; it is never the port-event
 // staleness Seq (that counter is s.seq and Msg must never advance it).
@@ -203,6 +204,45 @@ type ClipResponse struct {
 	Kind string `cbor:"k,omitempty"`
 	SHA  string `cbor:"sha,omitempty"`
 	Err  string `cbor:"err,omitempty"`
+}
+
+// CredRequest — agent → client. A remote keychain runner or askpass helper
+// hit the cmd socket asking the Mac to approve and supply a credential.
+// Nonce+Epoch correlate the CredResponse and reject stale responses across
+// reconnects exactly as for ClipRequest. Mode ∈ {"env","stdin","askpass"};
+// Target is the env-var name, command summary, or askpass prompt shown to the
+// user. The receiving endpoint caps Label at 200 bytes and Requester/Target at
+// 300 bytes each; the agent service caps Msg.Payload at 8192 bytes.
+//
+// As of v4 this travels inside Msg.Payload rather than as an Envelope field.
+type CredRequest struct {
+	Nonce     uint64 `cbor:"n"`
+	Epoch     uint64 `cbor:"e"`
+	Label     string `cbor:"l"`
+	Requester string `cbor:"r,omitempty"`
+	Mode      string `cbor:"m"`
+	Target    string `cbor:"t,omitempty"`
+}
+
+// CredResponse — client → agent. Answers a CredRequest by (Nonce,Epoch).
+// On approval OK is true and Secret carries at most 4096 bytes; on denial OK
+// is false and Err carries the machine-readable reason. Err ∈ {"denied",
+// "timeout","disabled","cooldown","gui-unavailable","label-invalid",
+// "no-client","busy"}. The agent may generate busy/no-client/timeout directly
+// as box-local socket denials. The Mac never sends no-client, but may send busy
+// defensively if a second request races an open dialog. The secret is
+// deliberately in-band, unlike ClipResponse's out-of-band SHA design:
+// credentials are small and must never touch the box's disk. The 4096-byte
+// Secret endpoint cap plus the cred service's 8192-byte MaxPayload limit keep
+// the containing Msg.Payload bounded.
+//
+// As of v4 this travels inside Msg.Payload rather than as an Envelope field.
+type CredResponse struct {
+	Nonce  uint64 `cbor:"n"`
+	Epoch  uint64 `cbor:"e"`
+	OK     bool   `cbor:"ok"`
+	Secret []byte `cbor:"s,omitempty"`
+	Err    string `cbor:"err,omitempty"`
 }
 
 // Notify — agent → client (v3). A remote event (a Claude Code hook firing

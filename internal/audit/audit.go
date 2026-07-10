@@ -1,8 +1,8 @@
 // Package audit is the append-only security audit log for the Mac-side daemon.
-// It records every clipboard read served to a remote, every notification
-// raised, and every URL opened — the user-inspectable trail of what the remote
-// dev box asked this Mac to do (SPEC C). cc-clip keeps session/notification
-// logs; this is the equivalent for portal's transport.
+// It records every clipboard read and credential served to a remote, every
+// notification raised, and every URL opened — the user-inspectable trail of
+// what the remote dev box asked this Mac to do (SPEC C). cc-clip keeps
+// session/notification logs; this is the equivalent for portal's transport.
 //
 // The log is intentionally simple: one line per event, RFC3339-timestamped,
 // tab-separated, appended under the portal config dir as `audit.log`. It is
@@ -10,7 +10,7 @@
 // un-served paste because of a full disk would be a worse failure mode than a
 // missed audit line. Concurrent writers are serialized by a mutex so lines
 // never interleave (the Mac daemon has several handler goroutines: clip,
-// notify, open-URL).
+// credentials, notify, open-URL).
 package audit
 
 import (
@@ -59,6 +59,26 @@ func (l *Log) ClipServed(host, kind, detail string) {
 // a short token ("disabled", "concealed", "none").
 func (l *Log) ClipDenied(host, kind, reason string) {
 	l.write("clip-denied", "host="+host, "kind="+kind, "reason="+reason)
+}
+
+// CredServed records that a credential was delivered after user approval.
+// source is "prompt", "prompt-remembered", or "keychain"; dur is the full
+// approval latency. The secret is deliberately outside this API.
+func (l *Log) CredServed(host, label, mode, source string, dur time.Duration) {
+	l.write("cred-served", "host="+host, "label="+oneLine(label), "mode="+mode,
+		"source="+source, "dur="+dur.String())
+}
+
+// CredDenied records that a credential request was refused before delivery.
+// reason is the short denial token returned to the box.
+func (l *Log) CredDenied(host, label, mode, reason string) {
+	l.write("cred-denied", "host="+host, "label="+oneLine(label), "mode="+mode,
+		"reason="+reason)
+}
+
+// CredForgotten records removal of a remembered credential from the Keychain.
+func (l *Log) CredForgotten(host, label string) {
+	l.write("cred-forgotten", "host="+host, "label="+oneLine(label))
 }
 
 // Notify records that a native notification was raised (or denied). verified

@@ -72,6 +72,7 @@ func newRootCmd(a *app.App) *cobra.Command {
 	root.AddCommand(newUnallowCmd(a))
 	root.AddCommand(newAllowedCmd(a))
 	root.AddCommand(newFeaturesCmd(a))
+	root.AddCommand(newKeychainCmd(a))
 	root.AddCommand(newExecCmd(a))
 	root.AddCommand(newSSHCmd(a))
 	root.AddCommand(newClipCheckCmd(a))
@@ -123,6 +124,13 @@ Usage: %[1]s <command>
                     deploys xclip/wl-paste read shims so a coding agent's own
                     Ctrl+V serves your Mac clipboard — no special command needed.
 
+  Credentials
+    keychain list   List credential labels remembered in this Mac's Keychain.
+    keychain forget <label>
+                    Forget a remembered credential on this Mac.
+                    On the dev box, agents use 'portal keychain run ...' or
+                    sudo; portal opens an approval dialog on this Mac.
+
   Inspect
     status          Show box, service state, ssh master, active forwards. (default)
     ports           List the loopback dev ports currently listening on the box.
@@ -141,8 +149,8 @@ Usage: %[1]s <command>
 
   Capabilities
     features [name on|off]
-                    Show or toggle the clip-image / clip-text / notify / exec
-                    gates; the running daemon picks changes up live.
+                    Show or toggle the clip-image / clip-text / notify / exec /
+                    cred gates; the running daemon picks changes up live.
 
   Advanced
     run             Run the forwarding loop in the foreground (used by launchd).

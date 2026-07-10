@@ -1,13 +1,17 @@
 package main
 
-import "testing"
+import (
+	"testing"
 
-// TestAppleScriptStr verifies the AppleScript-injection sanitizer escapes the
+	"github.com/VikashLoomba/Portal/internal/osa"
+)
+
+// TestOSAStringLiteral verifies the AppleScript-injection sanitizer escapes the
 // two metacharacters that matter inside a double-quoted AppleScript string
 // literal (backslash and double-quote) and strips control bytes — so a hostile
 // remote notification title/body cannot break out of the `display notification`
 // literal and run arbitrary AppleScript.
-func TestAppleScriptStr(t *testing.T) {
+func TestOSAStringLiteral(t *testing.T) {
 	tests := []struct {
 		name string
 		in   string
@@ -32,8 +36,8 @@ func TestAppleScriptStr(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := appleScriptStr(tc.in); got != tc.want {
-				t.Errorf("appleScriptStr(%q) = %q, want %q", tc.in, got, tc.want)
+			if got := osa.StringLiteral(tc.in); got != tc.want {
+				t.Errorf("osa.StringLiteral(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}

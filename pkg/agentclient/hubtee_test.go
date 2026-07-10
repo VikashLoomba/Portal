@@ -130,6 +130,18 @@ func TestHubTee_NoEventOnClip(t *testing.T) {
 	expectNoEvent(t, queued, "Queued (clip)")
 }
 
+// TestHubTee_NoEventOnCred asserts a credential publish remains daemon-local
+// and produces no hub event of either class.
+func TestHubTee_NoEventOnCred(t *testing.T) {
+	c, coal, queued := newTeeFixture(t)
+
+	c.publishCred(EngineEvent{Kind: KindCredRequest, Cred: &CredEvent{
+		Nonce: 2, Epoch: 3, Label: "database", Mode: "env", Target: "PW",
+	}})
+	expectNoEvent(t, coal, "Coalesced (cred)")
+	expectNoEvent(t, queued, "Queued (cred)")
+}
+
 // TestHubTee_LastDisconnectErr asserts LastDisconnectErr tracks the most recent
 // KindDisconnected error, and reports "" for a disconnect with no error.
 func TestHubTee_LastDisconnectErr(t *testing.T) {

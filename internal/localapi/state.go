@@ -65,7 +65,7 @@ type ExecStreamer interface {
 // Deps is the dependency set for a Server. The interface fields are narrow so
 // tests fake them without constructing an App; Doctor/PushAllow/Kick are
 // closures wired by run.go so localapi never imports package app. FeatureNames
-// defaults to [clip-image, clip-text, notify, exec] when empty.
+// defaults to [clip-image, clip-text, notify, exec, cred] when empty.
 type Deps struct {
 	Version      api.VersionInfo
 	Host         func() (string, error)

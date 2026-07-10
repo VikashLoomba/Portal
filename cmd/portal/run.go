@@ -54,12 +54,12 @@ func newRunCmd(a *app.App) *cobra.Command {
 			engine, openURLCh := a.NewEngineWithOpenURL()
 
 			// Run agent supervisor, reconcile engine, URL opener, the
-			// clipboard-read handler, the notification handler, and the local
-			// API server in parallel; any returning ends the daemon (launchd
-			// will relaunch).
+			// clipboard-read handler, credential handler, notification handler,
+			// and the local API server in parallel; any returning ends the daemon
+			// (launchd will relaunch).
 			var wg sync.WaitGroup
-			wg.Add(6)
-			errCh := make(chan error, 6)
+			wg.Add(7)
+			errCh := make(chan error, 7)
 
 			go func() {
 				defer wg.Done()
@@ -79,12 +79,16 @@ func newRunCmd(a *app.App) *cobra.Command {
 			}()
 			go func() {
 				defer wg.Done()
+				runCredHandler(ctx, a.AgentClient.CredEvents(), a)
+			}()
+			go func() {
+				defer wg.Done()
 				runNotifyHandler(ctx, a.AgentClient.NotifyEvents(), a)
 			}()
 			go func() {
 				defer wg.Done()
 				// D10: API bind failure is FATAL. On a bind failure we cancel
-				// the shared ctx so the other five goroutines return, wg.Wait
+				// the shared ctx so the other six goroutines return, wg.Wait
 				// unblocks, and the daemon exits non-zero for launchd to relaunch
 				// loudly. A serve failure (Serve returns non-nil) is fatal for
 				// the same reason; a clean ctx-cancel shutdown returns nil.

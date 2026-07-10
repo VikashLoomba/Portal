@@ -37,6 +37,7 @@ func TestFeatures_DaemonUp_ListDeterministicOrder(t *testing.T) {
 		config.FeatureClipText:  false,
 		config.FeatureNotify:    true,
 		config.FeatureExec:      false,
+		config.FeatureCred:      true,
 	})
 	cliCfg := newTestConfig(t, "devbox")
 	setFeatures(t, cliCfg, map[string]bool{
@@ -44,6 +45,7 @@ func TestFeatures_DaemonUp_ListDeterministicOrder(t *testing.T) {
 		config.FeatureClipText:  true,
 		config.FeatureNotify:    false,
 		config.FeatureExec:      true,
+		config.FeatureCred:      false,
 	})
 	d := startFakeDaemon(t, daemonCfg)
 	a := newDaemonTestApp(t, d.path, cliCfg)
@@ -57,7 +59,7 @@ func TestFeatures_DaemonUp_ListDeterministicOrder(t *testing.T) {
 	}
 
 	// The daemon's posture, NOT the CLI store's inverted one.
-	want := "clip-image: on\nclip-text: off\nnotify: on\nexec: off\n"
+	want := "clip-image: on\nclip-text: off\nnotify: on\nexec: off\ncred: on\n"
 	if out.String() != want {
 		t.Errorf("list output:\n--- got ---\n%s--- want ---\n%s", out.String(), want)
 	}
@@ -71,18 +73,18 @@ func TestFeatures_DaemonUp_ListDeterministicOrder(t *testing.T) {
 	}
 }
 
-// EC (features set, daemon up): `features clip-text off` PUTs through the daemon
+// EC (features set, daemon up): `features cred off` PUTs through the daemon
 // (writing the shared config.Store) and echoes only the changed line.
 func TestFeatures_DaemonUp_SetWritesThroughDaemon(t *testing.T) {
 	// The daemon writes daemonCfg; the CLI's fallback would write the SEPARATE
-	// cliCfg (a.Cfg). Both start with clip-text on. This split is what makes the
+	// cliCfg (a.Cfg). Both start with cred on. This split is what makes the
 	// two paths distinguishable: a real PUT mutates daemonCfg and leaves cliCfg
 	// untouched, whereas any fall-through — even one where lc.SetFeature still
 	// fired the PUT but the branch also ran a.Cfg.SetFeature — mutates cliCfg.
 	daemonCfg := newTestConfig(t, "devbox")
-	setFeatures(t, daemonCfg, map[string]bool{config.FeatureClipText: true})
+	setFeatures(t, daemonCfg, map[string]bool{config.FeatureCred: true})
 	cliCfg := newTestConfig(t, "devbox")
-	setFeatures(t, cliCfg, map[string]bool{config.FeatureClipText: true})
+	setFeatures(t, cliCfg, map[string]bool{config.FeatureCred: true})
 	d := startFakeDaemon(t, daemonCfg)
 	a := newDaemonTestApp(t, d.path, cliCfg)
 
@@ -90,7 +92,7 @@ func TestFeatures_DaemonUp_SetWritesThroughDaemon(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	before := d.featureWrites()
-	if err := runFeatures(ctx, &out, &errw, a, []string{"clip-text", "off"}); err != nil {
+	if err := runFeatures(ctx, &out, &errw, a, []string{"cred", "off"}); err != nil {
 		t.Fatalf("runFeatures set: %v", err)
 	}
 
@@ -99,16 +101,16 @@ func TestFeatures_DaemonUp_SetWritesThroughDaemon(t *testing.T) {
 		t.Errorf("daemon feature writes advanced by %d, want 1; the set never reached PUT /v1/features", got)
 	}
 	// The daemon's store reflects the change...
-	if daemonCfg.FeatureEnabled(config.FeatureClipText) {
-		t.Error("PUT /v1/features did not disable clip-text in the daemon's config.Store")
+	if daemonCfg.FeatureEnabled(config.FeatureCred) {
+		t.Error("PUT /v1/features did not disable cred in the daemon's config.Store")
 	}
 	// ...and the CLI's fallback store was NOT written. This is the decisive proof
 	// the write went THROUGH the daemon rather than falling through to a.Cfg: any
-	// fall-through would have flipped clip-text off here too.
-	if !a.Cfg.FeatureEnabled(config.FeatureClipText) {
+	// fall-through would have flipped cred off here too.
+	if !a.Cfg.FeatureEnabled(config.FeatureCred) {
 		t.Error("fallback config.Store was written; the set fell through to a.Cfg instead of PUT /v1/features")
 	}
-	if want := "clip-text: off\n"; out.String() != want {
+	if want := "cred: off\n"; out.String() != want {
 		t.Errorf("set output = %q, want %q", out.String(), want)
 	}
 	if errw.Len() != 0 {
@@ -132,7 +134,7 @@ func TestFeatures_UnknownName(t *testing.T) {
 	if !errors.As(err, &ue) {
 		t.Fatalf("err = %v, want usageErr", err)
 	}
-	if want := "unknown feature: bogus (known: clip-image, clip-text, notify, exec)\n"; errw.String() != want {
+	if want := "unknown feature: bogus (known: clip-image, clip-text, notify, exec, cred)\n"; errw.String() != want {
 		t.Errorf("stderr = %q, want %q", errw.String(), want)
 	}
 	if out.Len() != 0 {
@@ -150,6 +152,7 @@ func TestFeatures_DaemonDown_Fallback(t *testing.T) {
 		config.FeatureClipText:  true,
 		config.FeatureNotify:    true,
 		config.FeatureExec:      true,
+		config.FeatureCred:      false,
 	})
 	// Point APISock at a nonexistent path so client dials fail fast.
 	a := newDaemonTestApp(t, filepath.Join(t.TempDir(), "nope.sock"), cfg)
@@ -162,7 +165,7 @@ func TestFeatures_DaemonDown_Fallback(t *testing.T) {
 	if err := runFeatures(ctx, &out, &errw, a, nil); err != nil {
 		t.Fatalf("runFeatures list (down): %v", err)
 	}
-	if want := "clip-image: off\nclip-text: on\nnotify: on\nexec: on\n"; out.String() != want {
+	if want := "clip-image: off\nclip-text: on\nnotify: on\nexec: on\ncred: off\n"; out.String() != want {
 		t.Errorf("fallback list:\n--- got ---\n%s--- want ---\n%s", out.String(), want)
 	}
 	if errw.Len() != 0 {

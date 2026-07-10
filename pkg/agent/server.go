@@ -35,9 +35,9 @@ type Config struct {
 	BackpressureKill time.Duration
 	Log              *slog.Logger // stderr handler; nil → discard
 	Now              func() time.Time
-	// CmdSockPath is the Unix socket path where `portald open <url>`
-	// connects to relay URLs back to the Mac client. Empty = disabled.
-	// The socket is only active while a Mac client is subscribed.
+	// CmdSockPath is the Unix socket used by box-local portald service verbs to
+	// reach the agent. Empty disables the socket; handlers only relay while a Mac
+	// client is subscribed and advertises the matching service.
 	CmdSockPath string
 	// Services are registered AFTER the built-ins, in order.
 	Services []ServiceFactory
@@ -51,10 +51,10 @@ type Server struct {
 	dec    *protocol.Decoder
 
 	// reg is the service registry. It auto-registers the compiled-in openurl,
-	// notify, and clip services in New and owns the per-service outbox the Serve
-	// loop drains, the inbound Msg dispatch, and the generalized clip Call/epoch/
-	// nonce correlation machinery. It never holds an *Encoder — the Serve loop
-	// stays the sole agent→client writer.
+	// notify, clip, and cred services in New and owns the per-service outbox the
+	// Serve loop drains, inbound Msg dispatch, and generalized Call/epoch/nonce
+	// correlation machinery. It never holds an *Encoder — the Serve loop stays
+	// the sole agent→client writer.
 	reg *registry
 	// clip is the registered clip service. It is retained ONLY as a construction
 	// handle and a white-box test accessor (the timeout-budget test shortens its
@@ -63,6 +63,9 @@ type Server struct {
 	// the SAME instance registered in reg, so a field shortened here is the one
 	// routeVerb/reg.call read live.
 	clip *clipService
+	// cred is the registered cred service, retained for the same construction
+	// and white-box timeout-field access as clip.
+	cred *credService
 
 	mu          sync.Mutex
 	seq         uint64
@@ -111,9 +114,8 @@ func New(cfg Config) *Server {
 	// Build the registry and bind the Server's guarded subscription reader so
 	// services can gate on `hasClient() && clientHas(svc)` without ever touching
 	// s.mu directly. Then auto-register all compiled-in services (openurl,
-	// notify, clip). The registry owns the clip epoch/nonce/waiter correlation
-	// machinery (newRegistry seeds the epoch via newEpoch); server.go no longer
-	// carries any clip-specific state.
+	// notify, clip, cred). The registry owns the epoch/nonce/waiter correlation
+	// machinery (newRegistry seeds the epoch via newEpoch).
 	s.reg = newRegistry(cfg.Log)
 	s.reg.bindHasClient(func() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.hasClient })
 	host := &serviceHost{r: s.reg}
@@ -121,6 +123,8 @@ func New(cfg Config) *Server {
 	s.reg.register(newNotifyService(host, cfg.Log))
 	s.clip = newClipService(host, cfg.Log)
 	s.reg.register(s.clip)
+	s.cred = newCredService(host, cfg.Log)
+	s.reg.register(s.cred)
 	for _, f := range cfg.Services {
 		s.reg.register(f(host, cfg.Log))
 	}
@@ -182,7 +186,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	go s.readLoop(ctx, cmdCh, readErrCh)
 
 	// 5. Start cmd Unix socket if configured. The socket relays cmd-verb
-	// requests (open/clip/notify) from `portald <verb>` on the box. It is only
+	// requests (open/clip/notify/cred) from `portald <verb>` on the box. It is only
 	// live while a client is actively subscribed; the service handlers gate on
 	// hasClient, which is set in handleSubscribe.
 	if s.cfg.CmdSockPath != "" {
@@ -312,10 +316,10 @@ func (s *Server) handleCommand(ctx context.Context, env *protocol.Envelope) erro
 			Now: s.cfg.Now().UnixNano(), Nonce: env.Ping.Nonce,
 		}})
 	case env.Msg != nil:
-		// Inbound client→agent service frame (DESIGN §4): the clip "resp" flows
-		// here → reg.dispatch → clipService.HandleMsg → reg.completeCall. Dispatch
-		// runs under the registry's payload-cap/recover guards — an unknown
-		// service or panicking handler drops the frame, the session lives.
+		// Inbound client→agent service frame (DESIGN §4): clip/cred "resp"
+		// frames flow through reg.dispatch and service HandleMsg to completeCall.
+		// Dispatch runs under the registry's payload-cap/recover guards — an
+		// unknown service or panicking handler drops the frame, the session lives.
 		s.reg.dispatch(env.Msg)
 		return nil
 	case env.Shutdown != nil:
@@ -485,13 +489,12 @@ func (s *Server) serveCmdSock(ctx context.Context) {
 //	clip\timage\tpng\n   → "ok\t<sha>\n" | "none\n"
 //	clip\ttext\n         → "ok\t<sha>\n" | "none\n"
 //	notify\t<json>\n     → relay a notification to the Mac; "ok\n"|"no-client\n"|"dropped\n"
+//	cred\t<base64>\n      → "ok\t<base64-secret>\n" | "deny\t<reason>\n"
 //	<anything else>      → "rejected\n"
 func (s *Server) handleCmdConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
-	// Tight default deadline for the read + the open path. Clip extends it
-	// below (see clipSockDeadline) because the round trip to the Mac is slower
-	// than a local URL hand-off. routeVerb re-applies each claimed verb's live
-	// per-verb deadline before dispatching.
+	// Tight default deadline for the read + the open path. Clip and cred
+	// request/response paths extend it through service-specific deadlines.
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
@@ -504,9 +507,8 @@ func (s *Server) handleCmdConn(ctx context.Context, conn net.Conn) {
 	}
 	verb, rest, _ := strings.Cut(line, "\t")
 	// Claimed verbs route to their registered service ("open" → openurl,
-	// "notify" → notify, "clip" → clip, each applying its own live per-verb
-	// deadline). An unknown verb is not claimed, so routeVerb returns false and
-	// we default-deny.
+	// "notify" → notify, "clip" → clip, "cred" → cred), applying the
+	// service's live per-verb deadline. Unknown verbs default-deny.
 	if s.reg.routeVerb(ctx, conn, verb, rest) {
 		return
 	}

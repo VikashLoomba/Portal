@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { ExecStreamWinch, decode, decodeExecFrame, encodeExecFrame } from "../src/cbor.ts";
+import { ExecStreamWinch, decode, decodeExecFrame, encode, encodeExecFrame } from "../src/cbor.ts";
 import type { CborMap, CborValue, ExecFrame } from "../src/cbor.ts";
 
 const vectorDir = fileURLToPath(new URL("../../../docs/vectors/", import.meta.url));
@@ -154,6 +154,50 @@ const protocolMappings: ProtocolMapping[] = [
       ["p", "Payload", "payload"],
     ],
   },
+  {
+    name: "protocol_cred_request_full",
+    cborArm: "msg",
+    jsonArm: "Msg",
+    fields: [
+      ["svc", "Service"],
+      ["k", "Kind"],
+      ["seq", "Seq"],
+      ["p", "Payload", "payload"],
+    ],
+  },
+  {
+    name: "protocol_cred_request_minimal",
+    cborArm: "msg",
+    jsonArm: "Msg",
+    fields: [
+      ["svc", "Service"],
+      ["k", "Kind"],
+      ["seq", "Seq"],
+      ["p", "Payload", "payload"],
+    ],
+  },
+  {
+    name: "protocol_cred_response_ok",
+    cborArm: "msg",
+    jsonArm: "Msg",
+    fields: [
+      ["svc", "Service"],
+      ["k", "Kind"],
+      ["seq", "Seq"],
+      ["p", "Payload", "payload"],
+    ],
+  },
+  {
+    name: "protocol_cred_response_deny",
+    cborArm: "msg",
+    jsonArm: "Msg",
+    fields: [
+      ["svc", "Service"],
+      ["k", "Kind"],
+      ["seq", "Seq"],
+      ["p", "Payload", "payload"],
+    ],
+  },
 ];
 
 for (const mapping of protocolMappings) {
@@ -161,6 +205,7 @@ for (const mapping of protocolMappings) {
     const encoded = await readHexVector(mapping.name);
     const payload = stripProtocolFrame(encoded);
     const decoded = decode(payload);
+    assert.deepStrictEqual(Buffer.from(encode(decoded)), Buffer.from(payload));
     const actualEnvelope = requireCborMap(decoded, "envelope");
     assert.deepEqual(Object.keys(actualEnvelope), [mapping.cborArm]);
 

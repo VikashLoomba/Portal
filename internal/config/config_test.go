@@ -46,7 +46,7 @@ func TestFeatureEnabled(t *testing.T) {
 
 func TestSetFeature_RoundTrip(t *testing.T) {
 	s := New(t.TempDir())
-	for _, f := range []string{FeatureClipImage, FeatureClipText, FeatureNotify} {
+	for _, f := range []string{FeatureClipImage, FeatureClipText, FeatureNotify, FeatureCred} {
 		if !s.FeatureEnabled(f) {
 			t.Errorf("%s should default ON", f)
 		}

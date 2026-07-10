@@ -41,7 +41,7 @@ type Server struct {
 // the route table into the mux via Go 1.22 method patterns.
 func New(deps Deps) *Server {
 	if len(deps.FeatureNames) == 0 {
-		deps.FeatureNames = []string{config.FeatureClipImage, config.FeatureClipText, config.FeatureNotify, config.FeatureExec}
+		deps.FeatureNames = []string{config.FeatureClipImage, config.FeatureClipText, config.FeatureNotify, config.FeatureExec, config.FeatureCred}
 	}
 	s := &Server{
 		deps:         deps,

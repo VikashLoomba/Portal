@@ -95,6 +95,13 @@ portal <command>
     ssh <host> ...  Deprecated alias for plain `ssh` (clipboard paste now works
                     over plain ssh; kept so muscle memory and scripts don't break).
 
+  Credentials
+    keychain list / keychain forget <label>   Manage remembered credentials
+                                              on the Mac.
+    keychain run / keychain askpass           Dev-box commands agents use to
+                                              request a secret; sudo uses the
+                                              same approval path transparently.
+
   Inspect
     status          Show box, service state, ssh master, active forwards. (default)
     doctor          Self-test the clipboard + notification path over ssh.
@@ -108,7 +115,7 @@ portal <command>
 
   Capabilities
     features [name on|off]      Show or toggle the clip-image / clip-text /
-                                notify / exec gates (picked up live).
+                                notify / exec / cred gates (picked up live).
 ```
 
 Run `portal help` for the full command reference, or `portal <command> --help`
@@ -181,13 +188,55 @@ connection and raised as a native macOS notification. Events that arrive through
 the structured hook are trusted; a generic `portald notify --title … --body …`
 is rendered with an `[unverified]` prefix.
 
+## Credential sharing (`portal keychain`)
+
+When an agent needs a login secret, it can wrap the command on the **dev box**
+so the secret goes directly into the child process instead of through the
+conversation. For example:
+
+```sh
+portal keychain run --label "staging admin" --env PW -- sh -c 'curl -d "pass=$PW" …'
+```
+
+The single quotes are important: they make the child shell expand `$PW`; the
+caller's shell must not expand it. `--stdin` is also available when the child
+expects the secret on standard input.
+
+For `sudo`, portal's dev-box `sudo` shim and `SUDO_ASKPASS` helper take the same
+path transparently when the agent has no controlling terminal. Any session in
+which a human could still be prompted is a direct passthrough to the real sudo.
+
+> **Heads-up — transparent `sudo` is deliberately fail-safe around shared
+> terminals.** It fires only for an agent with **no controlling terminal**. In
+> a shared interactive SSH session the agent shares the human's tty, so portal
+> does not auto-intercept; use `portal keychain run …` there, or approve sudo
+> yourself. This tradeoff prevents portal from hijacking a human password
+> prompt, including when sudo's stdin has been redirected.
+
+Each request opens a native secure-input dialog on the Mac showing which
+process requested it, which box it came from, and how the secret will be
+delivered. Choosing **Allow & Remember** stores the secret in the macOS
+Keychain; later requests for that label are click-to-approve confirmations
+rather than another password entry. On the Mac, `portal keychain list` shows
+remembered labels; `portal keychain forget <label>` removes one. Run
+`portal features cred off` for the immediate kill switch that disables
+credential prompts and delivery.
+
+> **Heads-up — credential sharing protects the agent transcript, not a hostile
+> same-UID process on the box.** The guarantee is that the secret never enters
+> the agent's context window or transcript, process argv, portal logs, or the
+> box's disk; it travels in memory from the Mac Keychain/dialog to the consumer
+> process. It is **not** a defense against an actively malicious process running
+> as the same box user, which can read `/proc/<pid>/environ` or ptrace another
+> process. The consent dialog and audit log are the control points.
+
 ## Capability gates
 
-Clipboard-read, notifications, and exec are **on by default** (matching the
-install experience you'd expect) but are individually gated on the Mac. Toggle
-them with `portal features <name> on|off` (or edit the file under
-`~/.config/portal/` directly); the running daemon picks changes up with no
-restart:
+Clipboard-read, notifications, exec, and credential requests are **on by
+default** (matching the install experience you'd expect) but are individually
+gated on the Mac. Toggle them with `portal features <name> on|off` (or edit the
+file under `~/.config/portal/` directly); the running daemon picks changes up
+with no restart:
 
 | Gate | File | Gates |
 |---|---|---|
@@ -195,11 +244,12 @@ restart:
 | `clip-text`  | `feature.clip-text`  | serving the Mac clipboard **text** to the dev box |
 | `notify`     | `feature.notify`     | raising notifications relayed from the dev box |
 | `exec`       | `feature.exec`       | running commands on the box via `portal exec` / the control API |
+| `cred` | `feature.cred` | approving credential requests from the dev box (`portal keychain` / sudo askpass) |
 
 Clipboard **text** marked secret by a password manager (the macOS
 `org.nspasteboard.ConcealedType` hint) is never served, regardless of the
-toggle. Every served read and notification is recorded to an append-only audit
-log under the portal config directory.
+toggle. Every served read, credential outcome, and notification is recorded to
+an append-only audit log under the portal config directory.
 
 There is no bearer token (cc-clip needs one because it serves clipboard over a
 loopback HTTP server any local process can reach). portal's transport is the
