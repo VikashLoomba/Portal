@@ -23,8 +23,11 @@ The request commands "portal keychain run ..." and "portal keychain askpass ..."
 are dev-box-only commands used by agents through portald; they are not Mac
 subcommands.`
 
+// rememberedCredentialStore is the labels/delete subset needed by the Mac CLI.
 type rememberedCredentialStore interface {
+	// List returns remembered credential labels.
 	List() ([]string, error)
+	// Delete removes one remembered credential and its labels-index entry.
 	Delete(context.Context, string) error
 }
 

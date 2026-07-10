@@ -229,8 +229,9 @@ type CredRequest struct {
 // is false and Err carries the machine-readable reason. Err ∈ {"denied",
 // "timeout","disabled","cooldown","gui-unavailable","label-invalid",
 // "no-client","busy"}. The agent may generate busy/no-client/timeout directly
-// as box-local socket denials; the Mac never sends busy or no-client. The secret
-// is deliberately in-band, unlike ClipResponse's out-of-band SHA design:
+// as box-local socket denials. The Mac never sends no-client, but may send busy
+// defensively if a second request races an open dialog. The secret is
+// deliberately in-band, unlike ClipResponse's out-of-band SHA design:
 // credentials are small and must never touch the box's disk. The 4096-byte
 // Secret endpoint cap plus the cred service's 8192-byte MaxPayload limit keep
 // the containing Msg.Payload bounded.

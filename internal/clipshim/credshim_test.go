@@ -10,11 +10,11 @@ import (
 )
 
 func TestCredentialShimVersionAndMarkers(t *testing.T) {
-	if Version != "4" {
-		t.Fatalf("Version = %q, want 4", Version)
+	if Version != "5" {
+		t.Fatalf("Version = %q, want 5", Version)
 	}
-	if Marker != "Installed by portal clip-shim v4" {
-		t.Fatalf("Marker = %q, want v4 marker", Marker)
+	if Marker != "Installed by portal clip-shim v5" {
+		t.Fatalf("Marker = %q, want v5 marker", Marker)
 	}
 
 	tests := []struct {
@@ -48,6 +48,11 @@ func TestSudoShimSafetyMatrixText(t *testing.T) {
 		`[ ! -x "$SUDO_ASKPASS" ]`,
 		`for a in "$@"; do`,
 		`-A|--askpass|-S|--stdin|-n|--non-interactive|-e|--edit|-h|-V|-K|-k|-v)`,
+		`--)
+            break`,
+		`-*)`,
+		`*)
+            break`,
 		`exec "$_real" "$@"`,
 		`exec "$_real" -A "$@"`,
 	} {
@@ -128,6 +133,9 @@ done
 		{"invalidate timestamp passes through", askpassPath, []string{"-K"}, "<-K>\n"},
 		{"reset timestamp passes through", askpassPath, []string{"-k"}, "<-k>\n"},
 		{"timestamp passes through", askpassPath, []string{"-v"}, "<-v>\n"},
+		{"command short flag still injects", askpassPath, []string{"apt", "install", "-v"}, "<-A>\n<apt>\n<install>\n<-v>\n"},
+		{"command numeric flag still injects", askpassPath, []string{"systemctl", "-n", "3", "x"}, "<-A>\n<systemctl>\n<-n>\n<3>\n<x>\n"},
+		{"double dash ends sudo scan", askpassPath, []string{"--", "printf", "-n"}, "<-A>\n<-->\n<printf>\n<-n>\n"},
 		{"missing askpass passes through", filepath.Join(home, "missing-askpass"), []string{"whoami"}, "<whoami>\n"},
 	}
 	for _, tc := range tests {

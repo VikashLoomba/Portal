@@ -20,6 +20,8 @@ type osascriptPrompter struct {
 	run scriptRunner
 }
 
+// Prompt renders the request as the appropriate osascript dialog and maps the
+// process result to a Decision without formatting or retaining secret bytes.
 func (p *osascriptPrompter) Prompt(ctx context.Context, req Request) (Decision, error) {
 	result := p.run(ctx, dialogScript(req))
 	if result.err != nil || result.exitCode != 0 {

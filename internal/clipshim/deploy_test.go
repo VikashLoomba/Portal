@@ -177,6 +177,9 @@ func TestCurrentShimsProbeCoversDeploymentTable(t *testing.T) {
 	if got, want := strings.Count(probe, Marker), len(shims); got != want {
 		t.Fatalf("current marker probe contains Marker %d times, want %d", got, want)
 	}
+	if strings.Contains(probe, "clip-shim v4") {
+		t.Fatal("current marker probe still accepts the pre-refinement v4 shims")
+	}
 }
 
 // TestRemove_StripsEverything asserts Remove issues a script that removes the

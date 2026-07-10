@@ -34,8 +34,11 @@ var errCredKeychainUnavailable = errors.New("credential keychain unavailable")
 // credKeychain is the remembered-credential subset used by the serve path.
 // internal/keychain.Store satisfies it; tests provide a hermetic fake.
 type credKeychain interface {
+	// Get reads a remembered secret and reports whether the item exists.
 	Get(ctx context.Context, label string) ([]byte, bool, error)
+	// Set persists a newly approved secret under label.
 	Set(ctx context.Context, label string, secret []byte) error
+	// Delete removes a remembered item, tolerating absence in production.
 	Delete(ctx context.Context, label string) error
 }
 
@@ -104,14 +107,17 @@ type promptOnlyKeychain struct {
 	err error
 }
 
+// Get degrades every lookup to not-found so a fresh prompt remains available.
 func (promptOnlyKeychain) Get(context.Context, string) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
+// Set returns the construction error so remembering degrades to allow-once.
 func (p promptOnlyKeychain) Set(context.Context, string, []byte) error {
 	return p.err
 }
 
+// Delete returns the construction error because no backing store exists.
 func (p promptOnlyKeychain) Delete(context.Context, string) error {
 	return p.err
 }

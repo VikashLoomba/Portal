@@ -22,7 +22,7 @@ exit 127
 `
 
 // portalAskpassShim is installed at ~/.local/bin/portal-askpass. sudo invokes
-// it through SUDO_ASKPASS; any missing-agent path exits non-zero so sudo aborts
+// it through SUDO_ASKPASS; a missing-agent path exits non-zero so sudo aborts
 // instead of waiting for or accepting an absent password.
 const portalAskpassShim = `#!/bin/sh
 # ` + Marker + `. SUDO_ASKPASS helper; requests one approved secret from the Mac.
@@ -36,8 +36,9 @@ exit 1
 
 // sudoShim is installed at ~/.local/bin/sudo. It is a pure passthrough for
 // interactive use, missing askpass configuration, and every explicit sudo
-// input/non-interactive/edit/help flag. Only a non-TTY agent invocation with a
-// usable SUDO_ASKPASS and no conflicting flag receives an injected -A.
+// input/non-interactive/edit/help flag in sudo's leading option prefix. Only a
+// non-TTY agent invocation with a usable SUDO_ASKPASS and no conflicting sudo
+// flag receives an injected -A; flags after the command belong to that command.
 const sudoShim = `#!/bin/sh
 # ` + Marker + `. Non-TTY sudo askpass bridge; interactive sudo is untouched.
 _wrapper_dir=$(cd "$(dirname "$0")" && pwd)
@@ -59,12 +60,21 @@ if [ -z "${SUDO_ASKPASS:-}" ] || [ ! -x "$SUDO_ASKPASS" ]; then
 fi
 
 # Explicit askpass/stdin/non-interactive/edit/help/timestamp modes belong to
-# the caller. Scan every argv token portably and never add a second -A.
+# sudo's caller. Scan only sudo's leading options: -- or the first non-option
+# starts the command, whose own flags must not suppress portal askpass.
 _passthrough=0
 for a in "$@"; do
     case "$a" in
         -A|--askpass|-S|--stdin|-n|--non-interactive|-e|--edit|-h|-V|-K|-k|-v)
             _passthrough=1
+            break
+            ;;
+        --)
+            break
+            ;;
+        -*)
+            ;;
+        *)
             break
             ;;
     esac

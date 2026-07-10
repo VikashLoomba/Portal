@@ -33,7 +33,9 @@ const (
 // `cred\t<base64(CBOR)>` cmd-socket request. It is IPC between portald and the
 // agent on the same box; it is not a Mac↔box protocol frame and never rides
 // protocol.Msg.Payload. Base64 keeps label, target, and requester bytes from
-// corrupting the cmd socket's tab/newline framing.
+// corrupting the cmd socket's tab/newline framing. Label is required and capped
+// at 200 bytes; Mode is env, stdin, or askpass; Target and Requester are each
+// capped at 300 bytes before the request crosses the Mac↔box protocol.
 type CredShimReq struct {
 	Label     string `cbor:"l"`
 	Mode      string `cbor:"m"`
@@ -72,10 +74,17 @@ func newCredService(host ServiceHost, log *slog.Logger) *credService {
 	}
 }
 
-func (c *credService) Name() string    { return "cred" }
+// Name returns the service registry key advertised to clients.
+func (c *credService) Name() string { return "cred" }
+
+// Version returns the credential service protocol version.
 func (c *credService) Version() uint32 { return 1 }
+
+// MaxPayload returns the largest accepted credential Msg payload.
 func (c *credService) MaxPayload() int { return 8192 }
-func (c *credService) OutboxCap() int  { return 2 }
+
+// OutboxCap returns the service's merged-outbox capacity.
+func (c *credService) OutboxCap() int { return 2 }
 
 // Verbs claims the `cred` cmd-socket verb using the live socket-deadline field.
 func (c *credService) Verbs() []Verb {

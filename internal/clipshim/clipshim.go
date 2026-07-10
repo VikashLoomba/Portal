@@ -31,9 +31,9 @@ import (
 // reconnect without a manual reinstall (DESIGN §9.1). Bump this whenever any
 // shim script below changes.
 //
-// v4 adds the portal, portal-askpass, and sudo credential shims plus the
-// independently-convergent SUDO_ASKPASS export block.
-const Version = "4"
+// v5 refines the sudo wrapper to scan only sudo's leading options, leaving
+// command-specific flags after the command token out of the conflict check.
+const Version = "5"
 
 // Marker is the exact string grep -qF searches for to decide whether a file at
 // ~/.local/bin is our shim (skip-backup, safe-to-overwrite) and whether the
