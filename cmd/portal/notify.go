@@ -8,6 +8,7 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/osa"
 	"github.com/VikashLoomba/Portal/pkg/agentclient"
 )
 
@@ -99,28 +100,13 @@ func raiseNotification(ctx context.Context, title, body, subtitle, sound string)
 	// osascript fallback. `display notification` cannot take an argv vector
 	// (unlike `on run argv` scripts), so the strings are interpolated into the
 	// AppleScript source — they MUST be escaped against injection.
-	script := "display notification " + appleScriptStr(body) +
-		" with title " + appleScriptStr(title) +
-		" subtitle " + appleScriptStr(subtitle)
+	script := "display notification " + osa.StringLiteral(body) +
+		" with title " + osa.StringLiteral(title) +
+		" subtitle " + osa.StringLiteral(subtitle)
 	if sound != "" {
-		script += " sound name " + appleScriptStr(sound)
+		script += " sound name " + osa.StringLiteral(sound)
 	}
 	_ = exec.CommandContext(dctx, "osascript", "-e", script).Run()
-}
-
-// appleScriptStr renders s as a quoted AppleScript string literal, escaping the
-// two metacharacters that matter inside an AppleScript double-quoted string —
-// backslash and double-quote — and stripping control bytes (newlines, NULs)
-// that would terminate the literal or the -e argument. This is STRICTER than
-// cc-clip's bare Go %q (which does not guard against AppleScript's own escaping
-// rules); it closes the AppleScript-injection vector called out in SPEC B.
-func appleScriptStr(s string) string {
-	s = stripControl(s)
-	// Order matters: escape backslashes first so we don't double-escape the
-	// backslashes we introduce for the quotes.
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	return `"` + s + `"`
 }
 
 // stripControl removes ASCII control bytes (including newline, carriage return,

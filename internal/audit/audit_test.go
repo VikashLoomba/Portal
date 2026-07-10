@@ -100,10 +100,40 @@ func TestLog_StripsControlBytes(t *testing.T) {
 	}
 }
 
+func TestLog_CredentialEvents(t *testing.T) {
+	dir := t.TempDir()
+	l := New(dir)
+	fixed := time.Date(2026, 7, 10, 9, 8, 7, 0, time.UTC)
+	l.now = func() time.Time { return fixed }
+
+	// These APIs intentionally have no secret parameter: an audit call cannot
+	// accidentally format or persist credential material.
+	l.CredServed("box", "staging\tadmin\nroot", "env", "prompt-remembered", 1500*time.Millisecond)
+	l.CredDenied("box", "sudo", "askpass", "user-denied")
+	l.CredForgotten("box", "staging admin")
+
+	b, err := os.ReadFile(l.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "2026-07-10T09:08:07Z\tcred-served\thost=box\tlabel=staging admin root\tmode=env\tsource=prompt-remembered\tdur=1.5s\n" +
+		"2026-07-10T09:08:07Z\tcred-denied\thost=box\tlabel=sudo\tmode=askpass\treason=user-denied\n" +
+		"2026-07-10T09:08:07Z\tcred-forgotten\thost=box\tlabel=staging admin\n"
+	if got := string(b); got != want {
+		t.Errorf("credential audit lines:\n%s\nwant:\n%s", got, want)
+	}
+	if n := strings.Count(string(b), "\n"); n != 3 {
+		t.Fatalf("credential labels forged physical lines: got %d lines", n)
+	}
+}
+
 func TestLog_NilSafe(t *testing.T) {
 	var l *Log
 	// Must not panic.
 	l.ClipServed("h", "image", "x")
+	l.CredServed("h", "label", "env", "prompt", time.Millisecond)
+	l.CredDenied("h", "label", "env", "denied")
+	l.CredForgotten("h", "label")
 	l.Notify("h", "t", false, 1)
 	l.OpenURL("h", "u")
 	l.ExecOpen("h", "sid", "argv", 1, false)

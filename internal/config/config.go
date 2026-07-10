@@ -85,7 +85,8 @@ func (s *Store) featureFile(feature string) string {
 }
 
 // Feature toggle names. These are the capability-gate keys (SPEC C): the Mac
-// side serves clip-read / notify only when the corresponding feature is enabled.
+// side serves clip-read / notify / credentials only when the corresponding
+// feature is enabled.
 const (
 	// FeatureClipImage gates serving the Mac clipboard IMAGE to a remote shim.
 	FeatureClipImage = "clip-image"
@@ -100,6 +101,8 @@ const (
 	// FeatureExec gates the local exec WebSocket bridge that launches commands
 	// through the configured transport.
 	FeatureExec = "exec"
+	// FeatureCred gates credential prompts and delivery to the remote box.
+	FeatureCred = "cred"
 )
 
 // FeatureEnabled reports whether the named capability is enabled. The contract
