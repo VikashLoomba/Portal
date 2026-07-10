@@ -179,7 +179,7 @@ func TestHandleFeatures(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
-		for _, f := range []string{config.FeatureClipImage, config.FeatureClipText, config.FeatureNotify, config.FeatureExec} {
+		for _, f := range []string{config.FeatureClipImage, config.FeatureClipText, config.FeatureNotify, config.FeatureExec, config.FeatureCred} {
 			if v, ok := got[f]; !ok || !v {
 				t.Errorf("feature %q = (%v,%v), want present and true", f, v, ok)
 			}
