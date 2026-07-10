@@ -134,6 +134,9 @@ func TestEnsure_DeploysShimsAndHook(t *testing.T) {
 			t.Errorf("expected %s shim to be deployed", sh.name)
 		}
 	}
+	if !strings.Contains(scripts, `grep -qF "Installed by portal" ~/.local/bin/xdg-open`) {
+		t.Error("v6 convergence must recognize the legacy portal-owned xdg-open wrapper")
+	}
 }
 
 // TestEnsure_FastPathWhenCurrent: when all shims already carry the current
@@ -177,8 +180,8 @@ func TestCurrentShimsProbeCoversDeploymentTable(t *testing.T) {
 	if got, want := strings.Count(probe, Marker), len(shims); got != want {
 		t.Fatalf("current marker probe contains Marker %d times, want %d", got, want)
 	}
-	if strings.Contains(probe, "clip-shim v4") {
-		t.Fatal("current marker probe still accepts the pre-refinement v4 shims")
+	if strings.Contains(probe, "clip-shim v5") {
+		t.Fatal("current marker probe still accepts the pre-hardening v5 shims")
 	}
 }
 

@@ -213,11 +213,12 @@ func TestServeCredRequest_Disabled(t *testing.T) {
 	deps, state := newCredTestDeps(t, p, kc)
 	state.setEnabled(false)
 	req := baseCredEvent()
+	req.Label = "\n" + strings.Repeat("D", 250)
 
 	resp := serveCredRequest(context.Background(), deps, req)
 	assertCredResponse(t, resp, &protocol.CredResponse{Nonce: 41, Epoch: 7, Err: "disabled"})
 	assertCredAudit(t, deps.Audit, []string{
-		"cred-denied", "host=box", "label=database", "mode=env", "reason=disabled",
+		"cred-denied", "host=box", "label=" + strings.Repeat("D", 200), "mode=env", "reason=disabled",
 	})
 	if len(p.Requests()) != 0 || len(kc.getCalls) != 0 {
 		t.Fatal("disabled credential request reached prompt or Keychain")
@@ -278,8 +279,9 @@ func TestServeCredRequest_AllowOnceAndDisplaySanitization(t *testing.T) {
 	wantTarget := strings.Repeat("P", 300)
 	wantPrompt := prompt.Request{
 		Label: "database", Requester: wantRequester, Host: "box",
-		Delivery:   `will be set as env var "` + wantTarget + `" for the requested command`,
-		Remembered: false,
+		Delivery:    `will be set as env var "` + wantTarget + `" for the requested command`,
+		Remembered:  false,
+		TimeoutSecs: 115,
 	}
 	if requests[0] != wantPrompt {
 		t.Fatal("sanitized prompt request differs")
@@ -444,6 +446,79 @@ func TestServeCredRequest_RememberedForgetThenAllowOnce(t *testing.T) {
 		t.Fatal("Forget did not delete the remembered label")
 	}
 	assertSecretNotRecorded(t, deps, state, secret)
+}
+
+func TestServeCredRequest_ForgetRepromptUsesRemainingDialogBudget(t *testing.T) {
+	secret := []byte("budgeted-replacement-fake")
+	var state *credTestState
+	call := 0
+	p := &prompt.Fake{PromptFunc: func(_ context.Context, req prompt.Request) (prompt.Decision, error) {
+		call++
+		switch call {
+		case 1:
+			if !req.Remembered || req.TimeoutSecs != 115 {
+				t.Fatalf("first prompt = %+v, want remembered with 115 seconds", req)
+			}
+			state.setNow(state.nowTime().Add(100 * time.Second))
+			return prompt.Decision{Outcome: prompt.OutcomeForget}, nil
+		case 2:
+			if req.Remembered || req.TimeoutSecs != 15 {
+				t.Fatalf("replacement prompt = %+v, want fresh with 15 seconds", req)
+			}
+			return prompt.Decision{Outcome: prompt.OutcomeAllowOnce, Secret: secret}, nil
+		default:
+			t.Fatal("unexpected third credential prompt")
+			return prompt.Decision{Outcome: prompt.OutcomeUnavailable}, nil
+		}
+	}}
+	kc := &fakeCredKeychain{getResults: []fakeCredGetResult{{
+		secret: []byte("remembered-fake"), found: true,
+	}}}
+	deps, testState := newCredTestDeps(t, p, kc)
+	state = testState
+
+	resp := serveCredRequest(context.Background(), deps, baseCredEvent())
+	assertCredResponse(t, resp, &protocol.CredResponse{
+		Nonce: 41, Epoch: 7, OK: true, Secret: secret,
+	})
+	requests := p.Requests()
+	if len(requests) != 2 {
+		t.Fatalf("prompt requests = %d, want 2", len(requests))
+	}
+	if got := 100 + requests[1].TimeoutSecs; got != int(credDialogBudget/time.Second) {
+		t.Fatalf("elapsed + replacement timeout = %d, want %d", got, int(credDialogBudget/time.Second))
+	}
+	assertCredAudit(t, deps.Audit,
+		[]string{"cred-forgotten", "host=box", "label=database"},
+		[]string{"cred-served", "host=box", "label=database", "mode=env", "source=prompt", "dur=1m40s"},
+	)
+	assertSecretNotRecorded(t, deps, state, secret)
+}
+
+func TestServeCredRequest_ForgetDoesNotRepromptBelowMinimumBudget(t *testing.T) {
+	var state *credTestState
+	p := &prompt.Fake{PromptFunc: func(_ context.Context, req prompt.Request) (prompt.Decision, error) {
+		if req.TimeoutSecs != 115 {
+			t.Fatalf("first prompt timeout = %d, want 115", req.TimeoutSecs)
+		}
+		state.setNow(state.nowTime().Add(112 * time.Second))
+		return prompt.Decision{Outcome: prompt.OutcomeForget}, nil
+	}}
+	kc := &fakeCredKeychain{getResults: []fakeCredGetResult{{
+		secret: []byte("remembered-fake"), found: true,
+	}}}
+	deps, testState := newCredTestDeps(t, p, kc)
+	state = testState
+
+	resp := serveCredRequest(context.Background(), deps, baseCredEvent())
+	assertCredResponse(t, resp, &protocol.CredResponse{Nonce: 41, Epoch: 7, Err: "timeout"})
+	if len(p.Requests()) != 1 {
+		t.Fatalf("prompt requests = %d, want no replacement below five seconds", len(p.Requests()))
+	}
+	assertCredAudit(t, deps.Audit,
+		[]string{"cred-forgotten", "host=box", "label=database"},
+		[]string{"cred-denied", "host=box", "label=database", "mode=env", "reason=timeout"},
+	)
 }
 
 func TestServeCredRequest_DenyAndCooldown(t *testing.T) {

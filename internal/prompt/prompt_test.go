@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -21,7 +22,7 @@ func TestDialogACommandConstruction(t *testing.T) {
 		return scriptResult{stdout: []byte("button returned:Allow Once, text returned:s3kr3t, gave up:false\n")}
 	}}
 	decision, err := p.Prompt(context.Background(), Request{
-		Label: label, Requester: requester, Host: "box", Delivery: delivery,
+		Label: label, Requester: requester, Host: "box", Delivery: delivery, TimeoutSecs: 45,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -35,7 +36,7 @@ func TestDialogACommandConstruction(t *testing.T) {
 		`buttons {"Cancel","Allow Once","Allow & Remember"}`,
 		`default button "Allow Once"`,
 		`cancel button "Cancel"`,
-		`giving up after 120`,
+		`giving up after 45`,
 		`with title "portal"`,
 		osa.StringLiteral(label),
 		osa.StringLiteral("requested by " + requester + " on box"),
@@ -47,6 +48,28 @@ func TestDialogACommandConstruction(t *testing.T) {
 	}
 	if strings.Contains(script, label) {
 		t.Fatalf("attacker-influenced label appeared raw in script:\n%s", script)
+	}
+}
+
+func TestDialogTimeoutClamp(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested int
+		want      int
+	}{
+		{name: "default", requested: 0, want: 120},
+		{name: "minimum", requested: 1, want: 5},
+		{name: "within bounds", requested: 115, want: 115},
+		{name: "maximum", requested: 121, want: 120},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			script := dialogScript(Request{TimeoutSecs: tt.requested})
+			want := "giving up after " + strconv.Itoa(tt.want)
+			if !strings.Contains(script, want) {
+				t.Fatalf("dialog script missing %q: %s", want, script)
+			}
+		})
 	}
 }
 
@@ -110,8 +133,8 @@ func TestDialogOutputMapping(t *testing.T) {
 			want:   OutcomeDeny,
 		},
 		{
-			name:   "new dialog timeout",
-			result: scriptResult{stdout: []byte("gave up:true\n")},
+			name:   "new dialog timeout real output",
+			result: scriptResult{stdout: []byte("button returned:, text returned:, gave up:true\n")},
 			want:   OutcomeTimeout,
 		},
 		{
@@ -133,9 +156,9 @@ func TestDialogOutputMapping(t *testing.T) {
 			want:       OutcomeDeny,
 		},
 		{
-			name:       "remembered timeout",
+			name:       "remembered timeout real output",
 			remembered: true,
-			result:     scriptResult{stdout: []byte("gave up:true\n")},
+			result:     scriptResult{stdout: []byte("button returned:, gave up:true\n")},
 			want:       OutcomeTimeout,
 		},
 		{

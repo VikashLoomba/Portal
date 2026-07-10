@@ -314,6 +314,34 @@ func TestKeychainAskpassSuccess(t *testing.T) {
 	}
 }
 
+func TestKeychainAskpassTreatsHelpTokensAsPrompts(t *testing.T) {
+	for _, token := range []string{"help", "-h", "--help"} {
+		t.Run(token, func(t *testing.T) {
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			rt := baseTestKeychainRuntime(&stdout, &stderr)
+			requests := 0
+			rt.request = func(req agent.CredShimReq) ([]byte, string) {
+				requests++
+				if req.Mode != "askpass" || req.Target != token {
+					t.Fatalf("askpass request = %+v, want opaque prompt %q", req, token)
+				}
+				return []byte("opaque-prompt-secret"), ""
+			}
+
+			if code := runKeychainWithRuntime([]string{"askpass", token}, rt); code != 0 {
+				t.Fatalf("exit code = %d, want 0", code)
+			}
+			if requests != 1 {
+				t.Fatalf("credential requests = %d, want 1", requests)
+			}
+			if stdout.String() != "opaque-prompt-secret\n" || stderr.Len() != 0 {
+				t.Fatalf("askpass streams = stdout %q stderr %q", stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
 func TestKeychainDenyReasons(t *testing.T) {
 	tests := []struct {
 		reason string
@@ -404,15 +432,11 @@ func TestKeychainHelpIsAgentFirst(t *testing.T) {
 	}{
 		{
 			args:  []string{"--help"},
-			check: []string{quoteExample, "SINGLE quotes", "111", "112", "usage error"},
+			check: []string{quoteExample, "SINGLE quotes", "111", "112", "usage error", "opaque prompt text"},
 		},
 		{
 			args:  []string{"run", "--help"},
 			check: []string{quoteExample, "caller's shell must not expand it", "child process's exact exit code"},
-		},
-		{
-			args:  []string{"askpass", "--help"},
-			check: []string{"stdout contains only the secret plus one newline", "111", "112"},
 		},
 	}
 	for _, tt := range tests {

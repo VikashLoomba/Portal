@@ -10,11 +10,11 @@ import (
 )
 
 func TestCredentialShimVersionAndMarkers(t *testing.T) {
-	if Version != "5" {
-		t.Fatalf("Version = %q, want 5", Version)
+	if Version != "6" {
+		t.Fatalf("Version = %q, want 6", Version)
 	}
-	if Marker != "Installed by portal clip-shim v5" {
-		t.Fatalf("Marker = %q, want v5 marker", Marker)
+	if Marker != "Installed by portal clip-shim v6" {
+		t.Fatalf("Marker = %q, want v6 marker", Marker)
 	}
 
 	tests := []struct {
@@ -40,16 +40,21 @@ func TestCredentialShimVersionAndMarkers(t *testing.T) {
 
 func TestSudoShimSafetyMatrixText(t *testing.T) {
 	for _, want := range []string{
-		`grep -vxF "$_wrapper_dir"`,
-		`[ -z "$_real" ]`,
+		`for _d in $PATH; do`,
+		`[ -n "$_d" ] || continue`,
+		`[ -x "$_d/sudo" ]`,
+		`[ -z "$_real" ] || [ "$_real" -ef "$0" ]`,
 		`printf '%s\n' 'portal sudo: real sudo not found' >&2`,
-		`[ -t 0 ]`,
+		`[ -t 0 ] || [ -t 1 ] || [ -t 2 ] || { : < /dev/tty; } 2>/dev/null`,
 		`[ -z "${SUDO_ASKPASS:-}" ]`,
 		`[ ! -x "$SUDO_ASKPASS" ]`,
 		`for a in "$@"; do`,
-		`-A|--askpass|-S|--stdin|-n|--non-interactive|-e|--edit|-h|-V|-K|-k|-v)`,
+		`--askpass|--stdin|--non-interactive|--edit)`,
+		`case "${a#-}" in`,
+		`*[ASnehVKkv]*)`,
 		`--)
             break`,
+		`--*)`,
 		`-*)`,
 		`*)
             break`,
@@ -71,7 +76,7 @@ func TestSudoShimSafetyMatrixText(t *testing.T) {
 	if len(addingAskpass) != 1 || addingAskpass[0] != `exec "$_real" -A "$@"` {
 		t.Fatalf("exec lines adding -A = %q, want only the guarded injection branch", addingAskpass)
 	}
-	noRealBlock := `if [ -z "$_real" ]; then
+	noRealBlock := `if [ -z "$_real" ] || [ "$_real" -ef "$0" ]; then
     printf '%s\n' 'portal sudo: real sudo not found' >&2
     exit 1
 fi`
@@ -79,7 +84,7 @@ fi`
 		t.Fatal("missing-real-sudo branch must report one line and exit 1")
 	}
 
-	ttyCheck := strings.Index(sudoShim, `[ -t 0 ]`)
+	ttyCheck := strings.Index(sudoShim, `[ -t 0 ] || [ -t 1 ] || [ -t 2 ] || { : < /dev/tty; } 2>/dev/null`)
 	if ttyCheck < 0 {
 		t.Fatal("sudo shim missing TTY check")
 	}
@@ -90,7 +95,7 @@ fi`
 	}
 }
 
-func TestSudoShimNonTTYBehavior(t *testing.T) {
+func TestSudoShimDetachedBehavior(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("sudo shim is /bin/sh")
 	}
@@ -133,6 +138,9 @@ done
 		{"invalidate timestamp passes through", askpassPath, []string{"-K"}, "<-K>\n"},
 		{"reset timestamp passes through", askpassPath, []string{"-k"}, "<-k>\n"},
 		{"timestamp passes through", askpassPath, []string{"-v"}, "<-v>\n"},
+		{"bundled stdin passes through", askpassPath, []string{"-Sk", "apt", "update"}, "<-Sk>\n<apt>\n<update>\n"},
+		{"bundled non-interactive passes through", askpassPath, []string{"-nH", "x"}, "<-nH>\n<x>\n"},
+		{"bundled reset and stdin passes through", askpassPath, []string{"-kS", "x"}, "<-kS>\n<x>\n"},
 		{"command short flag still injects", askpassPath, []string{"apt", "install", "-v"}, "<-A>\n<apt>\n<install>\n<-v>\n"},
 		{"command numeric flag still injects", askpassPath, []string{"systemctl", "-n", "3", "x"}, "<-A>\n<systemctl>\n<-n>\n<3>\n<x>\n"},
 		{"double dash ends sudo scan", askpassPath, []string{"--", "printf", "-n"}, "<-A>\n<-->\n<printf>\n<-n>\n"},
@@ -141,6 +149,7 @@ done
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			cmd := exec.Command(shimPath, tc.args...)
+			detachFromControllingTerminal(cmd)
 			cmd.Env = []string{
 				"HOME=" + home,
 				"PATH=" + path,
@@ -157,6 +166,60 @@ done
 	}
 }
 
+func TestSudoShimControllingTerminalPassthroughWithRedirectedStdin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Darwin script(1) command form provides the hermetic controlling terminal")
+	}
+	scriptPath, err := exec.LookPath("script")
+	if err != nil {
+		t.Skip("script(1) is unavailable")
+	}
+
+	home := t.TempDir()
+	shimDir := filepath.Join(home, "shims")
+	realDir := filepath.Join(home, "real")
+	for _, dir := range []string{shimDir, realDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	shimPath := filepath.Join(shimDir, "sudo")
+	askpassPath := filepath.Join(shimDir, "portal-askpass")
+	writeExec(t, shimPath, "%s", sudoShim)
+	writeExec(t, askpassPath, "#!/bin/sh\nexit 0\n")
+	writeExec(t, filepath.Join(realDir, "sudo"), "%s", `#!/bin/sh
+for a in "$@"; do
+    printf '<%s>\n' "$a"
+done
+`)
+
+	inputPath := filepath.Join(home, "input")
+	outputPath := filepath.Join(home, "output")
+	errorPath := filepath.Join(home, "stderr")
+	if err := os.WriteFile(inputPath, []byte("redirected input"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := shellQuote(shimPath) + ` tee /etc/example < ` + shellQuote(inputPath) +
+		` > ` + shellQuote(outputPath) + ` 2> ` + shellQuote(errorPath)
+	cmd := exec.Command(scriptPath, "-q", "/dev/null", "/bin/sh", "-c", command)
+	cmd.Env = []string{
+		"HOME=" + home,
+		"PATH=" + coreutilsPath(shimDir, realDir),
+		"SUDO_ASKPASS=" + askpassPath,
+	}
+	transcript, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("sudo with controlling terminal: %v (transcript=%q)", err, transcript)
+	}
+	out, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(out), "<tee>\n</etc/example>\n"; got != want {
+		t.Fatalf("redirected-stdin sudo output = %q, want passthrough %q", got, want)
+	}
+}
+
 func TestAskpassEnvSnippetIsIndependentAndGuarded(t *testing.T) {
 	if AskpassMarkerStart != "# >>> portal askpass (sudo) >>>" {
 		t.Fatalf("AskpassMarkerStart = %q", AskpassMarkerStart)
@@ -164,14 +227,53 @@ func TestAskpassEnvSnippetIsIndependentAndGuarded(t *testing.T) {
 	if AskpassMarkerEnd != "# <<< portal askpass (sudo) <<<" {
 		t.Fatalf("AskpassMarkerEnd = %q", AskpassMarkerEnd)
 	}
-	want := `[ -x "$HOME/.local/bin/portal-askpass" ] && export SUDO_ASKPASS="$HOME/.local/bin/portal-askpass"`
+	want := `if [ -z "${SUDO_ASKPASS:-}" ] && [ -x "$HOME/.local/bin/portal-askpass" ]; then
+    export SUDO_ASKPASS="$HOME/.local/bin/portal-askpass"
+fi`
 	if !strings.Contains(askpassEnvSnippet, want) {
-		t.Errorf("askpass env block missing executable guard/export %q", want)
+		t.Errorf("askpass env block missing preservation guard/export %q", want)
+	}
+	if strings.Contains(askpassEnvSnippet, `[ -x "$HOME/.local/bin/portal-askpass" ] && export`) {
+		t.Error("askpass env block still overwrites a user-selected helper")
 	}
 	if strings.Contains(pathPrependSnippet, AskpassMarkerStart) {
 		t.Error("SUDO_ASKPASS block must remain separate from the PATH block")
 	}
 	if strings.Contains(askpassEnvSnippet, PathMarkerStart) {
 		t.Error("SUDO_ASKPASS block must not absorb the PATH block")
+	}
+}
+
+func TestAskpassEnvSnippetPreservesUserValue(t *testing.T) {
+	home := t.TempDir()
+	helper := filepath.Join(home, ".local", "bin", "portal-askpass")
+	if err := os.MkdirAll(filepath.Dir(helper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExec(t, helper, "#!/bin/sh\nexit 0\n")
+
+	tests := []struct {
+		name     string
+		existing string
+		want     string
+	}{
+		{name: "unset selects portal", want: helper},
+		{name: "existing value preserved", existing: "/user/selected/askpass", want: "/user/selected/askpass"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("sh", "-c", askpassEnvSnippet+"\nprintf '%s' \"${SUDO_ASKPASS-}\"")
+			cmd.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin"}
+			if tc.existing != "" {
+				cmd.Env = append(cmd.Env, "SUDO_ASKPASS="+tc.existing)
+			}
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("source askpass block: %v (out=%q)", err, out)
+			}
+			if string(out) != tc.want {
+				t.Fatalf("SUDO_ASKPASS = %q, want %q", out, tc.want)
+			}
+		})
 	}
 }

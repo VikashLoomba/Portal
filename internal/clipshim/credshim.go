@@ -34,23 +34,32 @@ printf '%s\n' 'portal-askpass: portald is unavailable' >&2
 exit 1
 `
 
-// sudoShim is installed at ~/.local/bin/sudo. It is a pure passthrough for
-// interactive use, missing askpass configuration, and every explicit sudo
-// input/non-interactive/edit/help flag in sudo's leading option prefix. Only a
-// non-TTY agent invocation with a usable SUDO_ASKPASS and no conflicting sudo
-// flag receives an injected -A; flags after the command belong to that command.
+// sudoShim is installed at ~/.local/bin/sudo. It is a pure passthrough whenever
+// a controlling terminal is reachable, askpass is unavailable, or sudo's
+// leading option prefix selects an explicit input/non-interactive/edit/help
+// mode. Only a fully detached agent invocation with a usable SUDO_ASKPASS and
+// no conflicting sudo flag receives an injected -A; flags after the command
+// belong to that command.
 const sudoShim = `#!/bin/sh
-# ` + Marker + `. Non-TTY sudo askpass bridge; interactive sudo is untouched.
+# ` + Marker + `. Detached sudo askpass bridge; human terminal sessions are untouched.
 _wrapper_dir=$(cd "$(dirname "$0")" && pwd)
-_real=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$_wrapper_dir" | tr '\n' ':' | xargs -I{} sh -c 'PATH={} command -v sudo 2>/dev/null' | head -1)
-if [ -z "$_real" ]; then
+_real=""
+_oifs=$IFS; IFS=:
+for _d in $PATH; do
+    [ "$_d" = "$_wrapper_dir" ] && continue
+    [ -n "$_d" ] || continue
+    if [ -x "$_d/sudo" ]; then _real="$_d/sudo"; break; fi
+done
+IFS=$_oifs
+if [ -z "$_real" ] || [ "$_real" -ef "$0" ]; then
     printf '%s\n' 'portal sudo: real sudo not found' >&2
     exit 1
 fi
 
-# SAFETY INVARIANT: a human with a TTY always reaches real sudo byte-for-byte;
-# portal must never replace an interactive terminal password prompt.
-if [ -t 0 ]; then
+# SAFETY INVARIANT: a human in any interactive session reaches real sudo
+# byte-for-byte, even with redirected stdin. Askpass is injected only when no
+# controlling terminal exists on which sudo could prompt that human.
+if [ -t 0 ] || [ -t 1 ] || [ -t 2 ] || { : < /dev/tty; } 2>/dev/null; then
     exec "$_real" "$@"
 fi
 
@@ -60,19 +69,28 @@ if [ -z "${SUDO_ASKPASS:-}" ] || [ ! -x "$SUDO_ASKPASS" ]; then
 fi
 
 # Explicit askpass/stdin/non-interactive/edit/help/timestamp modes belong to
-# sudo's caller. Scan only sudo's leading options: -- or the first non-option
-# starts the command, whose own flags must not suppress portal askpass.
+# sudo's caller. Scan only sudo's leading options, including bundled short
+# flags: -- or the first non-option starts the command, whose own flags must
+# not suppress portal askpass.
 _passthrough=0
 for a in "$@"; do
     case "$a" in
-        -A|--askpass|-S|--stdin|-n|--non-interactive|-e|--edit|-h|-V|-K|-k|-v)
+        --askpass|--stdin|--non-interactive|--edit)
             _passthrough=1
             break
             ;;
         --)
             break
             ;;
+        --*)
+            ;;
         -*)
+            case "${a#-}" in
+                *[ASnehVKkv]*)
+                    _passthrough=1
+                    break
+                    ;;
+            esac
             ;;
         *)
             break
@@ -83,7 +101,7 @@ if [ "$_passthrough" -eq 1 ]; then
     exec "$_real" "$@"
 fi
 
-# The only -A injection branch: non-TTY + executable askpass + no conflict.
+# The only -A injection branch: no controlling terminal + executable askpass + no conflict.
 exec "$_real" -A "$@"
 `
 
@@ -95,11 +113,14 @@ const (
 	AskpassMarkerEnd   = "# <<< portal askpass (sudo) <<<"
 )
 
-// askpassEnvSnippet exports the helper only while its executable shim exists.
-// This block stays separate from the pre-existing PATH block so upgrading an
-// installed box re-converges even when that older PATH marker is already there.
+// askpassEnvSnippet exports the helper only when its executable shim exists and
+// the user has not selected another SUDO_ASKPASS. This block stays separate
+// from the pre-existing PATH block so upgrading an installed box re-converges
+// even when that older PATH marker is already there.
 const askpassEnvSnippet = AskpassMarkerStart + `
-[ -x "$HOME/.local/bin/portal-askpass" ] && export SUDO_ASKPASS="$HOME/.local/bin/portal-askpass"
+if [ -z "${SUDO_ASKPASS:-}" ] && [ -x "$HOME/.local/bin/portal-askpass" ]; then
+    export SUDO_ASKPASS="$HOME/.local/bin/portal-askpass"
+fi
 ` + AskpassMarkerEnd
 
 // ensureAskpassEnv appends the SUDO_ASKPASS marker block to every shell startup

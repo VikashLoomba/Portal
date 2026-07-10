@@ -203,8 +203,15 @@ caller's shell must not expand it. `--stdin` is also available when the child
 expects the secret on standard input.
 
 For `sudo`, portal's dev-box `sudo` shim and `SUDO_ASKPASS` helper take the same
-path transparently in a non-TTY agent session. Interactive sudo with a TTY
-remains a direct passthrough to the real sudo.
+path transparently when the agent has no controlling terminal. Any session in
+which a human could still be prompted is a direct passthrough to the real sudo.
+
+> **Heads-up — transparent `sudo` is deliberately fail-safe around shared
+> terminals.** It fires only for an agent with **no controlling terminal**. In
+> a shared interactive SSH session the agent shares the human's tty, so portal
+> does not auto-intercept; use `portal keychain run …` there, or approve sudo
+> yourself. This tradeoff prevents portal from hijacking a human password
+> prompt, including when sudo's stdin has been redirected.
 
 Each request opens a native secure-input dialog on the Mac showing which
 process requested it, which box it came from, and how the secret will be

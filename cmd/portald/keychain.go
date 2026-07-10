@@ -184,10 +184,6 @@ func appendEnvOverride(environ []string, name, value string) []string {
 }
 
 func runKeychainAskpass(args []string, rt keychainRuntime) int {
-	if len(args) == 1 && isHelpArg(args[0]) {
-		writeKeychainAskpassHelp(rt.stdout)
-		return 0
-	}
 	prompt := truncateUTF8Bytes(strings.Join(args, " "), keychainContextMax)
 	secret, reason := rt.request(agent.CredShimReq{
 		Label: defaultAskpassLabel, Mode: "askpass", Target: prompt,
@@ -405,7 +401,7 @@ Exit codes:
   112         approval timed out
   2           usage error
 
-Use 'portal keychain run --help' or 'portal keychain askpass --help' for details.
+Use 'portal keychain run --help' for run details. Askpass treats every argument, including -h and --help, as opaque prompt text.
 `)
 }
 
@@ -428,24 +424,5 @@ Exit codes:
   111         request denied or unavailable
   112         approval timed out
   2           usage error
-`)
-}
-
-func writeKeychainAskpassHelp(w io.Writer) {
-	fmt.Fprint(w, `Serve one sudo/askpass prompt through the connected Mac approval dialog.
-
-Usage:
-  portal keychain askpass [prompt...]
-
-Example:
-  portal keychain askpass "Password:"
-
-On approval, stdout contains only the secret plus one newline. Diagnostics go to stderr; denials never write the secret.
-
-Exit codes:
-  0    approved secret written to stdout
-  111  request denied or unavailable
-  112  approval timed out
-  2    usage error
 `)
 }

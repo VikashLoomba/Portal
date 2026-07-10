@@ -3,6 +3,7 @@ package prompt
 import (
 	"bytes"
 	"context"
+	"strconv"
 
 	"github.com/VikashLoomba/Portal/internal/osa"
 )
@@ -19,6 +20,12 @@ type scriptRunner func(context.Context, string) scriptResult
 type osascriptPrompter struct {
 	run scriptRunner
 }
+
+const (
+	defaultDialogTimeoutSecs = 120
+	minDialogTimeoutSecs     = 5
+	maxDialogTimeoutSecs     = 120
+)
 
 // Prompt renders the request as the appropriate osascript dialog and maps the
 // process result to a Decision without formatting or retaining secret bytes.
@@ -37,15 +44,29 @@ func dialogScript(req Request) string {
 	message := osa.StringLiteral(req.Label) + " & return & return & " +
 		osa.StringLiteral("requested by "+req.Requester+" on "+req.Host) +
 		" & return & return & " + osa.StringLiteral(req.Delivery)
+	timeout := strconv.Itoa(dialogTimeoutSecs(req.TimeoutSecs))
 	if req.Remembered {
 		return "display dialog " + message +
 			` buttons {"Deny","Forget","Allow"} default button "Allow"` +
-			` cancel button "Deny" giving up after 120 with title "portal"`
+			` cancel button "Deny" giving up after ` + timeout + ` with title "portal"`
 	}
 	return "display dialog " + message +
 		` default answer "" buttons {"Cancel","Allow Once","Allow & Remember"}` +
 		` default button "Allow Once" cancel button "Cancel" with hidden answer` +
-		` giving up after 120 with title "portal"`
+		` giving up after ` + timeout + ` with title "portal"`
+}
+
+func dialogTimeoutSecs(requested int) int {
+	if requested == 0 {
+		return defaultDialogTimeoutSecs
+	}
+	if requested < minDialogTimeoutSecs {
+		return minDialogTimeoutSecs
+	}
+	if requested > maxDialogTimeoutSecs {
+		return maxDialogTimeoutSecs
+	}
+	return requested
 }
 
 func osascriptCanceled(result scriptResult) bool {
@@ -60,8 +81,16 @@ func osascriptCanceled(result scriptResult) bool {
 
 func parseDialogResult(output []byte, remembered bool) Decision {
 	output = trimResultNewline(output)
-	if bytes.Equal(bytes.TrimSpace(output), []byte("gave up:true")) {
-		return Decision{Outcome: OutcomeTimeout}
+	const gaveUpMarker = ", gave up:"
+	if i := bytes.LastIndex(output, []byte(gaveUpMarker)); i >= 0 {
+		gaveUp := bytes.TrimSpace(output[i+len(gaveUpMarker):])
+		if bytes.Equal(gaveUp, []byte("true")) {
+			return Decision{Outcome: OutcomeTimeout}
+		}
+		if !bytes.Equal(gaveUp, []byte("false")) {
+			return Decision{Outcome: OutcomeUnavailable}
+		}
+		output = output[:i]
 	}
 	const buttonPrefix = "button returned:"
 	if !bytes.HasPrefix(output, []byte(buttonPrefix)) {
@@ -69,16 +98,12 @@ func parseDialogResult(output []byte, remembered bool) Decision {
 	}
 	rest := output[len(buttonPrefix):]
 	if remembered {
-		button := rest
-		if i := bytes.LastIndex(rest, []byte(", gave up:")); i >= 0 {
-			button = rest[:i]
-		}
 		switch {
-		case bytes.Equal(button, []byte("Allow")):
+		case bytes.Equal(rest, []byte("Allow")):
 			return Decision{Outcome: OutcomeAllowRemember}
-		case bytes.Equal(button, []byte("Forget")):
+		case bytes.Equal(rest, []byte("Forget")):
 			return Decision{Outcome: OutcomeForget}
-		case bytes.Equal(button, []byte("Deny")):
+		case bytes.Equal(rest, []byte("Deny")):
 			return Decision{Outcome: OutcomeDeny}
 		default:
 			return Decision{Outcome: OutcomeUnavailable}
@@ -92,9 +117,6 @@ func parseDialogResult(output []byte, remembered bool) Decision {
 	}
 	button := rest[:i]
 	secret := rest[i+len(textMarker):]
-	if i := bytes.LastIndex(secret, []byte(", gave up:")); i >= 0 {
-		secret = secret[:i]
-	}
 	switch {
 	case bytes.Equal(button, []byte("Allow Once")):
 		return Decision{Outcome: OutcomeAllowOnce, Secret: append([]byte(nil), secret...)}

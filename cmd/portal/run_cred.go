@@ -24,6 +24,9 @@ const (
 	credContextMaxBytes = 300
 	credSecretMaxBytes  = 4096
 	credDenyCooldown    = 10 * time.Second
+	credDialogBudget    = 115 * time.Second
+	credDialogMinSecs   = 5
+	credDialogMaxSecs   = 120
 	// C1 has no "oversize" wire reason; an oversized secret fails closed under
 	// the generic denied token rather than inventing a new protocol value.
 	credInvalidSecretReason = "denied"
@@ -198,15 +201,15 @@ func serveCredRequest(ctx context.Context, deps credServeDeps, req *agentclient.
 		req = &agentclient.CredEvent{}
 	}
 	resp := &protocol.CredResponse{Nonce: req.Nonce, Epoch: req.Epoch}
+	label := stripCredControls(req.Label)
+	auditLabel := truncateCredText(label, credLabelMaxBytes)
 
 	if deps.FeatureEnabled == nil || !deps.FeatureEnabled(config.FeatureCred) {
-		return denyCredResponse(deps, resp, req.Label, req.Mode, "disabled")
+		return denyCredResponse(deps, resp, auditLabel, req.Mode, "disabled")
 	}
 
-	label := stripCredControls(req.Label)
 	if label == "" || len(label) > credLabelMaxBytes {
-		label = truncateCredText(label, credLabelMaxBytes)
-		return denyCredResponse(deps, resp, label, req.Mode, "label-invalid")
+		return denyCredResponse(deps, resp, auditLabel, req.Mode, "label-invalid")
 	}
 	now := credNow(deps)
 	if deps.Cooldown.active(label, now) {
@@ -220,12 +223,18 @@ func serveCredRequest(ctx context.Context, deps credServeDeps, req *agentclient.
 		Delivery: credDelivery(req.Mode, target),
 	}
 	started := now
+	deadline := started.Add(credDialogBudget)
 	remembered := false
 	if deps.KC != nil {
 		_, found, err := deps.KC.Get(ctx, label)
 		remembered = err == nil && found
 	}
 	promptReq.Remembered = remembered
+	timeoutSecs, ok := credPromptTimeoutSecs(deps, deadline)
+	if !ok {
+		return denyCredResponse(deps, resp, label, req.Mode, "timeout")
+	}
+	promptReq.TimeoutSecs = timeoutSecs
 	decision := credPrompt(ctx, deps.Prompter, promptReq)
 
 	if !remembered {
@@ -243,6 +252,11 @@ func serveCredRequest(ctx context.Context, deps credServeDeps, req *agentclient.
 		_ = deps.KC.Delete(ctx, label)
 		deps.Audit.CredForgotten(deps.Host, label)
 		promptReq.Remembered = false
+		timeoutSecs, ok = credPromptTimeoutSecs(deps, deadline)
+		if !ok {
+			return denyCredResponse(deps, resp, label, req.Mode, "timeout")
+		}
+		promptReq.TimeoutSecs = timeoutSecs
 		decision = credPrompt(ctx, deps.Prompter, promptReq)
 		return resolveFreshCredDecision(ctx, deps, req.Mode, label, started, resp, decision)
 	case prompt.OutcomeDeny:
@@ -333,6 +347,18 @@ func credNow(deps credServeDeps) time.Time {
 		return time.Now()
 	}
 	return deps.Now()
+}
+
+func credPromptTimeoutSecs(deps credServeDeps, deadline time.Time) (int, bool) {
+	remaining := deadline.Sub(credNow(deps))
+	seconds := int(remaining / time.Second)
+	if seconds < credDialogMinSecs {
+		return 0, false
+	}
+	if seconds > credDialogMaxSecs {
+		return credDialogMaxSecs, true
+	}
+	return seconds, true
 }
 
 func logCredLine(deps credServeDeps, line string) {

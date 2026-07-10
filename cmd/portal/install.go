@@ -232,40 +232,6 @@ func isatty(f *os.File) bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
-// xdgOpenWrapper is installed at ~/.local/bin/xdg-open on the dev box.
-// It tries `portald open "$@"` first; if no client is active (exit 1),
-// it falls through to the real xdg-open. The real binary location is
-// resolved at call time via `command -v` so the wrapper never hard-codes
-// a path.
-//
-// Design choices:
-//   - Only intercepts when portald is reachable (cmd socket exists + client
-//     connected). Falls through gracefully otherwise — safe even when the
-//     user SSH's in directly without portal running.
-//   - Does not shadow xclip/xsel or any other tool.
-//   - The wrapper is a shell script, not a symlink, so it survives across
-//     agent upgrades (the agent path changes with each SHA; the wrapper
-//     resolves it at runtime via the `portald` symlink).
-const xdgOpenWrapper = `#!/bin/sh
-# Installed by portal. Relays xdg-open calls to the Mac client when a
-# portal session is active; otherwise falls through to the real xdg-open.
-_portald="${HOME}/.cache/portal/portald"
-if [ -x "$_portald" ] && "$_portald" open "$@" 2>/dev/null; then
-    exit 0
-fi
-# Fall through to the real xdg-open. Build a PATH that excludes the wrapper's
-# own directory so we don't call ourselves recursively. Use fixed-string
-# whole-line matching (-xF) so dots and other regex metacharacters in the
-# directory path are treated literally.
-_wrapper_dir=$(cd "$(dirname "$0")" && pwd)
-_real=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$_wrapper_dir" | tr '\n' ':' | xargs -I{} sh -c 'PATH={} command -v xdg-open 2>/dev/null' | head -1)
-if [ -n "$_real" ]; then
-    exec "$_real" "$@"
-fi
-# xdg-open not installed on this box — exit silently (headless server).
-exit 0
-`
-
 // browserEnvSnippet is sourced by ~/.bashrc / ~/.zshrc on the dev box.
 // It sets BROWSER=xdg-open so Python's webbrowser module (used by aws sso
 // login, among others) delegates to xdg-open instead of falling through to
@@ -328,7 +294,7 @@ done`
 	_, _, _ = tr.Exec(ctx, nil, "bash", "-c", shellQuoteRemote(backupScript))
 
 	wrapScript := `mkdir -p ~/.local/bin && cat > ~/.local/bin/xdg-open.portal.tmp && chmod 0755 ~/.local/bin/xdg-open.portal.tmp && mv ~/.local/bin/xdg-open.portal.tmp ~/.local/bin/xdg-open`
-	if _, _, err := tr.Exec(ctx, []byte(xdgOpenWrapper), "bash", "-c", shellQuoteRemote(wrapScript)); err != nil {
+	if _, _, err := tr.Exec(ctx, []byte(clipshim.XDGOpenWrapper), "bash", "-c", shellQuoteRemote(wrapScript)); err != nil {
 		return fmt.Errorf("write wrapper: %w", err)
 	}
 

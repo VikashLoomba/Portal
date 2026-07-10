@@ -1,10 +1,11 @@
 // Package clipshim deploys (and removes) portal's transparent dev-box shims:
-// clipboard readers xclip/wl-paste plus the credential-facing portal,
+// xdg-open, clipboard readers xclip/wl-paste, and the credential-facing portal,
 // portal-askpass, and sudo wrappers. Shell rc blocks put ~/.local/bin first on
-// PATH and export SUDO_ASKPASS only while portal-askpass is executable. A
-// coding agent's own Ctrl+V execs xclip/wl-paste; those shims relay the read to
-// the Mac via `portald clip`, which serves the Mac clipboard over the existing
-// portal connection (DESIGN §6).
+// PATH and select portal-askpass only while it is executable and the user has
+// not configured another SUDO_ASKPASS. A coding agent's own Ctrl+V execs
+// xclip/wl-paste; those shims relay the read to the Mac via `portald clip`,
+// which serves the Mac clipboard over the existing portal connection (DESIGN
+// §6).
 //
 // The deploy is idempotent and DAEMON-DRIVEN (DESIGN §9.1): both `portal
 // install` (first run) and the agentclient reconnect loop call Ensure after the
@@ -31,14 +32,42 @@ import (
 // reconnect without a manual reinstall (DESIGN §9.1). Bump this whenever any
 // shim script below changes.
 //
-// v5 refines the sudo wrapper to scan only sudo's leading options, leaving
-// command-specific flags after the command token out of the conflict check.
-const Version = "5"
+// v6 makes real-binary resolution injection-safe, preserves every human
+// controlling-terminal sudo session, recognizes bundled conflicting sudo
+// options, and preserves a user-configured SUDO_ASKPASS.
+const Version = "6"
 
 // Marker is the exact string grep -qF searches for to decide whether a file at
 // ~/.local/bin is our shim (skip-backup, safe-to-overwrite) and whether the
 // currently-deployed shim is already at Version (skip re-deploy).
 const Marker = "Installed by portal clip-shim v" + Version
+
+// XDGOpenWrapper is installed at ~/.local/bin/xdg-open. It first relays open
+// requests through portald, then safely resolves a real xdg-open by treating
+// PATH entries as data. It is exported for the fresh-install path; reconnect
+// convergence uses the same script through the shims table below.
+const XDGOpenWrapper = `#!/bin/sh
+# ` + Marker + `. Relays xdg-open calls to the Mac client when a portal session
+# is active; otherwise falls through to the real xdg-open.
+_portald="${HOME}/.cache/portal/portald"
+if [ -x "$_portald" ] && "$_portald" open "$@" 2>/dev/null; then
+    exit 0
+fi
+_wrapper_dir=$(cd "$(dirname "$0")" && pwd)
+_real=""
+_oifs=$IFS; IFS=:
+for _d in $PATH; do
+    [ "$_d" = "$_wrapper_dir" ] && continue
+    [ -n "$_d" ] || continue
+    if [ -x "$_d/xdg-open" ]; then _real="$_d/xdg-open"; break; fi
+done
+IFS=$_oifs
+if [ -z "$_real" ] || [ "$_real" -ef "$0" ]; then
+    exit 0
+fi
+exec "$_real" "$@"
+exit 0
+`
 
 // xclipShim is installed at ~/.local/bin/xclip. It intercepts a coding agent's
 // clipboard IMAGE and TEXT reads (and TARGETS probes) and relays them to the
@@ -57,9 +86,10 @@ const Marker = "Installed by portal clip-shim v" + Version
 // rejected, empty clipboard, dial failure — all of it) short-circuits to the
 // real-binary fallback, so the agent never sees a spurious error and never
 // hangs beyond portald clip's own deadline. Recursion is avoided by resolving
-// the real xclip from a PATH with our own dir excluded (grep -vxF, proven in
-// the xdg-open wrapper). A headless box with no real xclip degrades to empty
-// stdout = "no content", which is the correct answer.
+// the real xclip with a quoted IFS loop that treats PATH entries strictly as
+// data, skips our own dir and empty entries, and rejects a logical-path alias
+// of this wrapper. A headless box with no real xclip degrades to empty stdout =
+// "no content", which is the correct answer.
 const xclipShim = `#!/bin/sh
 # ` + Marker + `. Intercepts clipboard IMAGE and TEXT reads for coding agents
 # and relays them to the Mac via portald; falls through to the real xclip on
@@ -77,11 +107,21 @@ case "$_args" in
   *"-t UTF8_STRING"*-o*|*"-t TEXT"*-o*|*"-t STRING"*-o*|*"-t text/plain"*-o*|*"-selection clipboard -o"*|*"-o -selection clipboard"*)
     [ -x "$_portald" ] && "$_portald" clip text 2>/dev/null && exit 0 ;;
 esac
-# Fallback: resolve the real xclip excluding our own dir, exec it. Use fixed
-# whole-line matching (-xF) so path metacharacters are treated literally.
+# Fallback: inspect PATH entries as data, excluding our own dir and empty
+# entries. Never feed PATH through a shell parser.
 _wrapper_dir=$(cd "$(dirname "$0")" && pwd)
-_real=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$_wrapper_dir" | tr '\n' ':' | xargs -I{} sh -c 'PATH={} command -v xclip 2>/dev/null' | head -1)
-[ -n "$_real" ] && exec "$_real" "$@"
+_real=""
+_oifs=$IFS; IFS=:
+for _d in $PATH; do
+    [ "$_d" = "$_wrapper_dir" ] && continue
+    [ -n "$_d" ] || continue
+    if [ -x "$_d/xclip" ]; then _real="$_d/xclip"; break; fi
+done
+IFS=$_oifs
+if [ -z "$_real" ] || [ "$_real" -ef "$0" ]; then
+    exit 0
+fi
+exec "$_real" "$@"
 exit 0   # headless box, no real xclip: empty stdout = "no image" (correct degrade)
 `
 
@@ -114,8 +154,18 @@ case "$_args" in
     [ -x "$_portald" ] && "$_portald" clip text 2>/dev/null && exit 0 ;;
 esac
 _wrapper_dir=$(cd "$(dirname "$0")" && pwd)
-_real=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$_wrapper_dir" | tr '\n' ':' | xargs -I{} sh -c 'PATH={} command -v wl-paste 2>/dev/null' | head -1)
-[ -n "$_real" ] && exec "$_real" "$@"
+_real=""
+_oifs=$IFS; IFS=:
+for _d in $PATH; do
+    [ "$_d" = "$_wrapper_dir" ] && continue
+    [ -n "$_d" ] || continue
+    if [ -x "$_d/wl-paste" ]; then _real="$_d/wl-paste"; break; fi
+done
+IFS=$_oifs
+if [ -z "$_real" ] || [ "$_real" -ef "$0" ]; then
+    exit 0
+fi
+exec "$_real" "$@"
 exit 0   # headless box, no real wl-paste: empty stdout = "no image" (correct degrade)
 `
 
@@ -155,6 +205,7 @@ var shims = []struct {
 	name   string
 	script string
 }{
+	{"xdg-open", XDGOpenWrapper},
 	{"xclip", xclipShim},
 	{"wl-paste", wlPasteShim},
 	{"portal", portalShim},
@@ -179,7 +230,7 @@ const (
 // managers (nvm/asdf/mise/conda) re-export PATH later and the agent may run
 // from a non-login / non-interactive context.
 const pathPrependSnippet = PathMarkerStart + `
-# Ensures portal's shims (~/.local/bin/xclip, wl-paste, portal,
+# Ensures portal's shims (~/.local/bin/xdg-open, xclip, wl-paste, portal,
 # portal-askpass, sudo) win on PATH.
 PATH="$HOME/.local/bin:$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$HOME/.local/bin" | paste -sd: -)"
 export PATH
@@ -331,9 +382,15 @@ func deployShim(ctx context.Context, tr transport.Transport, name, script string
 	// Back up only a pre-existing file that is NOT already our shim, and only
 	// if no backup exists yet (so repeated installs don't clobber the original
 	// with our own shim — DESIGN §9.3). cp -P preserves a symlink as a symlink.
+	ownershipMarker := Marker
+	if name == "xdg-open" {
+		// Older portal releases owned xdg-open with this unversioned marker.
+		// Treat it as ours so v6 convergence never backs it up as a user binary.
+		ownershipMarker = "Installed by portal"
+	}
 	backupScript := fmt.Sprintf(
 		`if [ -e %s ] && ! grep -qF %q %s 2>/dev/null && [ ! -e %s ]; then cp -P %s %s; fi`,
-		bin, Marker, bin, backup, bin, backup,
+		bin, ownershipMarker, bin, backup, bin, backup,
 	)
 	_, _, _ = tr.Exec(ctx, nil, "bash", "-c", shellQuote(backupScript))
 
