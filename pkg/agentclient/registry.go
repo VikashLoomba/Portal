@@ -19,10 +19,10 @@ var ErrNotConnected = errors.New("agentclient: not connected")
 // registry-stamped Msg.Seq (DESIGN S3 — the per-service monotonic correlation
 // counter, which the agent NEVER duplicates into the payload) plus the raw
 // payload into a typed EngineEvent; Deliver is the NON-BLOCKING sink (clip ⇒
-// publishClip cap-8, notify ⇒ publishNotify cap-16 preserving DESIGN S10 QoS;
+// publishClip cap-8, notify ⇒ publishNotify cap-16, cred ⇒ publishCred cap-2;
 // openurl ⇒ publish shared events). Channel capacity + drop policy are thus
 // DECLARED per handler via its Deliver target (the dedicated channels created in
-// Client.New). Handlers that do not correlate on seq (openurl/clip) ignore it.
+// Client.New). Handlers that do not correlate on seq ignore it.
 type HandlerSpec struct {
 	Service    string
 	Version    uint32

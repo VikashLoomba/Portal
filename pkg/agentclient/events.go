@@ -39,6 +39,11 @@ const (
 	// events channel, so a port-event burst can't evict a pending notification.
 	// runNotifyHandler on the Mac drains it and raises a native notification.
 	KindNotify
+	// KindCredRequest fires when a remote command asks the Mac to approve and
+	// supply a credential. Like clip and notify, it uses its own dedicated
+	// channel so shared engine traffic cannot evict a pending human prompt.
+	// runCredHandler answers it through Client.SendCredResponse.
+	KindCredRequest
 )
 
 // EngineEvent is the unit of communication from agentclient → engine.
@@ -56,6 +61,10 @@ type EngineEvent struct {
 	// fire-and-forget (no response frame), so the handler just raises the
 	// native notification.
 	Notify *NotifyEvent
+	// Cred carries the fields of a KindCredRequest event. nil otherwise. The
+	// handler answers by calling Client.SendCredResponse with the echoed
+	// Nonce/Epoch.
+	Cred *CredEvent
 }
 
 // NotifyEvent is the payload of a KindNotify. It mirrors protocol.Notify; the
@@ -80,4 +89,16 @@ type ClipEvent struct {
 	Epoch  uint64
 	Kind   string
 	Format string
+}
+
+// CredEvent is the payload of a KindCredRequest. Nonce/Epoch are echoed in the
+// CredResponse; Label identifies the credential, Requester identifies the box
+// process, and Mode/Target describe its delivery destination.
+type CredEvent struct {
+	Nonce     uint64
+	Epoch     uint64
+	Label     string
+	Requester string
+	Mode      string
+	Target    string
 }

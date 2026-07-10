@@ -56,8 +56,8 @@ type Config struct {
 	// Hub is an OPTIONAL read-only fan-out tee for local API observers. nil
 	// (the default) means no tee. When set, publish/publishNotify tee an
 	// EXPLICIT kind→hub.Event enumeration into it — never a pass-through. The
-	// hub can never become a second event-ordering authority: the engine, clip
-	// handler, and notify handler keep their dedicated channels (DESIGN §3/§10).
+	// hub can never become a second event-ordering authority: the engine, clip,
+	// notify, and credential handlers keep their dedicated channels.
 	Hub *hub.Hub
 	// ClipShim runs after a verified agent upload; nil skips shim deploy.
 	ClipShim ClipShim
@@ -101,9 +101,14 @@ type Client struct {
 	// Never closed by Run (the handler exits on ctx, not channel close).
 	notifyEvents chan EngineEvent
 
+	// credEvents is a DEDICATED cap-2 channel for KindCredRequest. A credential
+	// prompt can remain pending for up to two minutes, so shared engine traffic
+	// must not evict it. Never closed by Run; runCredHandler exits on ctx.
+	credEvents chan EngineEvent
+
 	// registry is the client-side service registry: it demuxes inbound Msg
-	// frames to per-service handlers (openurl this unit; notify/clip after
-	// u4/u5) and advertises the client's handlers in Hello. Auto-populated in
+	// frames to per-service handlers and advertises the client's handlers in
+	// Hello. Auto-populated in
 	// New; the handlers deliver through the existing publish* sinks (S11 facades).
 	registry *registry
 
@@ -144,6 +149,7 @@ func New(cfg Config) *Client {
 		events:       make(chan EngineEvent, 64),
 		clipEvents:   make(chan EngineEvent, 8),
 		notifyEvents: make(chan EngineEvent, 16),
+		credEvents:   make(chan EngineEvent, 2),
 	}
 	// Auto-register the compiled-in openurl handler so cmd/portal/run.go stays
 	// unchanged: it decodes the OpenURL payload and delivers via the shared
@@ -211,6 +217,25 @@ func New(cfg Config) *Client {
 		},
 		Deliver: c.publishClip,
 	})
+	// Auto-register the credential handler: CredRequest payloads use their own
+	// cap-2 channel because a human prompt may remain pending for 120 seconds.
+	// The Mac answers through SendCredResponse after an explicit decision.
+	c.registry.register(HandlerSpec{
+		Service:    "cred",
+		Version:    1,
+		MaxPayload: 8192,
+		Decode: func(_ uint64, payload cbor.RawMessage) (EngineEvent, error) {
+			cr, err := protocol.UnmarshalPayload[protocol.CredRequest](payload)
+			if err != nil {
+				return EngineEvent{}, err
+			}
+			return EngineEvent{Kind: KindCredRequest, Cred: &CredEvent{
+				Nonce: cr.Nonce, Epoch: cr.Epoch, Label: cr.Label,
+				Requester: cr.Requester, Mode: cr.Mode, Target: cr.Target,
+			}}, nil
+		},
+		Deliver: c.publishCred,
+	})
 	for _, h := range cfg.Handlers {
 		c.registry.register(h)
 	}
@@ -234,6 +259,12 @@ func (c *Client) ClipEvents() <-chan EngineEvent { return c.clipEvents }
 // channel.
 func (c *Client) NotifyEvents() <-chan EngineEvent { return c.notifyEvents }
 
+// CredEvents returns the dedicated KindCredRequest channel. runCredHandler in
+// cmd/portal drains it on its own goroutine. Like ClipEvents() it is NEVER
+// closed by Run — the handler exits on ctx cancellation, not channel close —
+// so a late credential request racing shutdown cannot panic on delivery.
+func (c *Client) CredEvents() <-chan EngineEvent { return c.credEvents }
+
 // SendClipResponse writes a ClipResponse up the current pipe, correlating the
 // agent's outstanding waiter by (Nonce,Epoch). It is the Mac-side answer to a
 // KindClipRequest. Returns an error if no connection is up — the caller treats
@@ -250,6 +281,20 @@ func (c *Client) SendClipResponse(resp *protocol.ClipResponse) error {
 		return err
 	}
 	return c.registry.send(enc, "clip", "resp", payload)
+}
+
+// SendCredResponse writes a CredResponse up the current pipe, correlating the
+// agent's outstanding waiter by (Nonce,Epoch). Returns an error if no connection
+// is up, leaving the agent to time out its pending credential request.
+func (c *Client) SendCredResponse(resp *protocol.CredResponse) error {
+	c.streamMu.Lock()
+	enc := c.enc
+	c.streamMu.Unlock()
+	payload, err := protocol.MarshalPayload(*resp)
+	if err != nil {
+		return err
+	}
+	return c.registry.send(enc, "cred", "resp", payload)
 }
 
 // Send writes a client→agent service frame on the current pipe.
@@ -462,6 +507,15 @@ func (c *Client) publishNotify(ev EngineEvent) {
 			Sound:    ev.Notify.Sound,
 			Seq:      ev.Notify.Seq,
 		}})
+	}
+}
+
+// publishCred sends to the dedicated credential channel without blocking the
+// protocol demux loop. credEvents is never closed by Run.
+func (c *Client) publishCred(ev EngineEvent) {
+	select {
+	case c.credEvents <- ev:
+	default:
 	}
 }
 
@@ -720,9 +774,9 @@ func (c *Client) demuxLoop(ctx context.Context, dec *protocol.Decoder) error {
 			case env.Msg != nil:
 				// Inbound service frame (v4): route to the registry, which decodes
 				// per-service and delivers on the handler's declared sink (openurl
-				// → publish; notify → publishNotify; clip → publishClip, the
-				// DEDICATED cap-8 channel so a port-event burst can't evict a
-				// pending paste, DESIGN §5/S10). Unknown/dormant services and
+				// → publish; notify → publishNotify; clip → publishClip; cred →
+				// publishCred). The dedicated channels prevent shared port-event
+				// traffic from evicting user-facing work. Unknown/dormant services and
 				// decode failures are logged drops — the session lives.
 				c.registry.dispatch(env.Msg)
 			case env.Heartbeat != nil:

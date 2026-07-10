@@ -2,6 +2,8 @@ package agentclient
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -409,6 +411,36 @@ func (s *e2eSession) serveClip(ctx context.Context, sha string) {
 	}()
 }
 
+// serveCred drains the client's dedicated credential channel and approves each
+// request with the supplied fake bytes through SendCredResponse.
+func (s *e2eSession) serveCred(ctx context.Context, secret []byte) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev := <-s.c.CredEvents():
+				if ev.Cred == nil {
+					continue
+				}
+				_ = s.c.SendCredResponse(&protocol.CredResponse{
+					Nonce: ev.Cred.Nonce, Epoch: ev.Cred.Epoch, OK: true,
+					Secret: append([]byte(nil), secret...),
+				})
+			}
+		}
+	}()
+}
+
+func credRequestLine(t *testing.T, req agent.CredShimReq) string {
+	t.Helper()
+	payload, err := protocol.MarshalPayload(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "cred\t" + base64.StdEncoding.EncodeToString(payload) + "\n"
+}
+
 // waitEvent reads the shared events channel until an event of kind arrives.
 func (s *e2eSession) waitEvent(t *testing.T, kind EngineEventKind) EngineEvent {
 	t.Helper()
@@ -464,14 +496,15 @@ func openurlHandler(version uint32, deliver func(EngineEvent)) HandlerSpec {
 	}
 }
 
-// TestE2EAllThreeServicesRoundTrip (EC2) drives openurl, notify, and clip end to
-// end over a real agent+client pipe, both auto-registering all three services.
+// TestE2EAllFourServicesRoundTrip drives openurl, notify, clip, and cred end to
+// end over a real agent+client pipe, both auto-registering all four services.
 // Every feature crosses via Msg frames ONLY (the legacy Envelope fields are
 // deleted — compiler-enforced, and asserted by the agent's deletion-invariant
-// test). HelloAck.Services proves the reverse-direction advertisement; the three
-// "ok" cmd replies prove the agent recorded the client's services (forward).
-func TestE2EAllThreeServicesRoundTrip(t *testing.T) {
+// test). HelloAck.Services proves the reverse-direction advertisement; the cmd
+// replies prove the agent recorded the client's services (forward).
+func TestE2EAllFourServicesRoundTrip(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef"
+	secret := []byte("s3kr3t-vector")
 	sess := newE2ESession(t, nil, nil, nil)
 	defer sess.close()
 
@@ -479,7 +512,7 @@ func TestE2EAllThreeServicesRoundTrip(t *testing.T) {
 	if ack == nil {
 		t.Fatal("no HelloAck")
 	}
-	for _, svc := range []string{"openurl", "notify", "clip"} {
+	for _, svc := range []string{"openurl", "notify", "clip", "cred"} {
 		if v, ok := ack.Services[svc]; !ok || v != 1 {
 			t.Fatalf("HelloAck.Services[%q] = %d (present %v), want 1", svc, v, ok)
 		}
@@ -488,6 +521,7 @@ func TestE2EAllThreeServicesRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess.serveClip(ctx, sha)
+	sess.serveCred(ctx, secret)
 
 	// openurl.
 	if got := sess.ask(t, "open\thttp://example.com/x\n"); got != "ok\n" {
@@ -508,6 +542,14 @@ func TestE2EAllThreeServicesRoundTrip(t *testing.T) {
 	// clip.
 	if got := sess.ask(t, "clip\timage\tpng\n"); got != "ok\t"+sha+"\n" {
 		t.Fatalf("clip = %q, want ok\\t<sha>\\n", got)
+	}
+
+	// cred.
+	wantCred := "ok\t" + base64.StdEncoding.EncodeToString(secret) + "\n"
+	if got := sess.ask(t, credRequestLine(t, agent.CredShimReq{
+		Label: "database", Mode: "env", Target: "PW", Requester: "pid 42: sh",
+	})); got != wantCred {
+		t.Fatal("credential response did not carry the approved fake bytes")
 	}
 }
 
@@ -545,6 +587,11 @@ func TestZeroServiceConsumer(t *testing.T) {
 	}
 	if got := sess.ask(t, "notify\t{\"title\":\"hi\"}\n"); got != "no-client\n" {
 		t.Fatalf("notify = %q, want no-client\\n", got)
+	}
+	if got := sess.ask(t, credRequestLine(t, agent.CredShimReq{
+		Label: "database", Mode: "env", Target: "PW",
+	})); got != "deny\tno-client\n" {
+		t.Fatalf("cred = %q, want deny\\tno-client\\n", got)
 	}
 }
 
@@ -656,6 +703,43 @@ func TestClientNotify_SurfacesMsgSeq(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("no notify event delivered for seq %d", want)
 		}
+	}
+}
+
+// TestClientCred_DecodePublish exercises the real built-in cred HandlerSpec and
+// pins the complete CredRequest→dedicated-channel field mapping.
+func TestClientCred_DecodePublish(t *testing.T) {
+	c := New(Config{})
+	payload, err := protocol.MarshalPayload(protocol.CredRequest{
+		Nonce: 11, Epoch: 12, Label: "staging admin", Requester: "pid 42: sh",
+		Mode: "env", Target: "PW",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.registry.dispatch(&protocol.Msg{Service: "cred", Kind: "req", Payload: payload})
+	select {
+	case ev := <-c.CredEvents():
+		if ev.Kind != KindCredRequest || ev.Cred == nil {
+			t.Fatal("credential request was not published on its dedicated channel")
+		}
+		got := ev.Cred
+		if got.Nonce != 11 || got.Epoch != 12 || got.Label != "staging admin" ||
+			got.Requester != "pid 42: sh" || got.Mode != "env" || got.Target != "PW" {
+			t.Fatal("credential event fields did not match the decoded request")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no credential event delivered")
+	}
+}
+
+// TestClientCred_SendBeforeConnect pins the response facade's connection error
+// contract, matching SendClipResponse.
+func TestClientCred_SendBeforeConnect(t *testing.T) {
+	c := New(Config{})
+	err := c.SendCredResponse(&protocol.CredResponse{Nonce: 1, Epoch: 2, Err: "denied"})
+	if !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("SendCredResponse before connect: want ErrNotConnected, got %v", err)
 	}
 }
 

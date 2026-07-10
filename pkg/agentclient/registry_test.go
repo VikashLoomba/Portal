@@ -140,10 +140,13 @@ func TestClientRegistry_PanicIsolation(t *testing.T) {
 	}
 }
 
-// QoS non-eviction (S10): flooding the shared events channel does not evict a
-// clip event routed to its dedicated channel.
+// QoS non-eviction (S10): flooding the shared events channel does not evict
+// clip or credential events routed to their dedicated channels.
 func TestClientRegistry_QoSNonEviction(t *testing.T) {
 	c := New(Config{})
+	if cap(c.credEvents) != 2 {
+		t.Fatalf("credEvents cap = %d, want 2", cap(c.credEvents))
+	}
 	// Fill the shared events channel to capacity.
 	for len(c.events) < cap(c.events) {
 		c.events <- EngineEvent{Kind: KindDelta}
@@ -164,6 +167,23 @@ func TestClientRegistry_QoSNonEviction(t *testing.T) {
 		}
 	default:
 		t.Fatal("clip event was evicted / not delivered despite a full events channel")
+	}
+
+	r.register(HandlerSpec{
+		Service: "cred", Version: 1, MaxPayload: 8192,
+		Decode: func(uint64, cbor.RawMessage) (EngineEvent, error) {
+			return EngineEvent{Kind: KindCredRequest, Cred: &CredEvent{Nonce: 9}}, nil
+		},
+		Deliver: c.publishCred,
+	})
+	r.dispatch(&protocol.Msg{Service: "cred", Kind: "req", Payload: raw1()})
+	select {
+	case ev := <-c.credEvents:
+		if ev.Cred == nil || ev.Cred.Nonce != 9 {
+			t.Fatal("wrong credential event delivered")
+		}
+	default:
+		t.Fatal("credential event was evicted / not delivered despite a full events channel")
 	}
 }
 
