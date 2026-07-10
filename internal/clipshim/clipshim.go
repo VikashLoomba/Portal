@@ -62,7 +62,7 @@ for _d in $PATH; do
     if [ -x "$_d/xdg-open" ]; then _real="$_d/xdg-open"; break; fi
 done
 IFS=$_oifs
-if [ -z "$_real" ] || [ "$_real" -ef "$0" ]; then
+if [ -z "$_real" ]; then
     exit 0
 fi
 exec "$_real" "$@"
@@ -118,7 +118,7 @@ for _d in $PATH; do
     if [ -x "$_d/xclip" ]; then _real="$_d/xclip"; break; fi
 done
 IFS=$_oifs
-if [ -z "$_real" ] || [ "$_real" -ef "$0" ]; then
+if [ -z "$_real" ]; then
     exit 0
 fi
 exec "$_real" "$@"
@@ -162,7 +162,7 @@ for _d in $PATH; do
     if [ -x "$_d/wl-paste" ]; then _real="$_d/wl-paste"; break; fi
 done
 IFS=$_oifs
-if [ -z "$_real" ] || [ "$_real" -ef "$0" ]; then
+if [ -z "$_real" ]; then
     exit 0
 fi
 exec "$_real" "$@"

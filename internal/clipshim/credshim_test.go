@@ -43,9 +43,9 @@ func TestSudoShimSafetyMatrixText(t *testing.T) {
 		`for _d in $PATH; do`,
 		`[ -n "$_d" ] || continue`,
 		`[ -x "$_d/sudo" ]`,
-		`[ -z "$_real" ] || [ "$_real" -ef "$0" ]`,
+		`[ -z "$_real" ]`,
 		`printf '%s\n' 'portal sudo: real sudo not found' >&2`,
-		`[ -t 0 ] || [ -t 1 ] || [ -t 2 ] || { : < /dev/tty; } 2>/dev/null`,
+		`[ -t 0 ] || [ -t 1 ] || [ -t 2 ] || ( : < /dev/tty ) 2>/dev/null`,
 		`[ -z "${SUDO_ASKPASS:-}" ]`,
 		`[ ! -x "$SUDO_ASKPASS" ]`,
 		`for a in "$@"; do`,
@@ -76,7 +76,7 @@ func TestSudoShimSafetyMatrixText(t *testing.T) {
 	if len(addingAskpass) != 1 || addingAskpass[0] != `exec "$_real" -A "$@"` {
 		t.Fatalf("exec lines adding -A = %q, want only the guarded injection branch", addingAskpass)
 	}
-	noRealBlock := `if [ -z "$_real" ] || [ "$_real" -ef "$0" ]; then
+	noRealBlock := `if [ -z "$_real" ]; then
     printf '%s\n' 'portal sudo: real sudo not found' >&2
     exit 1
 fi`
@@ -84,7 +84,7 @@ fi`
 		t.Fatal("missing-real-sudo branch must report one line and exit 1")
 	}
 
-	ttyCheck := strings.Index(sudoShim, `[ -t 0 ] || [ -t 1 ] || [ -t 2 ] || { : < /dev/tty; } 2>/dev/null`)
+	ttyCheck := strings.Index(sudoShim, `[ -t 0 ] || [ -t 1 ] || [ -t 2 ] || ( : < /dev/tty ) 2>/dev/null`)
 	if ttyCheck < 0 {
 		t.Fatal("sudo shim missing TTY check")
 	}

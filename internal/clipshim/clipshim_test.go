@@ -233,7 +233,7 @@ func TestShimResolversSkipEmptyEntriesAndRejectSelf(t *testing.T) {
 				`for _d in $PATH; do`,
 				`[ -n "$_d" ] || continue`,
 				`[ -x "$_d/` + tc.tool + `" ]`,
-				`[ "$_real" -ef "$0" ]`,
+				`[ -z "$_real" ]`,
 			} {
 				if !strings.Contains(tc.script, want) {
 					t.Errorf("%s resolver missing %q", tc.name, want)

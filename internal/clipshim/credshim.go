@@ -51,7 +51,7 @@ for _d in $PATH; do
     if [ -x "$_d/sudo" ]; then _real="$_d/sudo"; break; fi
 done
 IFS=$_oifs
-if [ -z "$_real" ] || [ "$_real" -ef "$0" ]; then
+if [ -z "$_real" ]; then
     printf '%s\n' 'portal sudo: real sudo not found' >&2
     exit 1
 fi
@@ -59,7 +59,11 @@ fi
 # SAFETY INVARIANT: a human in any interactive session reaches real sudo
 # byte-for-byte, even with redirected stdin. Askpass is injected only when no
 # controlling terminal exists on which sudo could prompt that human.
-if [ -t 0 ] || [ -t 1 ] || [ -t 2 ] || { : < /dev/tty; } 2>/dev/null; then
+# The /dev/tty probe MUST stay a subshell ( ... ), never a { ...; } group:
+# ':' is a POSIX special built-in, so a failed redirect on it in a
+# non-interactive shell (dash) is FATAL and would abort the whole script; the
+# subshell contains that exit so the fallthrough to askpass still runs.
+if [ -t 0 ] || [ -t 1 ] || [ -t 2 ] || ( : < /dev/tty ) 2>/dev/null; then
     exec "$_real" "$@"
 fi
 
