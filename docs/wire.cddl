@@ -14,7 +14,7 @@
 ;     printf '%s' "$h" | xxd -r -p > /tmp/v.cbor
 ;     cddl docs/wire.cddl validate /tmp/v.cbor || echo "FAIL: $hx"
 ;   done
-; Last run 2026-07-09 (cddl 0.12.14): all 21 vectors conform.
+; Last run 2026-07-09 (cddl 0.12.14): all 25 vectors conform.
 
 portal-cbor = envelope / exec-frame / msg-payload
 
@@ -212,7 +212,12 @@ port = {
 ; Service payload structs embedded as Msg.p CBOR items. Msg.p is
 ; cbor.RawMessage on the Go side, so these maps are nested directly, not bstr.
 
-msg-payload = open-url / clip-request / clip-response / notify
+msg-payload = open-url
+            / clip-request
+            / clip-response
+            / cred-request
+            / cred-response
+            / notify
 
 open-url = {
   "url" => tstr,
@@ -233,6 +238,23 @@ clip-response = {
   ? "has" => bool,
   ? "k" => tstr,
   ? "sha" => tstr,
+  ? "err" => tstr
+}
+
+cred-request = {
+  "n" => uint64,
+  "e" => uint64,
+  "l" => tstr,
+  ? "r" => tstr,
+  "m" => tstr,
+  ? "t" => tstr
+}
+
+cred-response = {
+  "n" => uint64,
+  "e" => uint64,
+  "ok" => bool,
+  ? "s" => bstr,
   ? "err" => tstr
 }
 

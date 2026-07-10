@@ -48,6 +48,36 @@ export function decode(input: Uint8Array): CborValue {
   return value;
 }
 
+export function encode(value: CborValue): Uint8Array {
+  if (typeof value === "number") {
+    return encodeInteger(value);
+  }
+  if (typeof value === "bigint") {
+    return value >= 0n ? encodeHead(0, value) : encodeHead(1, -1n - value);
+  }
+  if (typeof value === "string") {
+    return encodeText(value);
+  }
+  if (typeof value === "boolean") {
+    return Uint8Array.of(value ? 0xf5 : 0xf4);
+  }
+  if (value === null) {
+    return Uint8Array.of(0xf6);
+  }
+  if (value instanceof Uint8Array) {
+    return encodeBytes(value);
+  }
+  if (Array.isArray(value)) {
+    return concat([encodeHead(4, value.length), ...value.map((item) => encode(item))]);
+  }
+
+  const entries: EncodedMapEntry[] = [];
+  for (const [key, nested] of Object.entries(value)) {
+    entries.push([key, encode(nested)]);
+  }
+  return encodeMap(entries);
+}
+
 export function decodeExecFrame(input: Uint8Array): ExecFrame {
   const value = decode(input);
   if (!isCborMap(value)) {
