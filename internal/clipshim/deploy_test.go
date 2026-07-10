@@ -2,6 +2,7 @@ package clipshim
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -24,6 +25,8 @@ type recordTransport struct {
 	execBytesStdin   [][]byte
 	// reply maps a substring of the Exec script to the stdout to return.
 	reply map[string]string
+	// err maps a substring of the Exec script to the error to return.
+	err map[string]error
 }
 
 func (r *recordTransport) Ensure(context.Context) (bool, error) { return false, nil }
@@ -45,9 +48,17 @@ func (r *recordTransport) Exec(_ context.Context, stdin []byte, argv ...string) 
 	if len(stdin) > 0 {
 		r.execBytesScripts = append(r.execBytesScripts, joined)
 		r.execBytesStdin = append(r.execBytesStdin, stdin)
+	} else {
+		r.execScripts = append(r.execScripts, joined)
+	}
+	for key, err := range r.err {
+		if strings.Contains(joined, key) {
+			return "", "", err
+		}
+	}
+	if len(stdin) > 0 {
 		return "", "", nil
 	}
-	r.execScripts = append(r.execScripts, joined)
 	for key, out := range r.reply {
 		if strings.Contains(joined, key) {
 			return out, "", nil
@@ -74,9 +85,9 @@ func (r *recordTransport) allStdin() string {
 }
 
 // TestEnsure_DeploysShimsAndHook drives Ensure on a stale box (the marker grep
-// reports "stale") and asserts the full deploy fires: both shim scripts are
-// written, the notify hook script is written, the Claude settings.json merge
-// runs, and the PATH-prepend block is appended.
+// reports "stale") and asserts the full deploy fires: all versioned shim
+// scripts are written, the notify hook script is written, the Claude
+// settings.json merge runs, and both shell environment blocks are appended.
 func TestEnsure_DeploysShimsAndHook(t *testing.T) {
 	tr := &recordTransport{
 		reply: map[string]string{
@@ -91,9 +102,14 @@ func TestEnsure_DeploysShimsAndHook(t *testing.T) {
 	}
 
 	stdin := tr.allStdin()
-	// Both shims written (their Marker is in the stdin payload).
+	// Every versioned shim is written with its exact script payload.
 	if !strings.Contains(stdin, Marker) {
 		t.Error("expected shim Marker in a written payload")
+	}
+	for _, sh := range shims {
+		if !strings.Contains(stdin, sh.script) {
+			t.Errorf("expected %s shim script to be written", sh.name)
+		}
 	}
 	// The notify-hook script is written (recognized by its portald notify --hook line).
 	if !strings.Contains(stdin, "portald notify --hook") {
@@ -103,21 +119,26 @@ func TestEnsure_DeploysShimsAndHook(t *testing.T) {
 	if !strings.Contains(stdin, PathMarkerStart) {
 		t.Error("expected the PATH-prepend block to be written")
 	}
+	if !strings.Contains(stdin, AskpassMarkerStart) {
+		t.Error("expected the SUDO_ASKPASS block to be written")
+	}
 
 	scripts := tr.allScripts()
 	// The Claude settings.json merge runs (python3-guarded).
 	if !strings.Contains(scripts, ".claude/settings.json") {
 		t.Error("expected the Claude settings.json merge to run")
 	}
-	// Both shims targeted ~/.local/bin/xclip and wl-paste.
-	if !strings.Contains(scripts, "~/.local/bin/xclip") || !strings.Contains(scripts, "~/.local/bin/wl-paste") {
-		t.Error("expected both xclip and wl-paste shims to be deployed")
+	// Every table entry targets its ~/.local/bin path.
+	for _, sh := range shims {
+		if !strings.Contains(scripts, "~/.local/bin/"+sh.name) {
+			t.Errorf("expected %s shim to be deployed", sh.name)
+		}
 	}
 }
 
-// TestEnsure_FastPathWhenCurrent: when both shims already carry the current
+// TestEnsure_FastPathWhenCurrent: when all shims already carry the current
 // Marker, Ensure must NOT rewrite them (no shim ExecBytes), but must still
-// ensure the notify hook + PATH block (idempotent convergence).
+// ensure the notify hook plus both environment blocks (idempotent convergence).
 func TestEnsure_FastPathWhenCurrent(t *testing.T) {
 	tr := &recordTransport{
 		reply: map[string]string{
@@ -128,22 +149,40 @@ func TestEnsure_FastPathWhenCurrent(t *testing.T) {
 		t.Fatalf("Ensure: %v", err)
 	}
 	stdin := tr.allStdin()
-	// The shim Marker must NOT have been re-written (fast path skips deployShim).
-	if strings.Contains(stdin, "# "+Marker+". Intercepts") {
-		t.Error("fast path should NOT rewrite the shim scripts")
+	// No exact shim payload may be re-written (fast path skips deployShim).
+	for _, sh := range shims {
+		if strings.Contains(stdin, sh.script) {
+			t.Errorf("fast path should NOT rewrite the %s shim", sh.name)
+		}
 	}
-	// But the PATH block + notify hook still run.
+	// But both environment blocks + notify hook still run.
 	if !strings.Contains(stdin, PathMarkerStart) {
 		t.Error("fast path should still ensure the PATH-prepend block")
+	}
+	if !strings.Contains(stdin, AskpassMarkerStart) {
+		t.Error("fast path should still ensure the SUDO_ASKPASS block")
 	}
 	if !strings.Contains(stdin, "portald notify --hook") {
 		t.Error("fast path should still ensure the notify hook")
 	}
 }
 
+func TestCurrentShimsProbeCoversDeploymentTable(t *testing.T) {
+	probe := currentShimsProbe()
+	for _, sh := range shims {
+		if !strings.Contains(probe, "~/.local/bin/"+sh.name) {
+			t.Errorf("current marker probe missing %s", sh.name)
+		}
+	}
+	if got, want := strings.Count(probe, Marker), len(shims); got != want {
+		t.Fatalf("current marker probe contains Marker %d times, want %d", got, want)
+	}
+}
+
 // TestRemove_StripsEverything asserts Remove issues a script that removes the
 // shims, the notify hook, the portald symlink, the env snippet, strips the
-// PATH-prepend marker block, and strips the portal-managed settings.json hooks.
+// PATH/SUDO_ASKPASS marker blocks, and strips the portal-managed settings.json
+// hooks.
 func TestRemove_StripsEverything(t *testing.T) {
 	tr := &recordTransport{}
 	Remove(context.Background(), tr)
@@ -154,8 +193,10 @@ func TestRemove_StripsEverything(t *testing.T) {
 		"~/.config/portal/env.sh",
 		PathMarkerStart,
 		PathMarkerEnd,
+		AskpassMarkerStart,
+		AskpassMarkerEnd,
 		"PORTAL_MANAGED=1",
-		"xdg-open xclip wl-paste",
+		"xdg-open xclip wl-paste portal portal-askpass sudo",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("Remove script missing %q\nscript:\n%s", want, got)
@@ -165,14 +206,11 @@ func TestRemove_StripsEverything(t *testing.T) {
 
 // TestEnsure_NotifyHookFailureDoesNotBlockPath: a failed settings.json merge
 // must not abort Ensure (the headline clip PATH convergence takes priority). We
-// can't make Exec fail by substring alone here, but we assert the documented
-// contract structurally: ensureNotifyHook's error is swallowed in Ensure, so a
-// box without python3 (merge no-op) still converges the PATH block. Since the
-// fake never errors, the meaningful assertion is that PATH-prepend ran AFTER the
-// hook step regardless.
+// inject a merge error and assert both environment blocks still converge.
 func TestEnsure_NotifyHookFailureDoesNotBlockPath(t *testing.T) {
 	tr := &recordTransport{
 		reply: map[string]string{"echo current || echo stale": "current"},
+		err:   map[string]error{".claude/settings.json": errors.New("merge failed")},
 	}
 	if err := Ensure(context.Background(), tr); err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -180,5 +218,23 @@ func TestEnsure_NotifyHookFailureDoesNotBlockPath(t *testing.T) {
 	// PATH-prepend must have run (it is the last, non-skippable step).
 	if !strings.Contains(tr.allStdin(), PathMarkerStart) {
 		t.Fatal("PATH-prepend must run even though the notify hook is best-effort")
+	}
+	if !strings.Contains(tr.allStdin(), AskpassMarkerStart) {
+		t.Fatal("SUDO_ASKPASS must run even though the notify hook is best-effort")
+	}
+}
+
+func TestEnsure_AskpassEnvFailurePropagates(t *testing.T) {
+	writeErr := errors.New("rc file unavailable")
+	tr := &recordTransport{
+		reply: map[string]string{"echo current || echo stale": "current"},
+		err:   map[string]error{AskpassMarkerStart: writeErr},
+	}
+	err := Ensure(context.Background(), tr)
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("Ensure error = %v, want wrapped askpass write error", err)
+	}
+	if !strings.Contains(tr.allStdin(), PathMarkerStart) {
+		t.Fatal("PATH-prepend must run before the SUDO_ASKPASS block")
 	}
 }
