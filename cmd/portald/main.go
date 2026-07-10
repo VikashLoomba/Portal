@@ -8,6 +8,9 @@
 //	(default)  Run as the Mac-connected RPC agent.
 //	open <url> Relay a URL to the connected Mac client via the cmd socket.
 //	           Used internally by the ~/.local/bin/xdg-open wrapper.
+//	clip ...   Serve clipboard shim requests.
+//	notify ... Relay a notification to the connected Mac.
+//	keychain   Request and deliver a user-approved credential.
 //
 // Started by the local client via:
 //
@@ -18,6 +21,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -83,6 +87,16 @@ func main() {
 		return
 	}
 
+	// "portald keychain <run|askpass>" is the box-side credential surface.
+	if len(os.Args) >= 2 && os.Args[1] == "keychain" {
+		if code := runKeychain(os.Args[2:]); code != 0 {
+			os.Exit(code)
+		}
+		return
+	}
+
+	flag.Usage = printPortaldUsage
+
 	var (
 		protoVersion = flag.Uint("proto-version", 2, "wire protocol version expected by the client")
 		pollMs       = flag.Int("poll-ms", 75, "INET_DIAG dump period in ms (50-200 recommended)")
@@ -134,6 +148,18 @@ func main() {
 		logger.Error("agent server exited", "err", err, "proto_version", *protoVersion)
 		os.Exit(2)
 	}
+}
+
+func printPortaldUsage() {
+	fmt.Fprintln(os.Stderr, `Usage:
+  portald [agent flags]
+  portald open <url>
+  portald clip <targets [xclip|wl-paste]|image png|text>
+  portald notify --hook | --title <title> [options]
+  portald keychain <run|askpass> [options]
+
+Agent flags:`)
+	flag.PrintDefaults()
 }
 
 // runOpen connects to a cmd socket and sends the URL. Tries all
@@ -209,6 +235,19 @@ type clipReply struct {
 	payload string // for targets: "image/png"; for image/text: the SHA
 }
 
+type singleAgentFanoutState uint8
+
+const (
+	fanoutNoAgent singleAgentFanoutState = iota
+	fanoutOneAgent
+	fanoutMultipleAgents
+)
+
+type singleAgentReply struct {
+	raw     string
+	readErr error
+}
+
 // runClip implements `portald clip <targets|image png|text>`. It fans out over
 // cmd-*.sock like runOpen but REFUSES (exit 1) if more than one DISTINCT agent
 // socket answers, because on a shared box two Macs could be connected and user
@@ -277,45 +316,59 @@ func runClip(args []string) {
 // "Connected" means the socket accepted the connection and answered (a stale
 // socket whose agent is gone fails to dial and is ignored).
 func clipFanout(line string) (clipReply, bool) {
+	answer, state := singleAgentFanout(
+		cmdSocketEntries(), line, clipDialTimeout, clipReadTimeout, 256,
+	)
+	if state != fanoutOneAgent {
+		return clipReply{}, false
+	}
+	return parseClipReply(answer.raw)
+}
+
+// cmdSocketEntries returns the pid-keyed sockets beside the running portald
+// binary. Each live Mac session owns one distinct socket.
+func cmdSocketEntries() []string {
 	dir := filepath.Join(os.Getenv("HOME"), ".cache", "portal")
 	if self, err := os.Executable(); err == nil {
 		dir = filepath.Dir(self)
 	}
 	entries, _ := filepath.Glob(filepath.Join(dir, "cmd-*.sock"))
+	return entries
+}
+
+// singleAgentFanout sends line to every dialable socket and accepts a result
+// only when exactly one distinct agent connected. It is the shared
+// cross-clipboard/cross-credential refusal boundary; callers retain their own
+// deadlines, reply sizes, parsers, and user-facing failure behavior.
+func singleAgentFanout(entries []string, line string, dialTimeout, readTimeout time.Duration, replyLimit int) (singleAgentReply, singleAgentFanoutState) {
 	if len(entries) == 0 {
-		return clipReply{}, false
+		return singleAgentReply{}, fanoutNoAgent
 	}
 
-	var okReplies []clipReply
+	var answer singleAgentReply
 	connected := 0
 	for _, sock := range entries {
-		conn, err := net.DialTimeout("unix", sock, clipDialTimeout)
+		conn, err := net.DialTimeout("unix", sock, dialTimeout)
 		if err != nil {
 			continue // stale socket / agent gone
 		}
 		connected++
-		conn.SetDeadline(time.Now().Add(clipReadTimeout))
+		conn.SetDeadline(time.Now().Add(readTimeout))
 		_, _ = io.WriteString(conn, line)
-		// Replies are tiny single lines ("ok\t<sha>\n", "ok\timage/png\n",
-		// "none\n", "rejected\n"). A bounded read is plenty.
-		buf := make([]byte, 256)
-		n, _ := conn.Read(buf)
+		buf, readErr := bufio.NewReaderSize(conn, replyLimit).ReadSlice('\n')
 		conn.Close()
-		r, ok := parseClipReply(string(buf[:n]))
-		if ok {
-			okReplies = append(okReplies, r)
-		}
+		answer = singleAgentReply{raw: string(buf), readErr: readErr}
 	}
 
 	// Multi-client safety: if more than one distinct agent is CONNECTED, refuse
 	// regardless of how many answered ok — we cannot tell which Mac is "ours".
 	if connected > 1 {
-		return clipReply{}, false
+		return singleAgentReply{}, fanoutMultipleAgents
 	}
-	if len(okReplies) != 1 {
-		return clipReply{}, false
+	if connected == 0 {
+		return singleAgentReply{}, fanoutNoAgent
 	}
-	return okReplies[0], true
+	return answer, fanoutOneAgent
 }
 
 // targetLines maps the agent's canonical clipboard kind ("image"/"text") to the
