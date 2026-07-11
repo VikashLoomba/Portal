@@ -10,11 +10,11 @@ import (
 )
 
 func TestCredentialShimVersionAndMarkers(t *testing.T) {
-	if Version != "6" {
-		t.Fatalf("Version = %q, want 6", Version)
+	if Version != "7" {
+		t.Fatalf("Version = %q, want 7", Version)
 	}
-	if Marker != "Installed by portal clip-shim v6" {
-		t.Fatalf("Marker = %q, want v6 marker", Marker)
+	if Marker != "Installed by portal clip-shim v7" {
+		t.Fatalf("Marker = %q, want v7 marker", Marker)
 	}
 
 	tests := []struct {
@@ -40,12 +40,16 @@ func TestCredentialShimVersionAndMarkers(t *testing.T) {
 
 func TestSudoShimSafetyMatrixText(t *testing.T) {
 	for _, want := range []string{
+		`Detached shells default an empty SUDO_ASKPASS to executable portal-askpass.`,
 		`for _d in $PATH; do`,
 		`[ -n "$_d" ] || continue`,
 		`[ -x "$_d/sudo" ]`,
 		`[ -z "$_real" ]`,
 		`printf '%s\n' 'portal sudo: real sudo not found' >&2`,
 		`[ -t 0 ] || [ -t 1 ] || [ -t 2 ] || ( : < /dev/tty ) 2>/dev/null`,
+		`[ -z "${SUDO_ASKPASS:-}" ] && [ -x "$HOME/.local/bin/portal-askpass" ]`,
+		`SUDO_ASKPASS="$HOME/.local/bin/portal-askpass"`,
+		`export SUDO_ASKPASS`,
 		`[ -z "${SUDO_ASKPASS:-}" ]`,
 		`[ ! -x "$SUDO_ASKPASS" ]`,
 		`for a in "$@"; do`,
@@ -89,9 +93,14 @@ fi`
 		t.Fatal("sudo shim missing TTY check")
 	}
 	ttyPassthrough := strings.Index(sudoShim[ttyCheck:], `exec "$_real" "$@"`)
+	selfDefault := strings.Index(sudoShim, `SUDO_ASKPASS="$HOME/.local/bin/portal-askpass"`)
+	missingHelper := strings.Index(sudoShim, `if [ -z "${SUDO_ASKPASS:-}" ] || [ ! -x "$SUDO_ASKPASS" ]; then`)
 	injection := strings.LastIndex(sudoShim, `exec "$_real" -A "$@"`)
 	if ttyPassthrough < 0 || injection < ttyCheck+ttyPassthrough {
 		t.Fatal("TTY passthrough must precede the sole askpass injection branch")
+	}
+	if selfDefault < ttyCheck+ttyPassthrough || missingHelper < selfDefault {
+		t.Fatal("askpass self-default must follow TTY passthrough and precede the unavailable-helper check")
 	}
 }
 
@@ -141,6 +150,7 @@ done
 		{"bundled stdin passes through", askpassPath, []string{"-Sk", "apt", "update"}, "<-Sk>\n<apt>\n<update>\n"},
 		{"bundled non-interactive passes through", askpassPath, []string{"-nH", "x"}, "<-nH>\n<x>\n"},
 		{"bundled reset and stdin passes through", askpassPath, []string{"-kS", "x"}, "<-kS>\n<x>\n"},
+		{"bundled reset and non-interactive passes through", askpassPath, []string{"-kn", "x"}, "<-kn>\n<x>\n"},
 		{"command short flag still injects", askpassPath, []string{"apt", "install", "-v"}, "<-A>\n<apt>\n<install>\n<-v>\n"},
 		{"command numeric flag still injects", askpassPath, []string{"systemctl", "-n", "3", "x"}, "<-A>\n<systemctl>\n<-n>\n<3>\n<x>\n"},
 		{"double dash ends sudo scan", askpassPath, []string{"--", "printf", "-n"}, "<-A>\n<-->\n<printf>\n<-n>\n"},
@@ -161,6 +171,86 @@ done
 			}
 			if string(out) != tc.want {
 				t.Fatalf("sudo %v output = %q, want %q", tc.args, out, tc.want)
+			}
+		})
+	}
+}
+
+func TestSudoShimSelfDefaultsAskpass(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sudo shim is /bin/sh")
+	}
+
+	tests := []struct {
+		name       string
+		helperMode os.FileMode
+		setEnv     bool
+		existing   string
+		wantArgs   string
+		wantValue  string
+	}{
+		{name: "unset defaults to portal helper", helperMode: 0o755, wantArgs: "<-A>\n<whoami>\n", wantValue: "portal"},
+		{name: "empty defaults to portal helper", helperMode: 0o755, setEnv: true, wantArgs: "<-A>\n<whoami>\n", wantValue: "portal"},
+		{name: "existing helper stays selected", helperMode: 0o755, setEnv: true, existing: "user", wantArgs: "<-A>\n<whoami>\n", wantValue: "user"},
+		{name: "missing portal helper passes through", wantArgs: "<whoami>\n"},
+		{name: "non-executable portal helper passes through", helperMode: 0o644, wantArgs: "<whoami>\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			shimDir := filepath.Join(home, ".local", "bin")
+			realDir := filepath.Join(home, "realbin")
+			for _, dir := range []string{shimDir, realDir} {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			shimPath := filepath.Join(shimDir, "sudo")
+			portalHelper := filepath.Join(shimDir, "portal-askpass")
+			userHelper := filepath.Join(home, "user-askpass")
+			writeExec(t, shimPath, "%s", sudoShim)
+			if tc.helperMode != 0 {
+				writeExec(t, portalHelper, "#!/bin/sh\nexit 0\n")
+				if err := os.Chmod(portalHelper, tc.helperMode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeExec(t, userHelper, "#!/bin/sh\nexit 0\n")
+			writeExec(t, filepath.Join(realDir, "sudo"), "%s", `#!/bin/sh
+printf 'ASKPASS=<%s>\n' "${SUDO_ASKPASS-}"
+for a in "$@"; do
+    printf '<%s>\n' "$a"
+done
+`)
+
+			cmd := exec.Command(shimPath, "whoami")
+			detachFromControllingTerminal(cmd)
+			cmd.Env = []string{
+				"HOME=" + home,
+				"PATH=" + coreutilsPath(shimDir, realDir),
+			}
+			if tc.setEnv {
+				value := tc.existing
+				if value == "user" {
+					value = userHelper
+				}
+				cmd.Env = append(cmd.Env, "SUDO_ASKPASS="+value)
+			}
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("sudo whoami: %v (out=%q)", err, out)
+			}
+			wantValue := ""
+			switch tc.wantValue {
+			case "portal":
+				wantValue = portalHelper
+			case "user":
+				wantValue = userHelper
+			}
+			want := "ASKPASS=<" + wantValue + ">\n" + tc.wantArgs
+			if string(out) != want {
+				t.Fatalf("sudo output = %q, want %q", out, want)
 			}
 		})
 	}

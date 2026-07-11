@@ -32,15 +32,21 @@ import (
 // reconnect without a manual reinstall (DESIGN §9.1). Bump this whenever any
 // shim script below changes.
 //
-// v6 makes real-binary resolution injection-safe, preserves every human
-// controlling-terminal sudo session, recognizes bundled conflicting sudo
-// options, and preserves a user-configured SUDO_ASKPASS.
-const Version = "6"
+// v7 covers bash login and sshd-sourced non-interactive shells, and lets the
+// sudo shim select portal-askpass when no startup file exported it.
+const Version = "7"
 
-// Marker is the exact string grep -qF searches for to decide whether a file at
-// ~/.local/bin is our shim (skip-backup, safe-to-overwrite) and whether the
+// Marker is the exact string grep -qF searches for to decide whether the
 // currently-deployed shim is already at Version (skip re-deploy).
 const Marker = "Installed by portal clip-shim v" + Version
+
+// ownershipMarker is the version-INDEPENDENT prefix carried by every shim
+// marker ever shipped, including the legacy unversioned xdg-open wrapper.
+// Backup and restore decisions key on it so a portal shim of ANY version is
+// never mistaken for a user binary: keying them on the versioned Marker would
+// make an upgrade copy the outgoing shim into an empty backup slot, and
+// uninstall would then "restore" that stale shim instead of deleting it.
+const ownershipMarker = "Installed by portal"
 
 // XDGOpenWrapper is installed at ~/.local/bin/xdg-open. It first relays open
 // requests through portald, then safely resolves a real xdg-open by treating
@@ -214,11 +220,19 @@ var shims = []struct {
 }
 
 // PathMarkerStart/PathMarkerEnd delimit the portal PATH-prepend block written
-// into the shell rc files. The block is removed verbatim on uninstall by
+// at the bottom of shell rc files. The block is removed on uninstall by
 // matching these markers, so they MUST stay stable across versions.
 const (
 	PathMarkerStart = "# >>> portal PATH (clip shims) >>>"
 	PathMarkerEnd   = "# <<< portal PATH (clip shims) <<<"
+)
+
+// EarlyPathMarkerStart/EarlyPathMarkerEnd delimit the PATH block written at
+// the top of ~/.bashrc for sshd-sourced non-interactive bash. These markers
+// are shipped state and MUST stay stable across versions.
+const (
+	EarlyPathMarkerStart = "# >>> portal PATH early (non-interactive) >>>"
+	EarlyPathMarkerEnd   = "# <<< portal PATH early (non-interactive) <<<"
 )
 
 // pathPrependSnippet is the marker block injected into each shell rc/profile.
@@ -227,8 +241,9 @@ const (
 // box that already has /usr/bin/xclip with ~/.local/bin later on PATH. PATH
 // ordering is the single make-or-break for the whole feature. We inject into
 // ~/.bashrc, ~/.zshrc, ~/.zshenv and ~/.profile (not just one) because tool
-// managers (nvm/asdf/mise/conda) re-export PATH later and the agent may run
-// from a non-login / non-interactive context.
+// managers (nvm/asdf/mise/conda) re-export PATH later. Existing
+// ~/.bash_profile and ~/.bash_login files receive it too so bash login shells
+// that select either file do not bypass the shims.
 const pathPrependSnippet = PathMarkerStart + `
 # Ensures portal's shims (~/.local/bin/xdg-open, xclip, wl-paste, portal,
 # portal-askpass, sudo) win on PATH.
@@ -236,9 +251,23 @@ PATH="$HOME/.local/bin:$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$HOME/.l
 export PATH
 ` + PathMarkerEnd
 
-// rcFiles is the set of shell startup files where we manage the PATH and
-// SUDO_ASKPASS blocks, stripping both marker ranges on removal.
+// earlyPathPrependSnippet carries the same dedup-prepend as the bottom block,
+// but is placed before Debian and Ubuntu's interactive-shell guard. The bottom
+// block remains necessary so portal re-wins after interactive PATH managers.
+const earlyPathPrependSnippet = EarlyPathMarkerStart + `
+# Placed above the distro interactive guard so sshd-sourced non-interactive
+# bash gets the shims; the bottom portal PATH block re-wins interactively.
+PATH="$HOME/.local/bin:$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$HOME/.local/bin" | paste -sd: -)"
+export PATH
+` + EarlyPathMarkerEnd
+
+// rcFiles is the set of shell startup files we create when missing while
+// managing the PATH and SUDO_ASKPASS blocks.
 var rcFiles = []string{"~/.bashrc", "~/.zshrc", "~/.zshenv", "~/.profile"}
+
+// conditionalRCFiles receive both bottom blocks only when already present.
+// Creating either would make bash ignore ~/.profile in login shells.
+var conditionalRCFiles = []string{"~/.bash_profile", "~/.bash_login"}
 
 // Ensure deploys all versioned shims plus the PATH-prepend and SUDO_ASKPASS
 // blocks to the dev box over tr, idempotently. It is invoked from `portal
@@ -248,7 +277,7 @@ var rcFiles = []string{"~/.bashrc", "~/.zshrc", "~/.zshenv", "~/.profile"}
 //
 // For each shim it backs up a pre-existing non-shim binary preserving type
 // (cp -P), atomically writes the shim 0755, then verifies the marker landed.
-// For each rc file it appends each environment marker block exactly once.
+// For each rc file it converges each applicable marker block exactly once.
 // Returns an error describing the FIRST failure so the caller can surface it
 // loudly (DESIGN §9.6).
 func Ensure(ctx context.Context, tr transport.Transport) error {
@@ -272,8 +301,11 @@ func Ensure(ctx context.Context, tr transport.Transport) error {
 	// FIRST failure; here we swallow it so PATH-prepend still runs.
 	_ = ensureNotifyHook(ctx, tr)
 
-	// Environment marker blocks into every rc/profile (idempotent). Both run
-	// even on the fast path so a user who deleted either block re-converges.
+	// Shell marker blocks converge even on the fast path so a user who deleted
+	// one receives it again without forcing a shim rewrite.
+	if err := ensureEarlyPathPrepend(ctx, tr); err != nil {
+		return err
+	}
 	if err := ensurePathPrepend(ctx, tr); err != nil {
 		return err
 	}
@@ -379,15 +411,10 @@ os.replace(tmp,p)
 func deployShim(ctx context.Context, tr transport.Transport, name, script string) error {
 	bin := "~/.local/bin/" + name
 	backup := bin + ".portal-backup"
-	// Back up only a pre-existing file that is NOT already our shim, and only
-	// if no backup exists yet (so repeated installs don't clobber the original
-	// with our own shim — DESIGN §9.3). cp -P preserves a symlink as a symlink.
-	ownershipMarker := Marker
-	if name == "xdg-open" {
-		// Older portal releases owned xdg-open with this unversioned marker.
-		// Treat it as ours so v6 convergence never backs it up as a user binary.
-		ownershipMarker = "Installed by portal"
-	}
+	// Back up only a pre-existing file that is NOT a portal shim of any
+	// version (ownershipMarker), and only if no backup exists yet (so repeated
+	// installs and upgrades never clobber the original with our own shim —
+	// DESIGN §9.3). cp -P preserves a symlink as a symlink.
 	backupScript := fmt.Sprintf(
 		`if [ -e %s ] && ! grep -qF %q %s 2>/dev/null && [ ! -e %s ]; then cp -P %s %s; fi`,
 		bin, ownershipMarker, bin, backup, bin, backup,
@@ -411,18 +438,49 @@ func deployShim(ctx context.Context, tr transport.Transport, name, script string
 	return nil
 }
 
-// ensurePathPrepend appends the PATH-prepend marker block to each shell rc file
-// exactly once (idempotent via a grep on the start marker). We create the rc
-// file if it does not exist so a non-login/non-interactive agent shell still
-// resolves the shim first (DESIGN §9.2).
+// ensureEarlyPathPrepend puts the non-interactive PATH block at the top of
+// ~/.bashrc exactly once. The truncate-write keeps the existing file's inode
+// and permissions; ~/.bashrc is created when absent like the bottom blocks.
+func ensureEarlyPathPrepend(ctx context.Context, tr transport.Transport) error {
+	script := fmt.Sprintf(`block=$(cat)
+rc=~/.bashrc
+if [ -f "$rc" ] && grep -qF %q "$rc"; then
+    exit 0
+fi
+touch "$rc" || exit 1
+tmp=$(mktemp) || exit 1
+if printf '%%s\n\n' "$block" > "$tmp" &&
+    cat "$rc" >> "$tmp" &&
+    cat "$tmp" > "$rc" &&
+    rm -f "$tmp"
+then
+    exit 0
+fi
+rm -f "$tmp"
+exit 1`, EarlyPathMarkerStart)
+	if _, _, err := tr.Exec(ctx, []byte(earlyPathPrependSnippet), "bash", "-c", shellQuote(script)); err != nil {
+		return fmt.Errorf("write early PATH-prepend block: %w", err)
+	}
+	return nil
+}
+
+// ensurePathPrepend appends the bottom PATH block exactly once. The standard
+// rc files are created when missing; bash login alternatives are touched only
+// when already present so they never begin shadowing ~/.profile.
 func ensurePathPrepend(ctx context.Context, tr transport.Transport) error {
 	// The block text is passed on stdin so its characters need no further shell
-	// quoting; the loop appends it to any rc file missing the start marker.
+	// quoting; each loop appends it to files missing the start marker.
 	rcList := strings.Join(rcFiles, " ")
+	conditionalRCList := strings.Join(conditionalRCFiles, " ")
 	script := fmt.Sprintf(`block=$(cat); for rc in %s; do
     if [ -f "$rc" ] && grep -qF %q "$rc"; then continue; fi
     printf '\n%%s\n' "$block" >> "$rc"
-done`, rcList, PathMarkerStart)
+done
+for rc in %s; do
+    [ -f "$rc" ] || continue
+    if grep -qF %q "$rc"; then continue; fi
+    printf '\n%%s\n' "$block" >> "$rc"
+done`, rcList, PathMarkerStart, conditionalRCList, PathMarkerStart)
 	if _, _, err := tr.Exec(ctx, []byte(pathPrependSnippet), "bash", "-c", shellQuote(script)); err != nil {
 		return fmt.Errorf("write PATH-prepend block: %w", err)
 	}
@@ -431,22 +489,26 @@ done`, rcList, PathMarkerStart)
 
 // Remove deletes everything portal deploys to the dev box's ~/.local/bin and
 // shell rc files: the xdg-open wrapper; the xclip, wl-paste, portal,
-// portal-askpass, and sudo shims; the portald symlink; the env snippet; and both
-// shell marker blocks. It restores any pre-existing binaries backed up at
-// install (preserving type via `mv`, which keeps a backed-up symlink a symlink)
-// and never touches /usr/bin (DESIGN §9.3/§9.4).
+// portal-askpass, and sudo shims; the portald symlink; the env snippet; and all
+// three shell marker blocks. It restores any pre-existing binaries backed up
+// at install (preserving type via `mv`, which keeps a backed-up symlink a
+// symlink) and never touches /usr/bin (DESIGN §9.3/§9.4).
 //
-// Each rc-file edit strips the env.sh source line and both marker blocks
+// Each rc-file edit strips the env.sh source line and all marker blocks
 // (start..end inclusive) with awk range deletes keyed on the stable markers.
-// Best-effort: errors are ignored (uninstall continues regardless).
+// The truncate-write preserves the rc file's inode and mode. Best-effort:
+// errors are ignored (uninstall continues regardless).
 func Remove(ctx context.Context, tr transport.Transport) {
 	script := fmt.Sprintf(`
-# Restore or remove each ~/.local/bin entry, preserving symlink type via mv.
+# Restore each ~/.local/bin entry from a GENUINE user backup, preserving
+# symlink type via mv. A backup carrying the portal ownership marker is our
+# own shim (copied there by an older release's versioned backup grep): delete
+# it with the shim so uninstall never resurrects a stale portal shim.
 for bin in xdg-open xclip wl-paste portal portal-askpass sudo; do
-    if [ -e ~/.local/bin/"$bin".portal-backup ]; then
+    if [ -e ~/.local/bin/"$bin".portal-backup ] && ! grep -qF %[7]q ~/.local/bin/"$bin".portal-backup 2>/dev/null; then
         mv ~/.local/bin/"$bin".portal-backup ~/.local/bin/"$bin"
     else
-        rm -f ~/.local/bin/"$bin"
+        rm -f ~/.local/bin/"$bin".portal-backup ~/.local/bin/"$bin"
     fi
 done
 rm -f ~/.local/bin/portal-notify-hook
@@ -484,21 +546,25 @@ if isinstance(d,dict) and isinstance(d.get("hooks"),dict):
     os.replace(tmp,p)
 PORTAL_PY
 fi
-# Strip the env.sh source line and both portal marker blocks from each rc.
-for rc in ~/.bashrc ~/.zshrc ~/.zshenv ~/.profile; do
+# Strip the env.sh source line and all portal marker blocks from each rc.
+for rc in ~/.bashrc ~/.zshrc ~/.zshenv ~/.profile ~/.bash_profile ~/.bash_login; do
     [ -f "$rc" ] || continue
     tmp=$(mktemp) || continue
     awk '
-        index($0, %[1]q) { path_skip=1 }
-        path_skip && index($0, %[2]q) { path_skip=0; next }
+        index($0, %[1]q) { early_path_skip=1 }
+        early_path_skip && index($0, %[2]q) { early_path_skip=0; next }
+        early_path_skip { next }
+        index($0, %[3]q) { path_skip=1 }
+        path_skip && index($0, %[4]q) { path_skip=0; next }
         path_skip { next }
-        index($0, %[3]q) { askpass_skip=1 }
-        askpass_skip && index($0, %[4]q) { askpass_skip=0; next }
+        index($0, %[5]q) { askpass_skip=1 }
+        askpass_skip && index($0, %[6]q) { askpass_skip=0; next }
         askpass_skip { next }
         index($0, "portal/env.sh") { next }
         { print }
-    ' "$rc" > "$tmp" && mv "$tmp" "$rc"
-done`, PathMarkerStart, PathMarkerEnd, AskpassMarkerStart, AskpassMarkerEnd)
+    ' "$rc" > "$tmp" && cat "$tmp" > "$rc"
+    rm -f "$tmp"
+done`, EarlyPathMarkerStart, EarlyPathMarkerEnd, PathMarkerStart, PathMarkerEnd, AskpassMarkerStart, AskpassMarkerEnd, ownershipMarker)
 	_, _, _ = tr.Exec(ctx, nil, "bash", "-c", shellQuote(script))
 }
 

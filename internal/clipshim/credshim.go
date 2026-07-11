@@ -34,14 +34,15 @@ printf '%s\n' 'portal-askpass: portald is unavailable' >&2
 exit 1
 `
 
-// sudoShim is installed at ~/.local/bin/sudo. It is a pure passthrough whenever
-// a controlling terminal is reachable, askpass is unavailable, or sudo's
-// leading option prefix selects an explicit input/non-interactive/edit/help
-// mode. Only a fully detached agent invocation with a usable SUDO_ASKPASS and
-// no conflicting sudo flag receives an injected -A; flags after the command
-// belong to that command.
+// sudoShim is installed at ~/.local/bin/sudo. Human terminal passthrough stays
+// first. A detached invocation defaults an empty SUDO_ASKPASS to portal's
+// executable helper, then passes through if no usable helper exists or sudo's
+// leading options select an explicit input/non-interactive/edit/help mode.
+// Only a fully detached invocation with usable askpass and no conflicting sudo
+// flag receives an injected -A; flags after the command belong to that command.
 const sudoShim = `#!/bin/sh
-# ` + Marker + `. Detached sudo askpass bridge; human terminal sessions are untouched.
+# ` + Marker + `. Detached sudo bridge; terminal sessions pass through unchanged.
+# Detached shells default an empty SUDO_ASKPASS to executable portal-askpass.
 _wrapper_dir=$(cd "$(dirname "$0")" && pwd)
 _real=""
 _oifs=$IFS; IFS=:
@@ -65,6 +66,13 @@ fi
 # subshell contains that exit so the fallthrough to askpass still runs.
 if [ -t 0 ] || [ -t 1 ] || [ -t 2 ] || ( : < /dev/tty ) 2>/dev/null; then
     exec "$_real" "$@"
+fi
+
+# A detached shell may reach this wrapper even when no startup file exported
+# SUDO_ASKPASS. Select portal's helper only when the user left it empty.
+if [ -z "${SUDO_ASKPASS:-}" ] && [ -x "$HOME/.local/bin/portal-askpass" ]; then
+    SUDO_ASKPASS="$HOME/.local/bin/portal-askpass"
+    export SUDO_ASKPASS
 fi
 
 # Without an executable askpass helper, preserve sudo's native behavior.
@@ -127,14 +135,20 @@ if [ -z "${SUDO_ASKPASS:-}" ] && [ -x "$HOME/.local/bin/portal-askpass" ]; then
 fi
 ` + AskpassMarkerEnd
 
-// ensureAskpassEnv appends the SUDO_ASKPASS marker block to every shell startup
-// file exactly once, creating missing files just like ensurePathPrepend.
+// ensureAskpassEnv appends the SUDO_ASKPASS block exactly once. Standard rc
+// files are created when missing; bash login alternatives are never created.
 func ensureAskpassEnv(ctx context.Context, tr transport.Transport) error {
 	rcList := strings.Join(rcFiles, " ")
+	conditionalRCList := strings.Join(conditionalRCFiles, " ")
 	script := fmt.Sprintf(`block=$(cat); for rc in %s; do
     if [ -f "$rc" ] && grep -qF %q "$rc"; then continue; fi
     printf '\n%%s\n' "$block" >> "$rc"
-done`, rcList, AskpassMarkerStart)
+done
+for rc in %s; do
+    [ -f "$rc" ] || continue
+    if grep -qF %q "$rc"; then continue; fi
+    printf '\n%%s\n' "$block" >> "$rc"
+done`, rcList, AskpassMarkerStart, conditionalRCList, AskpassMarkerStart)
 	if _, _, err := tr.Exec(ctx, []byte(askpassEnvSnippet), "bash", "-c", shellQuote(script)); err != nil {
 		return fmt.Errorf("write SUDO_ASKPASS block: %w", err)
 	}

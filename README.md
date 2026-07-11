@@ -205,6 +205,15 @@ expects the secret on standard input.
 For `sudo`, portal's dev-box `sudo` shim and `SUDO_ASKPASS` helper take the same
 path transparently when the agent has no controlling terminal. Any session in
 which a human could still be prompted is a direct passthrough to the real sudo.
+The shim also selects `~/.local/bin/portal-askpass` itself when
+`SUDO_ASKPASS` is empty, without replacing a helper the user configured.
+
+Install covers interactive shells, bash login shells (including an existing
+`.bash_profile` or `.bash_login`), and Debian/Ubuntu ssh one-shot bash shells
+whose `.bashrc` returns early for non-interactive sessions. The remaining
+clean-environment limit is a plain `sh -c` or dash process: those shells source
+no rc file and inherit only their parent's environment, so they can reach
+portal's shims only if that parent supplied a PATH containing `~/.local/bin`.
 
 > **Heads-up — transparent `sudo` is deliberately fail-safe around shared
 > terminals.** It fires only for an agent with **no controlling terminal**. In
