@@ -245,7 +245,7 @@ func TestRunInstallValidationFailureNonTTYDoesNotPrompt(t *testing.T) {
 	}
 }
 
-func TestRunInstallValidationFailurePromptYesRevalidatesWithForce(t *testing.T) {
+func TestRunInstallValidationFailurePromptYesContinuesWithoutRevalidation(t *testing.T) {
 	fake := &installFakeSetup{report: &doctor.Report{Host: "box"}}
 	useInstallFake(t, fake)
 	var out bytes.Buffer
@@ -255,14 +255,17 @@ func TestRunInstallValidationFailurePromptYesRevalidatesWithForce(t *testing.T) 
 	if !strings.Contains(out.String(), "install anyway? [y/N] ") {
 		t.Fatalf("output missing prompt: %q", out.String())
 	}
-	if got := strings.Join(fake.calls, ","); got != "validate,validate,configure,deploy,verify,close" {
-		t.Fatalf("phase calls = %q, want forced revalidation followed by remaining phases", got)
+	if got := strings.Join(fake.calls, ","); got != "validate,configure,deploy,verify,close" {
+		t.Fatalf("phase calls = %q, want one validation followed by remaining phases", got)
 	}
-	if len(fake.validateForce) != 2 || fake.validateForce[0] || !fake.validateForce[1] {
-		t.Fatalf("validation force arguments = %v, want [false true]", fake.validateForce)
+	if len(fake.validateForce) != 1 || fake.validateForce[0] {
+		t.Fatalf("validation force arguments = %v, want [false]", fake.validateForce)
 	}
-	if got := strings.Count(out.String(), "checking ssh to box ...\n"); got != 2 {
-		t.Fatalf("validation progress count = %d, want 2: %q", got, out.String())
+	if got := strings.Count(out.String(), "checking ssh to box ...\n"); got != 1 {
+		t.Fatalf("validation progress count = %d, want 1: %q", got, out.String())
+	}
+	if got := strings.Count(out.String(), "FAILED\n"); got != 1 {
+		t.Fatalf("validation failure count = %d, want 1: %q", got, out.String())
 	}
 }
 
