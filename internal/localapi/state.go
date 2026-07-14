@@ -62,24 +62,38 @@ type ExecStreamer interface {
 	Describe() transport.Desc
 }
 
+// SetupRunner is one fresh host setup run. Phase implementations own their
+// running, line, and terminal event emissions through the sink passed to
+// Deps.NewSetup.
+type SetupRunner interface {
+	Validate(ctx context.Context, host string, force bool) (proceed bool)
+	Configure(ctx context.Context, host string) error
+	DeployRemote(ctx context.Context, host string)
+	Verify(ctx context.Context, host string) *doctor.Report
+	Close(ctx context.Context)
+}
+
 // Deps is the dependency set for a Server. The interface fields are narrow so
 // tests fake them without constructing an App; Doctor/PushAllow/Kick are
 // closures wired by run.go so localapi never imports package app. FeatureNames
 // defaults to [clip-image, clip-text, notify, exec, cred] when empty.
 type Deps struct {
-	Version      api.VersionInfo
-	Host         func() (string, error)
-	Agent        AgentSource
-	Master       MasterProber
-	Ports        ForwardLister
-	Service      ServiceStater
-	Config       ConfigStore
-	Hub          *hub.Hub
-	ExecStream   ExecStreamer
-	Audit        *audit.Log
-	PushAllow    func([]int) error
-	Kick         func()
-	ReconcileGen func() uint64
-	Doctor       func(context.Context) *doctor.Report
-	FeatureNames []string
+	Version       api.VersionInfo
+	Host          func() (string, error)
+	Agent         AgentSource
+	Master        MasterProber
+	Ports         ForwardLister
+	Service       ServiceStater
+	Config        ConfigStore
+	Hub           *hub.Hub
+	ExecStream    ExecStreamer
+	Audit         *audit.Log
+	PushAllow     func([]int) error
+	Kick          func()
+	ReconcileGen  func() uint64
+	Doctor        func(context.Context) *doctor.Report
+	NewSetup      func(sink func(api.SetupEvent)) SetupRunner
+	Activate      func(context.Context, string) error
+	NormalizeHost func(string) string
+	FeatureNames  []string
 }

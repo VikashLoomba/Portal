@@ -20,6 +20,7 @@ import (
 	"github.com/VikashLoomba/Portal/internal/clipupload"
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/localapi"
+	"github.com/VikashLoomba/Portal/internal/setup"
 	"github.com/VikashLoomba/Portal/pkg/agentclient"
 	"github.com/VikashLoomba/Portal/pkg/api"
 	"github.com/VikashLoomba/Portal/pkg/client"
@@ -74,6 +75,11 @@ func runDaemon(ctx context.Context, cancel context.CancelFunc, a *app.App, s *su
 		Kick:         s.kick,
 		ReconcileGen: s.reconciles,
 		Doctor:       s.doctor,
+		NewSetup: func(sink func(api.SetupEvent)) localapi.SetupRunner {
+			return setup.New(a.Paths, a.Cfg, setup.Sink(sink))
+		},
+		Activate:      s.Activate,
+		NormalizeHost: setup.NormalizeHost,
 	}
 	err = localapi.New(deps).Serve(ctx, ln)
 	cancel()

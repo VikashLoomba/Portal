@@ -29,12 +29,13 @@ type route struct {
 // here exactly once for the whole package (u6's events streamer only consumes
 // it). The zero value is not usable; call New.
 type Server struct {
-	deps         Deps
-	mux          *http.ServeMux
-	routes       []route
-	subCount     atomic.Int64
-	TickInterval time.Duration
-	log          *slog.Logger
+	deps          Deps
+	mux           *http.ServeMux
+	routes        []route
+	subCount      atomic.Int64
+	setupInFlight atomic.Bool
+	TickInterval  time.Duration
+	log           *slog.Logger
 }
 
 // New builds a Server, fills FeatureNames/TickInterval defaults, and registers
@@ -73,6 +74,7 @@ func (s *Server) registerRoutes() []route {
 		{http.MethodPost, "/v1/reconcile", s.handleReconcile},
 		{http.MethodPost, "/v1/doctor", s.handleDoctor},
 		{http.MethodPost, "/v1/exec", s.handleExec},
+		{http.MethodPost, "/v1/setup", s.handleSetup},
 	}
 }
 
