@@ -185,6 +185,11 @@ func (s *supervisor) Activate(ctx context.Context, host string) error {
 	if err != nil {
 		return err
 	}
+	// A request canceled after construction must not reach teardown: the old
+	// stack keeps serving and the caller sees the cancellation, not a swap.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if old != nil {
 		old.mu.Lock()
 		old.draining = true
@@ -274,6 +279,20 @@ func closeStackTransport(ctx context.Context, old *liveStack) error {
 		old.mu.Unlock()
 	}
 	if !stopped && stopRequired {
+		// Close's exit path unlinks the ControlPath socket even when ssh -O exit
+		// had nothing to stop, so a master that probes DOWN afterwards cannot be
+		// addressed by the replacement stack's -S calls — the S6 invariant holds.
+		// Without this, a stack whose master never established (offline host)
+		// could never be switched away from: born masterStopRequired with
+		// nothing to confirm-stop.
+		if health, err := stack.Transport.Health(ctx); err == nil && !health.Up {
+			if systemSSH {
+				old.mu.Lock()
+				old.masterStopRequired = false
+				old.mu.Unlock()
+			}
+			return closeErr
+		}
 		return errors.Join(closeErr, healthErr, errors.New("transport did not confirm shutdown"))
 	}
 	return closeErr

@@ -32,6 +32,18 @@ func TestNewStackLeavesAgentEventPumpUnstarted(t *testing.T) {
 	}
 }
 
+func TestNewStackRejectsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// The system branch constructs without I/O, so only this guard stops a
+	// canceled activation request from proceeding into old-stack teardown.
+	if _, err := NewStack(ctx, Paths{Sock: t.TempDir() + "/cm.sock"},
+		config.New(t.TempDir()), hub.New(), "box", &run.Fake{}, clock.Real{},
+		&forward.MemLogger{}, io.Discard); err == nil {
+		t.Fatal("NewStack succeeded with a canceled context")
+	}
+}
+
 func TestPumpAgentEventsCancellationAndMapping(t *testing.T) {
 	in := make(chan agentclient.EngineEvent)
 	out := make(chan forward.EngineEvent)

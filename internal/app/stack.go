@@ -40,6 +40,12 @@ func NewStack(ctx context.Context, paths Paths, cfg *config.Store, h *hub.Hub, h
 	runner run.Runner, clk clock.Clock, log forward.Logger, sshStderr io.Writer,
 	nativeOpts ...sshnative.Option) (*Stack, error) {
 
+	// The system-transport branch performs no I/O, so without this guard a
+	// setup request canceled before activation would construct "successfully"
+	// and proceed into teardown of the live stack.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	tr, pf, err := NewTransportContext(ctx, paths, host, runner, cfg, sshStderr, nativeOpts...)
 	if err != nil {
 		return nil, err

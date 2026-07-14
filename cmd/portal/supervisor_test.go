@@ -749,16 +749,22 @@ func TestSupervisorUnconfirmedMasterStopBlocksActivationRetry(t *testing.T) {
 	if err := s.Activate(context.Background(), "B"); err == nil {
 		t.Fatal("first Activate succeeded without a confirmed master stop")
 	}
-	oldTr.healthDown.Store(true)
-	if err := s.Activate(context.Background(), "B"); err == nil {
-		t.Fatal("retry Activate succeeded after the control socket lost the master")
-	}
 	if s.current().stack != old {
-		t.Fatal("activation retry published the replacement stack")
+		t.Fatal("blocked activation published the replacement stack")
+	}
+	// Once the master probes DOWN after a close (whose exit path unlinks the
+	// control socket), the S6 invariant holds and the retry must succeed —
+	// otherwise a dead master would brick switching away forever.
+	oldTr.healthDown.Store(true)
+	if err := s.Activate(context.Background(), "B"); err != nil {
+		t.Fatalf("retry Activate after the master died: %v", err)
+	}
+	if s.current().stack != next {
+		t.Fatal("retry did not publish the replacement stack")
 	}
 }
 
-func TestSupervisorUnconfirmedMasterStopBlocksActivationWhenHealthIsDown(t *testing.T) {
+func TestSupervisorDownMasterAllowsActivationWithoutConfirmedStop(t *testing.T) {
 	base := newSupervisorBase(t, "A")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -778,11 +784,45 @@ func TestSupervisorUnconfirmedMasterStopBlocksActivationWhenHealthIsDown(t *test
 	}
 	defer func() { cancel(); s.waitCurrent() }()
 
-	if err := s.Activate(context.Background(), "B"); err == nil {
-		t.Fatal("Activate succeeded after a down probe without a confirmed master stop")
+	// A stack whose master never established (offline host) reports DOWN and
+	// close cannot confirm a stop — activation away from it must still work.
+	if err := s.Activate(context.Background(), "B"); err != nil {
+		t.Fatalf("Activate away from an offline stack: %v", err)
+	}
+	if s.current().stack != next {
+		t.Fatal("offline-stack activation did not publish the replacement stack")
+	}
+}
+
+func TestSupervisorCanceledActivationLeavesOldStackServing(t *testing.T) {
+	base := newSupervisorBase(t, "A")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSupervisor(ctx, base, io.Discard)
+	oldTr := &recordingStackTransport{host: "A"}
+	old := newSupervisorStack(base, "A", oldTr)
+	next := newSupervisorStack(base, "B", &recordingStackTransport{host: "B"})
+	s.newStack = func(_ context.Context, host string) (*app.Stack, error) {
+		if host == "A" {
+			return old, nil
+		}
+		return next, nil
+	}
+	if err := s.startInitial(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); s.waitCurrent() }()
+
+	reqCtx, reqCancel := context.WithCancel(context.Background())
+	reqCancel()
+	if err := s.Activate(reqCtx, "B"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Activate with a canceled request context: %v", err)
 	}
 	if s.current().stack != old {
-		t.Fatal("unconfirmed master stop published the replacement stack")
+		t.Fatal("canceled activation swapped stacks")
+	}
+	if _, ok := s.serving(); !ok {
+		t.Fatal("canceled activation left the old stack draining")
 	}
 }
 
