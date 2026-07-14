@@ -121,14 +121,15 @@ endpoint checks the request `Origin` against the dev origin, so a browser page
 served from any foreign origin is rejected, and the exec bridge still requires
 the capability before opening a PTY.
 
-Note the residual exposure: the Nitro dev server binds every interface (see
-above), so unlike the packaged app the development server — and this endpoint —
-is reachable beyond loopback. The `Origin` check stops cross-origin browser
-pages, but a non-browser client that can reach the port (same user, or another
-host on your network) can forge the header and read the token. The dev trust
-posture is therefore same-user on a trusted network; run development there only.
-The packaged app carries none of this: it never exposes the capability over HTTP
-and runs no dev server.
+Although the Nitro dev server binds every interface (see above), the token
+endpoint requires the actual transport peer reported by `Deno.serve` and the
+requested hostname to be loopback. It also checks any request `Origin` against
+the dev origin. The development trust posture assumes loopback processes are
+same-user and trusted: a non-browser loopback client can retrieve the token,
+while the `Origin` check prevents arbitrary local browser pages from driving
+exec. The rest of the dev server remains reachable from the local network, so
+run development only on a trusted network. The packaged app carries none of
+this: it never exposes the capability over HTTP and runs no dev server.
 
 ## Automated check
 

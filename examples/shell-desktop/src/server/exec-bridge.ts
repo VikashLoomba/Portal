@@ -33,15 +33,23 @@ export function configureExecBridge(socketPath: string): void {
 // is delivered exclusively through `Deno.BrowserWindow.bind` and is never
 // exposed over HTTP, so this returns 404 there. In dev mode (framework dev
 // server, no desktop APIs) the renderer has no bind channel, so a loopback
-// bootstrap mints the same per-process capability. The Origin header is checked
-// against the dev origin: same-origin fetches (browsers omit Origin) and
-// non-browser loopback clients are allowed, foreign browser origins rejected.
+// bootstrap mints the same per-process capability. Nitro's Deno adapter exposes
+// the Deno.serve peer address as `request.ip`; require that transport peer and
+// the requested hostname to be loopback before checking the dev Origin. Same-
+// origin fetches (browsers omit Origin) and non-browser loopback clients are
+// allowed, while foreign browser origins and non-loopback peers are rejected.
 // The trust posture is documented in the example README.
 export function developmentExecTokenResponse(request: Request): Response {
   if (typeof Deno.BrowserWindow === "function") {
     return new Response("not found", { status: 404 });
   }
   const url = new URL(request.url);
+  if (
+    !isLoopbackAddress(requestPeerHostname(request)) ||
+    !isLoopbackUrlHostname(url.hostname)
+  ) {
+    return new Response("forbidden", { status: 403 });
+  }
   const origin = request.headers.get("origin");
   if (origin !== null && origin !== url.origin) {
     return new Response("forbidden", { status: 403 });
@@ -234,6 +242,37 @@ function sameOriginRequest(request: Request, url: URL): boolean {
   const origin = request.headers.get("origin");
   const host = request.headers.get("host");
   return origin === url.origin && host === url.host;
+}
+
+function requestPeerHostname(request: Request): string | null {
+  const value: unknown = request;
+  if (!isRecord(value) || typeof value.ip !== "string") {
+    return null;
+  }
+  return value.ip;
+}
+
+function isLoopbackUrlHostname(hostname: string): boolean {
+  return hostname.toLowerCase() === "localhost" || isLoopbackAddress(hostname);
+}
+
+function isLoopbackAddress(hostname: string | null): boolean {
+  if (hostname === null) {
+    return false;
+  }
+  const unwrapped = hostname.startsWith("[") && hostname.endsWith("]")
+    ? hostname.slice(1, -1)
+    : hostname;
+  const normalized = unwrapped.toLowerCase().startsWith("::ffff:")
+    ? unwrapped.slice(7)
+    : unwrapped;
+  if (normalized === "::1") {
+    return true;
+  }
+  const octets = normalized.split(".");
+  return octets.length === 4 && octets[0] === "127" && octets.every(
+    (octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255,
+  );
 }
 
 function capabilityOwner(candidate: string): number | null {
