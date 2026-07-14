@@ -76,3 +76,16 @@ export interface ErrorDetail {
 export interface ErrorBody {
   error: ErrorDetail;
 }
+
+export interface SetupRequest {
+  host?: string;
+  force?: boolean;
+}
+
+export interface SetupEvent {
+  step: string;
+  status: string;
+  line?: string;
+  error?: ErrorDetail;
+  report?: unknown;
+}

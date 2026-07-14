@@ -9,6 +9,8 @@ export type {
   Notify,
   PortStatus,
   ServiceStatus,
+  SetupEvent,
+  SetupRequest,
   Status,
   VersionInfo,
 } from "./dto.ts";
@@ -17,6 +19,9 @@ export { ApiError, PortalClient, apiErrorFromStatusBody, createClient } from "./
 export type { PortalRequestOptions } from "./http.ts";
 
 export { events } from "./events.ts";
+export { setup } from "./setup.ts";
+export { waitReady } from "./ready.ts";
+export type { WaitReadyOptions } from "./ready.ts";
 
 export {
   ExecStreamError,
