@@ -81,7 +81,7 @@ The sidecar belongs to the application, not a window:
 `deno desktop` is experimental and requires Deno 2.9 or newer. Pin the example and CI to the 2.9 line while the API is experimental. TanStack Start detection comes from the `@tanstack/react-start` dependency in `package.json`, and packaging consumes the Nitro `.output/server/index.*` production server. Generate routes and build the framework before packaging:
 
 ```sh
-deno task web:build
+npm run build
 deno desktop --unstable-no-legacy-abort \
   --allow-env --allow-net --allow-read --allow-run --allow-write \
   --include ../../portal -o PortalShellDesktop.app .

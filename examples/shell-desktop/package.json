@@ -7,7 +7,12 @@
     "deno": ">=2.9"
   },
   "scripts": {
-    "build": "deno task web:build"
+    "gen": "deno run --frozen --allow-env --allow-read --allow-sys=cpus --allow-write npm:@tanstack/router-cli@1.167.19 generate && deno run --frozen --allow-read --allow-write scripts/strict-route-tree.ts",
+    "build": "npm run gen && deno run --frozen --allow-env --allow-ffi --allow-net=localhost --allow-read --allow-sys=cpus,homedir,uid --allow-write npm:vite@8.1.4 build",
+    "dev": "deno run --frozen --unstable-no-legacy-abort --allow-env --allow-ffi --allow-net --allow-read --allow-run --allow-sys=cpus,homedir,uid --allow-write npm:vite@8.1.4 dev",
+    "desktop": "deno desktop --hmr --unstable-no-legacy-abort --allow-ffi --allow-sys=cpus,homedir,uid --allow-env=HOME,PATH,NODE_ENV,TERM,TMPDIR,NO_COLOR,FORCE_COLOR,CI,DENO_SERVE_ADDRESS,PORTAL_BIN,PORTAL_CONFIG_DIR,PORTAL_API_SOCK,PORTAL_SOCK '--allow-net=localhost,127.0.0.1,[::1]' --allow-read --allow-run --allow-write .",
+    "desktop:package": "npm run build && deno desktop --unstable-no-legacy-abort --allow-ffi --allow-sys=cpus,homedir,uid --allow-env=HOME,PATH,NODE_ENV,TERM,TMPDIR,NO_COLOR,FORCE_COLOR,CI,DENO_SERVE_ADDRESS,PORTAL_BIN,PORTAL_CONFIG_DIR,PORTAL_API_SOCK,PORTAL_SOCK --allow-net --allow-read --allow-run --allow-write --include ../../portal -o PortalShellDesktop.app .",
+    "check": "npm run gen && deno check --desktop --frozen vite.config.ts src/router.tsx src/server.ts src/bindings.d.ts src/lib/sse.ts src/routes/__root.tsx src/routes/index.tsx src/routes/onboarding.tsx src/routes/shell.tsx src/server/binary.ts src/server/boot.ts src/server/exec-bridge.ts src/server/exec-normalize.ts src/server/lifecycle.ts src/server/paths.ts src/server/portal-proxy.ts src/server/supervisor.ts src/server/paths_test.ts && deno test --frozen src/server/paths_test.ts"
   },
   "dependencies": {
     "@tanstack/react-router": "1.170.18",
