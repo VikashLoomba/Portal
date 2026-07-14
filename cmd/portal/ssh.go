@@ -20,7 +20,7 @@ import (
 // approach was fragile (per-terminal keystroke matching) and forced users
 // through `portal ssh`. It is REPLACED by transparent clipboard-READ
 // interception: deploy `xclip`/`wl-paste` shims on the dev box (see
-// ensureClipShims in install.go) and serve the Mac clipboard over the existing
+// internal/setup) and serve the Mac clipboard over the existing
 // daemon pipe. With that in place a coding agent reads the clipboard through
 // plain `ssh <host>` — no special command, no PTY, no keystroke matching.
 //
