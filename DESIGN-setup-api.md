@@ -314,7 +314,7 @@ Each unit compiles and tests green independently; the conformance test gates u4.
 | u4 | `internal/localapi` handleSetup: ndjson streaming, force, single-flight 409, activate wiring, audit, route + conformance | handler tests with a fake setup runner + fake activator: stream grammar, in-band fail, activate no-op/fail paths, 409, disconnect-cancel |
 | u5 | `pkg/client` Setup + WaitReady | stub-server tests |
 | u6 | TS SDK setup()/waitReady() + dto + shared ndjson reader extraction | node:test suite additions |
-| u7 | `examples/shell-electron` first-run flow + embedding doc | manual checklist (§9) |
+| u7 | `examples/shell-desktop` first-run flow + embedding doc | manual checklist (§9) |
 
 u3 is the load-bearing unit and lands before u4 so the handler composes against real seams.
 
@@ -336,14 +336,14 @@ u3 is the load-bearing unit and lands before u4 so the handler composes against 
    stream survives, forwards converge on B.
 6. `portal install <box>` from scratch → output text unchanged vs v0.4.1 (modulo shared-runner
    phrasing), launchd loaded, doctor PASS.
-7. Electron example first-run flow end-to-end on a fresh `PORTAL_CONFIG_DIR`.
+7. Deno Desktop example first-run flow end-to-end on a fresh `PORTAL_CONFIG_DIR`.
 
 ---
 
 ## 10. Non-goals
 
 - **Installing/managing launchd via the API.** Persistence-after-quit belongs to the embedding
-  app's native login-item mechanism (`SMAppService`, Electron `openAtLogin`): the user gets an
+  app's native login-item mechanism (for example, `SMAppService` on macOS): the user gets an
   OS-surfaced "Open at Login" toggle attributed to the app, and uninstalling the app cleans it
   up. A portal-written plist pointing into an app bundle would orphan on app deletion and break
   on bundle-path changes — worse UX at the wrong layer. Standalone installs keep the CLI's

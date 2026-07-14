@@ -4,6 +4,7 @@
     "npm:@tanstack/react-router@1.170.18": "1.170.18_react@19.2.7_react-dom@19.2.7__react@19.2.7",
     "npm:@tanstack/react-start@1.168.28": "1.168.28_react@19.2.7_react-dom@19.2.7__react@19.2.7_vite@8.1.4",
     "npm:@tanstack/router-cli@1.167.19": "1.167.19",
+    "npm:@tanstack/router-core@1.171.15": "1.171.15",
     "npm:@tanstack/router-plugin@1.168.20": "1.168.20_@tanstack+react-router@1.170.18__react@19.2.7__react-dom@19.2.7___react@19.2.7_vite@8.1.4_react@19.2.7_react-dom@19.2.7__react@19.2.7",
     "npm:@types/react-dom@19.2.3": "19.2.3_@types+react@19.2.17",
     "npm:@types/react@19.2.17": "19.2.17",
@@ -1128,6 +1129,7 @@
     "dependencies": [
       "npm:@tanstack/react-router@1.170.18",
       "npm:@tanstack/react-start@1.168.28",
+      "npm:@tanstack/router-core@1.171.15",
       "npm:@tanstack/router-plugin@1.168.20",
       "npm:@vitejs/plugin-react@6.0.3",
       "npm:@xterm/xterm@6.0.0",
@@ -1141,6 +1143,7 @@
         "npm:@tanstack/react-router@1.170.18",
         "npm:@tanstack/react-start@1.168.28",
         "npm:@tanstack/router-cli@1.167.19",
+        "npm:@tanstack/router-core@1.171.15",
         "npm:@tanstack/router-plugin@1.168.20",
         "npm:@types/react-dom@19.2.3",
         "npm:@types/react@19.2.17",

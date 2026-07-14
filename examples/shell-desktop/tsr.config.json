@@ -1,4 +1,9 @@
 {
   "target": "react",
-  "addExtensions": true
+  "addExtensions": true,
+  "routeTreeFileHeader": [
+    "/* eslint-disable */",
+    "// noinspection JSUnusedGlobalSymbols",
+    "import type {} from './router-generator-types.d.ts'"
+  ]
 }

@@ -7,6 +7,7 @@
     "@tanstack/react-router": "npm:@tanstack/react-router@1.170.18",
     "@tanstack/react-start": "npm:@tanstack/react-start@1.168.28",
     "@tanstack/react-start/": "npm:@tanstack/react-start@1.168.28/",
+    "@tanstack/router-core": "npm:@tanstack/router-core@1.171.15",
     "@tanstack/router-plugin": "npm:@tanstack/router-plugin@1.168.20",
     "@vitejs/plugin-react": "npm:@vitejs/plugin-react@6.0.3",
     "@xterm/xterm": "npm:@xterm/xterm@6.0.0",
@@ -25,7 +26,7 @@
     "noImplicitOverride": true
   },
   "tasks": {
-    "gen": "deno run --allow-env --allow-read --allow-sys=cpus --allow-write npm:@tanstack/router-cli@1.167.19 generate",
+    "gen": "deno run --allow-env --allow-read --allow-sys=cpus --allow-write npm:@tanstack/router-cli@1.167.19 generate && deno run --allow-read --allow-write scripts/strict-route-tree.ts",
     "web:build": "deno task gen && deno run -A npm:vite@8.1.4 build",
     "dev": "deno desktop --hmr --unstable-no-legacy-abort --allow-env --allow-net --allow-read --allow-run --allow-write .",
     "package": "deno task web:build && deno desktop --unstable-no-legacy-abort --allow-env --allow-net --allow-read --allow-run --allow-write --include ../../portal -o PortalShellDesktop.app .",
