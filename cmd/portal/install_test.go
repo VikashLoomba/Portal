@@ -24,6 +24,7 @@ type installFakeSetup struct {
 	proceed       bool
 	calls         []string
 	report        *doctor.Report
+	xdgWarn       bool
 	clipWarn      bool
 	missingSS     bool
 	configureErr  error
@@ -61,7 +62,11 @@ func (f *installFakeSetup) Configure(context.Context, string) error {
 func (f *installFakeSetup) DeployRemote(context.Context, string) {
 	f.calls = append(f.calls, "deploy")
 	f.sink(api.SetupEvent{Step: "xdg-open", Status: "running"})
-	f.sink(api.SetupEvent{Step: "xdg-open", Status: "ok"})
+	if f.xdgWarn {
+		f.sink(api.SetupEvent{Step: "xdg-open", Status: "warn", Error: &api.ErrorDetail{Code: "xdg_open_failed", Message: "wrapper denied"}})
+	} else {
+		f.sink(api.SetupEvent{Step: "xdg-open", Status: "ok"})
+	}
 	f.sink(api.SetupEvent{Step: "clip-shims", Status: "running"})
 	if f.clipWarn {
 		f.sink(api.SetupEvent{Step: "clip-shims", Status: "warn", Error: &api.ErrorDetail{Code: "clip_shims_failed", Message: "shim denied"}})
@@ -136,6 +141,7 @@ func TestRunInstallOutputRegression(t *testing.T) {
 	t.Setenv("PATH", "/usr/bin:/bin")
 	fake := &installFakeSetup{
 		proceed:  true,
+		xdgWarn:  true,
 		clipWarn: true,
 		report: &doctor.Report{Host: "user@box", Checks: []doctor.Check{
 			{Name: "ssh master", Status: doctor.Pass, Detail: "UP (pid=1)"},
@@ -157,7 +163,7 @@ func TestRunInstallOutputRegression(t *testing.T) {
 		"configured dev box: user@box  (saved to %s)\n"+
 		"installed command -> %s\n"+
 		"service loaded and started (%s)\n"+
-		"installed xdg-open wrapper on user@box\n"+
+		"WARNING: could not install xdg-open wrapper on user@box: wrapper denied\n"+
 		"WARNING: could not install clipboard shims on user@box: shim denied\n"+
 		"         clipboard paste into coding agents will NOT work until this succeeds.\n"+
 		"         fix the cause above and re-run: portal install user@box\n"+

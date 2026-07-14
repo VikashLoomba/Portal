@@ -65,7 +65,7 @@ paths:
                 $ref: "#/components/schemas/ErrorBody"
   /v1/ports:
     get:
-      summary: Remote loopback listeners from the cached Snapshot (503 before the first).
+      summary: Remote loopback listeners from the cached Snapshot.
       responses:
         "200":
           description: Cached remote loopback listeners.
@@ -76,7 +76,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/PortStatus"
         "503":
-          description: No cached Snapshot has arrived from the agent yet.
+          description: No host is configured, or no cached Snapshot has arrived from the agent yet.
           content:
             application/json:
               schema:

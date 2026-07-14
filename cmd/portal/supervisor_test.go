@@ -67,10 +67,13 @@ type recordingStackTransport struct {
 	closeGate       <-chan struct{}
 	closeIgnoresCtx bool
 	closeFirstOnly  bool
+	closeNotStopped bool
 	closeErr        error
 	closeCalls      atomic.Int32
 	workCheck       func()
 	closeOnce       sync.Once
+	healthOnce      sync.Once
+	healthDown      atomic.Bool
 	healthStarted   chan struct{}
 	healthCanceled  chan struct{}
 	healthRelease   <-chan struct{}
@@ -95,13 +98,20 @@ func (t *recordingStackTransport) Ensure(context.Context) (bool, error) {
 
 func (t *recordingStackTransport) Health(ctx context.Context) (transport.Health, error) {
 	if t.healthStarted != nil {
-		close(t.healthStarted)
-		<-ctx.Done()
-		close(t.healthCanceled)
-		if t.healthRelease != nil {
-			<-t.healthRelease
+		first := false
+		t.healthOnce.Do(func() { first = true })
+		if first {
+			close(t.healthStarted)
+			<-ctx.Done()
+			close(t.healthCanceled)
+			if t.healthRelease != nil {
+				<-t.healthRelease
+			}
+			return transport.Health{}, ctx.Err()
 		}
-		return transport.Health{}, ctx.Err()
+	}
+	if t.healthDown.Load() {
+		return transport.Health{Up: false}, nil
 	}
 	return transport.Health{Up: true, Detail: "test"}, nil
 }
@@ -138,7 +148,7 @@ func (t *recordingStackTransport) Close(ctx context.Context) (bool, error) {
 			}
 		}
 	}
-	return t.closeErr == nil, t.closeErr
+	return t.closeErr == nil && !t.closeNotStopped, t.closeErr
 }
 
 func (t *recordingStackTransport) Describe() transport.Desc {
@@ -393,8 +403,15 @@ func TestSupervisorDrainRejectsWorkAndPreservesPtyCapability(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := execAdapter.StreamPty(context.Background(), transport.PtyRequest{}, "true"); err != nil {
+	sess, err := execAdapter.StreamPty(context.Background(), transport.PtyRequest{}, "true")
+	if err != nil {
 		t.Fatalf("StreamPty through active adapter: %v", err)
+	}
+	if sess == nil {
+		t.Fatal("StreamPty through active adapter returned a nil session")
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatalf("close StreamPty session: %v", err)
 	}
 }
 
@@ -610,11 +627,13 @@ func TestSupervisorBlockedAllowlistPushDoesNotBlockActivationMutex(t *testing.T)
 
 func TestSupervisorTeardownFailureDoesNotStartReplacement(t *testing.T) {
 	for _, tt := range []struct {
-		name      string
-		closeErr  error
-		socketDir bool
+		name            string
+		closeErr        error
+		closeNotStopped bool
+		socketDir       bool
 	}{
 		{name: "transport close", closeErr: errors.New("close failed")},
+		{name: "transport stop unconfirmed", closeNotStopped: true},
 		{name: "socket removal", socketDir: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -623,7 +642,9 @@ func TestSupervisorTeardownFailureDoesNotStartReplacement(t *testing.T) {
 			defer cancel()
 			s := newSupervisor(ctx, base, io.Discard)
 			log := &callLog{}
-			old := newSupervisorStack(base, "A", &recordingStackTransport{host: "A", log: log, closeErr: tt.closeErr})
+			old := newSupervisorStack(base, "A", &recordingStackTransport{
+				host: "A", log: log, closeErr: tt.closeErr, closeNotStopped: tt.closeNotStopped,
+			})
 			next := newSupervisorStack(base, "B", &recordingStackTransport{host: "B", log: log})
 			s.newStack = func(_ context.Context, host string) (*app.Stack, error) {
 				if host == "A" {
@@ -655,6 +676,65 @@ func TestSupervisorTeardownFailureDoesNotStartReplacement(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSupervisorUnconfirmedMasterStopBlocksActivationRetry(t *testing.T) {
+	base := newSupervisorBase(t, "A")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSupervisor(ctx, base, io.Discard)
+	oldTr := &recordingStackTransport{host: "A", closeNotStopped: true}
+	old := newSupervisorStack(base, "A", oldTr)
+	next := newSupervisorStack(base, "B", &recordingStackTransport{host: "B"})
+	s.newStack = func(_ context.Context, host string) (*app.Stack, error) {
+		if host == "A" {
+			return old, nil
+		}
+		return next, nil
+	}
+	if err := s.startInitial(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); s.waitCurrent() }()
+
+	if err := s.Activate(context.Background(), "B"); err == nil {
+		t.Fatal("first Activate succeeded without a confirmed master stop")
+	}
+	oldTr.healthDown.Store(true)
+	if err := s.Activate(context.Background(), "B"); err == nil {
+		t.Fatal("retry Activate succeeded after the control socket lost the master")
+	}
+	if s.current().stack != old {
+		t.Fatal("activation retry published the replacement stack")
+	}
+}
+
+func TestSupervisorAllowsFalseCloseWhenNoMasterWasRunning(t *testing.T) {
+	base := newSupervisorBase(t, "A")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSupervisor(ctx, base, io.Discard)
+	oldTr := &recordingStackTransport{host: "A", closeNotStopped: true}
+	oldTr.healthDown.Store(true)
+	old := newSupervisorStack(base, "A", oldTr)
+	next := newSupervisorStack(base, "B", &recordingStackTransport{host: "B"})
+	s.newStack = func(_ context.Context, host string) (*app.Stack, error) {
+		if host == "A" {
+			return old, nil
+		}
+		return next, nil
+	}
+	if err := s.startInitial(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); s.waitCurrent() }()
+
+	if err := s.Activate(context.Background(), "B"); err != nil {
+		t.Fatalf("Activate with no old master: %v", err)
+	}
+	if s.current().stack != next {
+		t.Fatal("activation did not publish the replacement stack")
 	}
 }
 
@@ -742,6 +822,54 @@ func TestSupervisorShutdownIsBounded(t *testing.T) {
 	close(releaseShutdown)
 }
 
+func TestSupervisorQuiescesOldStackBeforeTransportClose(t *testing.T) {
+	base := newSupervisorBase(t, "A")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSupervisor(ctx, base, io.Discard)
+	closeStarted := make(chan struct{})
+	old := newSupervisorStack(base, "A", &recordingStackTransport{host: "A", closeStarted: closeStarted})
+	next := newSupervisorStack(base, "B", &recordingStackTransport{host: "B"})
+	s.newStack = func(_ context.Context, host string) (*app.Stack, error) {
+		if host == "A" {
+			return old, nil
+		}
+		return next, nil
+	}
+	if err := s.startInitial(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); s.waitCurrent() }()
+
+	workerCanceled := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	ls := s.current()
+	ls.wg.Add(1)
+	go func() {
+		defer ls.wg.Done()
+		<-ls.ctx.Done()
+		close(workerCanceled)
+		<-releaseWorker
+	}()
+
+	activated := make(chan error, 1)
+	go func() { activated <- s.Activate(context.Background(), "B") }()
+	select {
+	case <-workerCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("old-stack worker was not canceled")
+	}
+	select {
+	case <-closeStarted:
+		t.Fatal("transport closed before old-stack work quiesced")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseWorker)
+	if err := <-activated; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSupervisorTransportCloseIsBoundedWhenContextIgnored(t *testing.T) {
 	base := newSupervisorBase(t, "A")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -814,19 +942,15 @@ func TestSupervisorTimedOutCloseBlocksActivationRetry(t *testing.T) {
 	s.drainTimeout = time.Second
 	retried := make(chan error, 1)
 	go func() { retried <- s.Activate(context.Background(), "B") }()
-	deadline := time.Now().Add(time.Second)
-	for oldTr.closeCalls.Load() < 2 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if got := oldTr.closeCalls.Load(); got < 2 {
-		close(releaseFirstClose)
-		t.Fatalf("transport close calls = %d, want retry close", got)
-	}
 	select {
 	case err := <-retried:
 		close(releaseFirstClose)
 		t.Fatalf("activation retry returned before timed-out close exited: %v", err)
 	case <-time.After(20 * time.Millisecond):
+	}
+	if got := oldTr.closeCalls.Load(); got != 1 {
+		close(releaseFirstClose)
+		t.Fatalf("transport close calls = %d before first close exited, want 1", got)
 	}
 	if s.current().stack != old {
 		close(releaseFirstClose)
@@ -835,6 +959,9 @@ func TestSupervisorTimedOutCloseBlocksActivationRetry(t *testing.T) {
 	close(releaseFirstClose)
 	if err := <-retried; err != nil {
 		t.Fatalf("activation retry after close exit: %v", err)
+	}
+	if got := oldTr.closeCalls.Load(); got != 2 {
+		t.Fatalf("transport close calls = %d after retry, want 2", got)
 	}
 	if s.current().stack != next {
 		t.Fatal("activation retry did not publish replacement after close exit")
@@ -978,10 +1105,14 @@ func TestRunDaemonServesUnconfiguredAndBootConstructionFailure(t *testing.T) {
 				t.Fatalf("unconfigured status = %+v", st)
 			}
 			for _, path := range []string{"/v1/doctor", "/v1/exec?arg=true"} {
-				status, code := unixPOSTError(t, base.Paths.APISock, path)
+				status, code := unixRequestError(t, base.Paths.APISock, http.MethodPost, path)
 				if status != http.StatusServiceUnavailable || code != "not_configured" {
 					t.Fatalf("POST %s = %d/%q, want 503/not_configured", path, status, code)
 				}
+			}
+			status, code := unixRequestError(t, base.Paths.APISock, http.MethodGet, "/v1/ports")
+			if status != http.StatusServiceUnavailable || code != "not_configured" {
+				t.Fatalf("GET /v1/ports = %d/%q, want 503/not_configured", status, code)
 			}
 			cancel()
 			if err := <-done; err != nil {
@@ -991,12 +1122,12 @@ func TestRunDaemonServesUnconfiguredAndBootConstructionFailure(t *testing.T) {
 	}
 }
 
-func unixPOSTError(t *testing.T, socket, path string) (int, string) {
+func unixRequestError(t *testing.T, socket, method, path string) (int, string) {
 	t.Helper()
 	c := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
 	}}}
-	req, err := http.NewRequest(http.MethodPost, "http://unix"+path, nil)
+	req, err := http.NewRequest(method, "http://unix"+path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

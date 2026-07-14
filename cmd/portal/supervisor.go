@@ -26,8 +26,9 @@ type liveStack struct {
 	cancel context.CancelFunc
 	wg     lifecycleGroup
 
-	mu       sync.Mutex
-	draining bool
+	mu                 sync.Mutex
+	draining           bool
+	masterStopRequired bool
 }
 
 // lifecycleGroup exposes completion without creating an uncancelable waiter
@@ -218,12 +219,12 @@ func (s *supervisor) drain(ctx context.Context, old *liveStack) error {
 		shutdownErr = teardownCtx.Err()
 	}
 	old.cancel()
+	quiesceErr := s.wait(teardownCtx, old)
 	closeDone := make(chan error, 1)
 	old.wg.Add(1)
 	go func() {
 		defer old.wg.Done()
-		_, err := old.stack.CloseTransport(teardownCtx)
-		closeDone <- err
+		closeDone <- closeStackTransport(teardownCtx, old)
 	}()
 	var closeErr error
 	select {
@@ -235,10 +236,43 @@ func (s *supervisor) drain(ctx context.Context, old *liveStack) error {
 	waitErr := s.wait(teardownCtx, old)
 	return errors.Join(
 		wrapDrainError("shutdown old agent", shutdownErr),
+		wrapDrainError("quiesce old stack", quiesceErr),
 		wrapDrainError("close old transport", closeErr),
 		wrapDrainError("remove old control socket", removeErr),
 		wrapDrainError("wait for old stack", waitErr),
 	)
+}
+
+func closeStackTransport(ctx context.Context, old *liveStack) error {
+	stack := old.stack
+	systemSSH := stack.Transport.Describe().Impl == transport.ImplSystemSSH
+	var healthErr error
+	stopRequired := false
+	if systemSSH {
+		old.mu.Lock()
+		stopRequired = old.masterStopRequired
+		old.mu.Unlock()
+	}
+	if systemSSH && !stopRequired {
+		health, err := stack.Transport.Health(ctx)
+		healthErr = err
+		stopRequired = health.Up || err != nil
+		if stopRequired {
+			old.mu.Lock()
+			old.masterStopRequired = true
+			old.mu.Unlock()
+		}
+	}
+	stopped, closeErr := stack.CloseTransport(ctx)
+	if stopped && systemSSH {
+		old.mu.Lock()
+		old.masterStopRequired = false
+		old.mu.Unlock()
+	}
+	if !stopped && stopRequired {
+		return errors.Join(closeErr, healthErr, errors.New("transport did not confirm shutdown"))
+	}
+	return closeErr
 }
 
 func wrapDrainError(action string, err error) error {

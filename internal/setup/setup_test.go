@@ -244,6 +244,26 @@ func TestConfigureWriteHostFailureEmitsFail(t *testing.T) {
 	}
 }
 
+func TestConfigureMkdirFailureEmitsFailAndStops(t *testing.T) {
+	r, _, events := testRunner(t)
+	if err := os.MkdirAll(filepath.Dir(r.paths.ConfigDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(r.paths.ConfigDir, []byte("file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Configure(context.Background(), "box"); err == nil {
+		t.Fatal("Configure error = nil")
+	}
+	assertEventStatuses(t, *events, "configure:running", "configure:fail")
+	if (*events)[1].Error == nil || (*events)[1].Error.Code != "configure_failed" {
+		t.Fatalf("configure fail error = %#v", (*events)[1].Error)
+	}
+	if _, err := os.Stat(r.paths.BinDir); !os.IsNotExist(err) {
+		t.Fatalf("bin directory stat error = %v, want not-exist", err)
+	}
+}
+
 func TestConfigureHonorsCancellation(t *testing.T) {
 	t.Run("before start", func(t *testing.T) {
 		r, _, events := testRunner(t)
