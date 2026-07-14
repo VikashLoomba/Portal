@@ -20,8 +20,36 @@ const sessions = new Set<RegisteredExecSession>();
 const encoder = new TextEncoder();
 let apiSocketPath = "";
 
+// Dev-mode capabilities have no owning window, so they share a synthetic owner
+// id. Real windows use their positive `windowId`, so 0 never collides.
+const developmentOwner = 0;
+let developmentToken: string | null = null;
+
 export function configureExecBridge(socketPath: string): void {
   apiSocketPath = socketPath;
+}
+
+// Development-only exec-token endpoint. In packaged desktop mode the capability
+// is delivered exclusively through `Deno.BrowserWindow.bind` and is never
+// exposed over HTTP, so this returns 404 there. In dev mode (framework dev
+// server, no desktop APIs) the renderer has no bind channel, so a loopback
+// bootstrap mints the same per-process capability. The Origin header is checked
+// against the dev origin: same-origin fetches (browsers omit Origin) and
+// non-browser loopback clients are allowed, foreign browser origins rejected.
+// The trust posture is documented in the example README.
+export function developmentExecTokenResponse(request: Request): Response {
+  if (typeof Deno.BrowserWindow === "function") {
+    return new Response("not found", { status: 404 });
+  }
+  const url = new URL(request.url);
+  const origin = request.headers.get("origin");
+  if (origin !== null && origin !== url.origin) {
+    return new Response("forbidden", { status: 403 });
+  }
+  if (developmentToken === null) {
+    developmentToken = registerWindowCapability(developmentOwner);
+  }
+  return Response.json({ execToken: developmentToken });
 }
 
 export function registerWindowCapability(owner: number): string {

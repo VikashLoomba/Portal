@@ -19,7 +19,16 @@ const windows = new Map<
   { window: Deno.BrowserWindow; token: string }
 >();
 
-createWindow(true);
+// The framework dev server (`deno desktop --hmr`, or plain Vite) loads this
+// server entry in a process where the desktop APIs are absent, so
+// `Deno.BrowserWindow`/`Deno.dock` must never be touched there. Packaged builds
+// run inside the desktop runtime where both are present. Feature-detect the
+// window constructor once and drive window/dock/menu management only then.
+const desktopAvailable = typeof Deno.BrowserWindow === "function";
+
+if (desktopAvailable) {
+  createWindow(true);
+}
 try {
   paths = resolvePortalPaths();
   lifecycle.setSocketPath(paths.apiSock);
@@ -32,7 +41,7 @@ try {
 
 installSignal("SIGINT");
 installSignal("SIGTERM");
-if (Deno.build.os === "darwin") {
+if (desktopAvailable && Deno.build.os === "darwin") {
   Deno.dock.addEventListener("reopen", (event) => {
     if (!event.detail.hasVisibleWindows && windows.size === 0) {
       createWindow(false);

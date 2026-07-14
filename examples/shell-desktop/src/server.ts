@@ -1,7 +1,10 @@
 import handler, { createServerEntry } from "@tanstack/react-start/server-entry";
 
 import "./server/boot.ts";
-import { handleExecUpgrade } from "./server/exec-bridge.ts";
+import {
+  developmentExecTokenResponse,
+  handleExecUpgrade,
+} from "./server/exec-bridge.ts";
 import {
   eventsResponse,
   lifecycleResponse,
@@ -13,6 +16,11 @@ export default createServerEntry({
     const pathname = new URL(request.url).pathname;
     if (pathname === "/exec") {
       return handleExecUpgrade(request);
+    }
+    if (pathname === "/api/dev-exec-token") {
+      return request.method === "GET"
+        ? developmentExecTokenResponse(request)
+        : methodNotAllowed();
     }
     if (pathname === "/api/lifecycle") {
       return request.method === "GET"

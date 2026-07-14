@@ -135,9 +135,9 @@ function ShellRoute() {
       }
     });
 
-    void bindings.portalBootstrap().then((bootstrap) => {
+    void acquireExecToken().then((value) => {
       if (!disposed) {
-        token = bootstrap.execToken;
+        token = value;
         openExec([]);
       }
     }).catch((error: unknown) => setTerminalState(toErrorMessage(error)));
@@ -320,6 +320,29 @@ function eventDescription(
     }`;
   }
   return "event";
+}
+
+// Packaged desktop mode delivers the exec capability through the injected
+// `bindings.portalBootstrap` channel. Under the framework dev server that
+// channel is absent, so the renderer fetches the capability from the
+// loopback-only, origin-checked dev-exec-token endpoint instead.
+async function acquireExecToken(): Promise<string> {
+  if (
+    typeof bindings !== "undefined" &&
+    typeof bindings.portalBootstrap === "function"
+  ) {
+    const bootstrap = await bindings.portalBootstrap();
+    return bootstrap.execToken;
+  }
+  const response = await fetch("/api/dev-exec-token");
+  if (!response.ok) {
+    throw new Error(`dev exec token request failed (${response.status})`);
+  }
+  const value: unknown = await response.json();
+  if (!isRecord(value) || typeof value.execToken !== "string") {
+    throw new Error("dev exec token response was malformed");
+  }
+  return value.execToken;
 }
 
 function parseCommand(command: string): string[] {

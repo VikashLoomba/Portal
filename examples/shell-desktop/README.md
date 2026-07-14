@@ -5,28 +5,46 @@ This example embeds portal in a TanStack Start app hosted by the experimental
 workflow pins currently target Deno 2.9.x because the desktop APIs are still
 experimental.
 
-Build the repository-root sidecar first, then launch the auto-detected framework
-in desktop development mode:
+Build the repository-root sidecar first, then launch the desktop app in
+development mode:
 
 ```sh
 make portal
 cd examples/shell-desktop
-deno task dev
+deno task desktop
 ```
 
-`dev` and `package` run least-privilege where a static scope is practical:
-environment access is an explicit allowlist (the `PORTAL_*` overrides plus the
-handful of runtime variables the framework reads — extend the list in
-`deno.json` if your setup needs more), and network access is scoped to
-loopback (`Deno.serve`, HMR; the portal API rides a unix socket, which Deno
-gates via read/write, not net). Read, write, and subprocess stay broad by
+`deno task desktop` runs `deno desktop --hmr`, which auto-detects the TanStack
+Start framework and starts its own dev server by running the project's
+`deno task dev` (the Vite dev server). The desktop runtime owns the window and
+points its webview at that dev server. The launcher and the framework dev server
+must be separate tasks: `deno desktop --hmr` invokes the `dev` task by name, so
+if `dev` were the launcher it would recursively invoke itself. Run `deno task
+dev` on its own to serve the same app in a browser without the desktop shell —
+the sidecar, streams, and exec bridge all work there too.
+
+The `desktop` and `package` tasks run the desktop runtime least-privilege where a
+static scope is practical: environment access is an explicit allowlist (the
+`PORTAL_*` overrides plus the handful of runtime variables the runtime reads —
+extend the list in `deno.json` if your setup needs more), and their own network
+access is scoped to loopback. Read, write, and subprocess stay broad by
 necessity: the sidecar binary, its extraction cache, and the app-scoped config
 dir all live at per-user dynamic paths that a static task string cannot name.
-The tasks also opt into Deno's corrected request-abort behavior so closing an
-SSE client aborts the proxied SDK stream without aborting it immediately after
-a successful response. The webview appears before the supervisor waits for portal, so path,
-spawn, and readiness errors are visible in the app instead of producing a blank
-window.
+
+The `dev` and `web:build` tasks run the Vite toolchain (Vite, Rolldown, Nitro),
+which reads too many environment variables to enumerate, so they grant
+`--allow-env` in full. The Nitro dev server also binds its HTTP listener to every
+interface (`0.0.0.0:3000` and `[::]:3000`) — framework behavior that Vite config,
+a `--host` flag, and `DENO_SERVE_ADDRESS` all fail to override — so the `dev`
+task's `--allow-net` allowlist must include those wildcard binds. Treat the
+development server as reachable from your local network and run it only on
+trusted networks; the packaged app never runs it (see below).
+
+The tasks also opt into Deno's corrected request-abort behavior so closing an SSE
+client aborts the proxied SDK stream without aborting it immediately after a
+successful response. The webview appears before the supervisor waits for portal,
+so path, spawn, and readiness errors are visible in the app instead of producing
+a blank window.
 
 The supervisor resolves the binary in this order:
 
@@ -78,11 +96,39 @@ The default OS webview backend is used. Deno Desktop also supports
 `--backend cef`, and the output extension may be changed to a supported format
 such as `.dmg` or `.AppImage`.
 
-The `/exec` bridge additionally requires a random per-window capability
-delivered through `Deno.BrowserWindow.bind`. It is never returned from an HTTP
-endpoint. The server validates that capability plus the request origin/host
-before opening the SDK exec session, and window close or app quit closes the
-remote PTY.
+The `/exec` bridge additionally requires a random exec capability. In packaged
+desktop mode it is delivered through `Deno.BrowserWindow.bind` and is never
+returned from an HTTP endpoint. The server validates that capability plus the
+request origin/host before opening the SDK exec session, and window close or app
+quit closes the remote PTY.
+
+## Development mode
+
+The framework dev server loads the server entry in a process where
+`Deno.BrowserWindow` and `Deno.dock` are absent. The server feature-detects the
+desktop APIs (`typeof Deno.BrowserWindow === "function"`): when they are missing
+it skips all window, menu, and dock management and never touches them, so the
+entry loads without crashing while the sidecar supervisor still starts. Packaged
+builds run inside the desktop runtime where those APIs are present and the
+window/menu/quit/dock behavior is unchanged.
+
+Because the dev window has no bind channel, the renderer cannot receive the exec
+capability the packaged way. In dev mode only, the server exposes a
+`GET /api/dev-exec-token` endpoint that mints the same per-process capability and
+returns it to the renderer; the endpoint is disabled (404) in packaged mode,
+where the capability is delivered only through `Deno.BrowserWindow.bind`. The
+endpoint checks the request `Origin` against the dev origin, so a browser page
+served from any foreign origin is rejected, and the exec bridge still requires
+the capability before opening a PTY.
+
+Note the residual exposure: the Nitro dev server binds every interface (see
+above), so unlike the packaged app the development server — and this endpoint —
+is reachable beyond loopback. The `Origin` check stops cross-origin browser
+pages, but a non-browser client that can reach the port (same user, or another
+host on your network) can forge the header and read the token. The dev trust
+posture is therefore same-user on a trusted network; run development there only.
+The packaged app carries none of this: it never exposes the capability over HTTP
+and runs no dev server.
 
 ## Automated check
 
