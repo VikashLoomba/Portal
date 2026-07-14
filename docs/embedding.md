@@ -1,58 +1,49 @@
 # Embedding portal as an application sidecar
 
-An embedding application should own one `portal run` child for the application's full lifetime. The child starts before onboarding, stays alive while the app changes from unconfigured to configured, and is not restarted after setup. [`examples/shell-electron`](../examples/shell-electron) is the reference implementation.
+An embedding application should own one `portal run` child for the application's full lifetime. The child starts before onboarding, stays alive while the app changes from unconfigured to configured, and is not restarted after setup. [`examples/shell-desktop`](../examples/shell-desktop) is the Deno Desktop + TanStack Start reference implementation.
 
 ## Resolve app-scoped paths
 
-Keep the portal instance separate from a CLI-installed portal. Under the application's user-data directory, resolve short paths such as:
+Keep the portal instance separate from a CLI-installed portal. Resolve short paths under an app-owned directory and set all three portal variables:
 
-```text
-<userData>/portal/
-  api.sock
-  cm.sock
-```
+```ts
+const configDir = Deno.env.get("PORTAL_CONFIG_DIR") ?? `${Deno.env.get("HOME")}/.portal-shell`;
+const apiSock = Deno.env.get("PORTAL_API_SOCK") ?? `${configDir}/api.sock`;
+const controlSock = Deno.env.get("PORTAL_SOCK") ?? `${configDir}/cm.sock`;
 
-Set all three variables in the child's environment:
-
-```js
-const configDir = process.env.PORTAL_CONFIG_DIR || path.join(app.getPath("userData"), "portal");
-const apiSock = process.env.PORTAL_API_SOCK || path.join(configDir, "api.sock");
-const controlSock = process.env.PORTAL_SOCK || path.join(configDir, "cm.sock");
-
-spawn(binPath, ["run"], {
+const child = new Deno.Command(binPath, {
+  args: ["run"],
   env: {
-    ...process.env,
+    ...Deno.env.toObject(),
     PORTAL_CONFIG_DIR: configDir,
     PORTAL_API_SOCK: apiSock,
     PORTAL_SOCK: controlSock,
-    HOME: os.homedir(),
+    HOME: Deno.env.get("HOME") ?? "",
   },
-  stdio: "ignore",
-});
+  stdin: "null",
+  stdout: "null",
+  stderr: "null",
+}).spawn();
 ```
 
 `PORTAL_SOCK` is not optional. `PORTAL_CONFIG_DIR` changes the configuration directory and the default API socket, but it does not change `Paths.Sock`. Without an explicit `PORTAL_SOCK`, portal uses the global `~/.ssh/cm-portal.sock`; an embedded and a system-installed portal could then share an SSH ControlMaster and silently route work through the wrong instance.
 
-Unix-domain socket paths have a small platform limit (`sun_path` is about 104 bytes on macOS). Keep `api.sock` and `cm.sock` directly under a shallow app-owned directory. An environment override is useful when an application's normal user-data path is too long.
+On macOS, the `sun_path` field is 104 bytes including its terminator. Both socket paths must encode to at most 103 UTF-8 bytes. Keep `api.sock` and `cm.sock` directly under a shallow directory, reject overlong paths before spawn, and retain a short `PORTAL_CONFIG_DIR` override for long home-directory names.
 
-Resolve the binary as:
+Resolve the binary in this order:
 
-```js
-const binPath = process.env.PORTAL_BIN || (app.isPackaged
-  ? path.join(process.resourcesPath, "portal")
-  : path.resolve(appRoot, "../../portal"));
-```
+1. `PORTAL_BIN`.
+2. The packaged `portal` resource.
+3. The repository-root `../../portal` in development.
 
-`process.resourcesPath` is a directory, so the packaged branch must append the resource filename and must be gated by `app.isPackaged`. The repository fallback is only for development. This example is Unix-only; a Windows port would bundle and resolve `portal.exe` instead.
-
-Ignoring stdio, as above, satisfies the requirement to drain the child streams. If an application uses pipes instead, it must continuously consume both stdout and stderr so the sidecar cannot block on a full pipe.
+Null child stdio, as above, cannot fill a pipe. An application that selects piped stdout or stderr must continuously consume both streams.
 
 ## Start and onboard over one socket
 
-After spawning the child, use the TypeScript barrel API and the same `apiSock` throughout:
+Import the unmodified TypeScript SDK directly and use the same `apiSock` throughout:
 
-```js
-const { createClient, events, setup, waitReady } = await import(pathToFileURL(sdkEntry).href);
+```ts
+import { createClient, events, setup, waitReady } from "@portal/sdk";
 
 await waitReady(apiSock, { timeoutMs: 15_000, signal });
 const status = await createClient(apiSock).status({ signal });
@@ -70,80 +61,51 @@ for await (const event of events(apiSock, { signal })) {
 }
 ```
 
-The setup response renders the ordered `validate`, `configure`, remote-deploy, `activate`, `doctor`, and `done` events. Failures after streaming starts are in-band, so the UI must show `event.line` and `event.error?.message` and use the final `done.status` as the verdict. The long-lived `/v1/events` stream provides the configured transition when `event.status.host` becomes non-empty. Setup hot-swaps the daemon's host stack in-process: the API socket and child PID stay live, and there is no restart or reconnect step.
+The setup response renders the ordered `validate`, `configure`, remote-deploy, `activate`, `doctor`, and `done` events. Failures after streaming starts are in-band, so the UI must show `event.line` and `event.error?.message` and use the final `done.status` as the verdict. The already-open `/v1/events` stream owns the configured transition when `event.status.host` becomes non-empty. Setup hot-swaps the daemon's host stack in-process: the API socket and child PID stay live, with no restart or socket change.
 
-For every new or recreated window, recompute first-run state from a live `status().host` read. A cache may be used only as a short-read fallback and must be refreshed by successful setup and status responses. This prevents a macOS `activate` window or a later app launch from showing stale onboarding after setup has completed.
+For every new or recreated window, seed first-run state from a live `status().host` read. Keep the events subscription above route selection so onboarding-to-shell navigation cannot unmount or reopen it. Subscribe to lifecycle state before reading its current snapshot to avoid missing a fast ready or error transition.
 
-Renderer lifecycle gating must subscribe to the sidecar ready and error channels before reading the authoritative sidecar state. Reading first leaves a race in which a `starting` to `ready` or `error` transition can be broadcast with no listener, leaving the UI stuck. Guard application entry so the state response and ready event cannot initialize it twice, and make a ready event received after a terminal error a no-op for that renderer.
-
-Create the window before any fallible sidecar startup work. Show a connecting view immediately; convert directory, spawn, SDK-load, and readiness failures into an authoritative error state and a visible error panel. A missing or invalid `PORTAL_BIN` must never leave a blank window.
+Create or adopt the desktop window before awaiting any fallible sidecar work. Render a connecting view immediately, and convert directory, binary extraction, spawn, SDK, and readiness failures into a visible error panel. A missing or invalid `PORTAL_BIN` must never leave a blank app.
 
 ## Supervise the application-lifetime child
 
 The sidecar belongs to the application, not a window:
 
-- Keep it running through `window-all-closed` on macOS so `activate` can recreate a window against the live process.
-- On an unexpected exit, respawn with capped exponential backoff. Reset the retry count only after stable uptime, cap attempts, and surface the terminal failure in the UI. Handle both the child `error` event (including `ENOENT`) and its exit.
-- Set a quitting flag before teardown so an exit cannot schedule a replacement. On actual application quit, prevent the first quit, send `SIGTERM`, await exit with a bound, use `SIGKILL` as a fallback, then allow the final quit.
-- Close window-owned exec sessions with their window, but do not tie the sidecar or first-run state to any one `BrowserWindow`.
+- Keep it running after the last window closes on macOS; use the dock `reopen` event to create a new window against the same child. On other desktop platforms, last-window close may enter the actual quit path.
+- On unexpected exit, respawn with capped exponential backoff. Reset the retry count only after stable uptime, cap attempts, and surface terminal failure. A readiness failure must terminate its child before replacement so two daemons cannot overlap.
+- Set the quitting flag before teardown. On an actual native Quit action or termination signal, close exec sessions, send `SIGTERM`, await exit with a bound, use `SIGKILL` only as a fallback, then exit. A per-window `close` request must not tear down the app-owned sidecar on macOS.
+- Close window-owned exec sessions and invalidate their capabilities with the window.
 
-## Package the binary and TypeScript SDK
+## Package with Deno Desktop
 
-The reference resolves the SDK entry as:
+`deno desktop` is experimental and requires Deno 2.9 or newer. Pin the example and CI to the 2.9 line while the API is experimental. TanStack Start detection comes from the `@tanstack/react-start` dependency in `package.json`, and packaging consumes the Nitro `.output/server/index.*` production server. Generate routes and build the framework before packaging:
 
-```js
-const sdkEntry = process.env.PORTAL_SDK || (app.isPackaged
-  ? path.join(process.resourcesPath, "clients-ts", "index.ts")
-  : path.resolve(appRoot, "../../clients/ts/src/index.ts"));
-
-const api = import(pathToFileURL(sdkEntry).href);
+```sh
+deno task web:build
+deno desktop --unstable-no-legacy-abort \
+  --allow-env --allow-net --allow-read --allow-run --allow-write \
+  --include ../../portal -o PortalShellDesktop.app .
 ```
 
-The raw `.ts` client uses the Electron/Node runtime's native type stripping. Native loading must see the source as ESM: Node determines a `.ts` file's module system like `.js`, from the nearest `package.json` `type` field. Copying only `clients/ts/src` into a package leaves `index.ts` without an ESM package scope and causes its `export` syntax to fail as CommonJS.
+The no-legacy-abort flag is required for long-lived setup and events responses under Deno 2.9: without it, `request.signal` aborts as soon as a successful streaming `Response` is returned. The OS webview backend is the default; `--backend cef` is available when a bundled renderer is preferred. The output extension selects formats such as `.app`, `.dmg`, or `.AppImage`.
 
-For electron-builder, place the SDK and its real `package.json` outside `app.asar` with three `extraResources` entries:
+Configure the SDK alias in both places: a Deno import-map entry pointing to `../../clients/ts/src/index.ts`, and an absolute Vite `resolve.alias` for `@portal/sdk`. Nitro then follows the static server import and bundles the SDK into `.output`; do not fork or vendor the client.
 
-```json
-{
-  "build": {
-    "appId": "dev.portal.shell-electron",
-    "extraResources": [
-      { "from": "../../portal", "to": "portal" },
-      { "from": "../../clients/ts/src", "to": "clients-ts" },
-      { "from": "../../clients/ts/package.json", "to": "clients-ts/package.json" }
-    ]
-  }
-}
-```
+`--include ../../portal` places the native binary in Deno's compiled virtual filesystem. The packaged process cannot execute that in-memory resource path directly. Read its bytes relative to the extracted framework module tree, hash them, write a temporary file under an app-owned cache, apply mode `0755`, and atomically rename it before passing the real path to `Deno.Command`. This is the same extract-and-chmod pattern portal uses for its embedded `portald` agent.
 
-The third entry is required: it puts the real `type: "module"` package scope beside `<resources>/clients-ts/index.ts`, and that scope covers the barrel's relative imports. The client has no runtime dependencies. Keep both the TypeScript files and `package.json` in `extraResources`, not inside `app.asar`, because the native file-URL import needs real filesystem paths.
-
-Electron Forge and hand-rolled packages must produce the same outside-ASAR layout. They can copy the two inputs into `clients-ts/{index.ts,...,package.json}`, or use the equivalent single-directory copy:
-
-```js
-{
-  from: "../../clients/ts",
-  to: "clients-ts",
-  filter: ["**/*", "!node_modules{,/**}", "!test{,/**}"],
-}
-```
-
-With the single-directory layout, resolve the packaged entry as `path.join(process.resourcesPath, "clients-ts", "src", "index.ts")`. In either shape, keep the files outside ASAR and verify that the nearest package scope for the entry declares `type: "module"`.
+Deno Desktop bindings are the privileged bootstrap channel. Mint a random per-window exec capability and return it only from `BrowserWindow.bind`; do not expose it through `/api/config` or another loopback HTTP endpoint. Validate that capability and the app origin/host before upgrading `/exec`, and close both the SDK session and its stdin queue on WebSocket close, window close, or app quit.
 
 ## Manual verification
 
 These are live checks for a human; the repository gate does not simulate them:
 
-1. With a fresh config directory, run `portal run`. Confirm status reports `host: ""` and host-dependent exec and doctor calls return `503 not_configured`.
-2. Hold `/v1/events` open, run setup against a live box, and confirm the full stream ends in `done: ok`; the events connection stays open, reports a configured host, and the daemon PID does not change.
+1. With a fresh config directory, start the desktop example. Confirm the window appears immediately, status reports `host: ""`, and onboarding renders every setup event.
+2. Hold the proxied `/v1/events` stream open, run setup against a live box, and confirm it ends in `done: ok`; the same events connection reports a configured host and the daemon PID does not change.
 3. Re-run setup for the same host and confirm activation is a no-op and the daemon PID remains unchanged.
-4. Run setup against a bad host without force. Confirm validation and `done` fail, the host file is unchanged, and existing connectivity remains live.
-5. Switch from host A to host B with an exec session open. Confirm setup deploys to B, the A session ends at activation, and the events stream survives and converges on B.
-6. Run `portal install <box>` from scratch and confirm the CLI-managed install still loads its service and finishes with a passing doctor report.
-7. For the Electron example, use a fresh `PORTAL_CONFIG_DIR` and launch `electron .`. Confirm the window appears immediately in a connecting state, onboarding streams every setup step, `/v1/events` reveals the shell on the same socket without a restart, and quit waits for teardown. Then:
-   - launch with a bogus `PORTAL_BIN` and confirm the visible sidecar-error panel appears;
-   - exercise a fast-ready launch and confirm the renderer never sticks on connecting;
-   - close every window on macOS and activate the app again, then confirm the live sidecar and configured shell are reused;
-   - quit and relaunch with the same config directory, then confirm the live status read skips onboarding.
-
-An optional packaging check is to run electron-builder, inspect the package for `<resources>/portal`, `<resources>/clients-ts/index.ts`, and `<resources>/clients-ts/package.json`, and launch the packaged app. The sibling `package.json` must declare `type: "module"`; removing it should reproduce the CommonJS parse failure that this layout prevents.
+4. Run setup against a bad host without force. Confirm validation and `done` fail, then use the force-retry affordance.
+5. Switch from host A to host B with an exec session open. Confirm the A session ends at activation while the events stream survives and converges on B.
+6. Run an interactive program such as `vim` in xterm, resize the window, and confirm the remote PTY follows.
+7. Launch with a bogus `PORTAL_BIN` and confirm a visible error panel. Relaunch with the same config and confirm the live status read skips onboarding.
+8. Close every window on macOS, reopen from the dock, and confirm the child is reused. Quit through the native Quit item and confirm awaited `SIGTERM` to `SIGKILL` teardown.
+9. Dial `/exec` from a normal browser or another localhost process without the in-process capability and confirm rejection.
+10. Optionally package the app, launch it away from the repository, and confirm the included binary extracts with mode `0755` and starts.

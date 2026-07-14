@@ -281,8 +281,8 @@ One short doc section (README or `docs/embedding.md`): spawn the bundled binary 
 `Paths.Sock` (the SSH ControlMaster socket) derives from it with a GLOBAL default
 (`~/.ssh/cm-portal.sock`, `internal/app/paths.go`) that `PORTAL_CONFIG_DIR` does not affect — an
 embedded instance that omits it would share the ControlMaster with a system-installed portal,
-recreating the S7 cross-instance mux hazard. The `examples/shell-electron` example gains this
-flow behind a "first-run" branch so the reference embedding demonstrates it end-to-end.
+recreating the S7 cross-instance mux hazard. Post-merge amendment: `examples/shell-desktop`
+(Deno Desktop + TanStack Start) is the reference embedding that demonstrates this flow end-to-end.
 
 ---
 
