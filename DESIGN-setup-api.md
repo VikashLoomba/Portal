@@ -2,6 +2,10 @@
 
 **Status:** Approved (decision locked 2026-07-13; v1's restart contract replaced by in-process
 hot-swap per maintainer direction). Sections 2–8 are the implementation contract.
+**Amendment 2026-07-13 (plan review):** S6 swap ordering refined to construct → stop-old → swap →
+start-new — starting the new stack under a live old-host master on the shared `Paths.Sock` would
+route new-stack ssh work to the old box; §3 `done` grammar clarified; §4 gains the u2↔u3↔u4 seam
+contract and the adapter capability-preservation rule (PtyStreamer).
 **Audience:** repo maintainer + implementation agents.
 **Related:** `DESIGN-local-core-api.md` (D1–D10, Option A architecture),
 `DESIGN-split-daemon.md` (bootstrap manager, agent upload),
@@ -69,7 +73,7 @@ Non-decision reaffirmed: no FFI, no ssh2 rewrite — Option A (DESIGN-local-core
 | S3 | **Steps = install's remote half + activation** | `validate` → `configure` → `xdg-open` → `clip-shims` → `agent-symlink` → `activate` → `doctor` → `done`. Binary copy, launchd install, and PATH advice are NOT steps — they stay CLI-only. `activate` is the daemon-side hot-swap (S6); on a same-host re-deploy it is an explicit no-op `ok`. |
 | S4 | **`force` replaces the interactive "install anyway? [y/N]"** | `validate` failure with `force:false` fails the run (remaining steps skipped, `done.status=fail`, nothing written — validate precedes configure). With `force:true` it degrades to a warn and continues — byte-for-byte the semantics of answering `y` today. ssh's live stderr (e.g. Tailscale "To authenticate, visit: …") is relayed as `line` events so a GUI can surface it in real time, exactly as install.go:44 preserves it on the terminal. |
 | S5 | **Unconfigured idle mode = nil stack** | `portal run` with no host no longer exits with an error (`cmd/portal/run.go:36-38`). The daemon always starts, always serves the API; the host-bound machinery (transport, agentclient, engine, clip/cred/notify/openurl handlers) lives in a swappable **stack** that is nil until a host is configured. Host-dependent endpoints answer `503 not_configured` (new D9 code) while the stack is nil. `GET /v1/status` degrades as today (`host:""`, master down, nil agent — `buildStatus` already tolerates this). This also fixes the current launchd fresh-boot error-relaunch loop. |
-| S6 | **Activation = in-process stack hot-swap, construct-new-first** | `activate` builds the new stack against the requested host (construction failure → step `fail`, old stack untouched), swaps the daemon's current-stack ref, then gracefully drains the old one (agent Shutdown/Bye, ctx cancel, master Close + CM socket removal, bounded wait). The daemon process and API socket are never cycled. The hub is host-independent and shared across stacks, so `GET /v1/events` subscribers ride through a swap and see the state transition as ordinary events (D3 snapshot-as-reset needs nothing new). `Status`/`Deps.Host` report the **active stack's** host; the host file is persisted intent (transient divergence during a run is documented, §4). |
+| S6 | **Activation = in-process stack hot-swap: construct → stop-old → swap → start-new** | `activate` CONSTRUCTS the new stack against the requested host without starting it (construction failure → step `fail`, old stack untouched and still serving), then fully drains the old stack (agent Shutdown/Bye, ctx cancel, master Close + `Paths.Sock` removal, bounded wait), then swaps the daemon's current-stack ref, then starts the new stack's goroutines. The old stack must be GONE before any new-stack work begins: both system-transport stacks bind the same `Paths.Sock`, and `ssh -S` routes through whichever master owns the socket without re-verifying the destination — starting the new stack under a live old-host master would bootstrap portald / run exec **on the old box** (the S7 hazard, recreated at the activation layer). The cost is a brief (~2s bounded) window during `activate` where host-bound API calls transiently degrade; the setup stream is live precisely then, and other clients see an honest transient (documented in the endpoint description). The daemon process and API socket are never cycled. After the swap, `Activate` publishes a coalesced hub event so `GET /v1/events` subscribers receive the configured-state transition even if the new agent never connects (sharing the hub alone does not guarantee an emission). `Status`/`Deps.Host` report the **active stack's** host; the host file is persisted intent (transient divergence during a run is documented, §4). |
 | S7 | **One implementation: `internal/setup`, on an isolated ControlPath** | The remote-bootstrap steps move out of `cmd/portal/install.go` into `internal/setup`, exposed as composable phases (`Validate`, `Configure`, `DeployRemote`, `Verify`) emitting typed events into a sink. The CLI renders events to stdout (output text preserved as closely as practical); the API handler renders them to ndjson; `activate` is daemon-side, not a setup phase. Setup's transports are built fresh for the requested host **with a dedicated ControlPath** (`<ConfigDir>/setup-cm.sock`, best-effort Close + unlink when the run ends). This is mandatory, not hygiene: `sshctl.Exec` routes `ssh -S <sock> <host> …` through whatever master owns the socket without re-verifying the destination (`pkg/transport/sshctl/transport.go:203-205`), so sharing `Paths.Sock` during a host switch would silently execute deploy steps **on the old box**. (`Validate`/`HasSS` already dial direct — transport.go:326-343 — and the native transport dials per-session; the hazard is system-transport mux reuse only. The CLI flow only dodges it today because `Service.Install` bounces the daemon — and its master — before the deploy steps.) |
 | S8 | **Single-flight** | One setup at a time, guarded in the handler; a concurrent request gets `409 setup_in_progress`. Idempotent re-run is the recovery story for every partial failure (same as re-running `portal install`). |
 | S9 | **Audited** | `audit.Log` gains setup entries: requested host, forced or not, per-step outcome summary, activation (old host → new host), final verdict. Same posture as OpenURL/ClipServed. |
@@ -111,10 +115,15 @@ type SetupEvent struct {
 ```
 
 Stream grammar: each step emits `running` once, then zero or more `line` events, then exactly one
-terminal `ok|warn|fail`. All steps always appear (skipped steps after a hard fail are omitted, not
-faked). `done` is always the last line, `status` `ok` (all steps ok/warn) or `fail`. The socket
-and the connection's lifecycle are ordinary — after `done` the stream ends and the same daemon
-keeps serving; there is no post-setup reconnect choreography.
+terminal `ok|warn|fail` — EXCEPT `done`, which is a single event (no `running`, no `line`s) and is
+always the last line, `status` `ok` (all steps ok/warn) or `fail`. All steps always appear
+(skipped steps after a hard fail are omitted, not faked). The 400/409 pre-stream rejects are the
+ONLY non-2xx responses this endpoint has — there is no 500 in the spec; every post-first-byte
+failure is in-band (S2) — and the request body is `required` in the OpenAPI spec (an absent body
+is a malformed request). The socket and the connection's lifecycle are ordinary — after `done`
+the stream ends and the same daemon keeps serving; there is no post-setup reconnect choreography.
+During the `activate` step, host-bound calls from OTHER clients may transiently degrade for the
+bounded drain window (S6) — an honest transient, not an error state.
 
 ### Steps (remote work over fresh, ControlPath-isolated transports — S7)
 
@@ -125,7 +134,7 @@ keeps serving; there is no post-setup reconnect choreography.
 | `xdg-open` | Wrapper + BROWSER env snippet + rc sourcing (install.go `installXdgOpenWrapper`) | `warn` + continue (matches install.go:107-111). |
 | `clip-shims` | `clipshim.Ensure` | `warn` + continue, `Error` populated — LOUD per DESIGN-clipboard §9.6; remediation is re-running setup. (The agentclient also re-ensures shims on every verified connect — `pkg/agentclient/client.go:595-601` — so a warn here self-heals once the new stack connects.) |
 | `agent-symlink` | Force the `~/.cache/portal/portald` symlink from the embedded SHA (install.go:304-308) | `warn` + continue. |
-| `activate` | S6 hot-swap: build stack for the host, swap ref, drain old. No-op `ok` when the active stack already targets this host. | `fail` + stop (construction error, e.g. native-transport resolution); old stack stays active — existing connectivity preserved. |
+| `activate` | S6 hot-swap: construct stack for the host (unstarted), drain old fully, swap ref, start new (§4 ordering). No-op `ok` when the active stack already targets this host. | `fail` + stop (construction error, e.g. native-transport resolution); old stack stays active — existing connectivity preserved. |
 | `doctor` | `runDoctor` against the (now-active) host; report embedded in the event | Report speaks for itself; step is `ok` even when the report contains FAILs (matches install.go:131-136 — install never aborts on doctor). |
 | `done` | Verdict | — |
 
@@ -160,7 +169,10 @@ events-stream continuity across a swap free), and the localapi server itself.
   `Kick`, `PushAllow`, `Host`) are satisfied by thin adapters that read the current stack ref;
   a nil stack yields the `not_configured` sentinel (the `errTransport` pattern,
   `internal/app/app.go:203`, with a stable detail string). Handlers need no changes beyond
-  exec/doctor mapping that sentinel to `503 not_configured`.
+  exec/doctor mapping that sentinel to `503 not_configured`. Adapters must preserve the
+  transport's OPTIONAL capabilities, not just the interface they wrap: `handleExec`
+  type-asserts `transport.PtyStreamer` on the ExecStream dep, so an ExecStreamer-only adapter
+  would silently regress every PTY request to `409 pty_unsupported`.
 - `Deps.Host` reports the **active stack's** host (`""` for nil) rather than re-reading the host
   file, so status is always truthful about what the daemon is actually connected to. During a
   setup run there is a transient window (configure written, activate pending) where the file and
@@ -168,11 +180,28 @@ events-stream continuity across a swap free), and the localapi server itself.
 
 ### Swap ordering (S6)
 
-1. Build the new stack; on construction error, report `fail` and keep the old stack.
-2. Swap the ref — new API calls now see the new stack.
-3. Drain the old stack gracefully (Shutdown → cancel → master Close → CM sock removal), bounded
+1. Construct the new stack WITHOUT starting it; on construction error (e.g. native-transport
+   resolution), report `fail` and keep the old stack serving — existing connectivity survives a
+   failed activation.
+2. Drain the old stack fully (Shutdown → cancel → master Close → `Paths.Sock` removal), bounded
    (~2s); in-flight exec sessions to the old host die with it — correct, they target the old box.
    API connections and the events stream are untouched.
+3. Swap the ref — API calls now see the new stack.
+4. Start the new stack's goroutines; its master is established fresh against the new host on the
+   now-free `Paths.Sock`. Publish a coalesced hub event so events subscribers see the transition.
+
+Step 2 preceding steps 3–4 is load-bearing: a live old-host master on the shared `Paths.Sock`
+would silently serve any new-stack ssh work (see S6/S7 — `ssh -S` never re-verifies the socket
+owner's destination). The bounded degradation window between 2 and 4 is the accepted cost.
+
+### Seam contract (u2 ↔ u3 ↔ u4)
+
+Pinned here so the units compose without renegotiation: `internal/setup` phases emit
+`api.SetupEvent` values directly into a `Sink func(api.SetupEvent)` — each phase owns its own
+`running`/`line`/terminal emissions and the callers (CLI renderer, API handler) add none.
+`Validate`/`Configure`/`DeployRemote`/`Verify` all take `context.Context` and honor cancellation
+between remote operations. Activation is daemon-side: run.go exposes `Activate(ctx, host) error`
+(u3) and u4 wires it plus the setup runner into `localapi.Deps` closures.
 
 ---
 
