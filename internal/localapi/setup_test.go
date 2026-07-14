@@ -483,7 +483,7 @@ func TestHandleSetupInBandFailuresAndForce(t *testing.T) {
 		}
 	})
 
-	t.Run("activate no-op is ok", func(t *testing.T) {
+	t.Run("same-host activate event is ok", func(t *testing.T) {
 		f := &fakeSetupFactory{}
 		act := &fakeSetupActivator{}
 		_, path := newSetupTestServer(t, "box", f, act, audit.New(t.TempDir()))
@@ -491,6 +491,9 @@ func TestHandleSetupInBandFailuresAndForce(t *testing.T) {
 		assertSetupGrammar(t, events, allSteps, "ok")
 		if findSetupEvent(events, "activate", "ok") == nil {
 			t.Fatalf("same-host activate did not emit ok: %+v", events)
+		}
+		if calls := act.calls(); len(calls) != 1 || calls[0] != "box" {
+			t.Fatalf("Activate calls = %v, want [box]", calls)
 		}
 	})
 

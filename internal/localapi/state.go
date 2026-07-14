@@ -63,11 +63,13 @@ type ExecStreamer interface {
 }
 
 // StackView pins the host-bound dependencies used by one composite request to
-// the same live stack generation. HostKnown distinguishes an unconfigured
-// daemon from focused tests that omit host dependencies entirely.
+// the same live stack generation. Lifetime ends when that generation drains.
+// HostKnown distinguishes an unconfigured daemon from focused tests that omit
+// host dependencies entirely.
 type StackView struct {
 	Host         string
 	HostKnown    bool
+	Lifetime     context.Context
 	Agent        AgentSource
 	Master       MasterProber
 	Ports        ForwardLister

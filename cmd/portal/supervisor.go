@@ -124,7 +124,11 @@ func (s *supervisor) startInitial(ctx context.Context, host string) error {
 
 func (s *supervisor) newLiveStack(stack *app.Stack) *liveStack {
 	ctx, cancel := context.WithCancel(s.daemonCtx)
-	return &liveStack{stack: stack, ctx: ctx, cancel: cancel}
+	ls := &liveStack{stack: stack, ctx: ctx, cancel: cancel}
+	if stack.Transport.Describe().Impl == transport.ImplSystemSSH {
+		ls.masterStopRequired = true
+	}
+	return ls
 }
 
 func (s *supervisor) start(ls *liveStack) {

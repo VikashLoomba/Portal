@@ -83,6 +83,7 @@ func runDaemon(ctx context.Context, cancel context.CancelFunc, a *app.App, s *su
 			return localapi.StackView{
 				Host:         pinned.host(),
 				HostKnown:    true,
+				Lifetime:     pinned.ctx,
 				Agent:        pinned,
 				Master:       pinned,
 				Ports:        pinned,

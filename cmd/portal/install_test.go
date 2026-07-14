@@ -26,6 +26,7 @@ type installFakeSetup struct {
 	report        *doctor.Report
 	xdgWarn       bool
 	clipWarn      bool
+	agentWarn     bool
 	missingSS     bool
 	configureErr  error
 	validateForce []bool
@@ -74,7 +75,11 @@ func (f *installFakeSetup) DeployRemote(context.Context, string) {
 		f.sink(api.SetupEvent{Step: "clip-shims", Status: "ok"})
 	}
 	f.sink(api.SetupEvent{Step: "agent-symlink", Status: "running"})
-	f.sink(api.SetupEvent{Step: "agent-symlink", Status: "ok"})
+	if f.agentWarn {
+		f.sink(api.SetupEvent{Step: "agent-symlink", Status: "warn", Error: &api.ErrorDetail{Code: "agent_symlink_failed", Message: "symlink denied"}})
+	} else {
+		f.sink(api.SetupEvent{Step: "agent-symlink", Status: "ok"})
+	}
 }
 
 func (f *installFakeSetup) Verify(context.Context, string) *doctor.Report {
@@ -195,18 +200,32 @@ func TestRunInstallMissingSSWarningDoesNotJoinTerminalStatus(t *testing.T) {
 	}
 }
 
-func TestRunInstallClipboardSuccessOutput(t *testing.T) {
+func TestRunInstallRemoteSuccessOutput(t *testing.T) {
 	fake := &installFakeSetup{proceed: true, report: &doctor.Report{Host: "box"}}
 	useInstallFake(t, fake)
 	var out bytes.Buffer
 	if err := runInstall(context.Background(), &out, strings.NewReader(""), false, installTestApp(t), "box"); err != nil {
 		t.Fatalf("runInstall: %v", err)
 	}
-	want := "installed clipboard shims (xclip/wl-paste) on box\n" +
+	want := "installed xdg-open wrapper on box\n" +
+		"installed clipboard shims (xclip/wl-paste) on box\n" +
 		"NOTE: keep your terminal's OSC 52 clipboard-WRITE disabled — a remote\n" +
 		"      could otherwise write your Mac clipboard and read it back.\n"
 	if !strings.Contains(out.String(), want) {
 		t.Fatalf("clipboard success output = %q, want contiguous %q", out.String(), want)
+	}
+}
+
+func TestRunInstallAgentSymlinkWarningOutput(t *testing.T) {
+	fake := &installFakeSetup{proceed: true, agentWarn: true, report: &doctor.Report{Host: "box"}}
+	useInstallFake(t, fake)
+	var out bytes.Buffer
+	if err := runInstall(context.Background(), &out, strings.NewReader(""), false, installTestApp(t), "box"); err != nil {
+		t.Fatalf("runInstall: %v", err)
+	}
+	want := "WARNING: could not update portald symlink on box: symlink denied\n"
+	if !strings.Contains(out.String(), want) {
+		t.Fatalf("agent symlink warning output = %q, want %q", out.String(), want)
 	}
 }
 

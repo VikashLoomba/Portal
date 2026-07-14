@@ -18,6 +18,8 @@ import (
 	"github.com/VikashLoomba/Portal/pkg/wsbits"
 )
 
+const execWriteTimeout = time.Second
+
 // handleExec enforces the exec feature gate and argv rules before any
 // WebSocket upgrade; audits exactly one open and close with the peer uid; passes
 // argv verbatim to the transport per the T2 shell-join contract; binds the
@@ -68,6 +70,10 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	if stack.Lifetime != nil {
+		stopClose := context.AfterFunc(stack.Lifetime, func() { _ = conn.Close() })
+		defer stopClose()
+	}
 
 	host := stack.Host
 	if host == "" && stack.ExecStream != nil {
@@ -238,9 +244,10 @@ func (s *Server) bridgeExecPty(conn netConnWriter, rw *bufio.ReadWriter, writeMu
 type netConnWriter interface {
 	io.Writer
 	Close() error
+	SetWriteDeadline(time.Time) error
 }
 
-func copyExecPtyOutput(conn io.Writer, writeMu *sync.Mutex, wg *sync.WaitGroup, done chan<- struct{}, cancel context.CancelFunc, sess transport.PtySession) {
+func copyExecPtyOutput(conn netConnWriter, writeMu *sync.Mutex, wg *sync.WaitGroup, done chan<- struct{}, cancel context.CancelFunc, sess transport.PtySession) {
 	defer wg.Done()
 	defer close(done)
 
@@ -259,7 +266,7 @@ func copyExecPtyOutput(conn io.Writer, writeMu *sync.Mutex, wg *sync.WaitGroup, 
 	}
 }
 
-func readExecPtyWS(conn io.Writer, rw *bufio.ReadWriter, writeMu *sync.Mutex, wg *sync.WaitGroup, done chan<- struct{}, cancel context.CancelFunc, sess transport.PtySession) {
+func readExecPtyWS(conn netConnWriter, rw *bufio.ReadWriter, writeMu *sync.Mutex, wg *sync.WaitGroup, done chan<- struct{}, cancel context.CancelFunc, sess transport.PtySession) {
 	defer wg.Done()
 	defer close(done)
 
@@ -304,7 +311,7 @@ func readExecPtyWS(conn io.Writer, rw *bufio.ReadWriter, writeMu *sync.Mutex, wg
 	}
 }
 
-func copyExecOutput(conn io.Writer, writeMu *sync.Mutex, wg *sync.WaitGroup, done chan<- struct{}, cancel context.CancelFunc, src io.Reader, stream string) {
+func copyExecOutput(conn netConnWriter, writeMu *sync.Mutex, wg *sync.WaitGroup, done chan<- struct{}, cancel context.CancelFunc, src io.Reader, stream string) {
 	defer wg.Done()
 	defer func() { done <- struct{}{} }()
 
@@ -323,7 +330,7 @@ func copyExecOutput(conn io.Writer, writeMu *sync.Mutex, wg *sync.WaitGroup, don
 	}
 }
 
-func readExecWS(conn io.Writer, rw *bufio.ReadWriter, writeMu *sync.Mutex, wg *sync.WaitGroup, done chan<- struct{}, cancel context.CancelFunc, stdin io.WriteCloser) {
+func readExecWS(conn netConnWriter, rw *bufio.ReadWriter, writeMu *sync.Mutex, wg *sync.WaitGroup, done chan<- struct{}, cancel context.CancelFunc, stdin io.WriteCloser) {
 	defer wg.Done()
 	defer close(done)
 
@@ -363,30 +370,39 @@ func readExecWS(conn io.Writer, rw *bufio.ReadWriter, writeMu *sync.Mutex, wg *s
 	}
 }
 
-func writeExecError(w io.Writer, writeMu *sync.Mutex, errStr string) {
+func writeExecError(w netConnWriter, writeMu *sync.Mutex, errStr string) {
 	_ = writeExecFrame(w, writeMu, api.ExecFrame{Stream: api.ExecStreamError, Data: []byte(errStr)})
 	_ = writeExecClose(w, writeMu)
 }
 
-func writeExecFrame(w io.Writer, writeMu *sync.Mutex, f api.ExecFrame) error {
+func writeExecFrame(w netConnWriter, writeMu *sync.Mutex, f api.ExecFrame) error {
 	payload, err := api.EncodeExecFrame(f)
 	if err != nil {
 		return err
 	}
 	writeMu.Lock()
 	defer writeMu.Unlock()
+	if err := w.SetWriteDeadline(time.Now().Add(execWriteTimeout)); err != nil {
+		return err
+	}
 	return wsbits.WriteFrame(w, wsbits.OpBinary, payload, false)
 }
 
-func writeExecPong(w io.Writer, writeMu *sync.Mutex, payload []byte) error {
+func writeExecPong(w netConnWriter, writeMu *sync.Mutex, payload []byte) error {
 	writeMu.Lock()
 	defer writeMu.Unlock()
+	if err := w.SetWriteDeadline(time.Now().Add(execWriteTimeout)); err != nil {
+		return err
+	}
 	return wsbits.WriteFrame(w, wsbits.OpPong, payload, false)
 }
 
-func writeExecClose(w io.Writer, writeMu *sync.Mutex) error {
+func writeExecClose(w netConnWriter, writeMu *sync.Mutex) error {
 	writeMu.Lock()
 	defer writeMu.Unlock()
+	if err := w.SetWriteDeadline(time.Now().Add(execWriteTimeout)); err != nil {
+		return err
+	}
 	return wsbits.WriteClose(w, false, 1000, "")
 }
 

@@ -62,6 +62,7 @@ func (l *callLog) snapshot() []string {
 
 type recordingStackTransport struct {
 	host            string
+	impl            transport.Impl
 	log             *callLog
 	closeStarted    chan struct{}
 	closeGate       <-chan struct{}
@@ -152,7 +153,11 @@ func (t *recordingStackTransport) Close(ctx context.Context) (bool, error) {
 }
 
 func (t *recordingStackTransport) Describe() transport.Desc {
-	return transport.Desc{Impl: transport.ImplSystemSSH, Host: t.host, Endpoint: t.host}
+	impl := t.impl
+	if impl == "" {
+		impl = transport.ImplSystemSSH
+	}
+	return transport.Desc{Impl: impl, Host: t.host, Endpoint: t.host}
 }
 
 func (t *recordingStackTransport) Forward(context.Context, int, int) error { return nil }
@@ -313,6 +318,49 @@ func TestSupervisorActivateOrderingAndHubSignal(t *testing.T) {
 	}
 	if host, _ := s.host(); host != "B" {
 		t.Fatalf("active host = %q, want B", host)
+	}
+}
+
+func TestSupervisorSameHostActivationIsNoOp(t *testing.T) {
+	base := newSupervisorBase(t, "A")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSupervisor(ctx, base, io.Discard)
+	log := &callLog{}
+	tr := &recordingStackTransport{host: "A", log: log}
+	stack := newSupervisorStack(base, "A", tr)
+	constructions := 0
+	s.newStack = func(context.Context, string) (*app.Stack, error) {
+		constructions++
+		return stack, nil
+	}
+	shutdowns := 0
+	s.shutdownStack = func(context.Context, *app.Stack) error {
+		shutdowns++
+		return nil
+	}
+	if err := s.startInitial(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); s.waitCurrent() }()
+	waitForCall(t, log, "A.ensure")
+	log.reset()
+	old := s.current()
+
+	if err := s.Activate(context.Background(), "A"); err != nil {
+		t.Fatalf("same-host Activate: %v", err)
+	}
+	if constructions != 1 {
+		t.Fatalf("stack constructions = %d, want initial construction only", constructions)
+	}
+	if shutdowns != 0 || tr.closeCalls.Load() != 0 {
+		t.Fatalf("same-host activation drained stack: shutdowns=%d closes=%d", shutdowns, tr.closeCalls.Load())
+	}
+	if s.current() != old {
+		t.Fatal("same-host activation swapped the live stack")
+	}
+	if calls := log.snapshot(); len(calls) != 0 {
+		t.Fatalf("same-host activation started stack work: %v", calls)
 	}
 }
 
@@ -710,7 +758,7 @@ func TestSupervisorUnconfirmedMasterStopBlocksActivationRetry(t *testing.T) {
 	}
 }
 
-func TestSupervisorAllowsFalseCloseWhenNoMasterWasRunning(t *testing.T) {
+func TestSupervisorUnconfirmedMasterStopBlocksActivationWhenHealthIsDown(t *testing.T) {
 	base := newSupervisorBase(t, "A")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -730,8 +778,35 @@ func TestSupervisorAllowsFalseCloseWhenNoMasterWasRunning(t *testing.T) {
 	}
 	defer func() { cancel(); s.waitCurrent() }()
 
+	if err := s.Activate(context.Background(), "B"); err == nil {
+		t.Fatal("Activate succeeded after a down probe without a confirmed master stop")
+	}
+	if s.current().stack != old {
+		t.Fatal("unconfirmed master stop published the replacement stack")
+	}
+}
+
+func TestSupervisorAllowsFalseCloseForNativeTransport(t *testing.T) {
+	base := newSupervisorBase(t, "A")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSupervisor(ctx, base, io.Discard)
+	oldTr := &recordingStackTransport{host: "A", impl: transport.ImplNativeSSH, closeNotStopped: true}
+	old := newSupervisorStack(base, "A", oldTr)
+	next := newSupervisorStack(base, "B", &recordingStackTransport{host: "B"})
+	s.newStack = func(_ context.Context, host string) (*app.Stack, error) {
+		if host == "A" {
+			return old, nil
+		}
+		return next, nil
+	}
+	if err := s.startInitial(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); s.waitCurrent() }()
+
 	if err := s.Activate(context.Background(), "B"); err != nil {
-		t.Fatalf("Activate with no old master: %v", err)
+		t.Fatalf("Activate with no native client: %v", err)
 	}
 	if s.current().stack != next {
 		t.Fatal("activation did not publish the replacement stack")
