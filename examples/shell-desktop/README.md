@@ -14,10 +14,17 @@ cd examples/shell-desktop
 deno task dev
 ```
 
-`dev` grants read, write, network, environment, and subprocess permissions. It
-also opts into Deno's corrected request-abort behavior so closing an SSE client
-aborts the proxied SDK stream without aborting it immediately after a successful
-response. The webview appears before the supervisor waits for portal, so path,
+`dev` and `package` run least-privilege where a static scope is practical:
+environment access is an explicit allowlist (the `PORTAL_*` overrides plus the
+handful of runtime variables the framework reads — extend the list in
+`deno.json` if your setup needs more), and network access is scoped to
+loopback (`Deno.serve`, HMR; the portal API rides a unix socket, which Deno
+gates via read/write, not net). Read, write, and subprocess stay broad by
+necessity: the sidecar binary, its extraction cache, and the app-scoped config
+dir all live at per-user dynamic paths that a static task string cannot name.
+The tasks also opt into Deno's corrected request-abort behavior so closing an
+SSE client aborts the proxied SDK stream without aborting it immediately after
+a successful response. The webview appears before the supervisor waits for portal, so path,
 spawn, and readiness errors are visible in the app instead of producing a blank
 window.
 

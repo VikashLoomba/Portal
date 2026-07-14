@@ -5,6 +5,10 @@ import { LifecycleStore } from "./lifecycle.ts";
 import type { PortalPaths } from "./paths.ts";
 
 const readyTimeoutMs = 15_000;
+// The first status read after readiness gets its own deadline: a daemon that
+// accepts the socket but wedges before answering must surface as a failed
+// generation (terminate + respawn), never an app stuck in "starting".
+const firstStatusTimeoutMs = 5_000;
 const stableUptimeMs = 30_000;
 const maxRespawnAttempts = 5;
 
@@ -77,8 +81,12 @@ export class SidecarSupervisor {
     try {
       child = new Deno.Command(this.#binary, {
         args: ["run"],
+        // Clean env matching the launchd LaunchAgent posture (PATH + HOME only,
+        // plus the app-scoped portal overrides) — the daemon never inherits the
+        // desktop app's full environment.
+        clearEnv: true,
         env: {
-          ...Deno.env.toObject(),
+          PATH: Deno.env.get("PATH") ?? "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
           HOME: this.#paths.home,
           PORTAL_CONFIG_DIR: this.#paths.configDir,
           PORTAL_API_SOCK: this.#paths.apiSock,
@@ -114,7 +122,10 @@ export class SidecarSupervisor {
       }
 
       const status = await createClient(this.#paths.apiSock).status({
-        signal: abort.signal,
+        signal: AbortSignal.any([
+          abort.signal,
+          AbortSignal.timeout(firstStatusTimeoutMs),
+        ]),
       });
       if (this.#quitting || this.#child !== child) {
         return;

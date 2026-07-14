@@ -1,5 +1,7 @@
 import { basename, dirname, join, resolve } from "node:path";
 
+import { readPortalEnv } from "./paths.ts";
+
 export type BinarySourceKind = "override" | "packaged" | "development";
 
 export interface BinarySource {
@@ -50,7 +52,7 @@ export async function selectBinarySource(
 
 export async function resolvePortalBinary(configDir: string): Promise<string> {
   const source = await selectBinarySource({
-    env: Deno.env.toObject(),
+    env: readPortalEnv(),
     packaged: isPackagedRuntime(),
     moduleDir: import.meta.dirname ?? Deno.cwd(),
     cwd: Deno.cwd(),
