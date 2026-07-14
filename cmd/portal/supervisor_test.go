@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -65,7 +66,9 @@ type recordingStackTransport struct {
 	closeStarted    chan struct{}
 	closeGate       <-chan struct{}
 	closeIgnoresCtx bool
+	closeFirstOnly  bool
 	closeErr        error
+	closeCalls      atomic.Int32
 	workCheck       func()
 	closeOnce       sync.Once
 	healthStarted   chan struct{}
@@ -118,12 +121,13 @@ func (t *recordingStackTransport) Stream(ctx context.Context, _ ...string) (io.W
 
 func (t *recordingStackTransport) Close(ctx context.Context) (bool, error) {
 	t.record("close")
+	closeCall := t.closeCalls.Add(1)
 	t.closeOnce.Do(func() {
 		if t.closeStarted != nil {
 			close(t.closeStarted)
 		}
 	})
-	if t.closeGate != nil {
+	if t.closeGate != nil && (!t.closeFirstOnly || closeCall == 1) {
 		if t.closeIgnoresCtx {
 			<-t.closeGate
 		} else {
@@ -778,6 +782,63 @@ func TestSupervisorTransportCloseIsBoundedWhenContextIgnored(t *testing.T) {
 		t.Fatal("transport close was not attempted")
 	}
 	close(releaseClose)
+}
+
+func TestSupervisorTimedOutCloseBlocksActivationRetry(t *testing.T) {
+	base := newSupervisorBase(t, "A")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSupervisor(ctx, base, io.Discard)
+	s.drainTimeout = 40 * time.Millisecond
+	releaseFirstClose := make(chan struct{})
+	oldTr := &recordingStackTransport{
+		host: "A", closeGate: releaseFirstClose, closeIgnoresCtx: true, closeFirstOnly: true,
+	}
+	old := newSupervisorStack(base, "A", oldTr)
+	next := newSupervisorStack(base, "B", &recordingStackTransport{host: "B"})
+	s.newStack = func(_ context.Context, host string) (*app.Stack, error) {
+		if host == "A" {
+			return old, nil
+		}
+		return next, nil
+	}
+	if err := s.startInitial(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); s.waitCurrent() }()
+
+	if err := s.Activate(context.Background(), "B"); !errors.Is(err, context.DeadlineExceeded) {
+		close(releaseFirstClose)
+		t.Fatalf("first Activate error = %v, want drain deadline", err)
+	}
+	s.drainTimeout = time.Second
+	retried := make(chan error, 1)
+	go func() { retried <- s.Activate(context.Background(), "B") }()
+	deadline := time.Now().Add(time.Second)
+	for oldTr.closeCalls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := oldTr.closeCalls.Load(); got < 2 {
+		close(releaseFirstClose)
+		t.Fatalf("transport close calls = %d, want retry close", got)
+	}
+	select {
+	case err := <-retried:
+		close(releaseFirstClose)
+		t.Fatalf("activation retry returned before timed-out close exited: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if s.current().stack != old {
+		close(releaseFirstClose)
+		t.Fatal("activation retry published replacement while timed-out close was running")
+	}
+	close(releaseFirstClose)
+	if err := <-retried; err != nil {
+		t.Fatalf("activation retry after close exit: %v", err)
+	}
+	if s.current().stack != next {
+		t.Fatal("activation retry did not publish replacement after close exit")
+	}
 }
 
 func TestSupervisorCloseAndJoinShareDrainDeadline(t *testing.T) {

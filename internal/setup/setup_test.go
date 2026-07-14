@@ -72,19 +72,29 @@ func (r *recordTransport) Describe() transport.Desc {
 }
 
 type fakeValidator struct {
-	err    error
-	hasSS  bool
-	stderr string
+	err        error
+	hasSS      bool
+	stderr     string
+	onValidate func(context.Context)
+	onHasSS    func(context.Context)
 }
 
-func (v *fakeValidator) Validate(_ context.Context, _ string, stderrW io.Writer) error {
+func (v *fakeValidator) Validate(ctx context.Context, _ string, stderrW io.Writer) error {
+	if v.onValidate != nil {
+		v.onValidate(ctx)
+	}
 	if v.stderr != "" {
 		_, _ = io.WriteString(stderrW, v.stderr)
 	}
 	return v.err
 }
 
-func (v *fakeValidator) HasSS(context.Context, string) bool { return v.hasSS }
+func (v *fakeValidator) HasSS(ctx context.Context, _ string) bool {
+	if v.onHasSS != nil {
+		v.onHasSS(ctx)
+	}
+	return v.hasSS
+}
 
 func testRunner(t *testing.T) (*Runner, *recordTransport, *[]api.SetupEvent) {
 	t.Helper()
@@ -160,6 +170,48 @@ func TestValidateEventsAndForce(t *testing.T) {
 	}
 }
 
+func TestValidateHonorsCancellation(t *testing.T) {
+	t.Run("before start", func(t *testing.T) {
+		r, _, events := testRunner(t)
+		r.newValidator = func() validator {
+			t.Fatal("validator constructed after cancellation")
+			return &fakeValidator{}
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if r.Validate(ctx, "box", false) {
+			t.Fatal("Validate = true, want canceled false")
+		}
+		if len(*events) != 0 {
+			t.Fatalf("events = %#v, want none", *events)
+		}
+	})
+
+	t.Run("during reachability check", func(t *testing.T) {
+		r, _, events := testRunner(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		v := &fakeValidator{hasSS: true, onValidate: func(context.Context) { cancel() }}
+		v.onHasSS = func(context.Context) { t.Fatal("HasSS called after cancellation") }
+		r.newValidator = func() validator { return v }
+		if r.Validate(ctx, "box", false) {
+			t.Fatal("Validate = true, want canceled false")
+		}
+		assertEventStatuses(t, *events, "validate:running")
+	})
+
+	t.Run("during tooling check", func(t *testing.T) {
+		r, _, events := testRunner(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		r.newValidator = func() validator {
+			return &fakeValidator{onHasSS: func(context.Context) { cancel() }}
+		}
+		if r.Validate(ctx, "box", false) {
+			t.Fatal("Validate = true, want canceled false")
+		}
+		assertEventStatuses(t, *events, "validate:running")
+	})
+}
+
 func TestConfigureWritesHostAndDirectories(t *testing.T) {
 	r, _, events := testRunner(t)
 	if err := r.Configure(context.Background(), "user@box"); err != nil {
@@ -190,6 +242,36 @@ func TestConfigureWriteHostFailureEmitsFail(t *testing.T) {
 	if (*events)[1].Error == nil {
 		t.Fatal("configure fail missing error detail")
 	}
+}
+
+func TestConfigureHonorsCancellation(t *testing.T) {
+	t.Run("before start", func(t *testing.T) {
+		r, _, events := testRunner(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := r.Configure(ctx, "box"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Configure error = %v, want context canceled", err)
+		}
+		if len(*events) != 0 {
+			t.Fatalf("events = %#v, want none", *events)
+		}
+	})
+
+	t.Run("after running event", func(t *testing.T) {
+		r, _, events := testRunner(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		r.sink = func(ev api.SetupEvent) {
+			*events = append(*events, ev)
+			cancel()
+		}
+		if err := r.Configure(ctx, "box"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Configure error = %v, want context canceled", err)
+		}
+		assertEventStatuses(t, *events, "configure:running")
+		if _, err := os.Stat(r.paths.ConfigDir); !os.IsNotExist(err) {
+			t.Fatalf("config directory exists after cancellation: %v", err)
+		}
+	})
 }
 
 func TestDeployAndVerifyOrderCachesEstablishedTransport(t *testing.T) {
@@ -242,6 +324,40 @@ func TestDeployAndVerifyOrderCachesEstablishedTransport(t *testing.T) {
 	if err := json.Unmarshal(doctorEvent.Report, &decoded); err != nil || decoded.Host != "box" {
 		t.Fatalf("doctor event report = %s, %v", doctorEvent.Report, err)
 	}
+}
+
+func TestVerifyHonorsCancellation(t *testing.T) {
+	t.Run("after transport setup", func(t *testing.T) {
+		r, tr, events := testRunner(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		r.newTransport = func(context.Context, string) (transport.Transport, error) {
+			cancel()
+			return tr, nil
+		}
+		r.doctor = func(context.Context, string, transport.Transport) *doctor.Report {
+			t.Fatal("doctor called after cancellation")
+			return nil
+		}
+		rep := r.Verify(ctx, "box")
+		if rep.Host != "box" || len(*events) != 0 {
+			t.Fatalf("Verify report/events = %#v/%#v, want canceled empty result", rep, *events)
+		}
+	})
+
+	t.Run("during doctor", func(t *testing.T) {
+		r, tr, events := testRunner(t)
+		r.tr = tr
+		ctx, cancel := context.WithCancel(context.Background())
+		want := &doctor.Report{Host: "box"}
+		r.doctor = func(context.Context, string, transport.Transport) *doctor.Report {
+			cancel()
+			return want
+		}
+		if got := r.Verify(ctx, "box"); got != want {
+			t.Fatalf("Verify report = %#v, want %#v", got, want)
+		}
+		assertEventStatuses(t, *events, "doctor:running")
+	})
 }
 
 func TestDeployStepFailuresWarnAndContinue(t *testing.T) {

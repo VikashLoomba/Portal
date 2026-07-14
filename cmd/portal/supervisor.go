@@ -219,7 +219,9 @@ func (s *supervisor) drain(ctx context.Context, old *liveStack) error {
 	}
 	old.cancel()
 	closeDone := make(chan error, 1)
+	old.wg.Add(1)
 	go func() {
+		defer old.wg.Done()
 		_, err := old.stack.CloseTransport(teardownCtx)
 		closeDone <- err
 	}()

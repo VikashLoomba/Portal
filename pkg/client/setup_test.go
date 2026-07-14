@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,6 +19,23 @@ import (
 
 func TestSetupHappyPath(t *testing.T) {
 	serverResult := make(chan error, 1)
+	wantEvents := []api.SetupEvent{
+		{Step: "validate", Status: "running"},
+		{Step: "validate", Status: "ok"},
+		{Step: "configure", Status: "running"},
+		{Step: "configure", Status: "ok"},
+		{Step: "xdg-open", Status: "running"},
+		{Step: "xdg-open", Status: "ok"},
+		{Step: "clip-shims", Status: "running"},
+		{Step: "clip-shims", Status: "ok"},
+		{Step: "agent-symlink", Status: "running"},
+		{Step: "agent-symlink", Status: "ok"},
+		{Step: "activate", Status: "running"},
+		{Step: "activate", Status: "ok"},
+		{Step: "doctor", Status: "running"},
+		{Step: "doctor", Status: "ok", Report: json.RawMessage(`{"host":"devbox"}`)},
+		{Step: "done", Status: "ok"},
+	}
 	path := startSetupStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serverResult <- func() error {
 			if r.Method != http.MethodPost {
@@ -36,23 +54,7 @@ func TestSetupHappyPath(t *testing.T) {
 			if got.Host != "user@devbox" || got.Force {
 				return fmt.Errorf("request = %+v, want host user@devbox and force false", got)
 			}
-			return writeSetupEvents(w, []api.SetupEvent{
-				{Step: "validate", Status: "running"},
-				{Step: "validate", Status: "ok"},
-				{Step: "configure", Status: "running"},
-				{Step: "configure", Status: "ok"},
-				{Step: "xdg-open", Status: "running"},
-				{Step: "xdg-open", Status: "ok"},
-				{Step: "clip-shims", Status: "running"},
-				{Step: "clip-shims", Status: "ok"},
-				{Step: "agent-symlink", Status: "running"},
-				{Step: "agent-symlink", Status: "ok"},
-				{Step: "activate", Status: "running"},
-				{Step: "activate", Status: "ok"},
-				{Step: "doctor", Status: "running"},
-				{Step: "doctor", Status: "ok", Report: json.RawMessage(`{"host":"devbox"}`)},
-				{Step: "done", Status: "ok"},
-			})
+			return writeSetupEvents(w, wantEvents)
 		}()
 	}))
 
@@ -71,15 +73,8 @@ func TestSetupHappyPath(t *testing.T) {
 		}
 		events = append(events, ev)
 	}
-	if len(events) != 15 {
-		t.Fatalf("event count = %d, want 15", len(events))
-	}
-	if events[0].Step != "validate" {
-		t.Fatalf("first step = %q, want validate", events[0].Step)
-	}
-	last := events[len(events)-1]
-	if last.Step != "done" || last.Status != "ok" {
-		t.Fatalf("terminal event = %+v, want done/ok", last)
+	if !reflect.DeepEqual(events, wantEvents) {
+		t.Fatalf("events = %#v, want %#v", events, wantEvents)
 	}
 	assertSetupServerResult(t, serverResult)
 }
@@ -370,6 +365,36 @@ func TestWaitReadyTimeout(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("WaitReady elapsed = %v, want bounded timeout", elapsed)
+	}
+}
+
+func TestWaitReadyTimeoutCancelsHungProbe(t *testing.T) {
+	requestStarted := make(chan struct{})
+	handlerDone := make(chan struct{})
+	path := startSetupStub(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		close(requestStarted)
+		<-handlerDone
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-ctx.Done()
+		close(handlerDone)
+	}()
+	start := time.Now()
+	err := New(path).WaitReady(ctx, 40*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitReady error = %v, want context.DeadlineExceeded", err)
+	}
+	cancel()
+	select {
+	case <-requestStarted:
+	default:
+		t.Fatal("WaitReady did not start a /v1/version probe")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("WaitReady elapsed = %v, want bounded hung-probe timeout", elapsed)
 	}
 }
 

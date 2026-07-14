@@ -74,6 +74,12 @@ func runInstall(ctx context.Context, out io.Writer, in io.Reader, isTTY bool, a 
 			fmt.Fprintln(out, "aborted.")
 			return fmt.Errorf("install aborted")
 		}
+		if !r.Validate(ctx, host, true) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return fmt.Errorf("ssh validation failed for %s", host)
+		}
 	}
 
 	if err := r.Configure(ctx, host); err != nil {

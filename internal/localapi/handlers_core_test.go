@@ -65,6 +65,10 @@ type fakeService struct{ st service.Status }
 
 func (f fakeService) Status(context.Context) (service.Status, error) { return f.st, nil }
 
+type serviceStatusFunc func(context.Context) (service.Status, error)
+
+func (f serviceStatusFunc) Status(ctx context.Context) (service.Status, error) { return f(ctx) }
+
 // newTestServer builds a Server over in-file fakes plus a real config.Store on
 // t.TempDir. agent may be nil (no handshake).
 func newTestServer(t *testing.T, agent AgentSource) *Server {
@@ -240,6 +244,50 @@ func TestBuildStatusUsesOnePinnedStackView(t *testing.T) {
 	}
 	if got.Health.LastDisconnectErr != "stack-a-disconnect" || got.Health.ReconcileCount != 7 {
 		t.Fatalf("status stack health = %+v, want stack-a", got.Health)
+	}
+}
+
+func TestBuildStatusDoesNotPinStackDuringServiceProbe(t *testing.T) {
+	serviceStarted := make(chan struct{})
+	releaseService := make(chan struct{})
+	stackPinned := make(chan struct{})
+	stackReleased := make(chan struct{})
+	s := New(Deps{
+		Service: serviceStatusFunc(func(context.Context) (service.Status, error) {
+			close(serviceStarted)
+			<-releaseService
+			return service.Status{Loaded: true}, nil
+		}),
+		PinStack: func(context.Context) (StackView, func()) {
+			close(stackPinned)
+			return StackView{}, func() { close(stackReleased) }
+		},
+	})
+	done := make(chan struct{})
+	go func() {
+		s.buildStatus(context.Background())
+		close(done)
+	}()
+
+	<-serviceStarted
+	select {
+	case <-stackPinned:
+		close(releaseService)
+		<-done
+		t.Fatal("status pinned the stack while the host-independent service probe was blocked")
+	default:
+	}
+	close(releaseService)
+	<-done
+	select {
+	case <-stackPinned:
+	default:
+		t.Fatal("status did not pin the stack for host-bound probes")
+	}
+	select {
+	case <-stackReleased:
+	default:
+		t.Fatal("status did not release the stack pin")
 	}
 }
 

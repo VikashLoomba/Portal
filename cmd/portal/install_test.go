@@ -20,27 +20,31 @@ import (
 )
 
 type installFakeSetup struct {
-	sink         setup.Sink
-	proceed      bool
-	calls        []string
-	report       *doctor.Report
-	clipWarn     bool
-	missingSS    bool
-	configureErr error
+	sink          setup.Sink
+	proceed       bool
+	calls         []string
+	report        *doctor.Report
+	clipWarn      bool
+	missingSS     bool
+	configureErr  error
+	validateForce []bool
 }
 
 func (f *installFakeSetup) Validate(_ context.Context, _ string, force bool) bool {
 	f.calls = append(f.calls, "validate")
+	f.validateForce = append(f.validateForce, force)
 	f.sink(api.SetupEvent{Step: "validate", Status: "running"})
 	if f.missingSS {
 		f.sink(api.SetupEvent{Step: "validate", Status: "running", Line: "WARNING: 'box' is reachable but has no 'ss' command — is it Linux? Port discovery may not work.\n"})
 		f.sink(api.SetupEvent{Step: "validate", Status: "warn"})
 	} else if f.proceed {
 		f.sink(api.SetupEvent{Step: "validate", Status: "ok"})
+	} else if force {
+		f.sink(api.SetupEvent{Step: "validate", Status: "warn", Error: &api.ErrorDetail{Code: "validation_failed", Message: "unreachable"}})
 	} else {
 		f.sink(api.SetupEvent{Step: "validate", Status: "fail", Error: &api.ErrorDetail{Code: "validation_failed", Message: "unreachable"}})
 	}
-	return f.proceed
+	return f.proceed || force
 }
 
 func (f *installFakeSetup) Configure(context.Context, string) error {
@@ -241,7 +245,7 @@ func TestRunInstallValidationFailureNonTTYDoesNotPrompt(t *testing.T) {
 	}
 }
 
-func TestRunInstallValidationFailurePromptYesContinuesWithoutRevalidate(t *testing.T) {
+func TestRunInstallValidationFailurePromptYesRevalidatesWithForce(t *testing.T) {
 	fake := &installFakeSetup{report: &doctor.Report{Host: "box"}}
 	useInstallFake(t, fake)
 	var out bytes.Buffer
@@ -251,8 +255,14 @@ func TestRunInstallValidationFailurePromptYesContinuesWithoutRevalidate(t *testi
 	if !strings.Contains(out.String(), "install anyway? [y/N] ") {
 		t.Fatalf("output missing prompt: %q", out.String())
 	}
-	if got := strings.Join(fake.calls, ","); got != "validate,configure,deploy,verify,close" {
-		t.Fatalf("phase calls = %q, want one validate followed by remaining phases", got)
+	if got := strings.Join(fake.calls, ","); got != "validate,validate,configure,deploy,verify,close" {
+		t.Fatalf("phase calls = %q, want forced revalidation followed by remaining phases", got)
+	}
+	if len(fake.validateForce) != 2 || fake.validateForce[0] || !fake.validateForce[1] {
+		t.Fatalf("validation force arguments = %v, want [false true]", fake.validateForce)
+	}
+	if got := strings.Count(out.String(), "checking ssh to box ...\n"); got != 2 {
+		t.Fatalf("validation progress count = %d, want 2: %q", got, out.String())
 	}
 }
 

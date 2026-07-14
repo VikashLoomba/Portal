@@ -293,9 +293,6 @@ func (w *envelopeWriter) Write(b []byte) (int, error) {
 // buildStatus assembles the Status aggregate from deps. Missing/erroring
 // sources degrade to zero values rather than failing the whole status.
 func (s *Server) buildStatus(ctx context.Context) api.Status {
-	stack, release := s.stackView(ctx)
-	defer release()
-
 	// Ports/Forwards/Allowed are initialized to empty non-nil slices so the JSON
 	// fields are ALWAYS arrays, never null — matching GET /v1/ports and letting a
 	// polyglot client iterate them safely even in the disconnected state (§4.4).
@@ -307,12 +304,15 @@ func (s *Server) buildStatus(ctx context.Context) api.Status {
 		Allowed:  []int{},
 	}
 
-	st.Host = stack.Host
 	if s.deps.Service != nil {
 		if svc, err := s.deps.Service.Status(ctx); err == nil {
 			st.Service = api.ServiceStatus{Loaded: svc.Loaded, StateLines: svc.StateLines}
 		}
 	}
+
+	stack, release := s.stackView(ctx)
+	defer release()
+	st.Host = stack.Host
 
 	var masterUp bool
 	if stack.Master != nil {

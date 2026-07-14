@@ -617,8 +617,8 @@ func TestHandleSetupDisconnectCancelsAndAudits(t *testing.T) {
 		t.Fatal("runner.Close was not called after disconnect")
 	}
 	lines := waitAuditLines(t, a.Path(), 1, 2*time.Second)
-	if verdict := auditFields(lines[0])["verdict"]; verdict == "ok" || verdict == "" {
-		t.Fatalf("disconnect audit verdict = %q, want non-success: %s", verdict, lines[0])
+	if verdict := auditFields(lines[0])["verdict"]; verdict != "canceled" {
+		t.Fatalf("disconnect audit verdict = %q, want canceled: %s", verdict, lines[0])
 	}
 	rec := doReq(s, http.MethodPost, "/v1/setup", `{not json`)
 	if rec.Code != http.StatusBadRequest {
@@ -678,8 +678,8 @@ func TestHandleSetupDoneWriteFailureAuditsNonSuccess(t *testing.T) {
 		t.Fatalf("happy phases did not finish before done failure: %s", w.body.String())
 	}
 	lines := waitAuditLines(t, a.Path(), 1, 2*time.Second)
-	if verdict := auditFields(lines[0])["verdict"]; verdict == "ok" || verdict == "" {
-		t.Fatalf("done-write audit verdict = %q, want non-success: %s", verdict, lines[0])
+	if verdict := auditFields(lines[0])["verdict"]; verdict != "canceled" {
+		t.Fatalf("done-write audit verdict = %q, want canceled: %s", verdict, lines[0])
 	}
 }
 
