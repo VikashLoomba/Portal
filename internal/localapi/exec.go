@@ -25,7 +25,9 @@ import (
 // remote stream; and joins copy goroutines, the WebSocket reader, and wait
 // before returning.
 func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
-	if s.notConfigured() {
+	stack, release := s.stackView(r.Context())
+	defer release()
+	if stack.HostKnown && stack.Host == "" {
 		writeError(w, http.StatusServiceUnavailable, "not_configured", "no active host is configured")
 		return
 	}
@@ -44,7 +46,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "exec requires at least one arg query parameter")
 		return
 	}
-	pStreamer, ptyOK := s.deps.ExecStream.(transport.PtyStreamer)
+	pStreamer, ptyOK := stack.ExecStream.(transport.PtyStreamer)
 	if pty && !ptyOK {
 		writeError(w, http.StatusConflict, "pty_unsupported", "the active transport does not support PTY")
 		return
@@ -67,9 +69,9 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	host := ""
-	if s.deps.ExecStream != nil {
-		host = s.deps.ExecStream.Describe().Host
+	host := stack.Host
+	if host == "" && stack.ExecStream != nil {
+		host = stack.ExecStream.Describe().Host
 	}
 	uid, _ := r.Context().Value(peerUIDKey{}).(int)
 	s.deps.Audit.ExecOpen(host, sid, strings.Join(argv, " "), uid, pty)
@@ -84,14 +86,14 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.deps.ExecStream == nil {
+	if stack.ExecStream == nil {
 		errStr := "exec streamer is not configured"
 		writeExecError(conn, writeMu, errStr)
 		s.deps.Audit.ExecClose(host, sid, 0, errStr, time.Since(start))
 		return
 	}
 
-	stdin, stdout, stderr, wait, err := s.deps.ExecStream.Stream(bctx, argv...)
+	stdin, stdout, stderr, wait, err := stack.ExecStream.Stream(bctx, argv...)
 	if err != nil {
 		errStr := err.Error()
 		writeExecError(conn, writeMu, errStr)

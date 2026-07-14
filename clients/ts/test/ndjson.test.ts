@@ -22,3 +22,15 @@ test("ndjsonLines preserves split UTF-8 code points and JSON lines", async () =>
   }
   assert.deepStrictEqual(lines, ['{"line":"café"}', '{"line":"done"}']);
 });
+
+test("ndjsonLines rejects a line larger than 1 MiB", async () => {
+  async function* chunks(): AsyncGenerator<unknown> {
+    yield new Uint8Array((1 << 20) + 1).fill(0x61);
+  }
+
+  await assert.rejects(async () => {
+    for await (const _line of ndjsonLines(chunks())) {
+      // The oversized line must fail before it can be yielded.
+    }
+  }, /ndjson: line exceeds 1 MiB limit/);
+});

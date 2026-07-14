@@ -289,12 +289,20 @@ func TestDeployEstablishmentFailureWarnsEveryStepWithoutExec(t *testing.T) {
 	r, tr, events := testRunner(t)
 	tr.ensureErr = errors.New("dial failed")
 	r.DeployRemote(context.Background(), "box")
+	rep := r.Verify(context.Background(), "box")
 	assertEventStatuses(t, *events,
 		"xdg-open:running", "xdg-open:warn",
 		"clip-shims:running", "clip-shims:warn",
-		"agent-symlink:running", "agent-symlink:warn")
+		"agent-symlink:running", "agent-symlink:warn",
+		"doctor:running", "doctor:ok")
 	if got := countCallPrefix(tr.calls, "exec:"); got != 0 {
 		t.Fatalf("Exec calls = %d, want 0; calls=%v", got, tr.calls)
+	}
+	if got := countCall(tr.calls, "ensure"); got != 1 {
+		t.Fatalf("Ensure calls = %d, want cached establishment failure", got)
+	}
+	if len(rep.Checks) != 1 || rep.Checks[0].Name != "ssh master" || rep.Checks[0].Status != doctor.Fail || rep.Checks[0].Detail != "dial failed" {
+		t.Fatalf("Verify report = %#v, want cached transport failure", rep)
 	}
 }
 

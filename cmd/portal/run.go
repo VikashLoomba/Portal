@@ -75,6 +75,22 @@ func runDaemon(ctx context.Context, cancel context.CancelFunc, a *app.App, s *su
 		Kick:         s.kick,
 		ReconcileGen: s.reconciles,
 		Doctor:       s.doctor,
+		PinStack: func(ctx context.Context) (localapi.StackView, func()) {
+			pinned, release := s.pin(ctx)
+			if pinned == nil {
+				return localapi.StackView{HostKnown: true}, release
+			}
+			return localapi.StackView{
+				Host:         pinned.host(),
+				HostKnown:    true,
+				Agent:        pinned,
+				Master:       pinned,
+				Ports:        pinned,
+				ExecStream:   pinned,
+				ReconcileGen: pinned.reconciles,
+				Doctor:       pinned.doctor,
+			}, release
+		},
 		NewSetup: func(sink func(api.SetupEvent)) localapi.SetupRunner {
 			return setup.New(a.Paths, a.Cfg, setup.Sink(sink))
 		},

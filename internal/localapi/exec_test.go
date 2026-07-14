@@ -180,6 +180,37 @@ func TestExecAuditOpenCloseOnce(t *testing.T) {
 	}
 }
 
+func TestExecAuditUsesPinnedStackHost(t *testing.T) {
+	a := audit.New(t.TempDir())
+	fallback := hostExecStreamer{ExecStreamer: localexec.New(), host: "stack-b"}
+	pinned := hostExecStreamer{ExecStreamer: localexec.New(), host: "stack-a"}
+	released := make(chan struct{})
+	path, _ := startExecServerWithDeps(t, Deps{
+		Version:    api.VersionInfo{Version: "9.9"},
+		Config:     config.New(t.TempDir()),
+		ExecStream: fallback,
+		Audit:      a,
+		PinStack: func(context.Context) (StackView, func()) {
+			return StackView{Host: "stack-a", HostKnown: true, ExecStream: pinned}, func() { close(released) }
+		},
+	})
+
+	c := dialExecWS(t, path, []string{"printf", "hello"})
+	defer c.Close()
+	_ = readExecFramesUntilExit(t, c, 2*time.Second)
+	lines := waitAuditLines(t, a.Path(), 2, 2*time.Second)
+	for _, line := range lines {
+		if fields := auditFields(line); fields["host"] != "stack-a" {
+			t.Fatalf("audit host = %q, want pinned stack-a\n%s", fields["host"], strings.Join(lines, "\n"))
+		}
+	}
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("pinned exec stack was not released")
+	}
+}
+
 func TestExecAuditPtyOpenFlagAndSID(t *testing.T) {
 	a := audit.New(t.TempDir())
 	path, _ := startExecServer(t, config.New(t.TempDir()), a, localexec.New())
@@ -678,6 +709,15 @@ func (unsupportedPtyExecStreamer) Describe() transport.Desc {
 	return transport.Desc{Impl: "test", Host: "pipe-only", Endpoint: "net.Pipe"}
 }
 
+type hostExecStreamer struct {
+	ExecStreamer
+	host string
+}
+
+func (s hostExecStreamer) Describe() transport.Desc {
+	return transport.Desc{Impl: "test", Host: s.host, Endpoint: s.host}
+}
+
 type wsTestConn struct {
 	net.Conn
 	br      *bufio.Reader
@@ -687,13 +727,18 @@ type wsTestConn struct {
 
 func startExecServer(t *testing.T, cfg *config.Store, a *audit.Log, streamer ExecStreamer) (string, *Server) {
 	t.Helper()
-	path := filepath.Join(shortTempDir(t), "api.sock")
-	s := New(Deps{
+	return startExecServerWithDeps(t, Deps{
 		Version:    api.VersionInfo{Version: "9.9"},
 		Config:     cfg,
 		ExecStream: streamer,
 		Audit:      a,
 	})
+}
+
+func startExecServerWithDeps(t *testing.T, deps Deps) (string, *Server) {
+	t.Helper()
+	path := filepath.Join(shortTempDir(t), "api.sock")
+	s := New(deps)
 	ln, err := Listen(path)
 	if err != nil {
 		t.Fatalf("Listen: %v", err)

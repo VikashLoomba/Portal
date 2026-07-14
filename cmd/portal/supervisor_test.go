@@ -64,6 +64,7 @@ type recordingStackTransport struct {
 	log             *callLog
 	closeStarted    chan struct{}
 	closeGate       <-chan struct{}
+	closeIgnoresCtx bool
 	closeErr        error
 	workCheck       func()
 	closeOnce       sync.Once
@@ -123,10 +124,14 @@ func (t *recordingStackTransport) Close(ctx context.Context) (bool, error) {
 		}
 	})
 	if t.closeGate != nil {
-		select {
-		case <-t.closeGate:
-		case <-ctx.Done():
-			return false, ctx.Err()
+		if t.closeIgnoresCtx {
+			<-t.closeGate
+		} else {
+			select {
+			case <-t.closeGate:
+			case <-ctx.Done():
+				return false, ctx.Err()
+			}
 		}
 	}
 	return t.closeErr == nil, t.closeErr
@@ -550,6 +555,55 @@ func TestSupervisorAllowlistPushWaitsForActivationStartup(t *testing.T) {
 	}
 }
 
+func TestSupervisorBlockedAllowlistPushDoesNotBlockActivationMutex(t *testing.T) {
+	base := newSupervisorBase(t, "A")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSupervisor(ctx, base, io.Discard)
+	s.drainTimeout = 40 * time.Millisecond
+	old := newSupervisorStack(base, "A", &recordingStackTransport{host: "A"})
+	next := newSupervisorStack(base, "B", &recordingStackTransport{host: "B"})
+	s.newStack = func(_ context.Context, host string) (*app.Stack, error) {
+		if host == "A" {
+			return old, nil
+		}
+		return next, nil
+	}
+	pushStarted := make(chan struct{})
+	releasePush := make(chan struct{})
+	s.pushAllowStack = func(*app.Stack, []int) error {
+		close(pushStarted)
+		<-releasePush
+		return nil
+	}
+	if err := s.startInitial(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); s.waitCurrent() }()
+
+	pushed := make(chan error, 1)
+	go func() { pushed <- s.pushAllow([]int{8080}) }()
+	select {
+	case <-pushStarted:
+	case <-time.After(time.Second):
+		t.Fatal("allowlist push did not start")
+	}
+	started := time.Now()
+	err := s.Activate(context.Background(), "B")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		close(releasePush)
+		t.Fatalf("Activate error = %v, want bounded drain deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 120*time.Millisecond {
+		close(releasePush)
+		t.Fatalf("blocked allowlist push held activation mutex for %s", elapsed)
+	}
+	close(releasePush)
+	if err := <-pushed; err != nil {
+		t.Fatalf("pushAllow: %v", err)
+	}
+}
+
 func TestSupervisorTeardownFailureDoesNotStartReplacement(t *testing.T) {
 	for _, tt := range []struct {
 		name      string
@@ -682,6 +736,48 @@ func TestSupervisorShutdownIsBounded(t *testing.T) {
 		t.Fatal("timed-out shutdown published the replacement stack")
 	}
 	close(releaseShutdown)
+}
+
+func TestSupervisorTransportCloseIsBoundedWhenContextIgnored(t *testing.T) {
+	base := newSupervisorBase(t, "A")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSupervisor(ctx, base, io.Discard)
+	s.drainTimeout = 40 * time.Millisecond
+	closeStarted := make(chan struct{})
+	releaseClose := make(chan struct{})
+	old := newSupervisorStack(base, "A", &recordingStackTransport{
+		host: "A", closeStarted: closeStarted, closeGate: releaseClose, closeIgnoresCtx: true,
+	})
+	next := newSupervisorStack(base, "B", &recordingStackTransport{host: "B"})
+	s.newStack = func(_ context.Context, host string) (*app.Stack, error) {
+		if host == "A" {
+			return old, nil
+		}
+		return next, nil
+	}
+	if err := s.startInitial(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); s.waitCurrent() }()
+
+	started := time.Now()
+	err := s.Activate(context.Background(), "B")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		close(releaseClose)
+		t.Fatalf("Activate error = %v, want drain deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 120*time.Millisecond {
+		close(releaseClose)
+		t.Fatalf("context-ignoring transport close blocked activation for %s", elapsed)
+	}
+	select {
+	case <-closeStarted:
+	default:
+		close(releaseClose)
+		t.Fatal("transport close was not attempted")
+	}
+	close(releaseClose)
 }
 
 func TestSupervisorCloseAndJoinShareDrainDeadline(t *testing.T) {

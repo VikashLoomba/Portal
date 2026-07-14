@@ -1,25 +1,48 @@
 import type { IncomingMessage } from "node:http";
 
+const ndjsonLineLimit = 1 << 20;
+
 export async function* ndjsonLines(source: AsyncIterable<unknown>): AsyncGenerator<string> {
   let pending = "";
+  let pendingBytes = 0;
   const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
   for await (const chunk of source) {
-    pending += chunkToText(decoder, chunk);
+    const text = chunkToText(decoder, chunk);
+    let start = 0;
     for (;;) {
-      const newline = pending.indexOf("\n");
+      const newline = text.indexOf("\n", start);
       if (newline < 0) {
         break;
       }
-      const line = pending.slice(0, newline);
-      pending = pending.slice(newline + 1);
+      const tail = text.slice(start, newline);
+      pendingBytes += encoder.encode(tail).byteLength;
+      checkLineSize(pendingBytes);
+      const line = pending + tail;
+      pending = "";
+      pendingBytes = 0;
+      start = newline + 1;
       if (line !== "") {
         yield line;
       }
     }
+    const tail = text.slice(start);
+    pendingBytes += encoder.encode(tail).byteLength;
+    checkLineSize(pendingBytes);
+    pending += tail;
   }
-  pending += decoder.decode();
+  const tail = decoder.decode();
+  pendingBytes += encoder.encode(tail).byteLength;
+  checkLineSize(pendingBytes);
+  pending += tail;
   if (pending !== "") {
     yield pending;
+  }
+}
+
+function checkLineSize(size: number): void {
+  if (size > ndjsonLineLimit) {
+    throw new Error("ndjson: line exceeds 1 MiB limit");
   }
 }
 

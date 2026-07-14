@@ -344,6 +344,23 @@ func TestWaitReadyBecomesReady(t *testing.T) {
 	}
 }
 
+func TestWaitReadyAcceptsAnyHTTPResponse(t *testing.T) {
+	serverResult := make(chan error, 1)
+	path := startSetupStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/version" {
+			serverResult <- fmt.Errorf("request = %s %s, want GET /v1/version", r.Method, r.URL.Path)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		serverResult <- nil
+	}))
+
+	if err := New(path).WaitReady(context.Background(), time.Second); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+	assertSetupServerResult(t, serverResult)
+}
+
 func TestWaitReadyTimeout(t *testing.T) {
 	path := filepath.Join(shortTempDir(t), "nonexistent.sock")
 	start := time.Now()

@@ -200,6 +200,49 @@ func TestHandleStatus_AgentPresent(t *testing.T) {
 	}
 }
 
+func TestBuildStatusUsesOnePinnedStackView(t *testing.T) {
+	pins := 0
+	released := false
+	agent := &fakeAgent{
+		ack:     &protocol.HelloAck{AgentPID: 111, AgentGitSHA: "stack-a"},
+		ports:   []uint16{8080},
+		ok:      true,
+		lastErr: "stack-a-disconnect",
+	}
+	s := New(Deps{
+		Host:   func() (string, error) { return "stack-b", nil },
+		Agent:  &fakeAgent{ack: &protocol.HelloAck{AgentPID: 222}},
+		Master: fakeMaster{pid: 222},
+		Ports:  fakeForwards{lines: []string{"stack-b-forward"}},
+		Config: config.New(t.TempDir()),
+		PinStack: func(context.Context) (StackView, func()) {
+			pins++
+			return StackView{
+				Host:         "stack-a",
+				HostKnown:    true,
+				Agent:        agent,
+				Master:       fakeMaster{pid: 111},
+				Ports:        fakeForwards{lines: []string{"stack-a-forward"}},
+				ReconcileGen: func() uint64 { return 7 },
+			}, func() { released = true }
+		},
+	})
+
+	got := s.buildStatus(context.Background())
+	if pins != 1 || !released {
+		t.Fatalf("stack pins = %d, released=%v, want one released view", pins, released)
+	}
+	if got.Host != "stack-a" || got.Agent == nil || got.Agent.Pid != 111 || got.Master.Pid != 111 {
+		t.Fatalf("status generation fields = %+v, want stack-a", got)
+	}
+	if len(got.Ports) != 1 || got.Ports[0].Port != 8080 || len(got.Forwards) != 1 || got.Forwards[0].Name != "stack-a-forward" {
+		t.Fatalf("status stack collections = %+v/%+v, want stack-a", got.Ports, got.Forwards)
+	}
+	if got.Health.LastDisconnectErr != "stack-a-disconnect" || got.Health.ReconcileCount != 7 {
+		t.Fatalf("status stack health = %+v, want stack-a", got.Health)
+	}
+}
+
 // TestHandleStatus_NativeTransportWireFields pins finding 5 / T9 / EC7: on the
 // production daemon-up status path, the Master.transport and Master.detail JSON
 // fields must carry Describe().Impl and Health.Detail respectively (Pid stays 0

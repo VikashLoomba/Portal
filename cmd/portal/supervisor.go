@@ -73,9 +73,10 @@ type supervisor struct {
 	ref       atomic.Pointer[liveStack]
 	mu        sync.Mutex
 
-	newStack      func(context.Context, string) (*app.Stack, error)
-	shutdownStack func(context.Context, *app.Stack) error
-	drainTimeout  time.Duration
+	newStack       func(context.Context, string) (*app.Stack, error)
+	shutdownStack  func(context.Context, *app.Stack) error
+	pushAllowStack func(*app.Stack, []int) error
+	drainTimeout   time.Duration
 }
 
 func newSupervisor(ctx context.Context, base *app.App, sshStderr io.Writer) *supervisor {
@@ -86,6 +87,9 @@ func newSupervisor(ctx context.Context, base *app.App, sshStderr io.Writer) *sup
 	}
 	s.shutdownStack = func(ctx context.Context, stack *app.Stack) error {
 		return stack.Shutdown(ctx)
+	}
+	s.pushAllowStack = func(stack *app.Stack, allow []int) error {
+		return stack.AgentClient.Subscribe(toU16(app.DenyPorts), toU16(allow), true)
 	}
 	return s
 }
@@ -214,7 +218,17 @@ func (s *supervisor) drain(ctx context.Context, old *liveStack) error {
 		shutdownErr = teardownCtx.Err()
 	}
 	old.cancel()
-	_, closeErr := old.stack.CloseTransport(teardownCtx)
+	closeDone := make(chan error, 1)
+	go func() {
+		_, err := old.stack.CloseTransport(teardownCtx)
+		closeDone <- err
+	}()
+	var closeErr error
+	select {
+	case closeErr = <-closeDone:
+	case <-teardownCtx.Done():
+		closeErr = teardownCtx.Err()
+	}
 	removeErr := old.stack.RemoveSocket()
 	waitErr := s.wait(teardownCtx, old)
 	return errors.Join(
@@ -309,6 +323,112 @@ func (ls *liveStack) bindContext(caller context.Context) (context.Context, conte
 			ls.wg.Done()
 		})
 	}, nil
+}
+
+type pinnedStack struct {
+	base *app.App
+	ls   *liveStack
+	ctx  context.Context
+}
+
+func (s *supervisor) pin(ctx context.Context) (*pinnedStack, func()) {
+	ls, ok := s.serving()
+	if !ok {
+		return nil, func() {}
+	}
+	pctx, release, err := ls.bindContext(ctx)
+	if err != nil {
+		return nil, func() {}
+	}
+	return &pinnedStack{base: s.base, ls: ls, ctx: pctx}, release
+}
+
+func (p *pinnedStack) operationContext(caller context.Context) (context.Context, context.CancelFunc) {
+	return bindStackContext(caller, p.ctx)
+}
+
+func (p *pinnedStack) host() string { return p.ls.stack.Host }
+
+func (p *pinnedStack) HelloAck() *protocol.HelloAck {
+	return p.ls.stack.AgentClient.HelloAck()
+}
+
+func (p *pinnedStack) Snapshot() (uint64, []uint16, bool) {
+	return p.ls.stack.AgentClient.Snapshot()
+}
+
+func (p *pinnedStack) LastDisconnectErr() string {
+	return p.ls.stack.AgentClient.LastDisconnectErr()
+}
+
+func (p *pinnedStack) Health(ctx context.Context) (transport.Health, error) {
+	sctx, cancel := p.operationContext(ctx)
+	defer cancel()
+	return p.ls.stack.Transport.Health(sctx)
+}
+
+func (p *pinnedStack) Describe() transport.Desc {
+	return p.ls.stack.Transport.Describe()
+}
+
+func (p *pinnedStack) ForwardLines(ctx context.Context) ([]string, error) {
+	sctx, cancel := p.operationContext(ctx)
+	defer cancel()
+	return p.ls.stack.PF.ForwardLines(sctx)
+}
+
+func (p *pinnedStack) Stream(ctx context.Context, argv ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+	sctx, cancel := p.operationContext(ctx)
+	stdin, stdout, stderr, wait, err := p.ls.stack.Transport.Stream(sctx, argv...)
+	if err != nil {
+		cancel()
+		return nil, nil, nil, nil, err
+	}
+	if wait == nil {
+		cancel()
+		return stdin, stdout, stderr, nil, nil
+	}
+	var once sync.Once
+	return stdin, stdout, stderr, func() error {
+		defer once.Do(cancel)
+		return wait()
+	}, nil
+}
+
+func (p *pinnedStack) StreamPty(ctx context.Context, req transport.PtyRequest, argv ...string) (transport.PtySession, error) {
+	streamer, ok := p.ls.stack.Transport.(transport.PtyStreamer)
+	if !ok {
+		return nil, errors.New("portal: active transport does not support PTY")
+	}
+	sctx, cancel := p.operationContext(ctx)
+	sess, err := streamer.StreamPty(sctx, req, argv...)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if sess == nil {
+		cancel()
+		return nil, nil
+	}
+	return &supervisorPtySession{PtySession: sess, cancel: cancel}, nil
+}
+
+func (p *pinnedStack) reconciles() uint64 {
+	return p.ls.stack.Engine.Reconciles()
+}
+
+func (p *pinnedStack) doctor(ctx context.Context) *doctor.Report {
+	sctx, cancel := p.operationContext(ctx)
+	defer cancel()
+	sa := *p.base
+	sa.Transport = p.ls.stack.Transport
+	tr, err := doctorTransport(sctx, &sa, p.ls.stack.Host)
+	if err != nil {
+		rep := &doctor.Report{Host: p.ls.stack.Host}
+		rep.Add("transport", doctor.Fail, "transport unavailable: "+err.Error())
+		return rep
+	}
+	return runDoctor(sctx, p.ls.stack.Host, tr)
 }
 
 type supervisorAgent struct{ s *supervisor }
@@ -457,11 +577,18 @@ func (s *supervisor) host() (string, error) {
 
 func (s *supervisor) pushAllow(allow []int) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if ls, ok := s.serving(); ok {
-		return ls.stack.AgentClient.Subscribe(toU16(app.DenyPorts), toU16(allow), true)
+	ls, ok := s.serving()
+	if !ok {
+		s.mu.Unlock()
+		return errNotConfigured
 	}
-	return errNotConfigured
+	_, release, err := ls.bindContext(context.Background())
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	defer release()
+	return s.pushAllowStack(ls.stack, allow)
 }
 
 func (s *supervisor) kick() {

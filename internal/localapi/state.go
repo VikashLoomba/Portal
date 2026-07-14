@@ -62,6 +62,20 @@ type ExecStreamer interface {
 	Describe() transport.Desc
 }
 
+// StackView pins the host-bound dependencies used by one composite request to
+// the same live stack generation. HostKnown distinguishes an unconfigured
+// daemon from focused tests that omit host dependencies entirely.
+type StackView struct {
+	Host         string
+	HostKnown    bool
+	Agent        AgentSource
+	Master       MasterProber
+	Ports        ForwardLister
+	ExecStream   ExecStreamer
+	ReconcileGen func() uint64
+	Doctor       func(context.Context) *doctor.Report
+}
+
 // SetupRunner is one fresh host setup run. Phase implementations own their
 // running, line, and terminal event emissions through the sink passed to
 // Deps.NewSetup.
@@ -74,9 +88,9 @@ type SetupRunner interface {
 }
 
 // Deps is the dependency set for a Server. The interface fields are narrow so
-// tests fake them without constructing an App; Doctor/PushAllow/Kick are
-// closures wired by run.go so localapi never imports package app. FeatureNames
-// defaults to [clip-image, clip-text, notify, exec, cred] when empty.
+// tests fake them without constructing an App; PinStack and the operation
+// closures are wired by run.go so localapi never imports package app.
+// FeatureNames defaults to [clip-image, clip-text, notify, exec, cred] when empty.
 type Deps struct {
 	Version       api.VersionInfo
 	Host          func() (string, error)
@@ -92,6 +106,7 @@ type Deps struct {
 	Kick          func()
 	ReconcileGen  func() uint64
 	Doctor        func(context.Context) *doctor.Report
+	PinStack      func(context.Context) (StackView, func())
 	NewSetup      func(sink func(api.SetupEvent)) SetupRunner
 	Activate      func(context.Context, string) error
 	NormalizeHost func(string) string

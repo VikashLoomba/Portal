@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -19,12 +20,13 @@ import (
 )
 
 type installFakeSetup struct {
-	sink      setup.Sink
-	proceed   bool
-	calls     []string
-	report    *doctor.Report
-	clipWarn  bool
-	missingSS bool
+	sink         setup.Sink
+	proceed      bool
+	calls        []string
+	report       *doctor.Report
+	clipWarn     bool
+	missingSS    bool
+	configureErr error
 }
 
 func (f *installFakeSetup) Validate(_ context.Context, _ string, force bool) bool {
@@ -44,6 +46,10 @@ func (f *installFakeSetup) Validate(_ context.Context, _ string, force bool) boo
 func (f *installFakeSetup) Configure(context.Context, string) error {
 	f.calls = append(f.calls, "configure")
 	f.sink(api.SetupEvent{Step: "configure", Status: "running"})
+	if f.configureErr != nil {
+		f.sink(api.SetupEvent{Step: "configure", Status: "fail", Error: &api.ErrorDetail{Code: "configure_failed", Message: f.configureErr.Error()}})
+		return f.configureErr
+	}
 	f.sink(api.SetupEvent{Step: "configure", Status: "ok"})
 	return nil
 }
@@ -82,6 +88,16 @@ func (installFakeService) Restart(context.Context) error          { return nil }
 func (installFakeService) IsLoaded(context.Context) (bool, error) { return true, nil }
 func (installFakeService) Status(context.Context) (service.Status, error) {
 	return service.Status{Loaded: true}, nil
+}
+
+type recordingInstallService struct {
+	installFakeService
+	installed bool
+}
+
+func (s *recordingInstallService) Install(context.Context) error {
+	s.installed = true
+	return nil
 }
 
 func installTestApp(t *testing.T) *app.App {
@@ -166,6 +182,46 @@ func TestRunInstallMissingSSWarningDoesNotJoinTerminalStatus(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Port discovery may not work.\nok\n") {
 		t.Fatalf("missing-ss output joined warning and status: %q", out.String())
+	}
+}
+
+func TestRunInstallClipboardSuccessOutput(t *testing.T) {
+	fake := &installFakeSetup{proceed: true, report: &doctor.Report{Host: "box"}}
+	useInstallFake(t, fake)
+	var out bytes.Buffer
+	if err := runInstall(context.Background(), &out, strings.NewReader(""), false, installTestApp(t), "box"); err != nil {
+		t.Fatalf("runInstall: %v", err)
+	}
+	want := "installed clipboard shims (xclip/wl-paste) on box\n" +
+		"NOTE: keep your terminal's OSC 52 clipboard-WRITE disabled — a remote\n" +
+		"      could otherwise write your Mac clipboard and read it back.\n"
+	if !strings.Contains(out.String(), want) {
+		t.Fatalf("clipboard success output = %q, want contiguous %q", out.String(), want)
+	}
+}
+
+func TestRunInstallConfigureFailureStopsBeforeInstall(t *testing.T) {
+	boom := errors.New("write host failed")
+	fake := &installFakeSetup{proceed: true, configureErr: boom}
+	useInstallFake(t, fake)
+	a := installTestApp(t)
+	a.Paths.BinPath = filepath.Join(a.Paths.BinDir, "portal-copy")
+	svc := &recordingInstallService{}
+	a.Service = svc
+
+	var out bytes.Buffer
+	err := runInstall(context.Background(), &out, strings.NewReader(""), false, a, "box")
+	if !errors.Is(err, boom) {
+		t.Fatalf("runInstall error = %v, want configure error", err)
+	}
+	if got := strings.Join(fake.calls, ","); got != "validate,configure,close" {
+		t.Fatalf("phase calls = %q, want no deploy or verify", got)
+	}
+	if svc.installed {
+		t.Fatal("service installed after configure failure")
+	}
+	if _, err := os.Stat(a.Paths.BinPath); !os.IsNotExist(err) {
+		t.Fatalf("binary copy stat error = %v, want not-exist", err)
 	}
 }
 

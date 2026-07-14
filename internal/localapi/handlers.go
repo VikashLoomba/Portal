@@ -187,19 +187,16 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 // handleDoctor runs the doctor self-test and returns the structured report as
 // JSON. It passes r.Context() so a client disconnect aborts the ssh probes.
 func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
-	if s.notConfigured() {
+	stack, release := s.stackView(r.Context())
+	defer release()
+	if stack.HostKnown && stack.Host == "" {
 		writeError(w, http.StatusServiceUnavailable, "not_configured", "no active host is configured")
 		return
 	}
-	rep := s.deps.Doctor(r.Context())
-	writeJSON(w, http.StatusOK, rep)
-}
-
-// notConfigured is nil-safe for partial dependency sets used by focused tests.
-func (s *Server) notConfigured() bool {
-	if s.deps.Host == nil {
-		return false
+	doctor := stack.Doctor
+	if doctor == nil {
+		doctor = s.deps.Doctor
 	}
-	host, err := s.deps.Host()
-	return err == nil && host == ""
+	rep := doctor(r.Context())
+	writeJSON(w, http.StatusOK, rep)
 }
