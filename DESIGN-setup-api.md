@@ -196,12 +196,37 @@ owner's destination). The bounded degradation window between 2 and 4 is the acce
 
 ### Seam contract (u2 ↔ u3 ↔ u4)
 
-Pinned here so the units compose without renegotiation: `internal/setup` phases emit
-`api.SetupEvent` values directly into a `Sink func(api.SetupEvent)` — each phase owns its own
-`running`/`line`/terminal emissions and the callers (CLI renderer, API handler) add none.
-`Validate`/`Configure`/`DeployRemote`/`Verify` all take `context.Context` and honor cancellation
-between remote operations. Activation is daemon-side: run.go exposes `Activate(ctx, host) error`
-(u3) and u4 wires it plus the setup runner into `localapi.Deps` closures.
+Pinned here so the units compose without renegotiation — this is the exported surface, by name:
+
+```go
+package setup // internal/setup (u2)
+
+type Sink func(api.SetupEvent)      // phases own ALL running/line/terminal emissions; callers add none
+func NormalizeHost(raw string) string             // resolveInstallHost's all-whitespace strip, moved here
+func New(paths app.Paths, cfg *config.Store, sink Sink) *Runner
+func (r *Runner) Validate(ctx context.Context, host string, force bool) (proceed bool)
+func (r *Runner) Configure(ctx context.Context, host string) error
+func (r *Runner) DeployRemote(ctx context.Context, host string)   // xdg-open → clip-shims → agent-symlink
+func (r *Runner) Verify(ctx context.Context, host string) *doctor.Report
+func (r *Runner) Close(ctx context.Context)       // best-effort setup-transport close + setup-cm.sock unlink
+```
+
+One `Runner` per setup run, bound to one requested host's dedicated setup transport (S7); callers
+create it fresh per request and defer `Close` — reusing a host-bound Runner across requests could
+deploy to a previous host and leak the setup CM socket. Every phase honors ctx cancellation
+between remote operations, and the agent-symlink deploy OBSERVES its result before emitting the
+step's terminal event (install.go's current `2>/dev/null || true` swallow is not carried over).
+Exact unexported internals are u2's to shape; the exported names, one-Runner-per-request
+lifecycle, and phase-owned emission are contract.
+
+Activation is daemon-side (u3): run.go exposes `Activate(ctx context.Context, host string) error`
+where ctx bounds ONLY construction and the old-stack drain — the new stack starts under the
+SUPERVISOR's daemon-lifetime context, never the request's (a client disconnect after a successful
+activation must not undo the live stack). A freshly built stack seeds its AgentClient with the
+current allowlist (`Subscribe(DenyPorts, allow, true)`, preserving today's run.go:49-52 ordering)
+BEFORE `Run`, so a new connect never applies an empty filter. u4 wires the handler: fresh
+`setup.New` per request with deferred `Close`, `NormalizeHost` on the host param, and the
+`Activate` closure.
 
 ---
 
