@@ -1,7 +1,7 @@
 import { request } from "node:http";
 import type { ClientRequest, IncomingMessage } from "node:http";
 
-import type { SetupEvent, SetupRequest } from "./dto.ts";
+import type { ErrorDetail, SetupEvent, SetupRequest } from "./dto.ts";
 import { apiErrorFromStatusBody } from "./http.ts";
 import type { PortalRequestOptions } from "./http.ts";
 import { ndjsonLines, readErrorBody } from "./ndjson.ts";
@@ -64,6 +64,31 @@ function openSetup(socketPath: string, body: string, options: PortalRequestOptio
 }
 
 function parseSetupEventLine(line: string): SetupEvent {
-  // The setup stream is line-delimited local API JSON; dto.ts is the schema boundary.
-  return JSON.parse(line) as SetupEvent;
+  const value: unknown = JSON.parse(line);
+  if (!isSetupEvent(value)) {
+    throw new Error("setup: invalid event payload");
+  }
+  return value;
+}
+
+function isSetupEvent(value: unknown): value is SetupEvent {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  if (!("step" in value) || typeof value.step !== "string") {
+    return false;
+  }
+  if (!("status" in value) || typeof value.status !== "string") {
+    return false;
+  }
+  if ("line" in value && value.line !== undefined && typeof value.line !== "string") {
+    return false;
+  }
+  return !("error" in value && value.error !== undefined && !isErrorDetail(value.error));
+}
+
+function isErrorDetail(value: unknown): value is ErrorDetail {
+  return typeof value === "object" && value !== null &&
+    "code" in value && typeof value.code === "string" &&
+    "message" in value && typeof value.message === "string";
 }

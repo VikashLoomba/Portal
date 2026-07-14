@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -118,25 +119,29 @@ func TestRunInstallOutputRegression(t *testing.T) {
 	}
 	useInstallFake(t, fake)
 
+	a := installTestApp(t)
 	var out bytes.Buffer
-	if err := runInstall(context.Background(), &out, strings.NewReader(""), false, installTestApp(t), " user @box "); err != nil {
+	if err := runInstall(context.Background(), &out, strings.NewReader(""), false, a, " user @box "); err != nil {
 		t.Fatalf("runInstall: %v", err)
 	}
-	wants := []string{
-		"checking ssh to user@box ...",
-		"ok",
-		"configured dev box: user@box",
-		"service loaded and started",
-		"installed xdg-open wrapper on user@box",
-		"WARNING: could not install clipboard shims on user@box: shim denied",
-		"clipboard paste into coding agents will NOT work until this succeeds",
-		"is not on your PATH",
-		"running self-test (portal doctor) ...",
-		"portal doctor — user@box",
-		"RESULT: PASS",
-		"try:  portal status",
+	want := fmt.Sprintf("checking ssh to user@box ...\n"+
+		"ok\n"+
+		"configured dev box: user@box  (saved to %s)\n"+
+		"service loaded and started (%s)\n"+
+		"installed xdg-open wrapper on user@box\n"+
+		"WARNING: could not install clipboard shims on user@box: shim denied\n"+
+		"         clipboard paste into coding agents will NOT work until this succeeds.\n"+
+		"         fix the cause above and re-run: portal install user@box\n"+
+		"NOTE: %s is not on your PATH. Add it to your shell profile:\n"+
+		"      export PATH=\"$HOME/.local/bin:$PATH\"\n"+
+		"\nrunning self-test (portal doctor) ...\n"+
+		"portal doctor — user@box\n"+
+		"  [PASS] ssh master: UP (pid=1)\n"+
+		"\nRESULT: PASS — clipboard paste should work over plain ssh.\n"+
+		"\ntry:  portal status\n", a.Paths.HostFile, a.Paths.Label, a.Paths.BinDir)
+	if got := out.String(); got != want {
+		t.Fatalf("install output mismatch:\n--- got ---\n%s--- want ---\n%s", got, want)
 	}
-	assertTextInOrder(t, out.String(), wants...)
 	if got := strings.Join(fake.calls, ","); got != "validate,configure,deploy,verify,close" {
 		t.Fatalf("phase calls = %q", got)
 	}
@@ -202,17 +207,5 @@ func TestInstallCommandUsesTTYSeam(t *testing.T) {
 	err := cmd.ExecuteContext(context.Background())
 	if err == nil || err.Error() != "ssh validation failed for box" {
 		t.Fatalf("command error = %v", err)
-	}
-}
-
-func assertTextInOrder(t *testing.T, text string, wants ...string) {
-	t.Helper()
-	pos := 0
-	for _, want := range wants {
-		i := strings.Index(text[pos:], want)
-		if i < 0 {
-			t.Fatalf("output missing %q after byte %d:\n%s", want, pos, text)
-		}
-		pos += i + len(want)
 	}
 }

@@ -25,6 +25,7 @@ import (
 type fakeSetupBehavior struct {
 	validationFails bool
 	configureErr    error
+	panicConfigure  bool
 	concurrentLines bool
 	blockValidate   bool
 	releaseValidate <-chan struct{}
@@ -111,6 +112,9 @@ func (r *fakeSetupRunner) Configure(_ context.Context, host string) error {
 	r.configureHost = host
 	r.mu.Unlock()
 	r.sink(api.SetupEvent{Step: "configure", Status: "running"})
+	if r.behavior.panicConfigure {
+		panic("configure exploded")
+	}
 	if r.behavior.configureErr != nil {
 		r.sink(api.SetupEvent{
 			Step:   "configure",
@@ -194,6 +198,15 @@ func waitSetupRunner(t *testing.T, f *fakeSetupFactory) *fakeSetupRunner {
 	}
 	t.Fatal("setup runner was not constructed")
 	return nil
+}
+
+func assertSetupRunnerClosed(t *testing.T, r *fakeSetupRunner) {
+	t.Helper()
+	select {
+	case <-r.closed:
+	default:
+		t.Fatal("setup runner was not closed")
+	}
 }
 
 type fakeSetupActivator struct {
@@ -418,6 +431,7 @@ func TestHandleSetupInBandFailuresAndForce(t *testing.T) {
 		if len(act.calls()) != 0 {
 			t.Fatalf("Activate called after configure failure: %v", act.calls())
 		}
+		assertSetupRunnerClosed(t, f.last())
 	})
 
 	t.Run("validate fail without force stops before configure", func(t *testing.T) {
@@ -433,6 +447,7 @@ func TestHandleSetupInBandFailuresAndForce(t *testing.T) {
 		if configure != "" || len(act.calls()) != 0 {
 			t.Fatalf("configure=%q activate=%v after validate failure", configure, act.calls())
 		}
+		assertSetupRunnerClosed(t, f.last())
 	})
 
 	t.Run("force degrades validation failure and continues", func(t *testing.T) {
@@ -480,7 +495,24 @@ func TestHandleSetupInBandFailuresAndForce(t *testing.T) {
 		if findSetupEvent(events, "doctor", "running") != nil {
 			t.Fatalf("doctor ran after activate failure: %+v", events)
 		}
+		assertSetupRunnerClosed(t, f.last())
 	})
+}
+
+func TestHandleSetupPanicAfterHeadersIsInBand(t *testing.T) {
+	f := &fakeSetupFactory{behavior: fakeSetupBehavior{panicConfigure: true}}
+	act := &fakeSetupActivator{}
+	_, path := newSetupTestServer(t, "old", f, act, audit.New(t.TempDir()))
+
+	resp, events := postSetup(t, path, `{"host":"box"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want committed 200", resp.StatusCode)
+	}
+	assertSetupGrammar(t, events, []string{"validate", "configure"}, "fail")
+	if ev := findSetupEvent(events, "configure", "fail"); ev == nil || ev.Error == nil || ev.Error.Code != "internal" {
+		t.Fatalf("configure panic event = %+v, want in-band internal failure", ev)
+	}
+	assertSetupRunnerClosed(t, f.last())
 }
 
 func TestHandleSetupSingleFlightBeforeDecode(t *testing.T) {
@@ -648,6 +680,8 @@ func TestHandleSetupPreStreamValidation(t *testing.T) {
 		{name: "null body", body: "null", host: "box", want: http.StatusBadRequest},
 		{name: "scalar body", body: `"box"`, host: "box", want: http.StatusBadRequest},
 		{name: "array body", body: `[]`, host: "box", want: http.StatusBadRequest},
+		{name: "null host", body: `{"host":null}`, host: "box", want: http.StatusBadRequest},
+		{name: "null force", body: `{"force":null}`, host: "box", want: http.StatusBadRequest},
 		{name: "trailing second value", body: `{"host":"box"}{}`, host: "box", want: http.StatusBadRequest},
 		{name: "trailing bracket", body: `{"host":"box"}]`, host: "box", want: http.StatusBadRequest},
 		{name: "trailing brace", body: `{"host":"box"}}`, host: "box", want: http.StatusBadRequest},

@@ -102,6 +102,11 @@ func (r *Runner) setupTransport(ctx context.Context, host string) (transport.Tra
 	if r.tr != nil {
 		return r.tr, r.transportErr
 	}
+	// A live system-ssh master does not verify that an existing ControlPath
+	// belongs to host, so no setup run may inherit a prior run's socket.
+	if err := os.Remove(r.setupSock); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
 	tr, err := r.newTransport(ctx, host)
 	if err != nil {
 		return nil, err
@@ -156,9 +161,10 @@ func (r *Runner) Validate(ctx context.Context, host string, force bool) bool {
 		}
 		r.emit(api.SetupEvent{
 			Step:   "validate",
-			Status: "warn",
+			Status: "running",
 			Line:   "WARNING: '" + host + "' is reachable but has no 'ss' command — is it Linux? Port discovery may not work.",
 		})
+		r.emit(api.SetupEvent{Step: "validate", Status: "warn"})
 		return true
 	}
 	r.emit(api.SetupEvent{Step: "validate", Status: "ok"})

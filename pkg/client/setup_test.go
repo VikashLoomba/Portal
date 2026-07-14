@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -90,7 +91,7 @@ func TestSetupInBandFail(t *testing.T) {
 			{
 				Step:   "validate",
 				Status: "fail",
-				Error:  &api.ErrorDetail{Code: "validate_failed", Message: "ssh unreachable"},
+				Error:  &api.ErrorDetail{Code: "validation_failed", Message: "ssh unreachable"},
 			},
 			{Step: "done", Status: "fail"},
 		})
@@ -110,11 +111,34 @@ func TestSetupInBandFail(t *testing.T) {
 	if len(events) != 3 {
 		t.Fatalf("event count = %d, want 3", len(events))
 	}
-	if fail := events[1]; fail.Status != "fail" || fail.Error == nil || fail.Error.Code != "validate_failed" {
-		t.Fatalf("failure event = %+v, want validate_failed detail", fail)
+	if fail := events[1]; fail.Status != "fail" || fail.Error == nil || fail.Error.Code != "validation_failed" {
+		t.Fatalf("failure event = %+v, want validation_failed detail", fail)
 	}
 	if done := events[2]; done.Step != "done" || done.Status != "fail" {
 		t.Fatalf("terminal event = %+v, want done/fail", done)
+	}
+}
+
+func TestSetupSkipsBlankNDJSONLines(t *testing.T) {
+	path := startSetupStub(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "\n{\"step\":\"validate\",\"status\":\"running\"}\n\n{\"step\":\"done\",\"status\":\"ok\"}\n\n")
+	}))
+
+	seq, err := New(path).Setup(context.Background(), api.SetupRequest{Host: "box"})
+	if err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	var events []api.SetupEvent
+	for ev, err := range seq {
+		if err != nil {
+			t.Fatalf("blank line surfaced as iterator error: %v", err)
+		}
+		events = append(events, ev)
+	}
+	if len(events) != 2 || events[0].Step != "validate" || events[1].Step != "done" {
+		t.Fatalf("events = %+v, want validate and done", events)
 	}
 }
 

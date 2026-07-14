@@ -150,6 +150,12 @@ func TestValidateEventsAndForce(t *testing.T) {
 					t.Fatalf("stderr relay events = %#v", got)
 				}
 			}
+			if tt.name == "missing ss" {
+				assertEventStatuses(t, got, "validate:running", "validate:running", "validate:warn")
+				if got[1].Line == "" || got[2].Line != "" {
+					t.Fatalf("missing-ss events = %#v, want distinct line and terminal", got)
+				}
+			}
 		})
 	}
 }
@@ -199,6 +205,9 @@ func TestDeployAndVerifyOrderCachesEstablishedTransport(t *testing.T) {
 	}
 
 	r.DeployRemote(context.Background(), "box")
+	firstDeployCalls := append([]string(nil), tr.calls...)
+	r.DeployRemote(context.Background(), "box")
+	secondDeployCalls := append([]string(nil), tr.calls[len(firstDeployCalls):]...)
 	rep := r.Verify(context.Background(), "box")
 	if !doctorCalled || rep.OK() {
 		t.Fatalf("Verify report = %#v, doctorCalled=%v", rep, doctorCalled)
@@ -212,11 +221,48 @@ func TestDeployAndVerifyOrderCachesEstablishedTransport(t *testing.T) {
 	if got := countCall(tr.calls, "doctor"); got != 1 {
 		t.Fatalf("doctor calls = %d, want 1", got)
 	}
-	assertTerminalStepOrder(t, *events, "xdg-open", "clip-shims", "agent-symlink", "doctor")
+	wantExec := []string{
+		"xdg-env", "xdg-source", "xdg-backup", "xdg-wrapper", "xdg-verify",
+		"clip-probe", "notify-hook", "notify-settings", "early-path", "path", "askpass", "agent-symlink",
+	}
+	if got := labelDeployExecCalls(t, firstDeployCalls); strings.Join(got, ",") != strings.Join(wantExec, ",") {
+		t.Fatalf("first deploy Exec sequence = %v, want %v", got, wantExec)
+	}
+	if got := labelDeployExecCalls(t, secondDeployCalls); strings.Join(got, ",") != strings.Join(wantExec, ",") {
+		t.Fatalf("idempotent deploy Exec sequence = %v, want %v", got, wantExec)
+	}
+	assertTerminalStepOrder(t, *events,
+		"xdg-open", "clip-shims", "agent-symlink",
+		"xdg-open", "clip-shims", "agent-symlink", "doctor")
 	doctorEvent := (*events)[len(*events)-1]
 	var decoded doctor.Report
 	if err := json.Unmarshal(doctorEvent.Report, &decoded); err != nil || decoded.Host != "box" {
 		t.Fatalf("doctor event report = %s, %v", doctorEvent.Report, err)
+	}
+}
+
+func TestDeployStepFailuresWarnAndContinue(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		match      string
+		failedStep string
+	}{
+		{name: "xdg-open", match: "cat > ~/.config/portal/env.sh", failedStep: "xdg-open"},
+		{name: "clip-shims", match: "portal PATH early", failedStep: "clip-shims"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r, tr, events := testRunner(t)
+			tr.err = map[string]error{tt.match: errors.New("permission denied")}
+			r.DeployRemote(context.Background(), "box")
+			assertTerminalStepOrder(t, *events, "xdg-open", "clip-shims", "agent-symlink")
+			terminal := terminalSetupEvent(*events, tt.failedStep)
+			if terminal == nil || terminal.Status != "warn" || terminal.Error == nil {
+				t.Fatalf("%s terminal = %#v, want warn with error", tt.failedStep, terminal)
+			}
+			if agent := terminalSetupEvent(*events, "agent-symlink"); agent == nil || agent.Status != "ok" {
+				t.Fatalf("agent-symlink terminal after %s failure = %#v, want ok", tt.failedStep, agent)
+			}
+		})
 	}
 }
 
@@ -349,6 +395,28 @@ func TestDedicatedSocketAndCloseAreIdempotent(t *testing.T) {
 	}
 }
 
+func TestSetupTransportRemovesStaleSocketBeforeConstruction(t *testing.T) {
+	r, tr, _ := testRunner(t)
+	if err := os.MkdirAll(filepath.Dir(r.setupSock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(r.setupSock, []byte("stale host-A socket"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	constructed := false
+	r.newTransport = func(context.Context, string) (transport.Transport, error) {
+		if _, err := os.Stat(r.setupSock); !os.IsNotExist(err) {
+			t.Fatalf("stale setup socket still exists during transport construction: %v", err)
+		}
+		constructed = true
+		return tr, nil
+	}
+	r.DeployRemote(context.Background(), "box")
+	if !constructed {
+		t.Fatal("setup transport was not constructed")
+	}
+}
+
 func assertEventStatuses(t *testing.T, events []api.SetupEvent, want ...string) {
 	t.Helper()
 	got := make([]string, len(events))
@@ -391,4 +459,54 @@ func countCallPrefix(calls []string, prefix string) int {
 		}
 	}
 	return n
+}
+
+func terminalSetupEvent(events []api.SetupEvent, step string) *api.SetupEvent {
+	for i := range events {
+		if events[i].Step == step && events[i].Status != "running" {
+			return &events[i]
+		}
+	}
+	return nil
+}
+
+func labelDeployExecCalls(t *testing.T, calls []string) []string {
+	t.Helper()
+	var labels []string
+	for _, call := range calls {
+		if !strings.HasPrefix(call, "exec:") {
+			continue
+		}
+		label := ""
+		switch {
+		case strings.Contains(call, "cat > ~/.config/portal/env.sh"):
+			label = "xdg-env"
+		case strings.Contains(call, "portal/env.sh"):
+			label = "xdg-source"
+		case strings.Contains(call, "xdg-open.portal-backup"):
+			label = "xdg-backup"
+		case strings.Contains(call, "xdg-open.portal.tmp"):
+			label = "xdg-wrapper"
+		case strings.Contains(call, "echo current || echo stale"):
+			label = "clip-probe"
+		case strings.Contains(call, "grep -qF \"Installed by portal\" ~/.local/bin/xdg-open"):
+			label = "xdg-verify"
+		case strings.Contains(call, "portal-notify-hook.portal.tmp"):
+			label = "notify-hook"
+		case strings.Contains(call, ".claude/settings.json"):
+			label = "notify-settings"
+		case strings.Contains(call, "portal PATH early"):
+			label = "early-path"
+		case strings.Contains(call, "portal PATH (clip shims)"):
+			label = "path"
+		case strings.Contains(call, "portal askpass (sudo)"):
+			label = "askpass"
+		case strings.Contains(call, "ln -sf"):
+			label = "agent-symlink"
+		default:
+			t.Fatalf("unrecognized deploy Exec call: %s", call)
+		}
+		labels = append(labels, label)
+	}
+	return labels
 }

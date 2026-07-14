@@ -154,7 +154,11 @@ func deployedShimVersion(ctx context.Context, tr transport.Transport) (version s
 	if v == "" {
 		return "", false
 	}
-	v = strings.FieldsFunc(v, func(r rune) bool { return r == ' ' || r == '.' || r == '\t' })[0]
+	fields := strings.FieldsFunc(v, func(r rune) bool { return r == ' ' || r == '.' || r == '\t' })
+	if len(fields) == 0 {
+		return "", false
+	}
+	v = fields[0]
 	if v == "" {
 		return "", false
 	}

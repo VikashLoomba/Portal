@@ -64,6 +64,7 @@ type recordingStackTransport struct {
 	log          *callLog
 	closeStarted chan struct{}
 	closeGate    <-chan struct{}
+	closeErr     error
 	workCheck    func()
 	closeOnce    sync.Once
 }
@@ -113,7 +114,7 @@ func (t *recordingStackTransport) Close(ctx context.Context) (bool, error) {
 			return false, ctx.Err()
 		}
 	}
-	return true, nil
+	return t.closeErr == nil, t.closeErr
 }
 
 func (t *recordingStackTransport) Describe() transport.Desc {
@@ -326,6 +327,10 @@ func TestSupervisorDrainRejectsWorkAndPreservesPtyCapability(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { cancel(); s.waitCurrent() }()
+	captured, ok := s.serving()
+	if !ok {
+		t.Fatal("old stack was not serving before activation")
+	}
 
 	done := make(chan error, 1)
 	go func() { done <- s.Activate(context.Background(), "B") }()
@@ -343,6 +348,9 @@ func TestSupervisorDrainRejectsWorkAndPreservesPtyCapability(t *testing.T) {
 	}
 	if _, _, _, _, err := execAdapter.Stream(context.Background(), "true"); !errors.Is(err, errNotConfigured) {
 		t.Fatalf("Stream during drain error = %v, want not-configured sentinel", err)
+	}
+	if _, _, err := captured.bindContext(context.Background()); !errors.Is(err, errNotConfigured) {
+		t.Fatalf("captured old stack bind error = %v, want not-configured sentinel", err)
 	}
 	if rep := s.doctor(context.Background()); rep.OK() {
 		t.Fatalf("doctor during drain = %+v, want not-configured failure", rep)
@@ -392,6 +400,109 @@ func TestSupervisorCancelKillsInflightExec(t *testing.T) {
 	}
 }
 
+func TestBindStackContextStartsCanceledWithDeadStack(t *testing.T) {
+	stackCtx, stopStack := context.WithCancel(context.Background())
+	stopStack()
+	ctx, cancel := bindStackContext(context.Background(), stackCtx)
+	defer cancel()
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("bound context error = %v, want synchronous cancellation", ctx.Err())
+	}
+}
+
+func TestSupervisorAllowlistPushWaitsForActivationStartup(t *testing.T) {
+	base := newSupervisorBase(t, "A")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSupervisor(ctx, base, io.Discard)
+	gate := make(chan struct{})
+	closeStarted := make(chan struct{})
+	old := newSupervisorStack(base, "A", &recordingStackTransport{host: "A", closeStarted: closeStarted, closeGate: gate})
+	next := newSupervisorStack(base, "B", &recordingStackTransport{host: "B"})
+	s.newStack = func(_ context.Context, host string) (*app.Stack, error) {
+		if host == "A" {
+			return old, nil
+		}
+		return next, nil
+	}
+	if err := s.startInitial(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); s.waitCurrent() }()
+
+	activated := make(chan error, 1)
+	go func() { activated <- s.Activate(context.Background(), "B") }()
+	select {
+	case <-closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("activation did not enter drain")
+	}
+	pushed := make(chan error, 1)
+	go func() { pushed <- s.pushAllow([]int{8080}) }()
+	select {
+	case err := <-pushed:
+		t.Fatalf("allowlist push returned during activation: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(gate)
+	if err := <-activated; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-pushed; err != nil {
+		t.Fatalf("allowlist push after activation: %v", err)
+	}
+}
+
+func TestSupervisorTeardownFailureDoesNotStartReplacement(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		closeErr  error
+		socketDir bool
+	}{
+		{name: "transport close", closeErr: errors.New("close failed")},
+		{name: "socket removal", socketDir: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			base := newSupervisorBase(t, "A")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			s := newSupervisor(ctx, base, io.Discard)
+			log := &callLog{}
+			old := newSupervisorStack(base, "A", &recordingStackTransport{host: "A", log: log, closeErr: tt.closeErr})
+			next := newSupervisorStack(base, "B", &recordingStackTransport{host: "B", log: log})
+			s.newStack = func(_ context.Context, host string) (*app.Stack, error) {
+				if host == "A" {
+					return old, nil
+				}
+				return next, nil
+			}
+			if err := s.startInitial(ctx, "A"); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { cancel(); s.waitCurrent() }()
+			waitForCall(t, log, "A.ensure")
+			log.reset()
+			if tt.socketDir {
+				if err := os.MkdirAll(filepath.Join(base.Paths.Sock, "child"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := s.Activate(context.Background(), "B"); err == nil {
+				t.Fatal("Activate succeeded despite teardown failure")
+			}
+			if s.current().stack != old {
+				t.Fatal("teardown failure published the replacement stack")
+			}
+			for _, call := range log.snapshot() {
+				if strings.HasPrefix(call, "B.") {
+					t.Fatalf("replacement work started after teardown failure: %v", log.snapshot())
+				}
+			}
+		})
+	}
+}
+
 func TestSupervisorDrainJoinIsBounded(t *testing.T) {
 	base := newSupervisorBase(t, "A")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -418,12 +529,55 @@ func TestSupervisorDrainJoinIsBounded(t *testing.T) {
 		<-stuck
 	}()
 	started := time.Now()
-	if err := s.Activate(context.Background(), "B"); err != nil {
+	err := s.Activate(context.Background(), "B")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Activate error = %v, want drain deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 120*time.Millisecond {
+		t.Fatalf("activation used more than one 40ms drain budget: %s", elapsed)
+	}
+	if s.current().stack != old {
+		t.Fatal("timed-out drain published the replacement stack")
+	}
+	close(stuck)
+}
+
+func TestSupervisorCloseAndJoinShareDrainDeadline(t *testing.T) {
+	base := newSupervisorBase(t, "A")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSupervisor(ctx, base, io.Discard)
+	s.drainTimeout = 80 * time.Millisecond
+	closeGate := make(chan struct{})
+	old := newSupervisorStack(base, "A", &recordingStackTransport{host: "A", closeGate: closeGate})
+	next := newSupervisorStack(base, "B", &recordingStackTransport{host: "B"})
+	s.newStack = func(_ context.Context, host string) (*app.Stack, error) {
+		if host == "A" {
+			return old, nil
+		}
+		return next, nil
+	}
+	if err := s.startInitial(ctx, "A"); err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-		t.Fatalf("activation blocked %s on an undrained goroutine", elapsed)
+	defer func() { cancel(); s.waitCurrent() }()
+	stuck := make(chan struct{})
+	ls := s.current()
+	ls.wg.Add(1)
+	go func() {
+		defer ls.wg.Done()
+		<-stuck
+	}()
+
+	started := time.Now()
+	err := s.Activate(context.Background(), "B")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Activate error = %v, want drain deadline", err)
 	}
+	if elapsed := time.Since(started); elapsed > 140*time.Millisecond {
+		t.Fatalf("close plus join exceeded one 80ms budget: %s", elapsed)
+	}
+	close(closeGate)
 	close(stuck)
 }
 

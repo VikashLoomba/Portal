@@ -43,6 +43,9 @@ func (c *Client) Setup(ctx context.Context, req api.SetupRequest) (iter.Seq2[api
 		sc := bufio.NewScanner(resp.Body)
 		sc.Buffer(make([]byte, 0, 64*1024), eventsBufCap)
 		for sc.Scan() {
+			if len(sc.Bytes()) == 0 {
+				continue
+			}
 			var ev api.SetupEvent
 			if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
 				yield(api.SetupEvent{}, err)

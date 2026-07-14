@@ -63,7 +63,7 @@ test("setup yields an in-band configure failure without throwing", async (t) => 
 test("setup sends force and yields validate warn followed by done ok", async (t) => {
   const expected: SetupEvent[] = [
     { step: "validate", status: "running" },
-    { step: "validate", status: "warn", error: { code: "validate_failed", message: "ssh unreachable" } },
+    { step: "validate", status: "warn", error: { code: "validation_failed", message: "ssh unreachable" } },
     ...successfulTail,
   ];
   const fake = await FakeHttpServer.start(t, async (req, resp) => {

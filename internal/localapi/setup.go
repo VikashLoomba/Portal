@@ -1,6 +1,7 @@
 package localapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,8 +25,8 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	defer s.setupInFlight.Store(false)
 
 	dec := json.NewDecoder(r.Body)
-	var reqp *api.SetupRequest
-	if err := dec.Decode(&reqp); err != nil || reqp == nil {
+	var fields map[string]json.RawMessage
+	if err := dec.Decode(&fields); err != nil || fields == nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "request body must contain one JSON object")
 		return
 	}
@@ -33,7 +34,19 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "request body must contain one JSON object")
 		return
 	}
-	req := *reqp
+	var req api.SetupRequest
+	if raw, ok := fields["host"]; ok {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || json.Unmarshal(raw, &req.Host) != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "host must be a string")
+			return
+		}
+	}
+	if raw, ok := fields["force"]; ok {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || json.Unmarshal(raw, &req.Force) != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "force must be a boolean")
+			return
+		}
+	}
 
 	oldHost, _ := s.deps.Host()
 	host := s.deps.NormalizeHost(req.Host)
@@ -54,6 +67,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	failed := false
 	aborted := false
 	activation := ""
+	states := make(map[string]string)
 
 	defer func() {
 		sinkMu.Lock()
@@ -87,6 +101,9 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		sinkMu.Lock()
 		defer sinkMu.Unlock()
 
+		if ev.Step != "done" && ev.Line == "" {
+			states[ev.Step] = ev.Status
+		}
 		if ev.Step != "done" && isSetupTerminal(ev.Status) {
 			summary = append(summary, ev.Step+"="+ev.Status)
 		}
@@ -99,20 +116,52 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	runner := s.deps.NewSetup(sink)
-	defer func() {
-		closeCtx, closeCancel := context.WithTimeout(context.Background(), setupCloseTimeout)
-		defer closeCancel()
-		runner.Close(closeCtx)
-	}()
-
+	finished := false
 	finish := func() {
+		if finished {
+			return
+		}
+		finished = true
 		status := "ok"
 		if failed {
 			status = "fail"
 		}
 		sink(api.SetupEvent{Step: "done", Status: status})
 	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			s.log.Error("localapi setup panic", "err", rec)
+			failed = true
+			if finished {
+				return
+			}
+			for _, step := range []string{"validate", "configure", "xdg-open", "clip-shims", "agent-symlink", "activate", "doctor"} {
+				sinkMu.Lock()
+				state := states[step]
+				sinkMu.Unlock()
+				if isSetupTerminal(state) {
+					continue
+				}
+				if state != "running" {
+					sink(api.SetupEvent{Step: step, Status: "running"})
+				}
+				sink(api.SetupEvent{
+					Step:   step,
+					Status: "fail",
+					Error:  &api.ErrorDetail{Code: "internal", Message: "internal server error"},
+				})
+				break
+			}
+			finish()
+		}
+	}()
+
+	runner := s.deps.NewSetup(sink)
+	defer func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), setupCloseTimeout)
+		defer closeCancel()
+		runner.Close(closeCtx)
+	}()
 	canceled := func() bool {
 		if ctx.Err() == nil {
 			return false

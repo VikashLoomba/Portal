@@ -2,8 +2,9 @@ import type { IncomingMessage } from "node:http";
 
 export async function* ndjsonLines(source: AsyncIterable<unknown>): AsyncGenerator<string> {
   let pending = "";
+  const decoder = new TextDecoder();
   for await (const chunk of source) {
-    pending += chunkToText(chunk);
+    pending += chunkToText(decoder, chunk);
     for (;;) {
       const newline = pending.indexOf("\n");
       if (newline < 0) {
@@ -16,6 +17,7 @@ export async function* ndjsonLines(source: AsyncIterable<unknown>): AsyncGenerat
       }
     }
   }
+  pending += decoder.decode();
   if (pending !== "") {
     yield pending;
   }
@@ -39,12 +41,12 @@ export function readErrorBody(resp: IncomingMessage, limit: number): Promise<str
   });
 }
 
-function chunkToText(chunk: unknown): string {
+function chunkToText(decoder: TextDecoder, chunk: unknown): string {
   if (typeof chunk === "string") {
-    return chunk;
+    return decoder.decode() + chunk;
   }
   if (chunk instanceof Uint8Array) {
-    return Buffer.from(chunk).toString("utf8");
+    return decoder.decode(chunk, { stream: true });
   }
   throw new Error("ndjson: response chunk is not bytes");
 }

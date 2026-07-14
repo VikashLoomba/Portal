@@ -128,7 +128,7 @@ func (p promptOnlyKeychain) Delete(context.Context, string) error {
 // runCredHandler drains the dedicated credential channel and delegates to the
 // injectable handler loop. Production constructs one prompter, Keychain Store,
 // and cooldown map for the lifetime of this daemon run.
-func runCredHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a *app.App, wg *sync.WaitGroup) {
+func runCredHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a *app.App, wg goroutineTracker) {
 	logLine := func(line string) {
 		if a.Log != nil {
 			a.Log.Logf("%s", line)
@@ -154,7 +154,7 @@ func runCredHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a *a
 }
 
 func runCredHandlerWithDeps(ctx context.Context, ch <-chan agentclient.EngineEvent,
-	deps credServeDeps, send credResponseSender, wg *sync.WaitGroup) {
+	deps credServeDeps, send credResponseSender, wg goroutineTracker) {
 
 	sem := make(chan struct{}, 1)
 	for {

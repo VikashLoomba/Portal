@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -23,10 +24,47 @@ type liveStack struct {
 	stack  *app.Stack
 	ctx    context.Context
 	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	wg     lifecycleGroup
 
 	mu       sync.Mutex
 	draining bool
+}
+
+// lifecycleGroup exposes completion without creating an uncancelable waiter
+// goroutine for every bounded drain attempt.
+type lifecycleGroup struct {
+	mu     sync.Mutex
+	active int
+	done   chan struct{}
+}
+
+func (g *lifecycleGroup) Add(delta int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	next := g.active + delta
+	if next < 0 {
+		panic("portal: negative lifecycle group count")
+	}
+	if g.active == 0 && next > 0 {
+		g.done = make(chan struct{})
+	}
+	wasActive := g.active > 0
+	g.active = next
+	if wasActive && next == 0 {
+		close(g.done)
+	}
+}
+
+func (g *lifecycleGroup) Done() { g.Add(-1) }
+
+func (g *lifecycleGroup) DoneChan() <-chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.done == nil {
+		g.done = make(chan struct{})
+		close(g.done)
+	}
+	return g.done
 }
 
 type supervisor struct {
@@ -138,7 +176,9 @@ func (s *supervisor) Activate(ctx context.Context, host string) error {
 		old.mu.Lock()
 		old.draining = true
 		old.mu.Unlock()
-		s.drain(old)
+		if err := s.drain(ctx, old); err != nil {
+			return err
+		}
 	}
 
 	ls := s.newLiveStack(ns)
@@ -150,57 +190,106 @@ func (s *supervisor) Activate(ctx context.Context, host string) error {
 	return nil
 }
 
-func (s *supervisor) drain(old *liveStack) {
+func (s *supervisor) drain(ctx context.Context, old *liveStack) error {
 	timeout := s.drainTimeout
 	if timeout <= 0 {
 		timeout = stackDrainTimeout
 	}
-	teardownCtx, teardownCancel := context.WithTimeout(context.Background(), timeout)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	teardownCtx, teardownCancel := context.WithTimeout(ctx, timeout)
 	defer teardownCancel()
 
 	_ = old.stack.Shutdown(teardownCtx)
 	old.cancel()
-	_, _ = old.stack.CloseTransport(teardownCtx)
-	_ = old.stack.RemoveSocket()
-	s.wait(old, timeout)
+	_, closeErr := old.stack.CloseTransport(teardownCtx)
+	removeErr := old.stack.RemoveSocket()
+	waitErr := s.wait(teardownCtx, old)
+	return errors.Join(
+		wrapDrainError("close old transport", closeErr),
+		wrapDrainError("remove old control socket", removeErr),
+		wrapDrainError("wait for old stack", waitErr),
+	)
 }
 
-func (s *supervisor) wait(ls *liveStack, timeout time.Duration) {
-	if timeout <= 0 {
-		timeout = stackDrainTimeout
+func wrapDrainError(action string, err error) error {
+	if err == nil {
+		return nil
 	}
-	done := make(chan struct{})
-	go func() {
-		ls.wg.Wait()
-		close(done)
-	}()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
+	return fmt.Errorf("%s: %w", action, err)
+}
+
+func (s *supervisor) wait(ctx context.Context, ls *liveStack) error {
 	select {
-	case <-done:
-	case <-timer.C:
+	case <-ls.wg.DoneChan():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
 func (s *supervisor) waitCurrent() {
 	if ls := s.current(); ls != nil {
-		s.wait(ls, s.drainTimeout)
+		timeout := s.drainTimeout
+		if timeout <= 0 {
+			timeout = stackDrainTimeout
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		_ = s.wait(ctx, ls)
 	}
 }
 
 func bindStackContext(caller, stack context.Context) (context.Context, context.CancelFunc) {
-	if caller == nil {
-		caller = context.Background()
+	if stack == nil {
+		stack = context.Background()
 	}
-	ctx, cancel := context.WithCancel(caller)
-	go func() {
-		select {
-		case <-stack.Done():
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-	return ctx, cancel
+	// The stack must be the direct parent so cancellation is visible before a
+	// stale request can reach a replacement master's shared ControlPath.
+	ctx, cancel := context.WithCancel(stack)
+	if caller == nil {
+		return ctx, cancel
+	}
+	stop := context.AfterFunc(caller, cancel)
+	if caller.Err() != nil {
+		cancel()
+	}
+	return stackBoundContext{Context: ctx, caller: caller}, func() {
+		stop()
+		cancel()
+	}
+}
+
+type stackBoundContext struct {
+	context.Context
+	caller context.Context
+}
+
+func (c stackBoundContext) Deadline() (time.Time, bool) {
+	stackDeadline, stackOK := c.Context.Deadline()
+	callerDeadline, callerOK := c.caller.Deadline()
+	if !stackOK || callerOK && callerDeadline.Before(stackDeadline) {
+		return callerDeadline, callerOK
+	}
+	return stackDeadline, true
+}
+
+func (c stackBoundContext) Value(key any) any {
+	if value := c.caller.Value(key); value != nil {
+		return value
+	}
+	return c.Context.Value(key)
+}
+
+func (ls *liveStack) bindContext(caller context.Context) (context.Context, context.CancelFunc, error) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	if ls.draining || ls.ctx.Err() != nil {
+		return nil, nil, errNotConfigured
+	}
+	ctx, cancel := bindStackContext(caller, ls.ctx)
+	return ctx, cancel, nil
 }
 
 type supervisorAgent struct{ s *supervisor }
@@ -267,7 +356,10 @@ func (e supervisorExec) Stream(ctx context.Context, argv ...string) (io.WriteClo
 	if !ok {
 		return nil, nil, nil, nil, errNotConfigured
 	}
-	sctx, cancel := bindStackContext(ctx, ls.ctx)
+	sctx, cancel, err := ls.bindContext(ctx)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
 	stdin, stdout, stderr, wait, err := ls.stack.Transport.Stream(sctx, argv...)
 	if err != nil {
 		cancel()
@@ -293,7 +385,10 @@ func (e supervisorExec) StreamPty(ctx context.Context, req transport.PtyRequest,
 	if !ok {
 		return nil, errors.New("portal: active transport does not support PTY")
 	}
-	sctx, cancel := bindStackContext(ctx, ls.ctx)
+	sctx, cancel, err := ls.bindContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	sess, err := streamer.StreamPty(sctx, req, argv...)
 	if err != nil {
 		cancel()
@@ -330,6 +425,8 @@ func (s *supervisor) host() (string, error) {
 }
 
 func (s *supervisor) pushAllow(allow []int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if ls, ok := s.serving(); ok {
 		return ls.stack.AgentClient.Subscribe(toU16(app.DenyPorts), toU16(allow), true)
 	}
@@ -356,7 +453,12 @@ func (s *supervisor) doctor(ctx context.Context) *doctor.Report {
 		rep.Add("transport", doctor.Fail, errNotConfigured.Error())
 		return rep
 	}
-	sctx, cancel := bindStackContext(ctx, ls.ctx)
+	sctx, cancel, err := ls.bindContext(ctx)
+	if err != nil {
+		rep := &doctor.Report{}
+		rep.Add("transport", doctor.Fail, errNotConfigured.Error())
+		return rep
+	}
 	defer cancel()
 	sa := *s.base
 	sa.Transport = ls.stack.Transport

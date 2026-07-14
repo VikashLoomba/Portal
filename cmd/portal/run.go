@@ -267,7 +267,12 @@ type clipEntry struct {
 // the side channel and exit-0-confirmed BEFORE the OK=true ClipResponse is
 // sent, so by the time the agent answers the shim the file is guaranteed
 // present. Bytes NEVER touch the CBOR frame — the response carries only a SHA.
-func runClipHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a *app.App, wg *sync.WaitGroup) {
+type goroutineTracker interface {
+	Add(int)
+	Done()
+}
+
+func runClipHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a *app.App, wg goroutineTracker) {
 	cb := clip.New()
 	// probe caches the most recent eager `targets` read per kind so the
 	// follow-up `image`/`text` fetch can reuse it. Single-Mac-per-host, so a

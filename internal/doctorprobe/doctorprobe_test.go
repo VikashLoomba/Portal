@@ -9,6 +9,23 @@ import (
 	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
+type versionTransport struct{ out string }
+
+func (*versionTransport) Ensure(context.Context) (bool, error) { return false, nil }
+func (*versionTransport) Health(context.Context) (transport.Health, error) {
+	return transport.Health{Up: true, Pid: 1}, nil
+}
+func (t *versionTransport) Exec(context.Context, []byte, ...string) (string, string, error) {
+	return t.out, "", nil
+}
+func (*versionTransport) Stream(context.Context, ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
+	return nil, nil, nil, nil, nil
+}
+func (*versionTransport) Close(context.Context) (bool, error) { return false, nil }
+func (*versionTransport) Describe() transport.Desc {
+	return transport.Desc{Impl: transport.ImplSystemSSH, Host: "box"}
+}
+
 type cancelTransport struct {
 	cancel context.CancelFunc
 	execs  []string
@@ -40,5 +57,13 @@ func TestRunStopsBetweenRemoteProbesOnCancellation(t *testing.T) {
 	}
 	if len(rep.Checks) != 2 || rep.Checks[1].Name != "PATH winner: xclip" {
 		t.Fatalf("partial report = %#v", rep.Checks)
+	}
+}
+
+func TestDeployedShimVersionRejectsSeparatorOnlyOutput(t *testing.T) {
+	for _, out := range []string{".", "..", " .\t. \n"} {
+		if version, ok := deployedShimVersion(context.Background(), &versionTransport{out: out}); ok || version != "" {
+			t.Fatalf("deployedShimVersion(%q) = %q, %v, want empty false", out, version, ok)
+		}
 	}
 }
