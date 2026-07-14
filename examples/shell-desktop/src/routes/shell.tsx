@@ -39,7 +39,7 @@ function ShellRoute() {
     terminal.open(host);
 
     let disposed = false;
-    let token = "";
+    let credentials: ExecCredentials | null = null;
     let socket: WebSocket | null = null;
     let rows = 24;
     let cols = 80;
@@ -67,8 +67,8 @@ function ShellRoute() {
     sizeTerminal();
 
     const openExec = (argv: string[]): void => {
-      if (token === "") {
-        setTerminalState("desktop exec binding is not ready");
+      if (credentials === null) {
+        setTerminalState("exec capability is not ready");
         return;
       }
       socket?.close();
@@ -79,9 +79,8 @@ function ShellRoute() {
           : `starting ${argv.join(" ")}\r\n`,
       );
       setTerminalState("starting");
-      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const next = new WebSocket(
-        `${protocol}//${location.host}/exec?cap=${encodeURIComponent(token)}`,
+        `${credentials.socketUrl}?cap=${encodeURIComponent(credentials.token)}`,
       );
       next.binaryType = "arraybuffer";
       socket = next;
@@ -135,9 +134,9 @@ function ShellRoute() {
       }
     });
 
-    void acquireExecToken().then((value) => {
+    void acquireExecCredentials().then((value) => {
       if (!disposed) {
-        token = value;
+        credentials = value;
         openExec([]);
       }
     }).catch((error: unknown) => setTerminalState(toErrorMessage(error)));
@@ -322,52 +321,55 @@ function eventDescription(
   return "event";
 }
 
-// Packaged desktop mode delivers the exec capability through the injected
-// `bindings.portalBootstrap` channel. The webview injects the bindings bridge
-// in BOTH desktop modes as callable proxies — under `deno desktop --hmr` the
-// server runs in the framework dev server with no window bind, so calling the
-// proxy never resolves. Presence of the function therefore proves nothing:
-// race the binding against a short deadline and fall back to the loopback,
-// origin-checked dev-exec-token endpoint; if that endpoint says packaged-mode
-// (404), keep waiting on the binding rather than failing a slow packaged boot.
-const bootstrapBindingTimeoutMs = 1_500;
-
-async function acquireExecToken(): Promise<string> {
-  if (
-    typeof bindings !== "undefined" &&
-    typeof bindings.portalBootstrap === "function"
-  ) {
-    const viaBinding = bindings.portalBootstrap().then((b) => b.execToken);
-    viaBinding.catch(() => {}); // may be abandoned below; never an unhandled rejection
-    const timedOut = Symbol("binding-timeout");
-    const raced = await Promise.race([
-      viaBinding,
-      new Promise<typeof timedOut>((resolve) =>
-        setTimeout(() => resolve(timedOut), bootstrapBindingTimeoutMs)
-      ),
-    ]);
-    if (raced !== timedOut) {
-      return raced;
-    }
-    try {
-      return await fetchDevExecToken();
-    } catch {
-      return await viaBinding;
-    }
-  }
-  return await fetchDevExecToken();
+interface ExecCredentials {
+  token: string;
+  socketUrl: string;
 }
 
-async function fetchDevExecToken(): Promise<string> {
+// The dev-exec-token endpoint answers in both modes: in development (framework
+// HMR or a plain browser) it returns the capability after its loopback and
+// Origin checks, and in the packaged app it is disabled and returns 404. Ask
+// it first — the answer is immediate, so no deadline race is needed. Only
+// after a packaged-mode 404 does the renderer await `bindings.portalBootstrap`,
+// whose proxy exists in BOTH desktop modes but has a live handler only in the
+// packaged runtime; under `deno desktop --hmr` calling it rejects with
+// "No binding for 'portalBootstrap'". The credentials carry the exec socket
+// URL too: the dev bridge listens on its own loopback port because the
+// framework dev server never delivers WebSocket upgrades to app routes, while
+// the packaged app serves /exec on the app origin.
+async function acquireExecCredentials(): Promise<ExecCredentials> {
+  try {
+    return await fetchDevExecCredentials();
+  } catch (endpointError) {
+    if (
+      typeof bindings !== "undefined" &&
+      typeof bindings.portalBootstrap === "function"
+    ) {
+      const bootstrap = await bindings.portalBootstrap();
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      return {
+        token: bootstrap.execToken,
+        socketUrl: `${protocol}//${location.host}/exec`,
+      };
+    }
+    throw endpointError;
+  }
+}
+
+async function fetchDevExecCredentials(): Promise<ExecCredentials> {
   const response = await fetch("/api/dev-exec-token");
   if (!response.ok) {
     throw new Error(`dev exec token request failed (${response.status})`);
   }
   const value: unknown = await response.json();
-  if (!isRecord(value) || typeof value.execToken !== "string") {
+  if (
+    !isRecord(value) ||
+    typeof value.execToken !== "string" ||
+    typeof value.execSocketUrl !== "string"
+  ) {
     throw new Error("dev exec token response was malformed");
   }
-  return value.execToken;
+  return { token: value.execToken, socketUrl: value.execSocketUrl };
 }
 
 function parseCommand(command: string): string[] {

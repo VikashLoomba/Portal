@@ -57,7 +57,60 @@ export function developmentExecTokenResponse(request: Request): Response {
   if (developmentToken === null) {
     developmentToken = registerWindowCapability(developmentOwner);
   }
-  return Response.json({ execToken: developmentToken });
+  return Response.json({
+    execToken: developmentToken,
+    execSocketUrl: ensureDevelopmentExecServer(),
+  });
+}
+
+// The framework dev server cannot host the exec bridge: its Vite HTTP server
+// answers only its own HMR socket and leaves every other `upgrade` request
+// unanswered (they never reach the server entry's fetch handler), and
+// `Deno.upgradeWebSocket` requires a native `Deno.serve` request anyway. In
+// dev mode the bridge therefore listens on its own loopback `Deno.serve`
+// port, advertised to the renderer through the dev-exec-token response. The
+// packaged app serves `/exec` on the app origin and never starts this server.
+// A dev-only SSR module reload can strand an old idle instance until the
+// process exits; its capabilities die with the module that owned them.
+let developmentExecSocketUrl: string | null = null;
+
+function ensureDevelopmentExecServer(): string {
+  if (developmentExecSocketUrl !== null) {
+    return developmentExecSocketUrl;
+  }
+  const server = Deno.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    onListen: () => {},
+  }, (request, info) => {
+    if (new URL(request.url).pathname !== "/exec") {
+      return new Response("not found", { status: 404 });
+    }
+    if (
+      !isLoopbackAddress(info.remoteAddr.hostname) ||
+      !isLoopbackOrigin(request.headers.get("origin"))
+    ) {
+      return new Response("forbidden", { status: 403 });
+    }
+    return openExecSocket(request);
+  });
+  developmentExecSocketUrl = `ws://127.0.0.1:${server.addr.port}/exec`;
+  return developmentExecSocketUrl;
+}
+
+// Browsers always attach an Origin to WebSocket handshakes; requiring a
+// loopback one keeps pages served from non-loopback hosts away from the
+// bridge, while origin-less loopback clients (curl, tests) pass. The 256-bit
+// capability remains the gate that actually authorizes a PTY.
+function isLoopbackOrigin(origin: string | null): boolean {
+  if (origin === null) {
+    return true;
+  }
+  try {
+    return isLoopbackUrlHostname(new URL(origin).hostname);
+  } catch {
+    return false;
+  }
 }
 
 export function registerWindowCapability(owner: number): string {
@@ -98,6 +151,11 @@ export function handleExecUpgrade(request: Request): Response {
   if (!sameOriginRequest(request, url)) {
     return new Response("forbidden", { status: 403 });
   }
+  return openExecSocket(request);
+}
+
+function openExecSocket(request: Request): Response {
+  const url = new URL(request.url);
   const token = url.searchParams.get("cap") ?? "";
   const owner = capabilityOwner(token);
   if (owner === null) {
