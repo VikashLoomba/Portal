@@ -26,10 +26,10 @@
     "noImplicitOverride": true
   },
   "tasks": {
-    "gen": "deno run --allow-env --allow-read --allow-sys=cpus --allow-write npm:@tanstack/router-cli@1.167.19 generate && deno run --allow-read --allow-write scripts/strict-route-tree.ts",
-    "web:build": "deno task gen && deno run -A npm:vite@8.1.4 build",
+    "gen": "deno run --frozen --allow-env --allow-read --allow-sys=cpus --allow-write npm:@tanstack/router-cli@1.167.19 generate && deno run --frozen --allow-read --allow-write scripts/strict-route-tree.ts",
+    "web:build": "deno task gen && deno run --frozen --allow-env --allow-ffi --allow-net=localhost --allow-read --allow-sys=cpus,homedir,uid --allow-write npm:vite@8.1.4 build",
     "dev": "deno desktop --hmr --unstable-no-legacy-abort --allow-env --allow-net --allow-read --allow-run --allow-write .",
     "package": "deno task web:build && deno desktop --unstable-no-legacy-abort --allow-env --allow-net --allow-read --allow-run --allow-write --include ../../portal -o PortalShellDesktop.app .",
-    "check": "deno task gen && deno check --desktop --frozen vite.config.ts src/router.tsx src/server.ts src/bindings.d.ts src/lib/sse.ts src/routes/__root.tsx src/routes/index.tsx src/routes/onboarding.tsx src/routes/shell.tsx src/server/binary.ts src/server/boot.ts src/server/exec-bridge.ts src/server/exec-normalize.ts src/server/lifecycle.ts src/server/paths.ts src/server/portal-proxy.ts src/server/supervisor.ts src/server/paths_test.ts && deno test --frozen --allow-env --allow-read --allow-write src/server/paths_test.ts"
+    "check": "deno task gen && deno check --desktop --frozen vite.config.ts src/router.tsx src/server.ts src/bindings.d.ts src/lib/sse.ts src/routes/__root.tsx src/routes/index.tsx src/routes/onboarding.tsx src/routes/shell.tsx src/server/binary.ts src/server/boot.ts src/server/exec-bridge.ts src/server/exec-normalize.ts src/server/lifecycle.ts src/server/paths.ts src/server/portal-proxy.ts src/server/supervisor.ts src/server/paths_test.ts && deno test --frozen src/server/paths_test.ts"
   }
 }

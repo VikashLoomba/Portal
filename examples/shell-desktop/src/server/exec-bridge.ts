@@ -133,11 +133,14 @@ function handleMessage(
   }
   if (value.type === "stdin" && typeof value.data === "string") {
     if (value.data.length > 0) {
-      registered.stdin.push(encoder.encode(value.data.slice(0, 64 * 1024)));
+      registered.stdin.push(encoder.encode(value.data));
     }
     return;
   }
-  if (value.type === "resize" && registered.session !== null) {
+  if (value.type === "resize") {
+    if (registered.session === null) {
+      return;
+    }
     const size = normalizeExecSize(value);
     if (size !== null) {
       registered.session.resize(size.rows, size.cols).catch(
