@@ -90,8 +90,25 @@ func decodeErrCode(t *testing.T, rec *httptest.ResponseRecorder) string {
 }
 
 func TestHandlePorts(t *testing.T) {
-	t.Run("not_connected before first snapshot", func(t *testing.T) {
+	t.Run("not_configured without active stack", func(t *testing.T) {
 		s, _ := newMutServer(t, &fakeAgent{ok: false})
+		s.deps.PinStack = func(context.Context) (StackView, func()) {
+			return StackView{HostKnown: true}, func() {}
+		}
+		rec := doReq(s, http.MethodGet, "/v1/ports", "")
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", rec.Code)
+		}
+		if code := decodeErrCode(t, rec); code != "not_configured" {
+			t.Errorf("error code = %q, want not_configured", code)
+		}
+	})
+	t.Run("not_connected before first snapshot", func(t *testing.T) {
+		agent := &fakeAgent{ok: false}
+		s, _ := newMutServer(t, agent)
+		s.deps.PinStack = func(context.Context) (StackView, func()) {
+			return StackView{Host: "box", HostKnown: true, Agent: agent}, func() {}
+		}
 		rec := doReq(s, http.MethodGet, "/v1/ports", "")
 		if rec.Code != http.StatusServiceUnavailable {
 			t.Fatalf("status = %d, want 503", rec.Code)

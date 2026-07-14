@@ -70,11 +70,17 @@ func parsePort(raw string) (int, bool) {
 	return n, true
 }
 
-// handlePorts lists remote loopback listeners from the cached Snapshot. Before
-// the first cached Snapshot (ok==false) it is 503 not_connected — a later
-// boundary than the handshake (§4.5).
+// handlePorts lists remote loopback listeners from the cached Snapshot. An
+// unconfigured daemon has no host-bound stack; a configured stack without its
+// first Snapshot is not connected yet.
 func (s *Server) handlePorts(w http.ResponseWriter, r *http.Request) {
-	_, ports, ok := s.deps.Agent.Snapshot()
+	stack, release := s.stackView(r.Context())
+	defer release()
+	if stack.HostKnown && stack.Host == "" {
+		writeError(w, http.StatusServiceUnavailable, "not_configured", "no active host is configured")
+		return
+	}
+	_, ports, ok := stack.Agent.Snapshot()
 	if !ok {
 		writeError(w, http.StatusServiceUnavailable, "not_connected", "no cached port snapshot from the agent yet")
 		return
@@ -187,6 +193,16 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 // handleDoctor runs the doctor self-test and returns the structured report as
 // JSON. It passes r.Context() so a client disconnect aborts the ssh probes.
 func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
-	rep := s.deps.Doctor(r.Context())
+	stack, release := s.stackView(r.Context())
+	defer release()
+	if stack.HostKnown && stack.Host == "" {
+		writeError(w, http.StatusServiceUnavailable, "not_configured", "no active host is configured")
+		return
+	}
+	doctor := stack.Doctor
+	if doctor == nil {
+		doctor = s.deps.Doctor
+	}
+	rep := doctor(r.Context())
 	writeJSON(w, http.StatusOK, rep)
 }

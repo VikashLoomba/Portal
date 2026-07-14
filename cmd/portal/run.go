@@ -20,10 +20,10 @@ import (
 	"github.com/VikashLoomba/Portal/internal/clipupload"
 	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/internal/localapi"
+	"github.com/VikashLoomba/Portal/internal/setup"
 	"github.com/VikashLoomba/Portal/pkg/agentclient"
 	"github.com/VikashLoomba/Portal/pkg/api"
 	"github.com/VikashLoomba/Portal/pkg/client"
-	"github.com/VikashLoomba/Portal/pkg/doctor"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 )
 
@@ -32,125 +32,76 @@ func newRunCmd(a *app.App) *cobra.Command {
 		Use:   "run",
 		Short: "Run the forwarding loop in the foreground (used by launchd)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			host, _ := a.Cfg.ReadHost()
-			if host == "" {
-				return fmt.Errorf("no dev box configured — run: %s install <ssh-host>", app.Tool)
-			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
-			// A cancelable child of the signal ctx so a FATAL API bind/serve
-			// failure (D10) can bring the other goroutines down: cancelling it
-			// makes wg.Wait return so the daemon exits non-zero and launchd
-			// relaunches loudly.
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-
-			// Push the initial Subscribe so the agent has the latest filter
-			// even before its first connect — Subscribe is buffered until
-			// the encoder lands, then replayed.
-			allow, _ := a.Cfg.AllowedPorts()
-			_ = a.AgentClient.Subscribe(toU16(app.DenyPorts), toU16(allow), true)
-
-			engine, openURLCh := a.NewEngineWithOpenURL()
-
-			// Run agent supervisor, reconcile engine, URL opener, the
-			// clipboard-read handler, credential handler, notification handler,
-			// and the local API server in parallel; any returning ends the daemon
-			// (launchd will relaunch).
-			var wg sync.WaitGroup
-			wg.Add(7)
-			errCh := make(chan error, 7)
-
-			go func() {
-				defer wg.Done()
-				errCh <- a.AgentClient.Run(ctx)
-			}()
-			go func() {
-				defer wg.Done()
-				errCh <- engine.Run(ctx)
-			}()
-			go func() {
-				defer wg.Done()
-				runOpenURLHandler(ctx, openURLCh, a)
-			}()
-			go func() {
-				defer wg.Done()
-				runClipHandler(ctx, a.AgentClient.ClipEvents(), a)
-			}()
-			go func() {
-				defer wg.Done()
-				runCredHandler(ctx, a.AgentClient.CredEvents(), a)
-			}()
-			go func() {
-				defer wg.Done()
-				runNotifyHandler(ctx, a.AgentClient.NotifyEvents(), a)
-			}()
-			go func() {
-				defer wg.Done()
-				// D10: API bind failure is FATAL. On a bind failure we cancel
-				// the shared ctx so the other six goroutines return, wg.Wait
-				// unblocks, and the daemon exits non-zero for launchd to relaunch
-				// loudly. A serve failure (Serve returns non-nil) is fatal for
-				// the same reason; a clean ctx-cancel shutdown returns nil.
-				ln, err := localapi.Listen(a.Paths.APISock)
-				if err != nil {
-					errCh <- err
-					cancel()
-					return
-				}
-				deps := localapi.Deps{
-					Version: api.VersionInfo{
-						Version:      version,
-						GitSHA:       bootstrap.EmbeddedSHA(),
-						ProtoVersion: protocol.ProtoVersion,
-					},
-					Host:       a.Cfg.ReadHost,
-					Agent:      a.AgentClient,
-					Master:     a.Transport,
-					Ports:      a.PF,
-					Service:    a.Service,
-					Config:     a.Cfg,
-					Hub:        a.Hub,
-					ExecStream: a.Transport,
-					Audit:      a.Audit,
-					PushAllow: func(allow []int) error {
-						return a.AgentClient.Subscribe(toU16(app.DenyPorts), toU16(allow), true)
-					},
-					Kick:         engine.Kick,
-					ReconcileGen: engine.Reconciles,
-					Doctor: func(c context.Context) *doctor.Report {
-						// doctorTransport probes the daemon's LIVE native connection
-						// (a.Transport) — a fresh native client would report "ssh
-						// master DOWN" without dialing — while system uses a fresh
-						// nil-sink transport so ssh stderr is never tee'd into the
-						// launchd log. Config was validated at startup (NewProd), so
-						// an error here is unexpected; surface it, never panic.
-						tr, err := doctorTransport(c, a, host)
-						if err != nil {
-							rep := &doctor.Report{Host: host}
-							rep.Add("transport", doctor.Fail, "transport unavailable: "+err.Error())
-							return rep
-						}
-						return runDoctor(c, host, tr)
-					},
-				}
-				srv := localapi.New(deps)
-				if err := srv.Serve(ctx, ln); err != nil {
-					errCh <- err
-					cancel()
-				}
-			}()
-
-			wg.Wait()
-			close(errCh)
-			for err := range errCh {
-				if err != nil {
-					return err
-				}
-			}
-			return nil
+			s := newSupervisor(ctx, a, os.Stderr)
+			return runDaemon(ctx, cancel, a, s)
 		},
 	}
+}
+
+func runDaemon(ctx context.Context, cancel context.CancelFunc, a *app.App, s *supervisor) error {
+	host, _ := a.Cfg.ReadHost()
+	if host != "" {
+		if err := s.startInitial(ctx, host); err != nil {
+			a.Log.Logf("daemon stack for %s unavailable; serving unconfigured API: %v", host, err)
+		}
+	}
+
+	ln, err := localapi.Listen(a.Paths.APISock)
+	if err != nil {
+		cancel()
+		s.waitCurrent()
+		return err
+	}
+	deps := localapi.Deps{
+		Version: api.VersionInfo{
+			Version:      version,
+			GitSHA:       bootstrap.EmbeddedSHA(),
+			ProtoVersion: protocol.ProtoVersion,
+		},
+		Host:         s.host,
+		Agent:        supervisorAgent{s},
+		Master:       supervisorMaster{s},
+		Ports:        supervisorPorts{s},
+		Service:      a.Service,
+		Config:       a.Cfg,
+		Hub:          a.Hub,
+		ExecStream:   supervisorExec{s},
+		Audit:        a.Audit,
+		PushAllow:    s.pushAllow,
+		Kick:         s.kick,
+		ReconcileGen: s.reconciles,
+		Doctor:       s.doctor,
+		PinStack: func(ctx context.Context) (localapi.StackView, func()) {
+			pinned, release := s.pin(ctx)
+			if pinned == nil {
+				return localapi.StackView{HostKnown: true}, release
+			}
+			return localapi.StackView{
+				Host:         pinned.host(),
+				HostKnown:    true,
+				Lifetime:     pinned.ctx,
+				Agent:        pinned,
+				Master:       pinned,
+				Ports:        pinned,
+				ExecStream:   pinned,
+				ReconcileGen: pinned.reconciles,
+				Doctor:       pinned.doctor,
+			}, release
+		},
+		NewSetup: func(sink func(api.SetupEvent)) localapi.SetupRunner {
+			return setup.New(a.Paths, a.Cfg, setup.Sink(sink))
+		},
+		Activate:      s.Activate,
+		NormalizeHost: setup.NormalizeHost,
+	}
+	err = localapi.New(deps).Serve(ctx, ln)
+	cancel()
+	s.waitCurrent()
+	return err
 }
 
 func newOnceCmd(a *app.App) *cobra.Command {
@@ -333,7 +284,12 @@ type clipEntry struct {
 // the side channel and exit-0-confirmed BEFORE the OK=true ClipResponse is
 // sent, so by the time the agent answers the shim the file is guaranteed
 // present. Bytes NEVER touch the CBOR frame — the response carries only a SHA.
-func runClipHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a *app.App) {
+type goroutineTracker interface {
+	Add(int)
+	Done()
+}
+
+func runClipHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a *app.App, wg goroutineTracker) {
 	cb := clip.New()
 	// probe caches the most recent eager `targets` read per kind so the
 	// follow-up `image`/`text` fetch can reuse it. Single-Mac-per-host, so a
@@ -368,7 +324,13 @@ func runClipHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a *a
 			// Handle on a worker goroutine so the demux of the next event isn't
 			// blocked by the coercion+upload; the semaphore (cap 1) still
 			// serializes the reads themselves.
+			if wg != nil {
+				wg.Add(1)
+			}
 			go func(req *agentclient.ClipEvent) {
+				if wg != nil {
+					defer wg.Done()
+				}
 				defer func() { <-sem }()
 				resp := serveClipRequest(ctx, a, cb, probe, &probeMu, req)
 				if err := a.AgentClient.SendClipResponse(resp); err != nil {

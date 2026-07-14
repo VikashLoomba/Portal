@@ -180,6 +180,37 @@ func TestExecAuditOpenCloseOnce(t *testing.T) {
 	}
 }
 
+func TestExecAuditUsesPinnedStackHost(t *testing.T) {
+	a := audit.New(t.TempDir())
+	fallback := hostExecStreamer{ExecStreamer: localexec.New(), host: "stack-b"}
+	pinned := hostExecStreamer{ExecStreamer: localexec.New(), host: "stack-a"}
+	released := make(chan struct{})
+	path, _ := startExecServerWithDeps(t, Deps{
+		Version:    api.VersionInfo{Version: "9.9"},
+		Config:     config.New(t.TempDir()),
+		ExecStream: fallback,
+		Audit:      a,
+		PinStack: func(context.Context) (StackView, func()) {
+			return StackView{Host: "stack-a", HostKnown: true, ExecStream: pinned}, func() { close(released) }
+		},
+	})
+
+	c := dialExecWS(t, path, []string{"printf", "hello"})
+	defer c.Close()
+	_ = readExecFramesUntilExit(t, c, 2*time.Second)
+	lines := waitAuditLines(t, a.Path(), 2, 2*time.Second)
+	for _, line := range lines {
+		if fields := auditFields(line); fields["host"] != "stack-a" {
+			t.Fatalf("audit host = %q, want pinned stack-a\n%s", fields["host"], strings.Join(lines, "\n"))
+		}
+	}
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("pinned exec stack was not released")
+	}
+}
+
 func TestExecAuditPtyOpenFlagAndSID(t *testing.T) {
 	a := audit.New(t.TempDir())
 	path, _ := startExecServer(t, config.New(t.TempDir()), a, localexec.New())
@@ -574,14 +605,27 @@ func TestExecMalformedInboundFrameTearsDownSession(t *testing.T) {
 	t.Fatal("server did not close or end the exec session after malformed inbound frame")
 }
 
-func TestExecReaderCloseReleasesBlockedOutputWriter(t *testing.T) {
+func TestExecStackCancelReleasesBlockedOutputWriterAndPin(t *testing.T) {
 	a := audit.New(t.TempDir())
-	streamer := &blockedOutputExecStreamer{waitCalled: make(chan struct{})}
+	stackCtx, cancelStack := context.WithCancel(context.Background())
+	defer cancelStack()
+	released := make(chan struct{})
+	streamer := &blockedOutputExecStreamer{
+		waitCalled:    make(chan struct{}),
+		outputStarted: make(chan struct{}),
+	}
 	s := New(Deps{
-		Version:    api.VersionInfo{Version: "9.9"},
-		Config:     config.New(t.TempDir()),
-		ExecStream: streamer,
-		Audit:      a,
+		Version: api.VersionInfo{Version: "9.9"},
+		Config:  config.New(t.TempDir()),
+		Audit:   a,
+		PinStack: func(context.Context) (StackView, func()) {
+			return StackView{
+				Host:       "blocked-output",
+				HostKnown:  true,
+				Lifetime:   stackCtx,
+				ExecStream: streamer,
+			}, func() { close(released) }
+		},
 	})
 
 	server, client := net.Pipe()
@@ -612,19 +656,22 @@ func TestExecReaderCloseReleasesBlockedOutputWriter(t *testing.T) {
 		t.Fatalf("read upgrade headers: %v", err)
 	}
 
-	// handleExec may synchronously close the net.Pipe after reading OpClose;
-	// no further client writes follow, so leave this deadline in place.
-	if err := client.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("set write deadline: %v", err)
+	select {
+	case <-streamer.outputStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("exec output writer did not start")
 	}
-	if err := writeClientFrame(client, wsbits.OpClose, []byte{0x03, 0xe8}); err != nil {
-		t.Fatalf("write close frame: %v", err)
-	}
+	cancelStack()
 
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("handleExec did not return after client close with blocked output writer")
+		t.Fatal("handleExec did not return after stack cancellation with blocked output writer")
+	}
+	select {
+	case <-released:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pinned stack was not released")
 	}
 	select {
 	case <-streamer.waitCalled:
@@ -638,7 +685,8 @@ func TestExecReaderCloseReleasesBlockedOutputWriter(t *testing.T) {
 }
 
 type blockedOutputExecStreamer struct {
-	waitCalled chan struct{}
+	waitCalled    chan struct{}
+	outputStarted chan struct{}
 }
 
 func (s *blockedOutputExecStreamer) Stream(ctx context.Context, _ ...string) (io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error) {
@@ -646,7 +694,7 @@ func (s *blockedOutputExecStreamer) Stream(ctx context.Context, _ ...string) (io
 		close(s.waitCalled)
 		return nil
 	}
-	return nopWriteCloser{}, io.NopCloser(infiniteReader{}), io.NopCloser(bytes.NewReader(nil)), wait, nil
+	return nopWriteCloser{}, io.NopCloser(&infiniteReader{started: s.outputStarted}), io.NopCloser(bytes.NewReader(nil)), wait, nil
 }
 
 func (s *blockedOutputExecStreamer) Describe() transport.Desc {
@@ -659,9 +707,18 @@ func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
 
 func (nopWriteCloser) Close() error { return nil }
 
-type infiniteReader struct{}
+type infiniteReader struct {
+	started chan struct{}
+}
 
-func (infiniteReader) Read(p []byte) (int, error) {
+func (r *infiniteReader) Read(p []byte) (int, error) {
+	if r.started != nil {
+		select {
+		case <-r.started:
+		default:
+			close(r.started)
+		}
+	}
 	for i := range p {
 		p[i] = 'x'
 	}
@@ -678,6 +735,15 @@ func (unsupportedPtyExecStreamer) Describe() transport.Desc {
 	return transport.Desc{Impl: "test", Host: "pipe-only", Endpoint: "net.Pipe"}
 }
 
+type hostExecStreamer struct {
+	ExecStreamer
+	host string
+}
+
+func (s hostExecStreamer) Describe() transport.Desc {
+	return transport.Desc{Impl: "test", Host: s.host, Endpoint: s.host}
+}
+
 type wsTestConn struct {
 	net.Conn
 	br      *bufio.Reader
@@ -687,13 +753,18 @@ type wsTestConn struct {
 
 func startExecServer(t *testing.T, cfg *config.Store, a *audit.Log, streamer ExecStreamer) (string, *Server) {
 	t.Helper()
-	path := filepath.Join(shortTempDir(t), "api.sock")
-	s := New(Deps{
+	return startExecServerWithDeps(t, Deps{
 		Version:    api.VersionInfo{Version: "9.9"},
 		Config:     cfg,
 		ExecStream: streamer,
 		Audit:      a,
 	})
+}
+
+func startExecServerWithDeps(t *testing.T, deps Deps) (string, *Server) {
+	t.Helper()
+	path := filepath.Join(shortTempDir(t), "api.sock")
+	s := New(deps)
 	ln, err := Listen(path)
 	if err != nil {
 		t.Fatalf("Listen: %v", err)

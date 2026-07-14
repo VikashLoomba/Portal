@@ -100,6 +100,31 @@ func TestLog_StripsControlBytes(t *testing.T) {
 	}
 }
 
+func TestLog_SetupEntry(t *testing.T) {
+	dir := t.TempDir()
+	l := New(dir)
+	fixed := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	l.now = func() time.Time { return fixed }
+
+	l.Setup("box\n\x00\x7fhost", true, "validate=warn configure=ok", "old→box\nnew", "ok")
+
+	b, err := os.ReadFile(l.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	want := "2026-07-14T12:00:00Z\tsetup\thost=box   host\tforced=true\tsteps=validate=warn configure=ok\tactivation=old→box new\tverdict=ok\n"
+	if got != want {
+		t.Errorf("setup audit line:\n%s\nwant:\n%s", got, want)
+	}
+	if strings.Count(got, "\n") != 1 {
+		t.Fatalf("setup host forged physical lines: %q", got)
+	}
+	if len(strings.Split(strings.TrimSuffix(got, "\n"), "\t")) != 7 {
+		t.Fatalf("setup host forged audit columns: %q", got)
+	}
+}
+
 func TestLog_CredentialEvents(t *testing.T) {
 	dir := t.TempDir()
 	l := New(dir)
@@ -138,6 +163,7 @@ func TestLog_NilSafe(t *testing.T) {
 	l.OpenURL("h", "u")
 	l.ExecOpen("h", "sid", "argv", 1, false)
 	l.ExecClose("h", "sid", 0, "", time.Millisecond)
+	l.Setup("h", false, "validate=ok", "h→h", "ok")
 	if l.Path() != "" {
 		t.Errorf("nil Log.Path() should be empty")
 	}

@@ -29,12 +29,13 @@ type route struct {
 // here exactly once for the whole package (u6's events streamer only consumes
 // it). The zero value is not usable; call New.
 type Server struct {
-	deps         Deps
-	mux          *http.ServeMux
-	routes       []route
-	subCount     atomic.Int64
-	TickInterval time.Duration
-	log          *slog.Logger
+	deps          Deps
+	mux           *http.ServeMux
+	routes        []route
+	subCount      atomic.Int64
+	setupInFlight atomic.Bool
+	TickInterval  time.Duration
+	log           *slog.Logger
 }
 
 // New builds a Server, fills FeatureNames/TickInterval defaults, and registers
@@ -73,6 +74,7 @@ func (s *Server) registerRoutes() []route {
 		{http.MethodPost, "/v1/reconcile", s.handleReconcile},
 		{http.MethodPost, "/v1/doctor", s.handleDoctor},
 		{http.MethodPost, "/v1/exec", s.handleExec},
+		{http.MethodPost, "/v1/setup", s.handleSetup},
 	}
 }
 
@@ -302,27 +304,26 @@ func (s *Server) buildStatus(ctx context.Context) api.Status {
 		Allowed:  []int{},
 	}
 
-	if s.deps.Host != nil {
-		if h, err := s.deps.Host(); err == nil {
-			st.Host = h
-		}
-	}
 	if s.deps.Service != nil {
 		if svc, err := s.deps.Service.Status(ctx); err == nil {
 			st.Service = api.ServiceStatus{Loaded: svc.Loaded, StateLines: svc.StateLines}
 		}
 	}
 
+	stack, release := s.stackView(ctx)
+	defer release()
+	st.Host = stack.Host
+
 	var masterUp bool
-	if s.deps.Master != nil {
-		h, _ := s.deps.Master.Health(ctx)
-		d := s.deps.Master.Describe()
+	if stack.Master != nil {
+		h, _ := stack.Master.Health(ctx)
+		d := stack.Master.Describe()
 		masterUp = h.Up
 		st.Master = api.MasterStatus{Up: h.Up, Pid: h.Pid, Transport: string(d.Impl), Detail: h.Detail}
 	}
 
-	if s.deps.Agent != nil {
-		if ack := s.deps.Agent.HelloAck(); ack != nil {
+	if stack.Agent != nil {
+		if ack := stack.Agent.HelloAck(); ack != nil {
 			st.Agent = &api.AgentStatus{
 				Pid:    ack.AgentPID,
 				SHA:    ack.AgentGitSHA,
@@ -330,15 +331,15 @@ func (s *Server) buildStatus(ctx context.Context) api.Status {
 				BootID: ack.BootID,
 			}
 		}
-		if _, ports, ok := s.deps.Agent.Snapshot(); ok {
+		if _, ports, ok := stack.Agent.Snapshot(); ok {
 			for _, p := range ports {
 				st.Ports = append(st.Ports, api.PortStatus{Port: int(p)})
 			}
 		}
 	}
 
-	if s.deps.Ports != nil && masterUp {
-		if lines, err := s.deps.Ports.ForwardLines(ctx); err == nil {
+	if stack.Ports != nil && masterUp {
+		if lines, err := stack.Ports.ForwardLines(ctx); err == nil {
 			for _, name := range lines {
 				st.Forwards = append(st.Forwards, api.ForwardStatus{Name: name})
 			}
@@ -356,16 +357,37 @@ func (s *Server) buildStatus(ctx context.Context) api.Status {
 		}
 	}
 
-	if s.deps.Agent != nil {
-		st.Health.LastDisconnectErr = s.deps.Agent.LastDisconnectErr()
+	if stack.Agent != nil {
+		st.Health.LastDisconnectErr = stack.Agent.LastDisconnectErr()
 	}
 	if s.deps.Hub != nil {
 		st.Health.DroppedNotifyCount = s.deps.Hub.DroppedNotify()
 	}
 	st.Health.EventsSubscribers = int(s.subCount.Load())
-	if s.deps.ReconcileGen != nil {
-		st.Health.ReconcileCount = s.deps.ReconcileGen()
+	if stack.ReconcileGen != nil {
+		st.Health.ReconcileCount = stack.ReconcileGen()
 	}
 
 	return st
+}
+
+func (s *Server) stackView(ctx context.Context) (StackView, func()) {
+	if s.deps.PinStack != nil {
+		return s.deps.PinStack(ctx)
+	}
+	view := StackView{
+		Agent:        s.deps.Agent,
+		Master:       s.deps.Master,
+		Ports:        s.deps.Ports,
+		ExecStream:   s.deps.ExecStream,
+		ReconcileGen: s.deps.ReconcileGen,
+		Doctor:       s.deps.Doctor,
+	}
+	if s.deps.Host != nil {
+		if host, err := s.deps.Host(); err == nil {
+			view.Host = host
+			view.HostKnown = true
+		}
+	}
+	return view, func() {}
 }

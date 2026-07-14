@@ -157,13 +157,19 @@ func NewProd() (*App, error) {
 // hermetic (never reads the runner's real ~/.ssh). It applies ONLY to the native
 // branch; the system branch ignores it.
 func NewTransport(paths Paths, host string, runner run.Runner, cfg *config.Store, sshStderr io.Writer, nativeOpts ...sshnative.Option) (transport.Transport, transport.PortForwarder, error) {
+	return NewTransportContext(context.Background(), paths, host, runner, cfg, sshStderr, nativeOpts...)
+}
+
+// NewTransportContext is NewTransport with a caller-owned construction
+// context. Only native resolution performs I/O while the transport is built.
+func NewTransportContext(ctx context.Context, paths Paths, host string, runner run.Runner, cfg *config.Store, sshStderr io.Writer, nativeOpts ...sshnative.Option) (transport.Transport, transport.PortForwarder, error) {
 	sel, err := cfg.Transport()
 	if err != nil {
 		return nil, nil, err
 	}
 	switch sel {
 	case "native":
-		c, err := sshnative.New(host, nativeOpts...)
+		c, err := sshnative.NewContext(ctx, host, nativeOpts...)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -279,4 +285,32 @@ func adaptAgentEvents(in <-chan agentclient.EngineEvent) <-chan forward.EngineEv
 		}
 	}()
 	return out
+}
+
+func pumpAgentEvents(ctx context.Context, in <-chan agentclient.EngineEvent, out chan<- forward.EngineEvent) {
+	defer close(out)
+	for {
+		var ev agentclient.EngineEvent
+		var ok bool
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok = <-in:
+			if !ok {
+				return
+			}
+		}
+		mapped := forward.EngineEvent{
+			Kind:    forward.EngineEventKind(ev.Kind),
+			Err:     ev.Err,
+			Added:   ev.Added,
+			Removed: ev.Removed,
+			URL:     ev.URL,
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case out <- mapped:
+		}
+	}
 }

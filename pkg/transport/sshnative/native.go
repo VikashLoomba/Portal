@@ -178,6 +178,12 @@ var _ transport.PtyStreamer = (*Client)(nil)
 // Describe().Endpoint reports the RESOLVED endpoint; host-key verification keys
 // on the resolved HostKeyAlias when set, else the resolved HostName.
 func New(target string, opts ...Option) (*Client, error) {
+	return NewContext(context.Background(), target, opts...)
+}
+
+// NewContext is New with a caller-owned construction context. Resolution may
+// execute `ssh -G`, so activation uses this form to keep construction bounded.
+func NewContext(ctx context.Context, target string, opts ...Option) (*Client, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("sshnative: resolve home dir for ~/.ssh defaults: %w", err)
@@ -202,7 +208,7 @@ func New(target string, opts ...Option) (*Client, error) {
 		c.proxyCommandDialer = defaultProxyCommandDialer
 	}
 
-	rh, rerr := c.resolver(context.Background(), target)
+	rh, rerr := c.resolver(ctx, target)
 	if rerr != nil {
 		return nil, fmt.Errorf("sshnative: resolve %q: %w", target, rerr)
 	}
@@ -347,10 +353,7 @@ func (c *Client) Ensure(ctx context.Context) (bool, error) {
 	case c.proxyCommand != "" && c.proxyCommand != "none":
 		client, closer, err = c.dialViaProxyCommand(ctx, cfg)
 	default:
-		client, err = ssh.Dial("tcp", addr, cfg)
-		if err != nil {
-			err = fmt.Errorf("sshnative: dial %s: %w", addr, err)
-		}
+		client, err = dialDirect(ctx, addr, cfg)
 	}
 	if err != nil {
 		if agentConn != nil {
@@ -366,6 +369,24 @@ func (c *Client) Ensure(ctx context.Context) (bool, error) {
 	c.proxyCloser = closer
 	c.startKeepaliveLocked(client)
 	return true, nil
+}
+
+// dialDirect makes both the TCP dial and SSH handshake request-cancelable.
+// ssh.Dial only applies ClientConfig.Timeout to the TCP connection and cannot
+// interrupt a stalled handshake when the setup request disconnects.
+func dialDirect(ctx context.Context, addr string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	raw, err := (&net.Dialer{Timeout: dialTimeout}).DialContext(dialCtx, "tcp", addr)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("sshnative: dial %s: %w", addr, err)
+	}
+	conn, chans, reqs, err := newClientConnWithWatchdog(ctx, raw, addr, cfg)
+	if err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("sshnative: handshake %s: %w", addr, err)
+	}
+	return ssh.NewClient(conn, chans, reqs), nil
 }
 
 // teardownLocked releases the current client, its proxy chain, the keepalive

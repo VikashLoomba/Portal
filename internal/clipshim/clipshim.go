@@ -286,9 +286,15 @@ func Ensure(ctx context.Context, tr transport.Transport) error {
 	// reconnect.
 	check := currentShimsProbe()
 	out, _, _ := tr.Exec(ctx, nil, "bash", "-c", shellQuote(check))
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(out) != "current" {
 		for _, sh := range shims {
 			if err := deployShim(ctx, tr, sh.name, sh.script); err != nil {
+				return err
+			}
+			if err := ctx.Err(); err != nil {
 				return err
 			}
 		}
@@ -300,16 +306,28 @@ func Ensure(ctx context.Context, tr transport.Transport) error {
 	// Failure is logged by the caller via the returned error only when it is the
 	// FIRST failure; here we swallow it so PATH-prepend still runs.
 	_ = ensureNotifyHook(ctx, tr)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Shell marker blocks converge even on the fast path so a user who deleted
 	// one receives it again without forcing a shim rewrite.
 	if err := ensureEarlyPathPrepend(ctx, tr); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := ensurePathPrepend(ctx, tr); err != nil {
 		return err
 	}
-	return ensureAskpassEnv(ctx, tr)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ensureAskpassEnv(ctx, tr); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 // currentShimsProbe returns the remote marker check for every entry in shims.
@@ -345,6 +363,9 @@ func ensureNotifyHook(ctx context.Context, tr transport.Transport) error {
 	if _, _, err := tr.Exec(ctx, []byte(notifyHookScript), "bash", "-c", shellQuote(writeScript)); err != nil {
 		return fmt.Errorf("write notify hook script: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// 2. Merge the Stop/Notification hook entries into Claude Code settings.json.
 	// The python3 program reads the existing settings (if any), drops our prior
@@ -354,6 +375,9 @@ func ensureNotifyHook(ctx context.Context, tr transport.Transport) error {
 	merge := mergeClaudeSettingsProgram()
 	if _, _, err := tr.Exec(ctx, nil, "bash", "-c", shellQuote(merge)); err != nil {
 		return fmt.Errorf("merge claude settings: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -420,6 +444,9 @@ func deployShim(ctx context.Context, tr transport.Transport, name, script string
 		bin, ownershipMarker, bin, backup, bin, backup,
 	)
 	_, _, _ = tr.Exec(ctx, nil, "bash", "-c", shellQuote(backupScript))
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Atomic write: cat to a unique .tmp, chmod 0755, mv into place.
 	writeScript := fmt.Sprintf(
@@ -429,9 +456,15 @@ func deployShim(ctx context.Context, tr transport.Transport, name, script string
 	if _, _, err := tr.Exec(ctx, []byte(script), "bash", "-c", shellQuote(writeScript)); err != nil {
 		return fmt.Errorf("write %s shim: %w", name, err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	verifyScript := fmt.Sprintf(`grep -qF %q %s 2>/dev/null && echo ok || echo missing`, Marker, bin)
 	out, _, _ := tr.Exec(ctx, nil, "bash", "-c", shellQuote(verifyScript))
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(out) != "ok" {
 		return fmt.Errorf("%s shim not found at %s after write — check the upload", name, bin)
 	}

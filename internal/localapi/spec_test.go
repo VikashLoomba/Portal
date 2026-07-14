@@ -103,6 +103,9 @@ func specOps(t *testing.T, doc []byte) map[string]bool {
 	return scan.ops
 }
 
+// pendingSpecOps stages operations documented before their routes are added.
+var pendingSpecOps = map[string]bool{}
+
 // TestSpecMuxConformance is the D2 conformance check: every spec operation has a
 // registered route and every registered route is documented in the spec. It
 // fails on drift in either direction.
@@ -120,7 +123,7 @@ func TestSpecMuxConformance(t *testing.T) {
 	}
 
 	for op := range spec {
-		if !routes[op] {
+		if !routes[op] && !pendingSpecOps[op] {
 			t.Errorf("spec documents %q but no route is registered", op)
 		}
 	}

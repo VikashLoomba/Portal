@@ -1,10 +1,16 @@
-import type { Event, Notify, Status } from "../../clients/ts/src/index.ts";
+import type { Event, Notify, SetupEvent, SetupRequest, Status } from "../../clients/ts/src/index.ts";
 import type { Terminal as XtermTerminal, TerminalConstructor } from "@xterm/xterm";
 
 type Unsubscribe = () => void;
 
 interface PortalBridge {
   config(): Promise<{ socketPath: string }>;
+  sidecarState(): Promise<SidecarState>;
+  onSidecarReady(callback: () => void): Unsubscribe;
+  onSidecarError(callback: (error: BridgeError) => void): Unsubscribe;
+  firstRunState(): Promise<{ needsSetup: boolean }>;
+  startSetup(request: SetupRequest): Promise<SetupEvent | null>;
+  onSetupStep(callback: (event: SetupEvent) => void): Unsubscribe;
   onStatus(callback: (status: Status) => void): Unsubscribe;
   onStatusError(callback: (error: BridgeError) => void): Unsubscribe;
   onEvent(callback: (event: Event) => void): Unsubscribe;
@@ -20,6 +26,11 @@ interface PortalBridge {
 
 interface BridgeError {
   message: string;
+}
+
+interface SidecarState {
+  phase: "starting" | "ready" | "error";
+  error: string;
 }
 
 interface ExecStartRequest {
@@ -53,6 +64,17 @@ const globals = globalThis as typeof globalThis & {
 const portal = requireGlobal(globals.portal, "portal preload bridge");
 const Terminal = requireGlobal(globals.Terminal, "xterm.js");
 
+const sidecarPanelEl = requireElement("sidecar-panel");
+const sidecarConnectingEl = requireElement("sidecar-connecting");
+const sidecarErrorEl = requireElement("sidecar-error");
+const sidecarErrorMessageEl = requireElement("sidecar-error-message");
+const firstRunPanelEl = requireElement("first-run-panel");
+const firstRunHostEl = requireInput("firstrun-host");
+const firstRunForceEl = requireInput("firstrun-force");
+const firstRunStartEl = requireButton("firstrun-start");
+const firstRunStepsEl = requireElement("firstrun-steps");
+const firstRunMessageEl = requireElement("firstrun-message");
+const appShellEl = requireElement("app-shell");
 const socketPathEl = requireElement("socket-path");
 const statusGridEl = requireElement("status-grid");
 const statusMessageEl = requireElement("status-message");
@@ -69,6 +91,11 @@ let activeExecId: string | null = null;
 let lastRows = 24;
 let lastCols = 80;
 let resizeTimer: number | null = null;
+let entered = false;
+let sidecarFailed = false;
+let inFirstRun = false;
+let shellRevealed = false;
+let setupRunning = false;
 
 void initialize();
 
@@ -81,7 +108,10 @@ async function initialize(): Promise<void> {
     statusMessageEl.textContent = error.message;
     statusMessageEl.className = "message is-error";
   });
-  portal.onEvent(renderEvent);
+  portal.onEvent((event) => {
+    renderEvent(event);
+    maybeRevealShell(event);
+  });
   portal.onEventError((error) => {
     eventsMessageEl.textContent = error.message;
     eventsMessageEl.className = "message is-error";
@@ -89,8 +119,8 @@ async function initialize(): Promise<void> {
   portal.onExecData(writeExecData);
   portal.onExecExit(handleExecExit);
   portal.onExecError(handleExecError);
+  portal.onSetupStep(handleSetupStep);
 
-  setupTerminal();
   startButtonEl.addEventListener("click", () => {
     void startExecFromInput();
   });
@@ -100,12 +130,179 @@ async function initialize(): Promise<void> {
       void startExecFromInput();
     }
   });
+  firstRunStartEl.addEventListener("click", () => {
+    void startSetup();
+  });
+  firstRunHostEl.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      void startSetup();
+    }
+  });
   window.addEventListener("resize", scheduleResize);
 
-  await startExec([]);
+  portal.onSidecarReady(() => {
+    void enterApp();
+  });
+  portal.onSidecarError(showSidecarError);
+
+  const boot = await portal.sidecarState();
+  if (boot.phase === "error") {
+    showSidecarError({ message: boot.error });
+    return;
+  }
+  if (boot.phase === "ready") {
+    void enterApp();
+    return;
+  }
+  if (!entered && !sidecarFailed) {
+    showConnecting();
+  }
+}
+
+async function enterApp(): Promise<void> {
+  if (entered || sidecarFailed) {
+    return;
+  }
+  entered = true;
+
+  try {
+    const state = await portal.firstRunState();
+    if (state.needsSetup) {
+      showFirstRun();
+      return;
+    }
+    revealShell();
+  } catch (error) {
+    showSidecarError({ message: toErrorMessage(error) });
+  }
+}
+
+function showConnecting(): void {
+  sidecarPanelEl.hidden = false;
+  sidecarConnectingEl.hidden = false;
+  sidecarErrorEl.hidden = true;
+  firstRunPanelEl.hidden = true;
+  appShellEl.hidden = true;
+}
+
+function showSidecarError(error: BridgeError): void {
+  sidecarFailed = true;
+  sidecarErrorMessageEl.textContent = error.message || "Portal sidecar failed to start.";
+  sidecarPanelEl.hidden = false;
+  sidecarConnectingEl.hidden = true;
+  sidecarErrorEl.hidden = false;
+  firstRunPanelEl.hidden = true;
+  appShellEl.hidden = true;
+}
+
+function showFirstRun(): void {
+  inFirstRun = true;
+  sidecarPanelEl.hidden = true;
+  firstRunPanelEl.hidden = false;
+  appShellEl.hidden = true;
+  firstRunHostEl.focus();
+}
+
+function revealShell(): void {
+  if (shellRevealed || sidecarFailed) {
+    return;
+  }
+  shellRevealed = true;
+  inFirstRun = false;
+  sidecarPanelEl.hidden = true;
+  firstRunPanelEl.hidden = true;
+  appShellEl.hidden = false;
+  setupTerminal();
+  void startExec([]);
+}
+
+async function startSetup(): Promise<void> {
+  if (setupRunning) {
+    return;
+  }
+
+  const host = firstRunHostEl.value.trim();
+  if (host === "") {
+    firstRunMessageEl.textContent = "Enter the SSH host for your dev box.";
+    firstRunMessageEl.className = "message is-error";
+    firstRunHostEl.focus();
+    return;
+  }
+
+  setupRunning = true;
+  firstRunStartEl.disabled = true;
+  firstRunStepsEl.replaceChildren();
+  firstRunMessageEl.textContent = "setting up";
+  firstRunMessageEl.className = "message";
+  const request: SetupRequest = {
+    host,
+    force: firstRunForceEl.checked,
+  };
+
+  try {
+    const done = await portal.startSetup(request);
+    if (done?.step === "done" && done.status === "ok") {
+      revealShell();
+    } else if (done === null) {
+      firstRunMessageEl.textContent = "Setup ended without a verdict.";
+      firstRunMessageEl.className = "message is-error";
+    }
+  } catch (error) {
+    firstRunMessageEl.textContent = toErrorMessage(error);
+    firstRunMessageEl.className = "message is-error";
+  } finally {
+    setupRunning = false;
+    firstRunStartEl.disabled = false;
+  }
+}
+
+function handleSetupStep(event: SetupEvent): void {
+  const item = document.createElement("li");
+  item.className = event.status === "fail"
+    ? "setup-step is-error"
+    : event.status === "warn"
+      ? "setup-step is-warn"
+      : event.status === "ok"
+        ? "setup-step is-ok"
+        : "setup-step";
+
+  const summary = document.createElement("strong");
+  summary.textContent = `${event.step} · ${event.status}`;
+  item.append(summary);
+
+  const detail = event.line || event.error?.message || "";
+  if (detail !== "") {
+    const line = document.createElement("span");
+    line.textContent = detail;
+    item.append(line);
+  }
+  firstRunStepsEl.append(item);
+  item.scrollIntoView({ block: "nearest" });
+
+  firstRunMessageEl.textContent = event.step === "done"
+    ? event.status === "ok" ? "configured" : "setup failed"
+    : `${event.step}: ${event.status}`;
+  firstRunMessageEl.className = event.status === "fail"
+    ? "message is-error"
+    : event.status === "ok" && event.step === "done"
+      ? "message is-ok"
+      : "message";
+
+  if (event.step === "done" && event.status === "ok") {
+    revealShell();
+  }
+}
+
+function maybeRevealShell(event: Event): void {
+  if (inFirstRun && event.status !== null && event.status !== undefined && event.status.host !== "") {
+    revealShell();
+  }
 }
 
 function setupTerminal(): void {
+  if (term !== null) {
+    return;
+  }
   term = new Terminal({
     cursorBlink: true,
     fontFamily: "SFMono-Regular, Menlo, Consolas, monospace",

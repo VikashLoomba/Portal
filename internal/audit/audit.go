@@ -115,6 +115,12 @@ func (l *Log) ExecClose(host, sid string, code int, errStr string, dur time.Dura
 	l.write("exec-close", "host="+host, "sid="+sid, fmt.Sprintf("code=%d", code), "err="+oneLine(errStr), "dur="+dur.String())
 }
 
+// Setup records one completed or interrupted setup run.
+func (l *Log) Setup(host string, forced bool, steps, activation, verdict string) {
+	l.write("setup", "host="+oneLine(host), fmt.Sprintf("forced=%v", forced),
+		"steps="+oneLine(steps), "activation="+oneLine(activation), "verdict="+verdict)
+}
+
 // write appends one tab-separated, timestamped line. Best-effort: on any error
 // it silently no-ops (the action it records must not depend on the log).
 func (l *Log) write(event string, fields ...string) {

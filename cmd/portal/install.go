@@ -6,17 +6,30 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/clipshim"
-	"github.com/VikashLoomba/Portal/pkg/transport/sshctl"
+	"github.com/VikashLoomba/Portal/internal/setup"
+	"github.com/VikashLoomba/Portal/pkg/api"
+	"github.com/VikashLoomba/Portal/pkg/doctor"
 )
 
-func filepathDir(p string) string { return filepath.Dir(p) }
+type setupRunner interface {
+	Validate(context.Context, string, bool) bool
+	Configure(context.Context, string) error
+	DeployRemote(context.Context, string)
+	Verify(context.Context, string) *doctor.Report
+	Close(context.Context)
+}
+
+var newSetupRunner = func(a *app.App, sink setup.Sink) setupRunner {
+	return setup.New(a.Paths, a.Cfg, sink)
+}
+
+var installIsTTY = isatty
 
 func newInstallCmd(a *app.App) *cobra.Command {
 	return &cobra.Command{
@@ -32,146 +45,161 @@ the headless launchd daemon can connect.`,
 			if len(args) == 1 {
 				arg = args[0]
 			}
-			host, err := resolveInstallHost(a, arg, os.Stdin, os.Stderr)
-			if err != nil {
-				return usageErr{msg: fmt.Sprintf("no host given; run interactively or: %s install <ssh-host>", app.Tool)}
-			}
-
-			fmt.Printf("checking ssh to %s ...\n", host)
-			ssh := sshctlSSH(a)
-			// Pass os.Stderr directly so tools like Tailscale that print an
-			// auth URL while establishing the connection are visible to the
-			// user immediately (e.g. "To authenticate, visit: https://...").
-			if err := ssh.Validate(cmd.Context(), host, os.Stderr); err == nil {
-				fmt.Println("ok")
-				if !ssh.HasSS(cmd.Context(), host) {
-					fmt.Printf("WARNING: '%s' is reachable but has no 'ss' command — is it Linux? Port discovery may not work.\n", host)
-				}
-			} else {
-				fmt.Println("FAILED")
-				fmt.Printf("Could not reach '%s' with key-based auth. The background daemon needs\n", host)
-				fmt.Printf("passwordless SSH — set up your key (ssh-copy-id %s) and optionally an\n", host)
-				fmt.Println("entry in ~/.ssh/config, then re-run.")
-				if isatty(os.Stdin) {
-					fmt.Print("install anyway? [y/N] ")
-					reader := bufio.NewReader(os.Stdin)
-					ans, _ := reader.ReadString('\n')
-					ans = strings.ToLower(strings.TrimSpace(ans))
-					if ans != "y" && ans != "yes" {
-						fmt.Println("aborted.")
-						return fmt.Errorf("install aborted")
-					}
-				} else {
-					return fmt.Errorf("ssh validation failed for %s", host)
-				}
-			}
-
-			// Match bash: pre-create all four dirs before plist write.
-			for _, d := range []string{
-				a.Paths.ConfigDir,
-				a.Paths.BinDir,
-				filepathDir(a.Paths.Plist),
-				filepathDir(a.Paths.Log),
-			} {
-				if err := os.MkdirAll(d, 0o755); err != nil {
-					return err
-				}
-			}
-			if err := a.Cfg.WriteHost(host); err != nil {
-				return err
-			}
-			fmt.Printf("configured dev box: %s  (saved to %s)\n", host, a.Paths.HostFile)
-
-			self, err := app.ResolveSelf()
-			if err != nil {
-				return fmt.Errorf("resolve self: %w", err)
-			}
-			if self != a.Paths.BinPath {
-				if err := copyFile(self, a.Paths.BinPath, 0o755); err != nil {
-					return fmt.Errorf("copy binary: %w", err)
-				}
-				fmt.Printf("installed command -> %s\n", a.Paths.BinPath)
-			} else {
-				_ = os.Chmod(a.Paths.BinPath, 0o755)
-			}
-
-			if err := a.Service.Install(cmd.Context()); err != nil {
-				return err
-			}
-			fmt.Printf("service loaded and started (%s)\n", a.Paths.Label)
-
-			// Install the xdg-open wrapper on the dev box. Use a direct
-			// ssh call rather than going through a.Transport — the
-			// transport was built before the host was configured, so its
-			// HostID is empty on a fresh install.
-			if err := installXdgOpenWrapper(cmd.Context(), host, a); err != nil {
-				fmt.Printf("WARNING: could not install xdg-open wrapper on %s: %v\n", host, err)
-			} else {
-				fmt.Printf("installed xdg-open wrapper on %s\n", host)
-			}
-
-			// Deploy the clipboard read shims (xclip/wl-paste) + PATH-prepend.
-			// This is the headline clip feature; surface failure LOUDLY and
-			// name the remediation (DESIGN §9.6) rather than swallowing it.
-			if err := ensureClipShims(cmd.Context(), host, a); err != nil {
-				fmt.Printf("WARNING: could not install clipboard shims on %s: %v\n", host, err)
-				fmt.Printf("         clipboard paste into coding agents will NOT work until this succeeds.\n")
-				fmt.Printf("         fix the cause above and re-run: %s install %s\n", app.Tool, host)
-			} else {
-				fmt.Printf("installed clipboard shims (xclip/wl-paste) on %s\n", host)
-				fmt.Printf("NOTE: keep your terminal's OSC 52 clipboard-WRITE disabled — a remote\n")
-				fmt.Printf("      could otherwise write your Mac clipboard and read it back.\n")
-			}
-
-			if !pathContains(os.Getenv("PATH"), a.Paths.BinDir) {
-				fmt.Printf("NOTE: %s is not on your PATH. Add it to your shell profile:\n", a.Paths.BinDir)
-				fmt.Printf("      export PATH=\"$HOME/.local/bin:$PATH\"\n")
-			}
-
-			// Run the end-to-end self-test (SPEC D) so install surfaces a
-			// pass/fail verdict on the headline clip path LOUDLY, the same way
-			// cc-clip verifies its setup. A FAIL here is the single make-or-break
-			// (usually PATH ordering); we print the report but do NOT abort the
-			// install — the service is already loaded and the user can re-run
-			// `portal doctor` after fixing the cause.
-			fmt.Printf("\nrunning self-test (%s doctor) ...\n", app.Tool)
-			// nil ssh-stderr sink: install's transports carry no StderrSink (no
-			// leak into stdout). Install runs before the transport config exists,
-			// so the factory defaults to system.
-			tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
-			if err != nil {
-				return err
-			}
-			rep := runDoctor(cmd.Context(), host, tr)
-			renderDoctor(os.Stdout, rep)
-
-			fmt.Printf("\ntry:  %s status\n", app.Tool)
-			return nil
+			return runInstall(cmd.Context(), cmd.OutOrStdout(), os.Stdin, installIsTTY(os.Stdin), a, arg)
 		},
 	}
 }
 
-// sshctlSSH returns a fresh SSH transport bound to a placeholder host (used
-// for `Validate`/`HasSS` calls which take the host as an arg, not from the
-// transport's HostID).
-func sshctlSSH(a *app.App) *sshctl.SSH {
-	return sshctl.New(a.Paths.Sock, "", app.SSHOpts, a.Runner)
+func runInstall(ctx context.Context, out io.Writer, in io.Reader, isTTY bool, a *app.App, arg string) error {
+	host, err := resolveInstallHost(a, arg, in, isTTY, out)
+	if err != nil {
+		return usageErr{msg: fmt.Sprintf("no host given; run interactively or: %s install <ssh-host>", app.Tool)}
+	}
+
+	sink := setup.Sink(func(ev api.SetupEvent) {
+		renderSetupEvent(out, host, a.Paths, ev)
+	})
+	r := newSetupRunner(a, sink)
+	defer r.Close(ctx)
+
+	if !r.Validate(ctx, host, false) {
+		if !isTTY {
+			return fmt.Errorf("ssh validation failed for %s", host)
+		}
+		fmt.Fprint(out, "install anyway? [y/N] ")
+		reader := bufio.NewReader(in)
+		ans, _ := reader.ReadString('\n')
+		ans = strings.ToLower(strings.TrimSpace(ans))
+		if ans != "y" && ans != "yes" {
+			fmt.Fprintln(out, "aborted.")
+			return fmt.Errorf("install aborted")
+		}
+	}
+
+	if err := r.Configure(ctx, host); err != nil {
+		return err
+	}
+
+	self, err := app.ResolveSelf()
+	if err != nil {
+		return fmt.Errorf("resolve self: %w", err)
+	}
+	if self != a.Paths.BinPath {
+		if err := copyFile(self, a.Paths.BinPath, 0o755); err != nil {
+			return fmt.Errorf("copy binary: %w", err)
+		}
+		fmt.Fprintf(out, "installed command -> %s\n", a.Paths.BinPath)
+	} else {
+		_ = os.Chmod(a.Paths.BinPath, 0o755)
+	}
+
+	if err := a.Service.Install(ctx); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "service loaded and started (%s)\n", a.Paths.Label)
+
+	r.DeployRemote(ctx, host)
+
+	if !pathContains(os.Getenv("PATH"), a.Paths.BinDir) {
+		fmt.Fprintf(out, "NOTE: %s is not on your PATH. Add it to your shell profile:\n", a.Paths.BinDir)
+		fmt.Fprintln(out, `      export PATH="$HOME/.local/bin:$PATH"`)
+	}
+
+	rep := r.Verify(ctx, host)
+	renderDoctor(out, rep)
+
+	fmt.Fprintf(out, "\ntry:  %s status\n", app.Tool)
+	return nil
 }
 
-func resolveInstallHost(a *app.App, arg string, in *os.File, errw io.Writer) (string, error) {
-	if h := stripWhitespace(arg); h != "" {
+func renderSetupEvent(w io.Writer, host string, paths app.Paths, ev api.SetupEvent) {
+	if ev.Step == "validate" && ev.Status == "warn" && ev.Error == nil {
+		fmt.Fprintln(w, "ok")
+	}
+	if ev.Line != "" {
+		io.WriteString(w, ev.Line)
+		if ev.Status != "running" && !strings.HasSuffix(ev.Line, "\n") {
+			fmt.Fprintln(w)
+		}
+	}
+
+	switch ev.Step {
+	case "validate":
+		switch ev.Status {
+		case "running":
+			if ev.Line == "" {
+				fmt.Fprintf(w, "checking ssh to %s ...\n", host)
+			}
+		case "ok":
+			fmt.Fprintln(w, "ok")
+		case "fail":
+			renderValidationFailure(w, host)
+		case "warn":
+			if ev.Error != nil {
+				renderValidationFailure(w, host)
+			}
+		}
+	case "configure":
+		if ev.Status == "ok" {
+			fmt.Fprintf(w, "configured dev box: %s  (saved to %s)\n", host, paths.HostFile)
+		}
+	case "xdg-open":
+		switch ev.Status {
+		case "ok":
+			fmt.Fprintf(w, "installed xdg-open wrapper on %s\n", host)
+		case "warn":
+			fmt.Fprintf(w, "WARNING: could not install xdg-open wrapper on %s: %s\n", host, setupErrorMessage(ev))
+		}
+	case "clip-shims":
+		switch ev.Status {
+		case "ok":
+			fmt.Fprintf(w, "installed clipboard shims (xclip/wl-paste) on %s\n", host)
+			fmt.Fprintln(w, "NOTE: keep your terminal's OSC 52 clipboard-WRITE disabled — a remote")
+			fmt.Fprintln(w, "      could otherwise write your Mac clipboard and read it back.")
+		case "warn":
+			fmt.Fprintf(w, "WARNING: could not install clipboard shims on %s: %s\n", host, setupErrorMessage(ev))
+			fmt.Fprintln(w, "         clipboard paste into coding agents will NOT work until this succeeds.")
+			fmt.Fprintf(w, "         fix the cause above and re-run: %s install %s\n", app.Tool, host)
+		}
+	case "agent-symlink":
+		if ev.Status == "warn" {
+			fmt.Fprintf(w, "WARNING: could not update portald symlink on %s: %s\n", host, setupErrorMessage(ev))
+		}
+	case "doctor":
+		if ev.Status == "running" {
+			fmt.Fprintf(w, "\nrunning self-test (%s doctor) ...\n", app.Tool)
+		}
+	}
+}
+
+func renderValidationFailure(w io.Writer, host string) {
+	fmt.Fprintln(w, "FAILED")
+	fmt.Fprintf(w, "Could not reach '%s' with key-based auth. The background daemon needs\n", host)
+	fmt.Fprintf(w, "passwordless SSH — set up your key (ssh-copy-id %s) and optionally an\n", host)
+	fmt.Fprintln(w, "entry in ~/.ssh/config, then re-run.")
+}
+
+func setupErrorMessage(ev api.SetupEvent) string {
+	if ev.Error == nil || ev.Error.Message == "" {
+		return "unknown error"
+	}
+	return ev.Error.Message
+}
+
+func resolveInstallHost(a *app.App, arg string, in io.Reader, isTTY bool, errw io.Writer) (string, error) {
+	if h := setup.NormalizeHost(arg); h != "" {
 		return h, nil
 	}
 	if h, _ := a.Cfg.ReadHost(); h != "" {
 		return h, nil
 	}
-	if !isatty(in) {
+	if !isTTY {
 		return "", fmt.Errorf("no host and not a TTY")
 	}
 	fmt.Fprint(errw, "SSH host for your dev box (an alias from ~/.ssh/config, or user@hostname): ")
 	reader := bufio.NewReader(in)
 	line, _ := reader.ReadString('\n')
-	h := stripWhitespace(line)
+	h := setup.NormalizeHost(line)
 	if h == "" {
 		return "", fmt.Errorf("empty input")
 	}
@@ -232,107 +260,9 @@ func isatty(f *os.File) bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
-// browserEnvSnippet is sourced by ~/.bashrc / ~/.zshrc on the dev box.
-// It sets BROWSER=xdg-open so Python's webbrowser module (used by aws sso
-// login, among others) delegates to xdg-open instead of falling through to
-// w3m or other terminal browsers. This makes `aws sso login` open the URL
-// via our wrapper and relay it to the Mac.
-const browserEnvSnippet = `
-# Added by portal — sets BROWSER so Python's webbrowser module uses xdg-open.
-export BROWSER="${BROWSER:-xdg-open}"
-`
-
-// ensureClipShims deploys the xclip + wl-paste clipboard read shims and the
-// PATH-prepend block to the dev box (DESIGN §6/§9). The deploy logic lives in
-// internal/clipshim so the agentclient daemon loop — which cannot import this
-// CLI main package — shares exactly one implementation. Here we just bind a
-// transport to the freshly-configured host (its HostID is empty on a fresh
-// install, so a direct ssh call with `host` is required, mirroring
-// installXdgOpenWrapper).
-func ensureClipShims(ctx context.Context, host string, a *app.App) error {
-	// nil ssh-stderr sink; factory defaults to system (config not yet written on
-	// a fresh install).
-	tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
-	if err != nil {
-		return err
-	}
-	return clipshim.Ensure(ctx, tr)
-}
-
-// installXdgOpenWrapper writes the wrapper script to ~/.local/bin/xdg-open
-// on the dev box. Uses a direct (non-multiplexed) ssh call with the given
-// host so it works on a fresh install before the ControlMaster exists.
-func installXdgOpenWrapper(ctx context.Context, host string, a *app.App) error {
-	// nil ssh-stderr sink; factory defaults to system (config not yet written on
-	// a fresh install).
-	tr, _, err := app.NewTransport(a.Paths, host, a.Runner, a.Cfg, nil)
-	if err != nil {
-		return err
-	}
-
-	// Write the BROWSER env snippet to ~/.config/portal/env.sh and source
-	// it from ~/.bashrc and ~/.zshrc (if they exist). This ensures Python's
-	// webbrowser module (used by aws sso login, etc.) delegates to xdg-open.
-	envScript := `mkdir -p ~/.config/portal && cat > ~/.config/portal/env.sh`
-	if _, _, err := tr.Exec(ctx, []byte(browserEnvSnippet), "bash", "-c", shellQuoteRemote(envScript)); err != nil {
-		return fmt.Errorf("write env snippet: %w", err)
-	}
-	// Source the snippet from each shell rc file that exists, idempotently.
-	sourceSnippet := `
-for rc in ~/.bashrc ~/.zshrc; do
-    [ -f "$rc" ] || continue
-    grep -qF "portal/env.sh" "$rc" && continue
-    printf '\n[ -f ~/.config/portal/env.sh ] && . ~/.config/portal/env.sh\n' >> "$rc"
-done`
-	if _, _, err := tr.Exec(ctx, nil, "bash", "-c", shellQuoteRemote(sourceSnippet)); err != nil {
-		return fmt.Errorf("source env snippet: %w", err)
-	}
-
-	// Backup any pre-existing ~/.local/bin/xdg-open that isn't ours, so
-	// uninstall can restore it. Skip the backup if it's already our wrapper.
-	backupScript := `if [ -f ~/.local/bin/xdg-open ] && ! grep -qF "Installed by portal" ~/.local/bin/xdg-open 2>/dev/null; then cp ~/.local/bin/xdg-open ~/.local/bin/xdg-open.portal-backup; fi`
-	_, _, _ = tr.Exec(ctx, nil, "bash", "-c", shellQuoteRemote(backupScript))
-
-	wrapScript := `mkdir -p ~/.local/bin && cat > ~/.local/bin/xdg-open.portal.tmp && chmod 0755 ~/.local/bin/xdg-open.portal.tmp && mv ~/.local/bin/xdg-open.portal.tmp ~/.local/bin/xdg-open`
-	if _, _, err := tr.Exec(ctx, []byte(clipshim.XDGOpenWrapper), "bash", "-c", shellQuoteRemote(wrapScript)); err != nil {
-		return fmt.Errorf("write wrapper: %w", err)
-	}
-
-	// The bootstrap.Manager also writes this symlink after upload, but it
-	// may not have run yet on a fresh install (agent upload happens after
-	// the service starts). Force it now using the known SHA.
-	sha := a.Bootstrap.EmbeddedSHA()
-	if sha != "" {
-		symlinkScript := fmt.Sprintf(`ln -sf ~/.cache/portal/agent-%s ~/.cache/portal/portald 2>/dev/null || true`, sha)
-		_, _, _ = tr.Exec(ctx, nil, "bash", "-c", shellQuoteRemote(symlinkScript))
-	}
-
-	// Verify our wrapper landed correctly — check the file we just wrote
-	// rather than resolving xdg-open through PATH (which is unreliable in
-	// non-interactive ssh sessions and varies by distro).
-	verifyScript := `grep -qF "Installed by portal" ~/.local/bin/xdg-open 2>/dev/null && echo ok || echo missing`
-	out, _, _ := tr.Exec(ctx, nil, "bash", "-c", shellQuoteRemote(verifyScript))
-	if strings.TrimSpace(out) != "ok" {
-		return fmt.Errorf("wrapper not found at ~/.local/bin/xdg-open on %s — check that the upload succeeded", host)
-	}
-	return nil
-}
-
 // removePortalWrappers removes everything portal deploys to the dev box's
-// ~/.local/bin and shell rc files: the xdg-open wrapper, the xclip/wl-paste
-// clipboard shims, the portald symlink, the env snippet, AND the PATH-prepend
-// marker block — restoring any pre-existing binaries backed up at install. The
-// removal logic lives in internal/clipshim so it shares exactly one
-// implementation with the deploy side. Never touches /usr/bin (DESIGN §9.3/§9.4).
+// ~/.local/bin and shell rc files. The shared clipshim implementation restores
+// backups and removes the environment marker blocks.
 func removePortalWrappers(ctx context.Context, a *app.App) {
 	clipshim.Remove(ctx, a.Transport)
 }
-
-// shellQuoteRemote wraps a shell script in single quotes for safe remote
-// execution via ssh (which joins argv with spaces and passes to sh -c).
-func shellQuoteRemote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
-// silence unused-import for context (some build paths drop it).
-var _ = context.Background

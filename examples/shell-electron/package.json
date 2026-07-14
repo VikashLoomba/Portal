@@ -8,6 +8,23 @@
     "start": "electron .",
     "typecheck": "tsc --noEmit -p ."
   },
+  "build": {
+    "appId": "dev.portal.shell-electron",
+    "extraResources": [
+      {
+        "from": "../../portal",
+        "to": "portal"
+      },
+      {
+        "from": "../../clients/ts/src",
+        "to": "clients-ts"
+      },
+      {
+        "from": "../../clients/ts/package.json",
+        "to": "clients-ts/package.json"
+      }
+    ]
+  },
   "devDependencies": {
     "@xterm/xterm": "6.0.0",
     "electron": "43.1.0"

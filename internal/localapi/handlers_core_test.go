@@ -65,6 +65,10 @@ type fakeService struct{ st service.Status }
 
 func (f fakeService) Status(context.Context) (service.Status, error) { return f.st, nil }
 
+type serviceStatusFunc func(context.Context) (service.Status, error)
+
+func (f serviceStatusFunc) Status(ctx context.Context) (service.Status, error) { return f(ctx) }
+
 // newTestServer builds a Server over in-file fakes plus a real config.Store on
 // t.TempDir. agent may be nil (no handshake).
 func newTestServer(t *testing.T, agent AgentSource) *Server {
@@ -197,6 +201,93 @@ func TestHandleStatus_AgentPresent(t *testing.T) {
 	}
 	if len(got.Forwards) != 1 || got.Forwards[0].Name != "127.0.0.1:8080->box:8080" {
 		t.Errorf("Forwards = %+v", got.Forwards)
+	}
+}
+
+func TestBuildStatusUsesOnePinnedStackView(t *testing.T) {
+	pins := 0
+	released := false
+	agent := &fakeAgent{
+		ack:     &protocol.HelloAck{AgentPID: 111, AgentGitSHA: "stack-a"},
+		ports:   []uint16{8080},
+		ok:      true,
+		lastErr: "stack-a-disconnect",
+	}
+	s := New(Deps{
+		Host:   func() (string, error) { return "stack-b", nil },
+		Agent:  &fakeAgent{ack: &protocol.HelloAck{AgentPID: 222}},
+		Master: fakeMaster{pid: 222},
+		Ports:  fakeForwards{lines: []string{"stack-b-forward"}},
+		Config: config.New(t.TempDir()),
+		PinStack: func(context.Context) (StackView, func()) {
+			pins++
+			return StackView{
+				Host:         "stack-a",
+				HostKnown:    true,
+				Agent:        agent,
+				Master:       fakeMaster{pid: 111},
+				Ports:        fakeForwards{lines: []string{"stack-a-forward"}},
+				ReconcileGen: func() uint64 { return 7 },
+			}, func() { released = true }
+		},
+	})
+
+	got := s.buildStatus(context.Background())
+	if pins != 1 || !released {
+		t.Fatalf("stack pins = %d, released=%v, want one released view", pins, released)
+	}
+	if got.Host != "stack-a" || got.Agent == nil || got.Agent.Pid != 111 || got.Master.Pid != 111 {
+		t.Fatalf("status generation fields = %+v, want stack-a", got)
+	}
+	if len(got.Ports) != 1 || got.Ports[0].Port != 8080 || len(got.Forwards) != 1 || got.Forwards[0].Name != "stack-a-forward" {
+		t.Fatalf("status stack collections = %+v/%+v, want stack-a", got.Ports, got.Forwards)
+	}
+	if got.Health.LastDisconnectErr != "stack-a-disconnect" || got.Health.ReconcileCount != 7 {
+		t.Fatalf("status stack health = %+v, want stack-a", got.Health)
+	}
+}
+
+func TestBuildStatusDoesNotPinStackDuringServiceProbe(t *testing.T) {
+	serviceStarted := make(chan struct{})
+	releaseService := make(chan struct{})
+	stackPinned := make(chan struct{})
+	stackReleased := make(chan struct{})
+	s := New(Deps{
+		Service: serviceStatusFunc(func(context.Context) (service.Status, error) {
+			close(serviceStarted)
+			<-releaseService
+			return service.Status{Loaded: true}, nil
+		}),
+		PinStack: func(context.Context) (StackView, func()) {
+			close(stackPinned)
+			return StackView{}, func() { close(stackReleased) }
+		},
+	})
+	done := make(chan struct{})
+	go func() {
+		s.buildStatus(context.Background())
+		close(done)
+	}()
+
+	<-serviceStarted
+	select {
+	case <-stackPinned:
+		close(releaseService)
+		<-done
+		t.Fatal("status pinned the stack while the host-independent service probe was blocked")
+	default:
+	}
+	close(releaseService)
+	<-done
+	select {
+	case <-stackPinned:
+	default:
+		t.Fatal("status did not pin the stack for host-bound probes")
+	}
+	select {
+	case <-stackReleased:
+	default:
+		t.Fatal("status did not release the stack pin")
 	}
 }
 

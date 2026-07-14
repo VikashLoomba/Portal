@@ -65,7 +65,7 @@ paths:
                 $ref: "#/components/schemas/ErrorBody"
   /v1/ports:
     get:
-      summary: Remote loopback listeners from the cached Snapshot (503 before the first).
+      summary: Remote loopback listeners from the cached Snapshot.
       responses:
         "200":
           description: Cached remote loopback listeners.
@@ -76,7 +76,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/PortStatus"
         "503":
-          description: No cached Snapshot has arrived from the agent yet.
+          description: No host is configured, or no cached Snapshot has arrived from the agent yet.
           content:
             application/json:
               schema:
@@ -217,6 +217,12 @@ paths:
               schema:
                 type: object
                 additionalProperties: true
+        "503":
+          description: No active host stack is configured.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "500":
           description: Internal server error.
           content:
@@ -294,8 +300,43 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorBody"
+        "503":
+          description: No active host stack is configured.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "500":
           description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+  /v1/setup:
+    post:
+      summary: Bootstrap, re-deploy, or switch the configured remote host.
+      description: Streams setup progress without cycling the daemon or API socket. During the activate step, host-bound calls from other clients may transiently degrade for the bounded S6 drain window.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetupRequest"
+      responses:
+        "200":
+          description: Newline-delimited SetupEvent stream terminating with a done event.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        "400":
+          description: Malformed or empty request body, or no resolvable host (invalid_request).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "409":
+          description: Another setup is already running (setup_in_progress).
           content:
             application/json:
               schema:
@@ -472,4 +513,11 @@ components:
         - enabled
       properties:
         enabled:
+          type: boolean
+    SetupRequest:
+      type: object
+      properties:
+        host:
+          type: string
+        force:
           type: boolean
