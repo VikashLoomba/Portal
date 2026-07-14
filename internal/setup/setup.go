@@ -4,10 +4,12 @@ package setup
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/config"
@@ -26,6 +28,8 @@ type validator interface {
 	Validate(ctx context.Context, host string, stderrW io.Writer) error
 	HasSS(ctx context.Context, host string) bool
 }
+
+var setupRunID atomic.Uint64
 
 // Runner owns one setup run and its dedicated host-bound transport.
 type Runner struct {
@@ -64,7 +68,7 @@ func New(paths app.Paths, cfg *config.Store, sink Sink) *Runner {
 		cfg:       cfg,
 		sink:      sink,
 		runner:    run.OSRunner{},
-		setupSock: filepath.Join(paths.ConfigDir, "setup-cm.sock"),
+		setupSock: filepath.Join(paths.ConfigDir, fmt.Sprintf("setup-cm-%d-%d.sock", os.Getpid(), setupRunID.Add(1))),
 		doctor:    doctorprobe.Run,
 	}
 	r.newTransport = r.defaultNewTransport
@@ -91,10 +95,13 @@ func (r *Runner) setupValidator() validator {
 	return r.validator
 }
 
-func (r *Runner) defaultNewTransport(_ context.Context, host string) (transport.Transport, error) {
+func (r *Runner) defaultNewTransport(ctx context.Context, host string) (transport.Transport, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	paths := r.paths
 	paths.Sock = r.setupSock
-	tr, _, err := app.NewTransport(paths, host, r.runner, r.cfg, nil)
+	tr, _, err := app.NewTransportContext(ctx, paths, host, r.runner, r.cfg, nil)
 	return tr, err
 }
 
@@ -162,7 +169,7 @@ func (r *Runner) Validate(ctx context.Context, host string, force bool) bool {
 		r.emit(api.SetupEvent{
 			Step:   "validate",
 			Status: "running",
-			Line:   "WARNING: '" + host + "' is reachable but has no 'ss' command — is it Linux? Port discovery may not work.",
+			Line:   "WARNING: '" + host + "' is reachable but has no 'ss' command — is it Linux? Port discovery may not work.\n",
 		})
 		r.emit(api.SetupEvent{Step: "validate", Status: "warn"})
 		return true

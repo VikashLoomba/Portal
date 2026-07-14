@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import test from "node:test";
 
 import type { SetupEvent } from "../src/dto.ts";
-import { ApiError } from "../src/http.ts";
+import { ApiError, createClient } from "../src/http.ts";
 import { setup } from "../src/setup.ts";
 import { FakeHttpServer } from "./fake-http-server.ts";
 
@@ -77,6 +77,7 @@ test("setup sends force and yields validate warn followed by done ok", async (t)
 });
 
 test("setup yields activate failure and done fail without throwing", async (t) => {
+  const activeHost = "old-box";
   const expected: SetupEvent[] = [
     { step: "validate", status: "running" },
     { step: "validate", status: "ok" },
@@ -92,9 +93,19 @@ test("setup yields activate failure and done fail without throwing", async (t) =
     { step: "activate", status: "fail", error: { code: "activate_failed", message: "construct failed" } },
     { step: "done", status: "fail" },
   ];
-  const fake = await FakeHttpServer.start(t, (_req, resp) => writeSetupEvents(resp, expected));
+  const fake = await FakeHttpServer.start(t, (req, resp) => {
+    if (req.method === "GET" && req.url === "/v1/status") {
+      resp.writeHead(200, { "Content-Type": "application/json" });
+      resp.end(JSON.stringify({ host: activeHost }));
+      return;
+    }
+    assert.equal(req.method, "POST");
+    assert.equal(req.url, "/v1/setup");
+    writeSetupEvents(resp, expected);
+  });
 
   assert.deepStrictEqual(await collectSetup(fake.path, { host: "new-box" }), expected);
+  assert.equal((await createClient(fake.path).status()).host, "old-box");
   await fake.done;
 });
 

@@ -152,7 +152,7 @@ func TestValidateEventsAndForce(t *testing.T) {
 			}
 			if tt.name == "missing ss" {
 				assertEventStatuses(t, got, "validate:running", "validate:running", "validate:warn")
-				if got[1].Line == "" || got[2].Line != "" {
+				if !strings.HasSuffix(got[1].Line, "\n") || got[2].Line != "" {
 					t.Fatalf("missing-ss events = %#v, want distinct line and terminal", got)
 				}
 			}
@@ -235,6 +235,9 @@ func TestDeployAndVerifyOrderCachesEstablishedTransport(t *testing.T) {
 		"xdg-open", "clip-shims", "agent-symlink",
 		"xdg-open", "clip-shims", "agent-symlink", "doctor")
 	doctorEvent := (*events)[len(*events)-1]
+	if doctorEvent.Status != "ok" {
+		t.Fatalf("doctor terminal status = %q, want ok for a completed failing report", doctorEvent.Status)
+	}
 	var decoded doctor.Report
 	if err := json.Unmarshal(doctorEvent.Report, &decoded); err != nil || decoded.Host != "box" {
 		t.Fatalf("doctor event report = %s, %v", doctorEvent.Report, err)
@@ -367,31 +370,46 @@ func TestAgentSymlinkObservesExecFailure(t *testing.T) {
 
 func TestDedicatedSocketAndCloseAreIdempotent(t *testing.T) {
 	r, tr, _ := testRunner(t)
-	want := filepath.Join(r.paths.ConfigDir, "setup-cm.sock")
-	if r.setupSock != want || r.setupSock == r.paths.Sock {
-		t.Fatalf("setupSock = %q, shared = %q, want %q", r.setupSock, r.paths.Sock, want)
+	if filepath.Dir(r.setupSock) != r.paths.ConfigDir || r.setupSock == r.paths.Sock {
+		t.Fatalf("setupSock = %q, shared = %q, want a dedicated socket under %q", r.setupSock, r.paths.Sock, r.paths.ConfigDir)
+	}
+	other := New(r.paths, r.cfg, nil)
+	if other.setupSock == r.setupSock {
+		t.Fatalf("concurrent runners share setup socket %q", r.setupSock)
 	}
 	defaultTr, err := r.defaultNewTransport(context.Background(), "box")
 	if err != nil {
 		t.Fatalf("defaultNewTransport: %v", err)
 	}
-	if got := defaultTr.Describe().Endpoint; got != want {
-		t.Fatalf("default transport endpoint = %q, want %q", got, want)
+	if got := defaultTr.Describe().Endpoint; got != r.setupSock {
+		t.Fatalf("default transport endpoint = %q, want %q", got, r.setupSock)
 	}
-	if err := os.MkdirAll(filepath.Dir(want), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(r.setupSock), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(want, []byte("socket"), 0o600); err != nil {
+	if err := os.WriteFile(r.setupSock, []byte("socket"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	r.tr = tr
 	r.Close(context.Background())
 	r.Close(context.Background())
-	if _, err := os.Stat(want); !os.IsNotExist(err) {
+	if _, err := os.Stat(r.setupSock); !os.IsNotExist(err) {
 		t.Fatalf("setup socket still exists: %v", err)
 	}
 	if got := countCall(tr.calls, "close"); got != 1 {
 		t.Fatalf("Close calls = %d, want 1", got)
+	}
+}
+
+func TestDefaultNewTransportHonorsCanceledContext(t *testing.T) {
+	r, _, _ := testRunner(t)
+	if err := r.cfg.SetTransport("native"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := r.defaultNewTransport(ctx, "box"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("defaultNewTransport error = %v, want context canceled", err)
 	}
 }
 

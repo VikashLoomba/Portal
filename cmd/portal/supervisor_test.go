@@ -60,13 +60,19 @@ func (l *callLog) snapshot() []string {
 }
 
 type recordingStackTransport struct {
-	host         string
-	log          *callLog
-	closeStarted chan struct{}
-	closeGate    <-chan struct{}
-	closeErr     error
-	workCheck    func()
-	closeOnce    sync.Once
+	host            string
+	log             *callLog
+	closeStarted    chan struct{}
+	closeGate       <-chan struct{}
+	closeErr        error
+	workCheck       func()
+	closeOnce       sync.Once
+	healthStarted   chan struct{}
+	healthCanceled  chan struct{}
+	healthRelease   <-chan struct{}
+	forwardStarted  chan struct{}
+	forwardCanceled chan struct{}
+	forwardRelease  <-chan struct{}
 }
 
 func (t *recordingStackTransport) record(name string) {
@@ -83,7 +89,16 @@ func (t *recordingStackTransport) Ensure(context.Context) (bool, error) {
 	return false, nil
 }
 
-func (t *recordingStackTransport) Health(context.Context) (transport.Health, error) {
+func (t *recordingStackTransport) Health(ctx context.Context) (transport.Health, error) {
+	if t.healthStarted != nil {
+		close(t.healthStarted)
+		<-ctx.Done()
+		close(t.healthCanceled)
+		if t.healthRelease != nil {
+			<-t.healthRelease
+		}
+		return transport.Health{}, ctx.Err()
+	}
 	return transport.Health{Up: true, Detail: "test"}, nil
 }
 
@@ -126,7 +141,17 @@ func (t *recordingStackTransport) Cancel(context.Context, int, int) error  { ret
 func (t *recordingStackTransport) ListForwards(context.Context) ([]int, error) {
 	return []int{}, nil
 }
-func (t *recordingStackTransport) ForwardLines(context.Context) ([]string, error) {
+
+func (t *recordingStackTransport) ForwardLines(ctx context.Context) ([]string, error) {
+	if t.forwardStarted != nil {
+		close(t.forwardStarted)
+		<-ctx.Done()
+		close(t.forwardCanceled)
+		if t.forwardRelease != nil {
+			<-t.forwardRelease
+		}
+		return nil, ctx.Err()
+	}
 	return []string{}, nil
 }
 
@@ -400,6 +425,78 @@ func TestSupervisorCancelKillsInflightExec(t *testing.T) {
 	}
 }
 
+func TestSupervisorDrainJoinsControlSocketOperations(t *testing.T) {
+	for _, operation := range []string{"health", "forward lines"} {
+		t.Run(operation, func(t *testing.T) {
+			base := newSupervisorBase(t, "A")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			s := newSupervisor(ctx, base, io.Discard)
+			started := make(chan struct{})
+			canceled := make(chan struct{})
+			release := make(chan struct{})
+			oldTr := &recordingStackTransport{host: "A"}
+			if operation == "health" {
+				oldTr.healthStarted = started
+				oldTr.healthCanceled = canceled
+				oldTr.healthRelease = release
+			} else {
+				oldTr.forwardStarted = started
+				oldTr.forwardCanceled = canceled
+				oldTr.forwardRelease = release
+			}
+			old := newSupervisorStack(base, "A", oldTr)
+			next := newSupervisorStack(base, "B", &recordingStackTransport{host: "B"})
+			s.newStack = func(_ context.Context, host string) (*app.Stack, error) {
+				if host == "A" {
+					return old, nil
+				}
+				return next, nil
+			}
+			s.ref.Store(s.newLiveStack(old))
+			defer func() { cancel(); s.waitCurrent() }()
+
+			operationDone := make(chan error, 1)
+			if operation == "health" {
+				go func() {
+					_, err := (supervisorMaster{s}).Health(context.Background())
+					operationDone <- err
+				}()
+			} else {
+				go func() {
+					_, err := (supervisorPorts{s}).ForwardLines(context.Background())
+					operationDone <- err
+				}()
+			}
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatalf("%s did not start", operation)
+			}
+
+			activated := make(chan error, 1)
+			go func() { activated <- s.Activate(context.Background(), "B") }()
+			select {
+			case <-canceled:
+			case <-time.After(time.Second):
+				t.Fatalf("%s did not inherit stack cancellation", operation)
+			}
+			select {
+			case err := <-activated:
+				t.Fatalf("activation returned before %s exited: %v", operation, err)
+			case <-time.After(20 * time.Millisecond):
+			}
+			close(release)
+			if err := <-operationDone; !errors.Is(err, context.Canceled) {
+				t.Fatalf("%s error = %v, want context canceled", operation, err)
+			}
+			if err := <-activated; err != nil {
+				t.Fatalf("Activate after %s exit: %v", operation, err)
+			}
+		})
+	}
+}
+
 func TestBindStackContextStartsCanceledWithDeadStack(t *testing.T) {
 	stackCtx, stopStack := context.WithCancel(context.Background())
 	stopStack()
@@ -540,6 +637,51 @@ func TestSupervisorDrainJoinIsBounded(t *testing.T) {
 		t.Fatal("timed-out drain published the replacement stack")
 	}
 	close(stuck)
+}
+
+func TestSupervisorShutdownIsBounded(t *testing.T) {
+	base := newSupervisorBase(t, "A")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newSupervisor(ctx, base, io.Discard)
+	s.drainTimeout = 40 * time.Millisecond
+	old := newSupervisorStack(base, "A", &recordingStackTransport{host: "A"})
+	next := newSupervisorStack(base, "B", &recordingStackTransport{host: "B"})
+	s.newStack = func(_ context.Context, host string) (*app.Stack, error) {
+		if host == "A" {
+			return old, nil
+		}
+		return next, nil
+	}
+	shutdownStarted := make(chan struct{})
+	releaseShutdown := make(chan struct{})
+	s.shutdownStack = func(context.Context, *app.Stack) error {
+		close(shutdownStarted)
+		<-releaseShutdown
+		return nil
+	}
+	if err := s.startInitial(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); s.waitCurrent() }()
+
+	started := time.Now()
+	err := s.Activate(context.Background(), "B")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Activate error = %v, want drain deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 120*time.Millisecond {
+		t.Fatalf("blocked shutdown exceeded one 40ms drain budget: %s", elapsed)
+	}
+	select {
+	case <-shutdownStarted:
+	default:
+		t.Fatal("old-stack shutdown was not attempted")
+	}
+	if s.current().stack != old {
+		t.Fatal("timed-out shutdown published the replacement stack")
+	}
+	close(releaseShutdown)
 }
 
 func TestSupervisorCloseAndJoinShareDrainDeadline(t *testing.T) {

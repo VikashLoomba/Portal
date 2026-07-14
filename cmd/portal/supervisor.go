@@ -73,8 +73,9 @@ type supervisor struct {
 	ref       atomic.Pointer[liveStack]
 	mu        sync.Mutex
 
-	newStack     func(context.Context, string) (*app.Stack, error)
-	drainTimeout time.Duration
+	newStack      func(context.Context, string) (*app.Stack, error)
+	shutdownStack func(context.Context, *app.Stack) error
+	drainTimeout  time.Duration
 }
 
 func newSupervisor(ctx context.Context, base *app.App, sshStderr io.Writer) *supervisor {
@@ -82,6 +83,9 @@ func newSupervisor(ctx context.Context, base *app.App, sshStderr io.Writer) *sup
 	s.newStack = func(ctx context.Context, host string) (*app.Stack, error) {
 		return app.NewStack(ctx, base.Paths, base.Cfg, base.Hub, host,
 			base.Runner, base.Clk, base.Log, sshStderr)
+	}
+	s.shutdownStack = func(ctx context.Context, stack *app.Stack) error {
+		return stack.Shutdown(ctx)
 	}
 	return s
 }
@@ -201,12 +205,20 @@ func (s *supervisor) drain(ctx context.Context, old *liveStack) error {
 	teardownCtx, teardownCancel := context.WithTimeout(ctx, timeout)
 	defer teardownCancel()
 
-	_ = old.stack.Shutdown(teardownCtx)
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- s.shutdownStack(teardownCtx, old.stack) }()
+	var shutdownErr error
+	select {
+	case shutdownErr = <-shutdownDone:
+	case <-teardownCtx.Done():
+		shutdownErr = teardownCtx.Err()
+	}
 	old.cancel()
 	_, closeErr := old.stack.CloseTransport(teardownCtx)
 	removeErr := old.stack.RemoveSocket()
 	waitErr := s.wait(teardownCtx, old)
 	return errors.Join(
+		wrapDrainError("shutdown old agent", shutdownErr),
 		wrapDrainError("close old transport", closeErr),
 		wrapDrainError("remove old control socket", removeErr),
 		wrapDrainError("wait for old stack", waitErr),
@@ -288,8 +300,15 @@ func (ls *liveStack) bindContext(caller context.Context) (context.Context, conte
 	if ls.draining || ls.ctx.Err() != nil {
 		return nil, nil, errNotConfigured
 	}
+	ls.wg.Add(1)
 	ctx, cancel := bindStackContext(caller, ls.ctx)
-	return ctx, cancel, nil
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			cancel()
+			ls.wg.Done()
+		})
+	}, nil
 }
 
 type supervisorAgent struct{ s *supervisor }
@@ -318,8 +337,14 @@ func (a supervisorAgent) LastDisconnectErr() string {
 type supervisorMaster struct{ s *supervisor }
 
 func (m supervisorMaster) Health(ctx context.Context) (transport.Health, error) {
-	if ls, ok := m.s.serving(); ok {
-		return ls.stack.Transport.Health(ctx)
+	ls, ok := m.s.serving()
+	if ok {
+		sctx, cancel, err := ls.bindContext(ctx)
+		if err != nil {
+			return transport.Health{Up: false, Detail: errNotConfigured.Error()}, nil
+		}
+		defer cancel()
+		return ls.stack.Transport.Health(sctx)
 	}
 	return transport.Health{Up: false, Detail: errNotConfigured.Error()}, nil
 }
@@ -334,8 +359,14 @@ func (m supervisorMaster) Describe() transport.Desc {
 type supervisorPorts struct{ s *supervisor }
 
 func (p supervisorPorts) ForwardLines(ctx context.Context) ([]string, error) {
-	if ls, ok := p.s.serving(); ok {
-		return ls.stack.PF.ForwardLines(ctx)
+	ls, ok := p.s.serving()
+	if ok {
+		sctx, cancel, err := ls.bindContext(ctx)
+		if err != nil {
+			return []string{}, nil
+		}
+		defer cancel()
+		return ls.stack.PF.ForwardLines(sctx)
 	}
 	return []string{}, nil
 }

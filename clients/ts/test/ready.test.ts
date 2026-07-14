@@ -23,6 +23,16 @@ test("waitReady retries a failed version probe and resolves", async (t) => {
   assert.equal(probes, 2);
 });
 
+test("waitReady accepts any HTTP response as ready", async (t) => {
+  const fake = await FakeHttpServer.start(t, (_req, resp) => {
+    resp.writeHead(503, { "Content-Type": "application/json" });
+    resp.end(JSON.stringify({ error: { code: "starting", message: "not ready" } }));
+  });
+
+  await waitReady(fake.path, { timeoutMs: 1000, pollIntervalMs: 10 });
+  await fake.done;
+});
+
 test("waitReady times out an accepting server that never responds", async (t) => {
   let requestSeen = false;
   const fake = await FakeHttpServer.start(t, (req) => {

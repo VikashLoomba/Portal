@@ -119,6 +119,84 @@ func TestSetupInBandFail(t *testing.T) {
 	}
 }
 
+func TestSetupForceWarn(t *testing.T) {
+	serverResult := make(chan error, 1)
+	path := startSetupStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req api.SetupRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			serverResult <- err
+			return
+		}
+		if req.Host != "badbox" || !req.Force {
+			serverResult <- fmt.Errorf("request = %+v, want badbox with force", req)
+			return
+		}
+		serverResult <- writeSetupEvents(w, []api.SetupEvent{
+			{Step: "validate", Status: "running"},
+			{Step: "validate", Status: "warn", Error: &api.ErrorDetail{Code: "validation_failed", Message: "ssh unreachable"}},
+			{Step: "done", Status: "ok"},
+		})
+	}))
+
+	seq, err := New(path).Setup(context.Background(), api.SetupRequest{Host: "badbox", Force: true})
+	if err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	var events []api.SetupEvent
+	for ev, err := range seq {
+		if err != nil {
+			t.Fatalf("forced warning surfaced as iterator error: %v", err)
+		}
+		events = append(events, ev)
+	}
+	if len(events) != 3 || events[1].Status != "warn" || events[2].Step != "done" || events[2].Status != "ok" {
+		t.Fatalf("events = %+v, want validate warn followed by done ok", events)
+	}
+	assertSetupServerResult(t, serverResult)
+}
+
+func TestSetupActivateFailurePreservesActiveState(t *testing.T) {
+	const activeHost = "old-box"
+	path := startSetupStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/setup":
+			_ = writeSetupEvents(w, []api.SetupEvent{
+				{Step: "activate", Status: "running"},
+				{Step: "activate", Status: "fail", Error: &api.ErrorDetail{Code: "activate_failed", Message: "construct failed"}},
+				{Step: "done", Status: "fail"},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(api.Status{Host: activeHost})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+
+	c := New(path)
+	seq, err := c.Setup(context.Background(), api.SetupRequest{Host: "new-box"})
+	if err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	var events []api.SetupEvent
+	for ev, err := range seq {
+		if err != nil {
+			t.Fatalf("activate failure surfaced as iterator error: %v", err)
+		}
+		events = append(events, ev)
+	}
+	if len(events) != 3 || events[1].Error == nil || events[1].Error.Code != "activate_failed" || events[2].Status != "fail" {
+		t.Fatalf("events = %+v, want activate failure followed by done fail", events)
+	}
+	st, err := c.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status after failed activation: %v", err)
+	}
+	if st.Host != activeHost {
+		t.Fatalf("active host after failed activation = %q, want %q", st.Host, activeHost)
+	}
+}
+
 func TestSetupSkipsBlankNDJSONLines(t *testing.T) {
 	path := startSetupStub(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/x-ndjson")

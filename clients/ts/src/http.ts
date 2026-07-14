@@ -33,6 +33,25 @@ export class PortalClient {
     return this.requestJson("GET", "/v1/version", 200, undefined, options);
   }
 
+  available(options: PortalRequestOptions = {}): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const req = request(
+        {
+          socketPath: this.socketPath,
+          method: "GET",
+          path: "/v1/version",
+          signal: options.signal,
+        },
+        (resp) => {
+          resp.destroy();
+          resolve();
+        },
+      );
+      req.once("error", reject);
+      req.end();
+    });
+  }
+
   status(options: PortalRequestOptions = {}): Promise<Status> {
     return this.requestJson("GET", "/v1/status", 200, undefined, options);
   }

@@ -19,17 +19,21 @@ import (
 )
 
 type installFakeSetup struct {
-	sink     setup.Sink
-	proceed  bool
-	calls    []string
-	report   *doctor.Report
-	clipWarn bool
+	sink      setup.Sink
+	proceed   bool
+	calls     []string
+	report    *doctor.Report
+	clipWarn  bool
+	missingSS bool
 }
 
 func (f *installFakeSetup) Validate(_ context.Context, _ string, force bool) bool {
 	f.calls = append(f.calls, "validate")
 	f.sink(api.SetupEvent{Step: "validate", Status: "running"})
-	if f.proceed {
+	if f.missingSS {
+		f.sink(api.SetupEvent{Step: "validate", Status: "running", Line: "WARNING: 'box' is reachable but has no 'ss' command — is it Linux? Port discovery may not work.\n"})
+		f.sink(api.SetupEvent{Step: "validate", Status: "warn"})
+	} else if f.proceed {
 		f.sink(api.SetupEvent{Step: "validate", Status: "ok"})
 	} else {
 		f.sink(api.SetupEvent{Step: "validate", Status: "fail", Error: &api.ErrorDetail{Code: "validation_failed", Message: "unreachable"}})
@@ -120,6 +124,10 @@ func TestRunInstallOutputRegression(t *testing.T) {
 	useInstallFake(t, fake)
 
 	a := installTestApp(t)
+	if err := os.MkdirAll(a.Paths.BinDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.Paths.BinPath = filepath.Join(a.Paths.BinDir, "portal")
 	var out bytes.Buffer
 	if err := runInstall(context.Background(), &out, strings.NewReader(""), false, a, " user @box "); err != nil {
 		t.Fatalf("runInstall: %v", err)
@@ -127,6 +135,7 @@ func TestRunInstallOutputRegression(t *testing.T) {
 	want := fmt.Sprintf("checking ssh to user@box ...\n"+
 		"ok\n"+
 		"configured dev box: user@box  (saved to %s)\n"+
+		"installed command -> %s\n"+
 		"service loaded and started (%s)\n"+
 		"installed xdg-open wrapper on user@box\n"+
 		"WARNING: could not install clipboard shims on user@box: shim denied\n"+
@@ -138,12 +147,25 @@ func TestRunInstallOutputRegression(t *testing.T) {
 		"portal doctor — user@box\n"+
 		"  [PASS] ssh master: UP (pid=1)\n"+
 		"\nRESULT: PASS — clipboard paste should work over plain ssh.\n"+
-		"\ntry:  portal status\n", a.Paths.HostFile, a.Paths.Label, a.Paths.BinDir)
+		"\ntry:  portal status\n", a.Paths.HostFile, a.Paths.BinPath, a.Paths.Label, a.Paths.BinDir)
 	if got := out.String(); got != want {
 		t.Fatalf("install output mismatch:\n--- got ---\n%s--- want ---\n%s", got, want)
 	}
 	if got := strings.Join(fake.calls, ","); got != "validate,configure,deploy,verify,close" {
 		t.Fatalf("phase calls = %q", got)
+	}
+}
+
+func TestRunInstallMissingSSWarningDoesNotJoinTerminalStatus(t *testing.T) {
+	fake := &installFakeSetup{proceed: true, missingSS: true, report: &doctor.Report{Host: "box"}}
+	useInstallFake(t, fake)
+	a := installTestApp(t)
+	var out bytes.Buffer
+	if err := runInstall(context.Background(), &out, strings.NewReader(""), false, a, "box"); err != nil {
+		t.Fatalf("runInstall: %v", err)
+	}
+	if !strings.Contains(out.String(), "Port discovery may not work.\nok\n") {
+		t.Fatalf("missing-ss output joined warning and status: %q", out.String())
 	}
 }
 

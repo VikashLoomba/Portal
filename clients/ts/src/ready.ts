@@ -24,7 +24,7 @@ export async function waitReady(socketPath: string, options: WaitReadyOptions): 
 
   for (;;) {
     try {
-      await client.version({ signal: composed });
+      await client.available({ signal: composed });
       return;
     } catch {
       throwIfAborted();

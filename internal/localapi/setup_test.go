@@ -419,7 +419,8 @@ func TestHandleSetupInBandFailuresAndForce(t *testing.T) {
 	t.Run("configure fail stops remaining phases", func(t *testing.T) {
 		f := &fakeSetupFactory{behavior: fakeSetupBehavior{configureErr: errors.New("disk full")}}
 		act := &fakeSetupActivator{}
-		_, path := newSetupTestServer(t, "old", f, act, audit.New(t.TempDir()))
+		a := audit.New(t.TempDir())
+		_, path := newSetupTestServer(t, "old", f, act, a)
 		resp, events := postSetup(t, path, `{"host":"box"}`)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -432,6 +433,10 @@ func TestHandleSetupInBandFailuresAndForce(t *testing.T) {
 			t.Fatalf("Activate called after configure failure: %v", act.calls())
 		}
 		assertSetupRunnerClosed(t, f.last())
+		fields := auditFields(waitAuditLines(t, a.Path(), 1, 2*time.Second)[0])
+		if fields["forced"] != "false" || fields["steps"] != "validate=ok configure=fail" || fields["activation"] != "" || fields["verdict"] != "fail" {
+			t.Fatalf("configure-failure audit fields = %v", fields)
+		}
 	})
 
 	t.Run("validate fail without force stops before configure", func(t *testing.T) {
@@ -453,7 +458,8 @@ func TestHandleSetupInBandFailuresAndForce(t *testing.T) {
 	t.Run("force degrades validation failure and continues", func(t *testing.T) {
 		f := &fakeSetupFactory{behavior: fakeSetupBehavior{validationFails: true}}
 		act := &fakeSetupActivator{}
-		_, path := newSetupTestServer(t, "old", f, act, audit.New(t.TempDir()))
+		a := audit.New(t.TempDir())
+		_, path := newSetupTestServer(t, "old", f, act, a)
 		resp, events := postSetup(t, path, `{"host":"box","force":true}`)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -465,6 +471,10 @@ func TestHandleSetupInBandFailuresAndForce(t *testing.T) {
 		_, force, _, _, _ := f.last().hosts()
 		if !force {
 			t.Fatal("force was not passed to Validate")
+		}
+		fields := auditFields(waitAuditLines(t, a.Path(), 1, 2*time.Second)[0])
+		if fields["forced"] != "true" || fields["steps"] != "validate=warn configure=ok xdg-open=ok clip-shims=ok agent-symlink=ok activate=ok doctor=ok" || fields["activation"] != "old→box" || fields["verdict"] != "ok" {
+			t.Fatalf("forced-warning audit fields = %v", fields)
 		}
 	})
 
@@ -482,7 +492,8 @@ func TestHandleSetupInBandFailuresAndForce(t *testing.T) {
 	t.Run("activate fail stops doctor", func(t *testing.T) {
 		f := &fakeSetupFactory{}
 		act := &fakeSetupActivator{err: errors.New("construct failed")}
-		_, path := newSetupTestServer(t, "old", f, act, audit.New(t.TempDir()))
+		a := audit.New(t.TempDir())
+		_, path := newSetupTestServer(t, "old", f, act, a)
 		resp, events := postSetup(t, path, `{"host":"box"}`)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -496,6 +507,10 @@ func TestHandleSetupInBandFailuresAndForce(t *testing.T) {
 			t.Fatalf("doctor ran after activate failure: %+v", events)
 		}
 		assertSetupRunnerClosed(t, f.last())
+		fields := auditFields(waitAuditLines(t, a.Path(), 1, 2*time.Second)[0])
+		if fields["forced"] != "false" || fields["steps"] != "validate=ok configure=ok xdg-open=ok clip-shims=ok agent-symlink=ok activate=fail" || fields["activation"] != "old→box (failed)" || fields["verdict"] != "fail" {
+			t.Fatalf("activate-failure audit fields = %v", fields)
+		}
 	})
 }
 
