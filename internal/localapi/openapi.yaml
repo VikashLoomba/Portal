@@ -217,6 +217,12 @@ paths:
               schema:
                 type: object
                 additionalProperties: true
+        "503":
+          description: No active host stack is configured.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "500":
           description: Internal server error.
           content:
@@ -290,6 +296,12 @@ paths:
                 $ref: "#/components/schemas/ErrorBody"
         "409":
           description: The active transport does not support PTY (pty_unsupported).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "503":
+          description: No active host stack is configured.
           content:
             application/json:
               schema:

@@ -178,6 +178,12 @@ var _ transport.PtyStreamer = (*Client)(nil)
 // Describe().Endpoint reports the RESOLVED endpoint; host-key verification keys
 // on the resolved HostKeyAlias when set, else the resolved HostName.
 func New(target string, opts ...Option) (*Client, error) {
+	return NewContext(context.Background(), target, opts...)
+}
+
+// NewContext is New with a caller-owned construction context. Resolution may
+// execute `ssh -G`, so activation uses this form to keep construction bounded.
+func NewContext(ctx context.Context, target string, opts ...Option) (*Client, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("sshnative: resolve home dir for ~/.ssh defaults: %w", err)
@@ -202,7 +208,7 @@ func New(target string, opts ...Option) (*Client, error) {
 		c.proxyCommandDialer = defaultProxyCommandDialer
 	}
 
-	rh, rerr := c.resolver(context.Background(), target)
+	rh, rerr := c.resolver(ctx, target)
 	if rerr != nil {
 		return nil, fmt.Errorf("sshnative: resolve %q: %w", target, rerr)
 	}

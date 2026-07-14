@@ -25,6 +25,10 @@ import (
 // remote stream; and joins copy goroutines, the WebSocket reader, and wait
 // before returning.
 func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
+	if s.notConfigured() {
+		writeError(w, http.StatusServiceUnavailable, "not_configured", "no active host is configured")
+		return
+	}
 	if s.deps.Config == nil || !s.deps.Config.FeatureEnabled(config.FeatureExec) {
 		writeError(w, http.StatusForbidden, "feature_disabled", "exec capability is disabled")
 		return

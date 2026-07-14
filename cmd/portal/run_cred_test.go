@@ -660,7 +660,7 @@ func TestRunCredHandler_Busy(t *testing.T) {
 			copyResp.Secret = append([]byte(nil), resp.Secret...)
 			responses <- &copyResp
 			return nil
-		})
+		}, nil)
 	}()
 
 	first := baseCredEvent()
