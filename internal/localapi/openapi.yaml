@@ -300,6 +300,35 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorBody"
+  /v1/setup:
+    post:
+      summary: Bootstrap, re-deploy, or switch the configured remote host.
+      description: Streams setup progress without cycling the daemon or API socket. During the activate step, host-bound calls from other clients may transiently degrade for the bounded S6 drain window.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetupRequest"
+      responses:
+        "200":
+          description: Newline-delimited SetupEvent stream terminating with a done event.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        "400":
+          description: Malformed or empty request body, or no resolvable host (invalid_request).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "409":
+          description: Another setup is already running (setup_in_progress).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
 components:
   schemas:
     Status:
@@ -472,4 +501,11 @@ components:
         - enabled
       properties:
         enabled:
+          type: boolean
+    SetupRequest:
+      type: object
+      properties:
+        host:
+          type: string
+        force:
           type: boolean
