@@ -6,6 +6,24 @@ contextBridge.exposeInMainWorld("portal", {
   config() {
     return ipcRenderer.invoke("portal:config");
   },
+  sidecarState() {
+    return ipcRenderer.invoke("portal:sidecar:state");
+  },
+  onSidecarReady(callback) {
+    return subscribe("portal:sidecar:ready", callback);
+  },
+  onSidecarError(callback) {
+    return subscribe("portal:sidecar:error", callback);
+  },
+  firstRunState() {
+    return ipcRenderer.invoke("portal:first-run:state");
+  },
+  startSetup(request) {
+    return ipcRenderer.invoke("portal:setup:start", normalizeSetupRequest(request));
+  },
+  onSetupStep(callback) {
+    return subscribe("portal:setup:step", callback);
+  },
   onStatus(callback) {
     return subscribe("portal:status", callback);
   },
@@ -70,6 +88,16 @@ function normalizeExecRequest(request) {
     rows: normalizeInteger(request.rows),
     cols: normalizeInteger(request.cols),
     term: typeof request.term === "string" ? request.term : "xterm-256color",
+  };
+}
+
+function normalizeSetupRequest(request) {
+  if (request === null || typeof request !== "object") {
+    return { host: "", force: false };
+  }
+  return {
+    host: typeof request.host === "string" ? request.host : "",
+    force: request.force === true,
   };
 }
 

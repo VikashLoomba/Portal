@@ -1,5 +1,6 @@
 "use strict";
 
+const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
 const { stripTypeScriptTypes } = require("node:module");
 const os = require("node:os");
@@ -10,12 +11,29 @@ const { app, BrowserWindow, ipcMain, protocol } = require("electron");
 
 const appRoot = __dirname;
 const rendererScheme = "portal-shell";
-const socketPath = resolveSocketPath();
+const readyTimeoutMs = 15000;
+const stableUptimeMs = 30000;
+const maxRespawnAttempts = 5;
 
 let portalApi;
+let portalPaths;
 let mainWindow;
 let nextExecId = 1;
+let sidecarProcess = null;
+let sidecarGeneration = 0;
+let sidecarPhase = "starting";
+let sidecarError = "";
+let sidecarReadyOnce = false;
+let respawnAttempts = 0;
+let respawnTimer = null;
+let setupRunning = false;
+let needsSetup = true;
+let quitting = false;
+let allowQuit = false;
+let teardownPromise = null;
+const sidecarAbort = new AbortController();
 const execSessions = new Map();
+const attachedWindows = new WeakSet();
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -28,18 +46,19 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
-app.whenReady().then(async () => {
+app.whenReady().then(() => {
   registerRendererProtocol();
+  portalPaths = resolvePaths();
   registerIpc();
   mainWindow = createWindow();
-  startStatusLoop(mainWindow);
-  startEventsLoop(mainWindow);
+  void bootstrap();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       mainWindow = createWindow();
-      startStatusLoop(mainWindow);
-      startEventsLoop(mainWindow);
+      if (sidecarPhase === "ready") {
+        attachWindow(mainWindow);
+      }
     }
   });
 });
@@ -50,6 +69,32 @@ app.on("window-all-closed", () => {
     app.quit();
   }
 });
+
+app.on("before-quit", (event) => {
+  quitting = true;
+  if (allowQuit) {
+    return;
+  }
+
+  event.preventDefault();
+  if (teardownPromise === null) {
+    closeAllExecSessions();
+    teardownPromise = stopSidecar().finally(() => {
+      allowQuit = true;
+      app.quit();
+    });
+  }
+});
+
+async function bootstrap() {
+  try {
+    await startSidecar();
+  } catch (error) {
+    if (!quitting) {
+      setSidecarError(`Unable to start portal: ${toErrorMessage(error)}`);
+    }
+  }
+}
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -119,7 +164,57 @@ function registerRendererProtocol() {
 
 function registerIpc() {
   ipcMain.handle("portal:config", () => {
-    return { socketPath };
+    return { socketPath: portalPaths.apiSock };
+  });
+
+  ipcMain.handle("portal:sidecar:state", () => {
+    return { phase: sidecarPhase, error: sidecarError };
+  });
+
+  ipcMain.handle("portal:first-run:state", async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    try {
+      const api = await loadPortalApi();
+      const status = await api.createClient(portalPaths.apiSock).status({ signal: controller.signal });
+      needsSetup = status.host === "";
+    } catch {
+      // The cache is refreshed by setup and the status loop when this short live read fails.
+    } finally {
+      clearTimeout(timeout);
+    }
+    return { needsSetup };
+  });
+
+  ipcMain.handle("portal:setup:start", async (event, input) => {
+    if (setupRunning) {
+      throw new Error("portal setup is already running");
+    }
+
+    setupRunning = true;
+    const request = normalizeSetupStart(input);
+    const owner = event.sender;
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    let done = null;
+    owner.once("destroyed", abort);
+
+    try {
+      const api = await loadPortalApi();
+      for await (const setupEvent of api.setup(portalPaths.apiSock, request, { signal: controller.signal })) {
+        sendToOwner(owner, "portal:setup:step", setupEvent);
+        if (setupEvent.step === "done") {
+          done = setupEvent;
+          if (setupEvent.status === "ok") {
+            needsSetup = false;
+          }
+        }
+      }
+      return done;
+    } finally {
+      owner.removeListener("destroyed", abort);
+      setupRunning = false;
+    }
   });
 
   ipcMain.handle("portal:exec:start", async (event, input) => {
@@ -129,7 +224,7 @@ function registerIpc() {
     const api = await loadPortalApi();
     const owner = event.sender;
 
-    const session = api.exec(socketPath, {
+    const session = api.exec(portalPaths.apiSock, {
       argv: request.argv,
       pty: {
         term: request.term,
@@ -202,10 +297,216 @@ function registerIpc() {
 
 async function loadPortalApi() {
   if (portalApi === undefined) {
-    const url = pathToFileURL(path.resolve(appRoot, "../../clients/ts/src/index.ts"));
+    const url = pathToFileURL(portalPaths.sdkEntry);
     portalApi = import(url.href);
   }
   return portalApi;
+}
+
+async function startSidecar() {
+  await fs.mkdir(portalPaths.configDir, { recursive: true });
+  await spawnSidecar();
+}
+
+function spawnSidecar() {
+  if (quitting) {
+    return Promise.resolve();
+  }
+
+  let child;
+  try {
+    child = spawn(portalPaths.binPath, ["run"], {
+      env: {
+        ...process.env,
+        PORTAL_CONFIG_DIR: portalPaths.configDir,
+        PORTAL_API_SOCK: portalPaths.apiSock,
+        PORTAL_SOCK: portalPaths.controlSock,
+        HOME: os.homedir(),
+      },
+      stdio: "ignore",
+    });
+  } catch (error) {
+    const message = toErrorMessage(error);
+    setSidecarError(`Unable to spawn portal: ${message}`);
+    scheduleRespawn(message, true);
+    return Promise.resolve();
+  }
+
+  const generation = ++sidecarGeneration;
+  const startedAt = Date.now();
+  let settled = false;
+  let spawnFailure = null;
+  sidecarProcess = child;
+
+  child.once("error", (error) => {
+    spawnFailure = error;
+    setSidecarError(`Unable to spawn portal: ${toErrorMessage(error)}`);
+    handleSidecarDeparture(child, startedAt, null, null, spawnFailure, settled);
+    settled = true;
+  });
+  child.once("exit", (code, signal) => {
+    handleSidecarDeparture(child, startedAt, code, signal, spawnFailure, settled);
+    settled = true;
+  });
+
+  return observeSidecarReady(generation);
+}
+
+async function observeSidecarReady(generation) {
+  try {
+    const api = await loadPortalApi();
+    await api.waitReady(portalPaths.apiSock, {
+      timeoutMs: readyTimeoutMs,
+      signal: sidecarAbort.signal,
+    });
+    if (quitting || generation !== sidecarGeneration || sidecarProcess === null) {
+      return;
+    }
+
+    if (!sidecarReadyOnce) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      try {
+        const status = await api.createClient(portalPaths.apiSock).status({ signal: controller.signal });
+        if (quitting || generation !== sidecarGeneration || sidecarProcess === null) {
+          return;
+        }
+        needsSetup = status.host === "";
+      } finally {
+        clearTimeout(timeout);
+      }
+      sidecarReadyOnce = true;
+    }
+
+    setSidecarReady();
+    for (const win of BrowserWindow.getAllWindows()) {
+      attachWindow(win);
+    }
+  } catch (error) {
+    if (!quitting && generation === sidecarGeneration) {
+      setSidecarError(`Portal did not become ready: ${toErrorMessage(error)}`);
+    }
+  }
+}
+
+function handleSidecarDeparture(child, startedAt, code, signal, spawnFailure, alreadySettled) {
+  if (alreadySettled) {
+    return;
+  }
+  if (sidecarProcess === child) {
+    sidecarProcess = null;
+  }
+  if (quitting) {
+    return;
+  }
+
+  if (Date.now() - startedAt >= stableUptimeMs) {
+    respawnAttempts = 0;
+  }
+
+  const message = spawnFailure === null
+    ? `portal exited (${code === null ? signal || "unknown" : `code ${code}`})`
+    : toErrorMessage(spawnFailure);
+  scheduleRespawn(message, spawnFailure !== null);
+}
+
+function scheduleRespawn(message, preserveError) {
+  if (quitting) {
+    return;
+  }
+
+  respawnAttempts += 1;
+  if (respawnAttempts >= maxRespawnAttempts) {
+    setSidecarError(`Portal stopped repeatedly: ${message}`);
+    return;
+  }
+
+  if (!preserveError) {
+    sidecarPhase = "starting";
+    sidecarError = "";
+  }
+  const backoffMs = Math.min(250 * (2 ** (respawnAttempts - 1)), 4000);
+  clearTimeout(respawnTimer);
+  respawnTimer = setTimeout(() => {
+    respawnTimer = null;
+    void spawnSidecar();
+  }, backoffMs);
+}
+
+async function stopSidecar() {
+  sidecarAbort.abort();
+  clearTimeout(respawnTimer);
+  respawnTimer = null;
+
+  const child = sidecarProcess;
+  sidecarProcess = null;
+  if (child === null || child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+
+  const exited = waitForChildExit(child, 2000);
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    return;
+  }
+  if (await exited) {
+    return;
+  }
+
+  const killed = waitForChildExit(child, 1000);
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    return;
+  }
+  await killed;
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve(true);
+  }
+
+  return new Promise((resolve) => {
+    const finish = (exited) => {
+      clearTimeout(timer);
+      child.removeListener("exit", onExit);
+      child.removeListener("error", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.once("exit", onExit);
+    child.once("error", onExit);
+  });
+}
+
+function setSidecarReady() {
+  sidecarPhase = "ready";
+  sidecarError = "";
+  broadcast("portal:sidecar:ready", {});
+}
+
+function setSidecarError(message) {
+  sidecarPhase = "error";
+  sidecarError = message;
+  broadcast("portal:sidecar:error", { message });
+}
+
+function broadcast(channel, payload) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    sendToOwner(win.webContents, channel, payload);
+  }
+}
+
+function attachWindow(win) {
+  if (attachedWindows.has(win) || win.isDestroyed()) {
+    return;
+  }
+  attachedWindows.add(win);
+  startStatusLoop(win);
+  startEventsLoop(win);
 }
 
 function startStatusLoop(win) {
@@ -222,8 +523,9 @@ function startStatusLoop(win) {
     const timeout = setTimeout(() => controller.abort(), 5000);
     try {
       const api = await loadPortalApi();
-      const client = api.createClient(socketPath);
+      const client = api.createClient(portalPaths.apiSock);
       const status = await client.status({ signal: controller.signal });
+      needsSetup = status.host === "";
       sendToOwner(win.webContents, "portal:status", status);
     } catch (error) {
       sendToOwner(win.webContents, "portal:status:error", { message: toErrorMessage(error) });
@@ -248,7 +550,7 @@ function startEventsLoop(win) {
     while (!controller.signal.aborted && !win.webContents.isDestroyed()) {
       try {
         const api = await loadPortalApi();
-        for await (const event of api.events(socketPath, { signal: controller.signal })) {
+        for await (const event of api.events(portalPaths.apiSock, { signal: controller.signal })) {
           sendToOwner(win.webContents, "portal:event", event);
           if (controller.signal.aborted || win.webContents.isDestroyed()) {
             break;
@@ -315,6 +617,16 @@ function execDataPayload(id, stream, chunk) {
   const view = chunk instanceof Uint8Array ? chunk : Buffer.from(chunk);
   const data = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
   return { id, stream, data };
+}
+
+function normalizeSetupStart(input) {
+  if (input === null || typeof input !== "object") {
+    return { host: "", force: false };
+  }
+  return {
+    host: typeof input.host === "string" ? input.host : "",
+    force: input.force === true,
+  };
 }
 
 function normalizeExecStart(input) {
@@ -398,11 +710,20 @@ function delay(ms, signal) {
   });
 }
 
-function resolveSocketPath() {
-  return process.env.PORTAL_API_SOCK
-    || process.env.PORTAL_APISOCK
-    || process.env.PORTAL_SOCKET
-    || path.join(os.homedir(), ".config", "portal", "api.sock");
+function resolvePaths() {
+  const configDir = process.env.PORTAL_CONFIG_DIR
+    || path.join(app.getPath("userData"), "portal");
+  return {
+    configDir,
+    apiSock: process.env.PORTAL_API_SOCK || path.join(configDir, "api.sock"),
+    controlSock: process.env.PORTAL_SOCK || path.join(configDir, "cm.sock"),
+    binPath: process.env.PORTAL_BIN || (app.isPackaged
+      ? path.join(process.resourcesPath, "portal")
+      : path.resolve(appRoot, "../../portal")),
+    sdkEntry: process.env.PORTAL_SDK || (app.isPackaged
+      ? path.join(process.resourcesPath, "clients-ts", "index.ts")
+      : path.resolve(appRoot, "../../clients/ts/src/index.ts")),
+  };
 }
 
 function isPathInside(root, candidate) {

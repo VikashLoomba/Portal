@@ -44,6 +44,130 @@
         min-height: 100vh;
       }
 
+      [hidden] {
+        display: none !important;
+      }
+
+      .lifecycle-screen {
+        display: grid;
+        min-height: 100vh;
+        place-items: center;
+        padding: 32px;
+      }
+
+      .lifecycle-card {
+        width: min(620px, 100%);
+        padding: 24px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--panel);
+        box-shadow: 0 18px 60px rgb(0 0 0 / 24%);
+      }
+
+      .lifecycle-card h1 {
+        margin-bottom: 10px;
+      }
+
+      .lifecycle-card p {
+        margin: 8px 0 0;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+
+      .lifecycle-card .remediation {
+        color: var(--warn);
+      }
+
+      .first-run-form {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 10px;
+        margin-top: 20px;
+      }
+
+      .first-run-form input[type="text"] {
+        min-width: 0;
+        height: 38px;
+        padding: 0 11px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--panel-strong);
+        color: var(--text);
+        outline: none;
+      }
+
+      .first-run-form input[type="text"]:focus {
+        border-color: var(--accent);
+      }
+
+      .first-run-form button {
+        height: 38px;
+        padding: 0 16px;
+        border: 1px solid var(--accent);
+        border-radius: 7px;
+        background: #20434a;
+        color: var(--text);
+      }
+
+      .first-run-form button:disabled {
+        cursor: not-allowed;
+        opacity: 0.65;
+      }
+
+      .force-option {
+        display: flex;
+        grid-column: 1 / -1;
+        align-items: center;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .setup-steps {
+        display: grid;
+        gap: 7px;
+        max-height: 330px;
+        margin: 18px 0 0;
+        padding: 0;
+        overflow: auto;
+        list-style: none;
+      }
+
+      .setup-step {
+        display: grid;
+        gap: 4px;
+        padding: 9px 10px;
+        border: 1px solid var(--line);
+        border-left: 3px solid var(--muted);
+        border-radius: 7px;
+        background: var(--panel-strong);
+        font-size: 12px;
+      }
+
+      .setup-step strong {
+        font-size: 12px;
+      }
+
+      .setup-step span {
+        color: var(--muted);
+        overflow-wrap: anywhere;
+        white-space: pre-wrap;
+      }
+
+      .setup-step.is-ok {
+        border-left-color: var(--ok);
+      }
+
+      .setup-step.is-warn,
+      .is-warn {
+        border-left-color: var(--warn);
+        color: var(--warn);
+      }
+
+      .setup-step.is-error {
+        border-left-color: var(--bad);
+      }
+
       header {
         display: flex;
         align-items: center;
@@ -286,7 +410,37 @@
     </style>
   </head>
   <body>
-    <div class="app-shell">
+    <section id="sidecar-panel" class="lifecycle-screen">
+      <div class="lifecycle-card">
+        <h1>Portal Shell</h1>
+        <div id="sidecar-connecting">
+          <p>Starting the bundled portal sidecar…</p>
+        </div>
+        <div id="sidecar-error" hidden>
+          <p id="sidecar-error-message" class="message is-error"></p>
+          <p class="remediation">Check <code>PORTAL_BIN</code>, or confirm that the portal binary is bundled with the app.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="first-run-panel" class="lifecycle-screen" hidden>
+      <div class="lifecycle-card">
+        <h1>Connect your dev box</h1>
+        <p>Portal will validate SSH access, install its remote helpers, and activate this host without restarting the sidecar.</p>
+        <div class="first-run-form">
+          <input id="firstrun-host" type="text" spellcheck="false" autocomplete="off" placeholder="user@devbox">
+          <button id="firstrun-start" type="button">Set up</button>
+          <label class="force-option">
+            <input id="firstrun-force" type="checkbox">
+            Continue when SSH validation warns
+          </label>
+        </div>
+        <div id="firstrun-message" class="message">waiting for a host</div>
+        <ol id="firstrun-steps" class="setup-steps"></ol>
+      </div>
+    </section>
+
+    <div id="app-shell" class="app-shell" hidden>
       <header>
         <h1>Portal Shell</h1>
         <div id="socket-path" class="socket"></div>

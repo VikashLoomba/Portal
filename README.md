@@ -288,6 +288,8 @@ is built from are public packages.
   client for the control API, and
   [`examples/shell-electron`](examples/shell-electron) is a minimal Electron
   app driving a remote PTY session through it.
+- **Embedding guide** — [`docs/embedding.md`](docs/embedding.md) covers bundling
+  portal as an application-lifetime sidecar, first-run setup, and packaging.
 
 ## Requirements
 
