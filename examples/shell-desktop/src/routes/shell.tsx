@@ -323,17 +323,42 @@ function eventDescription(
 }
 
 // Packaged desktop mode delivers the exec capability through the injected
-// `bindings.portalBootstrap` channel. Under the framework dev server that
-// channel is absent, so the renderer fetches the capability from the
-// loopback-only, origin-checked dev-exec-token endpoint instead.
+// `bindings.portalBootstrap` channel. The webview injects the bindings bridge
+// in BOTH desktop modes as callable proxies — under `deno desktop --hmr` the
+// server runs in the framework dev server with no window bind, so calling the
+// proxy never resolves. Presence of the function therefore proves nothing:
+// race the binding against a short deadline and fall back to the loopback,
+// origin-checked dev-exec-token endpoint; if that endpoint says packaged-mode
+// (404), keep waiting on the binding rather than failing a slow packaged boot.
+const bootstrapBindingTimeoutMs = 1_500;
+
 async function acquireExecToken(): Promise<string> {
   if (
     typeof bindings !== "undefined" &&
     typeof bindings.portalBootstrap === "function"
   ) {
-    const bootstrap = await bindings.portalBootstrap();
-    return bootstrap.execToken;
+    const viaBinding = bindings.portalBootstrap().then((b) => b.execToken);
+    viaBinding.catch(() => {}); // may be abandoned below; never an unhandled rejection
+    const timedOut = Symbol("binding-timeout");
+    const raced = await Promise.race([
+      viaBinding,
+      new Promise<typeof timedOut>((resolve) =>
+        setTimeout(() => resolve(timedOut), bootstrapBindingTimeoutMs)
+      ),
+    ]);
+    if (raced !== timedOut) {
+      return raced;
+    }
+    try {
+      return await fetchDevExecToken();
+    } catch {
+      return await viaBinding;
+    }
   }
+  return await fetchDevExecToken();
+}
+
+async function fetchDevExecToken(): Promise<string> {
   const response = await fetch("/api/dev-exec-token");
   if (!response.ok) {
     throw new Error(`dev exec token request failed (${response.status})`);
