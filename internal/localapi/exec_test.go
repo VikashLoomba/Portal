@@ -33,13 +33,13 @@ import (
 )
 
 func TestExecUpgradeReaches101(t *testing.T) {
-	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	path, _ := startExecServer(t, config.New(t.TempDir()), drainedAudit(t, 1), localexec.New())
 	c := dialExecWS(t, path, []string{"printf", "hello"})
 	c.Close()
 }
 
 func TestExecPrintfStdoutExitZero(t *testing.T) {
-	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	path, _ := startExecServer(t, config.New(t.TempDir()), drainedAudit(t, 1), localexec.New())
 	c := dialExecWS(t, path, []string{"printf", "hello"})
 	defer c.Close()
 
@@ -53,7 +53,7 @@ func TestExecPrintfStdoutExitZero(t *testing.T) {
 }
 
 func TestExecNonZeroExitFrame(t *testing.T) {
-	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	path, _ := startExecServer(t, config.New(t.TempDir()), drainedAudit(t, 1), localexec.New())
 	c := dialExecWS(t, path, []string{"sh", "-c", "'exit 4'"})
 	defer c.Close()
 
@@ -64,7 +64,7 @@ func TestExecNonZeroExitFrame(t *testing.T) {
 }
 
 func TestExecStdinHalfClose(t *testing.T) {
-	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	path, _ := startExecServer(t, config.New(t.TempDir()), drainedAudit(t, 1), localexec.New())
 	c := dialExecWS(t, path, []string{"cat"})
 	defer c.Close()
 
@@ -82,7 +82,7 @@ func TestExecStdinHalfClose(t *testing.T) {
 }
 
 func TestExecMalformedApplicationFrameDoesNotTearDownSession(t *testing.T) {
-	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	path, _ := startExecServer(t, config.New(t.TempDir()), drainedAudit(t, 1), localexec.New())
 	c := dialExecWS(t, path, []string{"cat"})
 	defer c.Close()
 
@@ -340,7 +340,7 @@ func TestExecPtyCapabilityHeaderConfirm(t *testing.T) {
 }
 
 func TestExecPtySttySize(t *testing.T) {
-	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	path, _ := startExecServer(t, config.New(t.TempDir()), drainedAudit(t, 1), localexec.New())
 	c := dialExecWSWithQuery(t, path, []string{"stty", "size"}, url.Values{
 		"pty":  {"1"},
 		"rows": {"40"},
@@ -359,7 +359,7 @@ func TestExecPtySttySize(t *testing.T) {
 }
 
 func TestExecPtyWinchResizesSession(t *testing.T) {
-	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	path, _ := startExecServer(t, config.New(t.TempDir()), drainedAudit(t, 1), localexec.New())
 	c := dialExecWSWithQuery(t, path, []string{"sh", "-c", "'stty size; read _; stty size'"}, url.Values{
 		"pty":  {"1"},
 		"rows": {"40"},
@@ -385,7 +385,7 @@ func TestExecPtyWinchResizesSession(t *testing.T) {
 }
 
 func TestExecPtyMalformedWinchFrameDoesNotTearDownSession(t *testing.T) {
-	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	path, _ := startExecServer(t, config.New(t.TempDir()), drainedAudit(t, 1), localexec.New())
 	c := dialExecWSWithQuery(t, path, []string{"sh", "-c", "'stty size; read _; stty size'"}, url.Values{
 		"pty":  {"1"},
 		"rows": {"40"},
@@ -418,7 +418,7 @@ func TestExecPtyMalformedWinchFrameDoesNotTearDownSession(t *testing.T) {
 }
 
 func TestExecPtyZeroLengthStdinNoOp(t *testing.T) {
-	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	path, _ := startExecServer(t, config.New(t.TempDir()), drainedAudit(t, 1), localexec.New())
 	c := dialExecWSWithQuery(t, path, []string{"sh", "-c", "'read line; printf \"%s\\n\" \"$line\"'"}, url.Values{"pty": {"1"}})
 	defer c.Close()
 
@@ -460,7 +460,7 @@ func TestExecClientDisconnectCancelsStream(t *testing.T) {
 }
 
 func TestExecBridgeNoGoroutineLeakAcrossOrderings(t *testing.T) {
-	a := audit.New(t.TempDir())
+	a := drainedAudit(t, 16)
 	path, _ := startExecServer(t, config.New(t.TempDir()), a, localexec.New())
 
 	warm := dialExecWS(t, path, []string{"printf", "warm"})
@@ -581,7 +581,7 @@ func TestNoThirdPartyWebSocketImportsAndGoModPinned(t *testing.T) {
 }
 
 func TestExecMalformedInboundFrameTearsDownSession(t *testing.T) {
-	path, _ := startExecServer(t, config.New(t.TempDir()), audit.New(t.TempDir()), localexec.New())
+	path, _ := startExecServer(t, config.New(t.TempDir()), drainedAudit(t, 1), localexec.New())
 	c := dialExecWS(t, path, []string{"cat"})
 	defer c.Close()
 
@@ -749,6 +749,20 @@ type wsTestConn struct {
 	br      *bufio.Reader
 	status  string
 	headers textproto.MIMEHeader
+}
+
+// drainedAudit returns an audit log whose expected exec lines are awaited in
+// cleanup. Exec handlers run on hijacked connections that Serve shutdown does
+// not wait for, and each handler writes its exec-close audit line AFTER the
+// client-visible close frame — so a test body can return while that write is
+// still in flight, and TempDir RemoveAll races the lazily created audit file
+// ("directory not empty" on Linux CI). Every session writes exactly one
+// exec-open and one exec-close line.
+func drainedAudit(t *testing.T, sessions int) *audit.Log {
+	t.Helper()
+	a := audit.New(t.TempDir())
+	t.Cleanup(func() { _ = waitAuditLines(t, a.Path(), 2*sessions, 5*time.Second) })
+	return a
 }
 
 func startExecServer(t *testing.T, cfg *config.Store, a *audit.Log, streamer ExecStreamer) (string, *Server) {
