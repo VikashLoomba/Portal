@@ -7,3 +7,5 @@ internal/bootstrap/agent/portald-linux-amd64
 internal/bootstrap/agent/portald-linux-arm64
 internal/bootstrap/agent/sha.txt
 .claude/settings.local.json
+.deno_desktop_entry-*
+examples/shell-desktop/*.app/

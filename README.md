@@ -286,8 +286,8 @@ is built from are public packages.
   client in any language can prove itself conformant.
 - **TypeScript client** — [`clients/ts`](clients/ts) is a zero-runtime-dependency
   client for the control API, and
-  [`examples/shell-electron`](examples/shell-electron) is a minimal Electron
-  app driving a remote PTY session through it.
+  [`examples/shell-desktop`](examples/shell-desktop) is a Deno Desktop +
+  TanStack Start app driving a remote PTY session through it.
 - **Embedding guide** — [`docs/embedding.md`](docs/embedding.md) covers bundling
   portal as an application-lifetime sidecar, first-run setup, and packaging.
 

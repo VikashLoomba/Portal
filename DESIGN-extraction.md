@@ -10,7 +10,7 @@ exit criteria EC1–EC17; manual live-box checks §8.
 Stage 6 turns devportal's internals into the reusable platform Option A promised: a public Go
 surface under `pkg/` for "local shell, remote brain" app authors, a full PTY capability for
 interactive remote commands (user-ratified 2026-07-06), a language-neutral wire spec with
-cross-language test vectors, and a reference non-Go client (TypeScript library + Electron
+cross-language test vectors, and a reference non-Go client (TypeScript library + Deno Desktop
 example shell) proving a desktop app can drive the core daemon end-to-end.
 
 In scope:
@@ -25,7 +25,7 @@ In scope:
 - Wire spec: `docs/wire.cddl` (CBOR frame protocol + exec WS subprotocol) with golden test
   vectors verified from BOTH Go and TypeScript; `openapi.yaml` gains real schemas.
 - Reference client: `clients/ts` (zero-runtime-dependency TypeScript, gate-tested) and
-  `examples/shell-electron` (thin Electron app, NOT gate-built, manually validated).
+  `examples/shell-desktop` (Deno Desktop + TanStack Start, gate-tested and manually validated).
 
 Out of scope (documented, not silently dropped):
 - Termios mirroring of the local terminal's exact modes over the exec subprotocol (E6 fixes a
@@ -557,12 +557,10 @@ commits precede seam-edit commits inside u7–u9 (E11).
   (a `test-ts` make target used from u11 on): assert `node --version` ≥ 24 with a clear
   failure, `npm ci` in `clients/ts`, `npx tsc --noEmit -p clients/ts`, `node --test` the
   `.ts` tests directly.
-- **u12 — examples/shell-electron (E15-shell).** Thin Electron app consuming `clients/ts`:
+- **u12 — examples/shell-desktop (E15-shell).** Thin Deno Desktop app consuming `clients/ts`:
   status panel, live events/notifications feed, exec terminal (xterm.js) with PTY + resize.
-  Has its own `package.json` (electron + xterm devDeps); NOT built in the gate — gate runs
-  `node --check` on its plain-JS main/preload files and `tsc --noEmit -p examples/shell-electron`
-  if a tsconfig is present. README documents `npm install && npm start`. Full validation is
-  §8.7 (manual).
+  Has its own `deno.json` and pinned lockfile; the gate runs `deno task check`. README documents
+  `make portal` followed by `deno task dev`. Full validation is §8.7 (manual).
 
 ## 4. Exit criteria
 
@@ -625,7 +623,7 @@ commits precede seam-edit commits inside u7–u9 (E11).
 | ServiceHost facade proves insufficient for clip's nonce/epoch flow | E12 explicitly authorizes matching the real contract; built-ins rewired through the facade is the sufficiency proof; reviewer verifies no privileged bypass remains. |
 | Vectors pin non-canonical CBOR (`SortNone`) byte output too tightly | vectors assert Go byte-stability + cross-language SEMANTIC equality (TS decodes, compares content, re-encodes its own bytes which Go must accept — not byte-compare) (E14). |
 | Node version drift breaks the TS gate | gate asserts node ≥ 24 with a clear message; zero runtime deps keeps the surface tiny (u11). |
-| Electron example rots ungated | explicitly documented as manually-validated (§8.7); `node --check`/tsc smoke in gate; it consumes only `clients/ts`'s public API. |
+| Desktop example rots | gate runs `deno task check` (route gen + type-check + permissionless unit tests); §8.7 manual validation; it consumes only `clients/ts`'s public API. |
 | PTY dead-client close races Wait/Close (double-close, leaked registration) | u4 registration/deregistration tests + `-race` gate; Close idempotency in the E5 contract. |
 
 ## 6. Principal review (2026-07-09): APPROVE
@@ -718,7 +716,7 @@ Diff base: `git merge-base main HEAD` on `feat/stage6-extraction`.
    conformance stands in — the live box speaks Tailscale-SSH which native strict-knownhosts
    correctly rejects, per Stage 4).
 7. **Reference clients**: `clients/ts` smoke script against the real daemon (status, an events
-   tick, exec echo round-trip); `examples/shell-electron` via `npm install && npm start` —
+   tick, exec echo round-trip); `examples/shell-desktop` via `deno task dev` —
    status panel live, a notification appears in the feed, exec terminal runs `vim` with
    resize.
 8. **Bootstrap**: first connect after upgrade re-uploads the agent exactly once (new SHA),
