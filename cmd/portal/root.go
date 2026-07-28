@@ -129,7 +129,8 @@ Usage: %[1]s <command>
     keychain forget <label>
                     Forget a remembered credential on this Mac.
                     On the dev box, agents use 'portal keychain run ...' or
-                    sudo; portal opens an approval dialog on this Mac.
+                    sudo; portal uses Touch ID for remembered credentials when
+                    available, with an approval-dialog fallback.
 
   Inspect
     status          Show box, service state, ssh master, active forwards. (default)
@@ -150,7 +151,8 @@ Usage: %[1]s <command>
   Capabilities
     features [name on|off]
                     Show or toggle the clip-image / clip-text / clip-write /
-                    notify / exec / cred gates; changes are picked up live.
+                    notify / exec / cred / cred-touchid gates; changes are
+                    picked up live.
 
   Advanced
     run             Run the forwarding loop in the foreground (used by launchd).

@@ -12,6 +12,7 @@ import (
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/audit"
 	"github.com/VikashLoomba/Portal/internal/keychain"
+	"github.com/VikashLoomba/Portal/internal/prompt"
 )
 
 const keychainHelp = `Manage credentials remembered by portal in the macOS Keychain on THIS Mac.
@@ -33,6 +34,7 @@ type rememberedCredentialStore interface {
 
 type keychainCommandDeps struct {
 	openStore func() (rememberedCredentialStore, error)
+	biometry  prompt.Biometry
 	audit     *audit.Log
 	host      string
 }
@@ -47,6 +49,7 @@ func newKeychainCmd(a *app.App) *cobra.Command {
 	}
 	return newKeychainCmdWithDeps(keychainCommandDeps{
 		openStore: productionRememberedCredentialStore,
+		biometry:  prompt.NewBiometry(),
 		audit:     a.Audit,
 		host:      host,
 	})
@@ -95,6 +98,11 @@ func newKeychainCmdWithDeps(deps keychainCommandDeps) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("portal keychain: list remembered credentials: %w", err)
 			}
+			touchID := "unavailable"
+			if deps.biometry != nil && deps.biometry.Available(cmd.Context()) {
+				touchID = "available"
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "touch id: %s\n", touchID)
 			labels = append([]string(nil), labels...)
 			sort.Strings(labels)
 			for _, label := range labels {

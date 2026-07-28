@@ -90,7 +90,7 @@ func (s *credTestState) featureEnabled(feature string) bool {
 	switch feature {
 	case config.FeatureCred:
 		return s.enabled
-	case credTouchIDFeature:
+	case config.FeatureCredTouchID:
 		return s.touchIDEnabled
 	default:
 		return false

@@ -27,7 +27,6 @@ const (
 	credDialogBudget    = 115 * time.Second
 	credDialogMinSecs   = 5
 	credDialogMaxSecs   = 120
-	credTouchIDFeature  = "cred-touchid"
 	// C1 has no "oversize" wire reason; an oversized secret fails closed under
 	// the generic denied token rather than inventing a new protocol value.
 	credInvalidSecretReason = "denied"
@@ -240,7 +239,7 @@ func serveCredRequest(ctx context.Context, deps credServeDeps, req *agentclient.
 	}
 	touchIDAvailable := false
 	if (remembered || req.Mode == "askpass") &&
-		deps.Biometry != nil && deps.FeatureEnabled(credTouchIDFeature) {
+		deps.Biometry != nil && deps.FeatureEnabled(config.FeatureCredTouchID) {
 		touchIDAvailable = deps.Biometry.Available(ctx)
 		// The availability probe is not part of the consent-sheet budget.
 		deadline = credNow(deps).Add(credDialogBudget)
