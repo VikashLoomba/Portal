@@ -77,6 +77,7 @@ func newRootCmd(a *app.App) *cobra.Command {
 	root.AddCommand(newSSHCmd(a))
 	root.AddCommand(newClipCheckCmd(a))
 	root.AddCommand(newDoctorCmd(a))
+	root.AddCommand(newUpgradeCmd(a))
 	root.AddCommand(newVersionCmd(a))
 	root.AddCommand(newAgentVersionCmd(a))
 	return root
@@ -140,6 +141,8 @@ Usage: %[1]s <command>
                     read/copy shims win PATH, portald advertises clip copy,
                     clipwrite@1 is live, and runs a clip-targets smoke.
     clip-check      Diagnose Mac clipboard image detection (--upload to test).
+    upgrade         Install the latest published release and reload the daemon
+                    (--check reports whether one exists without installing).
     version         Print the portal version and build commit (also -v/--version).
 
   Allowlist (forward ports the auto-filter would otherwise skip)
