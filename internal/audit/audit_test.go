@@ -152,10 +152,52 @@ func TestLog_CredentialEvents(t *testing.T) {
 	}
 }
 
+func TestLog_ClipWriteEvents(t *testing.T) {
+	dir := t.TempDir()
+	l := New(dir)
+	fixed := time.Date(2026, 7, 27, 9, 8, 7, 0, time.UTC)
+	l.now = func() time.Time { return fixed }
+
+	l.ClipWritten("box", "text", "sha=abc123 size=42")
+	l.ClipWriteDenied("box", "image", "oversize")
+
+	b, err := os.ReadFile(l.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "2026-07-27T09:08:07Z\tclip-written\thost=box\tkind=text\tsha=abc123 size=42\n" +
+		"2026-07-27T09:08:07Z\tclip-write-denied\thost=box\tkind=image\treason=oversize\n"
+	got := string(b)
+	if got != want {
+		t.Errorf("clipboard-write audit lines:\n%s\nwant:\n%s", got, want)
+	}
+
+	forged := New(t.TempDir())
+	forged.now = func() time.Time { return fixed }
+	forged.ClipWriteDenied("box", "im\nage\t\x00", "badsha")
+	b, err = os.ReadFile(forged.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = string(b)
+	want = "2026-07-27T09:08:07Z\tclip-write-denied\thost=box\tkind=im age  \treason=badsha\n"
+	if got != want {
+		t.Errorf("sanitized clipboard-write audit line:\n%s\nwant:\n%s", got, want)
+	}
+	if n := strings.Count(got, "\n"); n != 1 {
+		t.Fatalf("clipboard kind forged physical lines: got %d lines", n)
+	}
+	if fields := strings.Split(strings.TrimSuffix(got, "\n"), "\t"); len(fields) != 5 {
+		t.Fatalf("clipboard kind forged audit columns: %q", got)
+	}
+}
+
 func TestLog_NilSafe(t *testing.T) {
 	var l *Log
 	// Must not panic.
 	l.ClipServed("h", "image", "x")
+	l.ClipWritten("h", "text", "x")
+	l.ClipWriteDenied("h", "clear", "disabled")
 	l.CredServed("h", "label", "env", "prompt", time.Millisecond)
 	l.CredDenied("h", "label", "env", "denied")
 	l.CredForgotten("h", "label")

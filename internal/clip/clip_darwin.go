@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -25,6 +26,22 @@ const maxTextBytes = 16 << 20 // 16 MiB
 type Darwin struct{}
 
 func New() Clipboard { return Darwin{} }
+
+func NewWriter() Writer { return writer{run: runPasteboardCmd} }
+
+func runPasteboardCmd(ctx context.Context, name string, args []string, stdin []byte) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdin = bytes.NewReader(stdin)
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(errb.String()); msg != "" {
+			return fmt.Errorf("%s: %w: %s", filepath.Base(name), err, msg)
+		}
+		return fmt.Errorf("%s: %w", filepath.Base(name), err)
+	}
+	return nil
+}
 
 // Info returns the raw `clipboard info` flavor list — used by the
 // `portal clip-check` diagnostic so we can see exactly what macOS reports.

@@ -18,6 +18,7 @@ import (
 var featureNames = []string{
 	config.FeatureClipImage,
 	config.FeatureClipText,
+	config.FeatureClipWrite,
 	config.FeatureNotify,
 	config.FeatureExec,
 	config.FeatureCred,
@@ -26,7 +27,7 @@ var featureNames = []string{
 func newFeaturesCmd(a *app.App) *cobra.Command {
 	return &cobra.Command{
 		Use:   "features [name on|off]",
-		Short: "Show or toggle the clip-image/clip-text/notify/exec/cred capability gates",
+		Short: "Show or toggle the clip-image/clip-text/clip-write/notify/exec/cred capability gates",
 		Args:  cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runFeatures(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), a, args)
@@ -63,7 +64,7 @@ func runFeatures(ctx context.Context, w, errw io.Writer, a *app.App, args []stri
 			return usageErr{}
 		}
 		if !knownFeature(name) {
-			fmt.Fprintf(errw, "unknown feature: %s (known: clip-image, clip-text, notify, exec, cred)\n", name)
+			fmt.Fprintf(errw, "unknown feature: %s (known: clip-image, clip-text, clip-write, notify, exec, cred)\n", name)
 			return usageErr{}
 		}
 		if _, err := lc.SetFeature(ctx, name, on); err == nil {
@@ -72,7 +73,7 @@ func runFeatures(ctx context.Context, w, errw io.Writer, a *app.App, args []stri
 		} else if errors.Is(err, client.ErrFeatureUnknown) {
 			// The daemon considers the name unknown — fail the same way as the
 			// local check rather than writing through the fallback.
-			fmt.Fprintf(errw, "unknown feature: %s (known: clip-image, clip-text, notify, exec, cred)\n", name)
+			fmt.Fprintf(errw, "unknown feature: %s (known: clip-image, clip-text, clip-write, notify, exec, cred)\n", name)
 			return usageErr{}
 		}
 		// Daemon down: write config.Store directly (same file the daemon uses).

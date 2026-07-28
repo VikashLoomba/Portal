@@ -115,7 +115,8 @@ portal <command>
 
   Capabilities
     features [name on|off]      Show or toggle the clip-image / clip-text /
-                                notify / exec / cred gates (picked up live).
+                                clip-write / notify / exec / cred gates
+                                (picked up live).
 ```
 
 Run `portal help` for the full command reference, or `portal <command> --help`
@@ -241,16 +242,17 @@ credential prompts and delivery.
 
 ## Capability gates
 
-Clipboard-read, notifications, exec, and credential requests are **on by
-default** (matching the install experience you'd expect) but are individually
-gated on the Mac. Toggle them with `portal features <name> on|off` (or edit the
-file under `~/.config/portal/` directly); the running daemon picks changes up
-with no restart:
+Clipboard reads and writes, notifications, exec, and credential requests are
+**on by default** (matching the install experience you'd expect) but are
+individually gated on the Mac. Toggle them with `portal features <name> on|off`
+(or edit the file under `~/.config/portal/` directly); the running daemon picks
+changes up with no restart:
 
 | Gate | File | Gates |
 |---|---|---|
 | `clip-image` | `feature.clip-image` | serving the Mac clipboard **image** to the dev box |
 | `clip-text`  | `feature.clip-text`  | serving the Mac clipboard **text** to the dev box |
+| `clip-write` | `feature.clip-write` | setting the Mac clipboard from the dev box; every successful write is audited and bannered |
 | `notify`     | `feature.notify`     | raising notifications relayed from the dev box |
 | `exec`       | `feature.exec`       | running commands on the box via `portal exec` / the control API |
 | `cred` | `feature.cred` | approving credential requests from the dev box (`portal keychain` / sudo askpass) |

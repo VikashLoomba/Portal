@@ -149,8 +149,8 @@ Usage: %[1]s <command>
 
   Capabilities
     features [name on|off]
-                    Show or toggle the clip-image / clip-text / notify / exec /
-                    cred gates; the running daemon picks changes up live.
+                    Show or toggle the clip-image / clip-text / clip-write /
+                    notify / exec / cred gates; changes are picked up live.
 
   Advanced
     run             Run the forwarding loop in the foreground (used by launchd).

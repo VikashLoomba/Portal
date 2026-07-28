@@ -1,8 +1,9 @@
 // Package audit is the append-only security audit log for the Mac-side daemon.
-// It records every clipboard read and credential served to a remote, every
-// notification raised, and every URL opened — the user-inspectable trail of
-// what the remote dev box asked this Mac to do (SPEC C). cc-clip keeps
-// session/notification logs; this is the equivalent for portal's transport.
+// It records every clipboard read and write, every credential served to a
+// remote, every notification raised, and every URL opened — the
+// user-inspectable trail of what the remote dev box asked this Mac to do (SPEC
+// C). cc-clip keeps session/notification logs; this is the equivalent for
+// portal's transport.
 //
 // The log is intentionally simple: one line per event, RFC3339-timestamped,
 // tab-separated, appended under the portal config dir as `audit.log`. It is
@@ -59,6 +60,18 @@ func (l *Log) ClipServed(host, kind, detail string) {
 // a short token ("disabled", "concealed", "none").
 func (l *Log) ClipDenied(host, kind, reason string) {
 	l.write("clip-denied", "host="+host, "kind="+kind, "reason="+reason)
+}
+
+// ClipWritten records that a remote host set this Mac's clipboard. kind is
+// "text", "image", or "clear"; detail is the caller-formatted SHA and size.
+func (l *Log) ClipWritten(host, kind, detail string) {
+	l.write("clip-written", "host="+host, "kind="+oneLine(kind), detail)
+}
+
+// ClipWriteDenied records that a remote clipboard write was refused. reason is
+// "disabled", "oversize", "badsha", "shamismatch", or "inflight".
+func (l *Log) ClipWriteDenied(host, kind, reason string) {
+	l.write("clip-write-denied", "host="+host, "kind="+oneLine(kind), "reason="+reason)
 }
 
 // CredServed records that a credential was delivered after user approval.
