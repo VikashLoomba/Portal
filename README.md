@@ -64,6 +64,25 @@ make build              # produces ./portal for your host architecture
 `make portal-all` cross-compiles the Apple Silicon binary (`portal-darwin-arm64`)
 — this is what CI publishes as the release artifact.
 
+### Updating
+
+```sh
+portal upgrade          # install the newest release and reload the daemon
+portal upgrade --check  # just report whether a newer release exists
+```
+
+`upgrade` downloads the latest published `portal-darwin-arm64`, **runs it once
+to confirm it works and reports the expected version**, and only then swaps it
+into `~/.local/bin/portal` with an atomic rename before reloading the login
+agent. A download that is truncated, wrong-architecture, or reports an
+unexpected version leaves your working binary untouched. Nothing on the dev box
+changes: the agent and clipboard shims re-converge on their own at the next
+reconnect.
+
+A build made from a git checkout (`v0.7.0-3-gabc1234`) already sits *after* its
+base tag, so `upgrade` reports it as current rather than moving it backwards;
+`--force` re-installs the published release regardless.
+
 ## Usage
 
 ```
