@@ -49,6 +49,9 @@ func TestDialogACommandConstruction(t *testing.T) {
 	if strings.Contains(script, label) {
 		t.Fatalf("attacker-influenced label appeared raw in script:\n%s", script)
 	}
+	if strings.Contains(script, "Remember stores this in your Mac Keychain; future approvals for this credential use Touch ID.") {
+		t.Fatalf("Dialog A script contains Touch ID enrollment message:\n%s", script)
+	}
 }
 
 func TestDialogAEnrollmentCommandConstruction(t *testing.T) {
@@ -117,7 +120,11 @@ func TestDialogBCommandConstruction(t *testing.T) {
 			t.Errorf("Dialog B script missing %q:\n%s", want, script)
 		}
 	}
-	for _, forbidden := range []string{"hidden answer", "default answer"} {
+	for _, forbidden := range []string{
+		"hidden answer",
+		"default answer",
+		"Remember stores this in your Mac Keychain; future approvals for this credential use Touch ID.",
+	} {
 		if strings.Contains(script, forbidden) {
 			t.Errorf("Dialog B script contains %q:\n%s", forbidden, script)
 		}

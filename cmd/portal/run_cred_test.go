@@ -446,8 +446,13 @@ func TestServeCredRequest_TouchIDEnrollFlag(t *testing.T) {
 			if requests[0].TimeoutSecs != 115 {
 				t.Fatalf("prompt timeout = %d, want 115", requests[0].TimeoutSecs)
 			}
-			if b, ok := tt.biometry.(*prompt.BiometryFake); ok && b.AvailabilityChecks() != tt.wantChecks {
-				t.Fatalf("availability checks = %d, want %d", b.AvailabilityChecks(), tt.wantChecks)
+			if b, ok := tt.biometry.(*prompt.BiometryFake); ok {
+				if b.AvailabilityChecks() != tt.wantChecks {
+					t.Fatalf("availability checks = %d, want %d", b.AvailabilityChecks(), tt.wantChecks)
+				}
+				if len(b.Requests()) != 0 {
+					t.Fatalf("Touch ID approvals = %d, want 0 for fresh credential", len(b.Requests()))
+				}
 			}
 			assertSecretNotRecorded(t, deps, state, secret)
 		})
@@ -633,9 +638,12 @@ func TestServeCredRequest_TouchIDFallbackUsesDialogBRemainingBudget(t *testing.T
 			current := []byte("fallback-current-fake")
 			p := &prompt.Fake{Decision: prompt.Decision{Outcome: prompt.OutcomeAllowRemember}}
 			var state *credTestState
+			var approveContextDeadline time.Time
+			var approveContextHasDeadline bool
 			b := &prompt.BiometryFake{
 				AvailableResult: true,
-				ApproveFunc: func(context.Context, string, time.Time) (prompt.BiometryOutcome, error) {
+				ApproveFunc: func(ctx context.Context, _ string, _ time.Time) (prompt.BiometryOutcome, error) {
+					approveContextDeadline, approveContextHasDeadline = ctx.Deadline()
 					state.setNow(state.nowTime().Add(100 * time.Second))
 					return tt.outcome, tt.err
 				},
@@ -649,10 +657,20 @@ func TestServeCredRequest_TouchIDFallbackUsesDialogBRemainingBudget(t *testing.T
 			deps.Biometry = b
 			started := state.nowTime()
 
+			before := time.Now()
 			resp := serveCredRequest(context.Background(), deps, baseCredEvent())
+			after := time.Now()
 			assertCredResponse(t, resp, &protocol.CredResponse{
 				Nonce: 41, Epoch: 7, OK: true, Secret: current,
 			})
+			if !approveContextHasDeadline {
+				t.Fatal("Touch ID approval context has no deadline")
+			}
+			if approveContextDeadline.Before(before.Add(credDialogBudget)) ||
+				approveContextDeadline.After(after.Add(credDialogBudget)) {
+				t.Fatalf("Touch ID approval context deadline = %v, want call time + %v",
+					approveContextDeadline, credDialogBudget)
+			}
 			wantPrompt := prompt.Request{
 				Label: "database", Requester: "pid 42: sh", Host: "box",
 				Delivery:    `will be set as env var "PW" for the requested command`,
