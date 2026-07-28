@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -37,14 +38,19 @@ var (
 )
 
 type keychainRuntime struct {
-	stdout      io.Writer
-	stderr      io.Writer
-	request     func(agent.CredShimReq) ([]byte, string)
-	requester   func() string
-	lookPath    func(string) (string, error)
-	execProcess func(string, []string, []string) error
-	environ     func() []string
-	runStdin    func(string, []string, []byte, io.Writer, io.Writer) (int, error)
+	stdout    io.Writer
+	stderr    io.Writer
+	request   func(agent.CredShimReq) ([]byte, string)
+	requester func() string
+	// parentName is the basename of the process that invoked portald. askpass
+	// serves a secret only when a real askpass consumer did (see
+	// runKeychainAskpass); tests set it explicitly.
+	parentName     func() string
+	allowAnyParent func() bool
+	lookPath       func(string) (string, error)
+	execProcess    func(string, []string, []string) error
+	environ        func() []string
+	runStdin       func(string, []string, []byte, io.Writer, io.Writer) (int, error)
 }
 
 type credentialReply struct {
@@ -55,14 +61,16 @@ type credentialReply struct {
 
 func productionKeychainRuntime() keychainRuntime {
 	return keychainRuntime{
-		stdout:      os.Stdout,
-		stderr:      os.Stderr,
-		request:     requestCredential,
-		requester:   requesterContext,
-		lookPath:    exec.LookPath,
-		execProcess: syscall.Exec,
-		environ:     os.Environ,
-		runStdin:    runStdinChild,
+		stdout:         os.Stdout,
+		stderr:         os.Stderr,
+		request:        requestCredential,
+		requester:      requesterContext,
+		parentName:     parentProcessName,
+		allowAnyParent: func() bool { return os.Getenv(askpassAllowAnyEnv) == "1" },
+		lookPath:       exec.LookPath,
+		execProcess:    syscall.Exec,
+		environ:        os.Environ,
+		runStdin:       runStdinChild,
 	}
 }
 
@@ -183,7 +191,50 @@ func appendEnvOverride(environ []string, name, value string) []string {
 	return append(out, prefix+value)
 }
 
+// askpassConsumers are the programs that legitimately invoke an askpass helper
+// and read the secret off its stdout. sudo execs the helper directly (portal's
+// shim `exec`s portald, so the parent stays sudo), as does ssh when a user
+// points SSH_ASKPASS here.
+var askpassConsumers = map[string]bool{
+	"sudo": true, "sudoedit": true, "sudo-rs": true, "ssh": true,
+}
+
+// askpassAllowAnyEnv overrides the consumer check for someone wiring this
+// helper into a different askpass-protocol consumer.
+const askpassAllowAnyEnv = "PORTAL_ASKPASS_ALLOW_ANY"
+
+// runKeychainAskpass serves ONE approved secret on stdout for a real askpass
+// consumer. Two guards stand in front of it, both learned the hard way: a
+// coding agent ran `portal keychain askpass --help` expecting usage, got a
+// live credential request instead, and the approved password landed in the
+// agent's context — the exact outcome this whole feature exists to prevent.
+//
+//  1. A lone help token prints help and NEVER requests. sudo's prompt is
+//     human text like "[sudo] password for u:", so losing "--help" as a
+//     literal prompt costs nothing next to leaking a secret to whoever typed
+//     it out of curiosity.
+//  2. The invoking parent must be an askpass consumer. Anything else — a
+//     shell, an agent's tool runner, an unreadable parent — is refused
+//     WITHOUT prompting, so a human is never asked to approve a request whose
+//     output goes somewhere it should not.
+//
+// Guard 2 prevents ACCIDENTS, not attacks: a hostile same-uid process can
+// present any parent it likes, and the threat model (DESIGN-cred.md §1)
+// already excludes that adversary.
 func runKeychainAskpass(args []string, rt keychainRuntime) int {
+	if len(args) == 1 && isHelpArg(args[0]) {
+		writeKeychainAskpassHelp(rt.stdout)
+		return 0
+	}
+	if !askpassParentAllowed(rt) {
+		fmt.Fprintln(rt.stderr, "portal keychain askpass: refusing to request a credential — "+
+			"this helper is invoked BY sudo (or ssh) via SUDO_ASKPASS and writes the approved "+
+			"secret to stdout, so running it directly would hand that secret to whatever is "+
+			"reading this output.")
+		fmt.Fprintln(rt.stderr, "portal keychain askpass: run 'sudo <command>' and let the shim "+
+			"call this helper, or see 'portal keychain askpass --help'.")
+		return keychainExitUsage
+	}
 	prompt := truncateUTF8Bytes(strings.Join(args, " "), keychainContextMax)
 	secret, reason := rt.request(agent.CredShimReq{
 		Label: defaultAskpassLabel, Mode: "askpass", Target: prompt,
@@ -316,6 +367,55 @@ func reportCredentialFailure(stderr io.Writer, reason string) int {
 	return keychainExitDenied
 }
 
+// askpassParentAllowed reports whether the invoking process may receive a
+// secret on stdout. An undeterminable parent fails CLOSED.
+func askpassParentAllowed(rt keychainRuntime) bool {
+	if rt.allowAnyParent != nil && rt.allowAnyParent() {
+		return true
+	}
+	if rt.parentName == nil {
+		return false
+	}
+	return askpassConsumers[rt.parentName()]
+}
+
+func parentProcessName() string {
+	return processNameForPID(os.Getppid())
+}
+
+func processNameForPID(pid int) string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return ""
+	}
+	return processNameFromCmdline(raw)
+}
+
+// processNameFromCmdline extracts argv[0]'s basename from /proc cmdline bytes.
+func processNameFromCmdline(raw []byte) string {
+	argv0, _, _ := bytes.Cut(raw, []byte{0})
+	name := strings.TrimSpace(strings.ToValidUTF8(string(argv0), ""))
+	if name == "" {
+		return ""
+	}
+	return filepath.Base(name)
+}
+
+func writeKeychainAskpassHelp(w io.Writer) {
+	fmt.Fprint(w, `portal keychain askpass is the SUDO_ASKPASS helper sudo calls for you. It is not meant to be run by hand.
+
+Every argument is the prompt text sudo passed (portal shows it on the Mac); it is NOT a flag. On approval the secret is written to stdout for sudo to read, so portald refuses to run unless sudo (or ssh) invoked it — otherwise the secret would go to whoever ran the command.
+
+To exercise the credential path yourself, use:
+  portal keychain run --label "test" --env PW -- sh -c 'echo "len=${#PW}"'
+
+Set `+askpassAllowAnyEnv+`=1 only if you are wiring this helper into another askpass-protocol consumer that reads its stdout.
+`)
+}
+
 func requesterContext() string {
 	return requesterContextForPID(os.Getppid())
 }
@@ -390,7 +490,7 @@ Usage:
 Examples:
   portal keychain run --label "staging admin" --env PW -- sh -c 'curl -d "pass=$PW" …'
   portal keychain run --label "database password" --stdin -- psql
-  portal keychain askpass "Password:"
+  portal keychain askpass "Password:"   (sudo calls this FOR you — see 'portal keychain askpass --help')
 
 The SINGLE quotes in the first example make the child shell expand $PW. The caller's shell must not expand it.
 

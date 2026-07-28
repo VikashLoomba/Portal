@@ -93,7 +93,9 @@ func baseTestKeychainRuntime(stdout, stderr io.Writer) keychainRuntime {
 		request: func(agent.CredShimReq) ([]byte, string) {
 			return nil, "no-client"
 		},
-		requester: func() string { return "pid 99: test-agent" },
+		requester:      func() string { return "pid 99: test-agent" },
+		parentName:     func() string { return "sudo" },
+		allowAnyParent: func() bool { return false },
 		lookPath: func(name string) (string, error) {
 			return "/resolved/" + name, nil
 		},
@@ -107,9 +109,14 @@ func baseTestKeychainRuntime(stdout, stderr io.Writer) keychainRuntime {
 
 func runKeychainBin(t *testing.T, bin, home string, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
+	env := []string{"HOME=" + home}
+	for len(args) > 0 && strings.Contains(args[0], "=") && !strings.HasPrefix(args[0], "-") {
+		env = append(env, args[0])
+		args = args[1:]
+	}
 	full := append([]string{"keychain"}, args...)
 	cmd := exec.Command(bin, full...)
-	cmd.Env = append(os.Environ(), "HOME="+home)
+	cmd.Env = append(os.Environ(), env...)
 	var out bytes.Buffer
 	var errOut bytes.Buffer
 	cmd.Stdout = &out
@@ -314,34 +321,134 @@ func TestKeychainAskpassSuccess(t *testing.T) {
 	}
 }
 
-func TestKeychainAskpassTreatsHelpTokensAsPrompts(t *testing.T) {
+// REGRESSION: a lone help token must print help and NEVER request a credential.
+// Treating it as opaque prompt text (the previous behavior) fired a live request
+// at the Mac when an agent ran `portal keychain askpass --help`, and the approved
+// secret was written to stdout straight into that agent's context.
+func TestKeychainAskpassHelpTokenPrintsHelpAndNeverRequests(t *testing.T) {
 	for _, token := range []string{"help", "-h", "--help"} {
 		t.Run(token, func(t *testing.T) {
-			var stdout bytes.Buffer
-			var stderr bytes.Buffer
+			var stdout, stderr bytes.Buffer
 			rt := baseTestKeychainRuntime(&stdout, &stderr)
 			requests := 0
-			rt.request = func(req agent.CredShimReq) ([]byte, string) {
+			rt.request = func(agent.CredShimReq) ([]byte, string) {
 				requests++
-				if req.Mode != "askpass" || req.Target != token {
-					t.Fatalf("askpass request = %+v, want opaque prompt %q", req, token)
-				}
-				return []byte("opaque-prompt-secret"), ""
+				return []byte("MUST-NOT-BE-SERVED"), ""
 			}
 
 			if code := runKeychainWithRuntime([]string{"askpass", token}, rt); code != 0 {
-				t.Fatalf("exit code = %d, want 0", code)
+				t.Fatalf("exit = %d, want 0", code)
 			}
-			if requests != 1 {
-				t.Fatalf("credential requests = %d, want 1", requests)
+			if requests != 0 {
+				t.Fatalf("credential requests = %d, want 0 for a help token", requests)
 			}
-			if stdout.String() != "opaque-prompt-secret\n" || stderr.Len() != 0 {
-				t.Fatalf("askpass streams = stdout %q stderr %q", stdout.String(), stderr.String())
+			if strings.Contains(stdout.String(), "MUST-NOT-BE-SERVED") {
+				t.Fatal("a secret reached stdout on the help path")
+			}
+			if !strings.Contains(stdout.String(), "SUDO_ASKPASS") {
+				t.Fatalf("help output = %q, want askpass usage", stdout.String())
 			}
 		})
 	}
 }
 
+// A help token alongside real prompt text stays prompt text: sudo passed it.
+func TestKeychainAskpassHelpTokenWithOtherArgsStaysAPrompt(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	rt := baseTestKeychainRuntime(&stdout, &stderr)
+	var got agent.CredShimReq
+	rt.request = func(req agent.CredShimReq) ([]byte, string) {
+		got = req
+		return []byte("secret"), ""
+	}
+
+	if code := runKeychainWithRuntime([]string{"askpass", "--help", "me"}, rt); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if got.Target != "--help me" {
+		t.Fatalf("target = %q, want the full prompt text", got.Target)
+	}
+}
+
+// REGRESSION: only a real askpass consumer may receive the secret on stdout.
+// A shell or an agent's tool runner must be refused WITHOUT prompting, so no
+// human is asked to approve a request whose output goes into a transcript.
+func TestKeychainAskpassRefusesNonConsumerParent(t *testing.T) {
+	for _, parent := range []string{"bash", "zsh", "sh", "node", "python3", ""} {
+		t.Run("parent="+parent, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			rt := baseTestKeychainRuntime(&stdout, &stderr)
+			rt.parentName = func() string { return parent }
+			requests := 0
+			rt.request = func(agent.CredShimReq) ([]byte, string) {
+				requests++
+				return []byte("MUST-NOT-BE-SERVED"), ""
+			}
+
+			code := runKeychainWithRuntime([]string{"askpass", "Password:"}, rt)
+			if code != keychainExitUsage {
+				t.Fatalf("exit = %d, want %d", code, keychainExitUsage)
+			}
+			if requests != 0 {
+				t.Fatalf("credential requests = %d, want 0 — no prompt may reach the Mac", requests)
+			}
+			if strings.Contains(stdout.String(), "MUST-NOT-BE-SERVED") || stdout.Len() != 0 {
+				t.Fatalf("stdout = %q, want nothing written", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), "refusing") {
+				t.Fatalf("stderr = %q, want an explanation", stderr.String())
+			}
+		})
+	}
+}
+
+func TestKeychainAskpassServesEveryConsumerParent(t *testing.T) {
+	for _, parent := range []string{"sudo", "sudoedit", "sudo-rs", "ssh"} {
+		t.Run(parent, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			rt := baseTestKeychainRuntime(&stdout, &stderr)
+			rt.parentName = func() string { return parent }
+			rt.request = func(agent.CredShimReq) ([]byte, string) { return []byte("ok-secret"), "" }
+
+			if code := runKeychainWithRuntime([]string{"askpass", "Password:"}, rt); code != 0 {
+				t.Fatalf("exit = %d, want 0", code)
+			}
+			if stdout.String() != "ok-secret\n" {
+				t.Fatalf("stdout = %q, want the secret", stdout.String())
+			}
+		})
+	}
+}
+
+func TestKeychainAskpassAllowAnyParentOverride(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	rt := baseTestKeychainRuntime(&stdout, &stderr)
+	rt.parentName = func() string { return "some-other-askpass-consumer" }
+	rt.allowAnyParent = func() bool { return true }
+	rt.request = func(agent.CredShimReq) ([]byte, string) { return []byte("ok-secret"), "" }
+
+	if code := runKeychainWithRuntime([]string{"askpass", "Password:"}, rt); code != 0 {
+		t.Fatalf("exit = %d, want 0 under the override", code)
+	}
+	if stdout.String() != "ok-secret\n" {
+		t.Fatalf("stdout = %q, want the secret", stdout.String())
+	}
+}
+
+func TestProcessNameFromCmdline(t *testing.T) {
+	tests := []struct{ raw, want string }{
+		{"sudo\x00whoami\x00", "sudo"},
+		{"/usr/bin/sudo\x00-A\x00ls\x00", "sudo"},
+		{"bash\x00", "bash"},
+		{"", ""},
+		{"\x00\x00", ""},
+	}
+	for _, tt := range tests {
+		if got := processNameFromCmdline([]byte(tt.raw)); got != tt.want {
+			t.Errorf("processNameFromCmdline(%q) = %q, want %q", tt.raw, got, tt.want)
+		}
+	}
+}
 func TestKeychainDenyReasons(t *testing.T) {
 	tests := []struct {
 		reason string
@@ -495,7 +602,11 @@ func TestKeychainAskpassMainDispatch(t *testing.T) {
 		"ok\t"+base64.StdEncoding.EncodeToString(secret)+"\n")
 	defer fake.stop()
 
-	stdout, stderr, code := runKeychainBin(t, bin, home, "askpass", "Password:")
+	// The real parent here is the test binary, not sudo, so the askpass
+	// consumer gate would (correctly) refuse. Use the documented override to
+	// exercise the dispatch path itself; TestKeychainAskpassBinRefusesTestParent
+	// pins the gate for the un-overridden case.
+	stdout, stderr, code := runKeychainBin(t, bin, home, askpassAllowAnyEnv+"=1", "askpass", "Password:")
 	if code != 0 || stdout != "dispatch-secret\n" || stderr != "" {
 		t.Fatalf("dispatch result = code %d stdout %q stderr %q", code, stdout, stderr)
 	}
@@ -535,5 +646,58 @@ func TestKeychainRunStdinMainDispatchAndExitPropagation(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("stdin dispatch fake agent received no request")
+	}
+}
+
+// The shipped binary must refuse when its real parent is not an askpass
+// consumer — here, the test runner. This is the end-to-end form of the leak
+// that put a live password into a coding agent's context.
+func TestKeychainAskpassBinRefusesTestParent(t *testing.T) {
+	src := buildPortald(t)
+	home, bin := setupClipHome(t, src)
+	cacheDir := filepath.Join(home, ".cache", "portal")
+
+	secret := []byte("MUST-NOT-BE-SERVED")
+	fake := startFakeCredentialSocket(t, cacheDir, "cmd-askpass-gate.sock",
+		"ok\t"+base64.StdEncoding.EncodeToString(secret)+"\n")
+	defer fake.stop()
+
+	stdout, stderr, code := runKeychainBin(t, bin, home, "askpass", "Password:")
+	if code != keychainExitUsage {
+		t.Fatalf("exit = %d, want %d", code, keychainExitUsage)
+	}
+	if strings.Contains(stdout, "MUST-NOT-BE-SERVED") || stdout != "" {
+		t.Fatalf("stdout = %q, want nothing", stdout)
+	}
+	if !strings.Contains(stderr, "refusing") {
+		t.Fatalf("stderr = %q, want an explanation", stderr)
+	}
+	select {
+	case <-fake.requests:
+		t.Fatal("a credential request reached the agent despite the gate")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// The shipped binary must print help — not request — for a lone help token.
+func TestKeychainAskpassBinHelpTokenPrintsHelp(t *testing.T) {
+	src := buildPortald(t)
+	home, bin := setupClipHome(t, src)
+	cacheDir := filepath.Join(home, ".cache", "portal")
+	fake := startFakeCredentialSocket(t, cacheDir, "cmd-askpass-help.sock",
+		"ok\t"+base64.StdEncoding.EncodeToString([]byte("MUST-NOT-BE-SERVED"))+"\n")
+	defer fake.stop()
+
+	stdout, _, code := runKeychainBin(t, bin, home, "askpass", "--help")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "SUDO_ASKPASS") || strings.Contains(stdout, "MUST-NOT-BE-SERVED") {
+		t.Fatalf("stdout = %q, want askpass help and no secret", stdout)
+	}
+	select {
+	case <-fake.requests:
+		t.Fatal("a credential request reached the agent on the help path")
+	case <-time.After(300 * time.Millisecond):
 	}
 }
