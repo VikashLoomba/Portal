@@ -15,7 +15,7 @@ type scriptResult struct {
 	err      error
 }
 
-type scriptRunner func(context.Context, string) scriptResult
+type scriptRunner func(context.Context, []string) scriptResult
 
 type osascriptPrompter struct {
 	run scriptRunner
@@ -30,7 +30,7 @@ const (
 // Prompt renders the request as the appropriate osascript dialog and maps the
 // process result to a Decision without formatting or retaining secret bytes.
 func (p *osascriptPrompter) Prompt(ctx context.Context, req Request) (Decision, error) {
-	result := p.run(ctx, dialogScript(req))
+	result := p.run(ctx, []string{"-e", dialogScript(req)})
 	if result.err != nil || result.exitCode != 0 {
 		if osascriptCanceled(result) {
 			return Decision{Outcome: OutcomeDeny}, nil

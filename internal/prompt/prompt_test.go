@@ -17,8 +17,8 @@ func TestDialogACommandConstruction(t *testing.T) {
 	requester := `pid 42: sh -c "deploy"`
 	delivery := `will be set as env var PW for: sh -c "curl $PW"`
 	var script string
-	p := &osascriptPrompter{run: func(_ context.Context, got string) scriptResult {
-		script = got
+	p := &osascriptPrompter{run: func(_ context.Context, args []string) scriptResult {
+		script = appleScriptSource(t, args)
 		return scriptResult{stdout: []byte("button returned:Allow Once, text returned:s3kr3t, gave up:false\n")}
 	}}
 	decision, err := p.Prompt(context.Background(), Request{
@@ -75,8 +75,8 @@ func TestDialogTimeoutClamp(t *testing.T) {
 
 func TestDialogBCommandConstruction(t *testing.T) {
 	var script string
-	p := &osascriptPrompter{run: func(_ context.Context, got string) scriptResult {
-		script = got
+	p := &osascriptPrompter{run: func(_ context.Context, args []string) scriptResult {
+		script = appleScriptSource(t, args)
 		return scriptResult{stdout: []byte("button returned:Allow, gave up:false\n")}
 	}}
 	decision, err := p.Prompt(context.Background(), Request{
@@ -184,7 +184,7 @@ func TestDialogOutputMapping(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p := &osascriptPrompter{run: func(context.Context, string) scriptResult {
+			p := &osascriptPrompter{run: func(context.Context, []string) scriptResult {
 				return tt.result
 			}}
 			decision, err := p.Prompt(context.Background(), Request{Remembered: tt.remembered})
@@ -199,6 +199,14 @@ func TestDialogOutputMapping(t *testing.T) {
 			}
 		})
 	}
+}
+
+func appleScriptSource(t *testing.T, args []string) string {
+	t.Helper()
+	if len(args) != 2 || args[0] != "-e" {
+		t.Fatalf("AppleScript argv = %q, want [-e <script>]", args)
+	}
+	return args[1]
 }
 
 func TestFakeRecordsRequestsAndCopiesSecret(t *testing.T) {
