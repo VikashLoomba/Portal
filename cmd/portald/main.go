@@ -154,7 +154,7 @@ func printPortaldUsage() {
 	fmt.Fprintln(os.Stderr, `Usage:
   portald [agent flags]
   portald open <url>
-  portald clip <targets [xclip|wl-paste]|image png|text>
+  portald clip <targets [xclip|wl-paste]|image png|text|copy text [--trim]|copy image png|copy clear>
   portald notify --hook | --title <title> [options]
   portald keychain <run|askpass> [options]
 
@@ -256,6 +256,10 @@ type singleAgentReply struct {
 // checks out. EVERY adverse path exits 1 with empty stdout so the agent's
 // `>tmp || …` fallback chain advances to the real binary.
 func runClip(args []string) {
+	if len(args) > 0 && args[0] == "copy" {
+		os.Exit(runClipCopy(args[1:], productionClipCopyRuntime()))
+	}
+
 	var verb, format, tool string
 	switch {
 	case len(args) == 2 && args[0] == "targets" && (args[1] == "xclip" || args[1] == "wl-paste"):
@@ -271,7 +275,7 @@ func runClip(args []string) {
 	case len(args) == 2 && args[0] == "image" && args[1] == "png":
 		verb, format = "image", "png"
 	default:
-		fmt.Fprintln(os.Stderr, "usage: portald clip <targets [xclip|wl-paste]|image png|text>")
+		fmt.Fprintln(os.Stderr, "usage: portald clip <targets [xclip|wl-paste]|image png|text|copy text [--trim]|copy image png|copy clear>")
 		os.Exit(1)
 	}
 
