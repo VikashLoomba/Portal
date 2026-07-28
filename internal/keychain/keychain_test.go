@@ -61,11 +61,13 @@ func TestSetUsesInteractiveStdinAndIndexesLabel(t *testing.T) {
 			t.Fatalf("secret appeared in argv token")
 		}
 	}
-	wantStdin := []byte("add-generic-password -U -s portal-cred -a \"staging \\\"admin\\\"\\\\db\" -w\n")
-	wantStdin = append(wantStdin, secret...)
-	wantStdin = append(wantStdin, '\n')
+	// The secret is a QUOTED ARGUMENT of the command line, not a reply to
+	// security's password prompt: in -i mode that prompt consumes the rest of
+	// the (empty) command line, agrees with itself on an empty password, and
+	// stores that instead of the real secret.
+	wantStdin := []byte("add-generic-password -U -s portal-cred -a \"staging \\\"admin\\\"\\\\db\" -w \"s3kr3t-vector\"\n")
 	if !bytes.Equal(call.stdin, wantStdin) {
-		t.Errorf("security interactive stdin shape differs")
+		t.Errorf("security interactive stdin = %q, want %q", call.stdin, wantStdin)
 	}
 	stdinCommand := string(call.stdin[:bytes.IndexByte(call.stdin, '\n')])
 	for _, want := range []string{"add-generic-password", "-U", "-s portal-cred", "-w"} {
@@ -211,5 +213,68 @@ func TestSetRejectsInteractiveFramingBytesBeforeExec(t *testing.T) {
 				t.Fatalf("security invoked %d times for invalid framing", len(fake.calls))
 			}
 		})
+	}
+}
+
+// REGRESSION: a bare `-w` made security's own prompts consume the empty tail of
+// the command line, so it stored an EMPTY password, created the item anyway,
+// and then failed parsing the secret as a command. Set must therefore pass the
+// secret as a quoted argument — and quote the characters security's parser
+// treats specially — so the stored value round-trips byte-exactly.
+func TestSetQuotesSecretOnTheCommandLine(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		secret string
+		want   string
+	}{
+		{"plain", "hunter2", `"hunter2"`},
+		{"spaces", "correct horse battery", `"correct horse battery"`},
+		{"double quote", `pa"ss`, `"pa\"ss"`},
+		{"backslash", `pa\ss`, `"pa\\ss"`},
+		{"both", `a"b\c`, `"a\"b\\c"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeCommandRunner{}
+			store := newStore(filepath.Join(t.TempDir(), "cred-labels"), fake.run)
+			if err := store.Set(context.Background(), "lbl", []byte(tc.secret)); err != nil {
+				t.Fatal(err)
+			}
+			got := string(fake.calls[0].stdin)
+			wantSuffix := " -w " + tc.want + "\n"
+			if !strings.HasSuffix(got, wantSuffix) {
+				t.Fatalf("stdin = %q, want it to end with %q", got, wantSuffix)
+			}
+			// The prompt-driven form is what stored empty passwords.
+			if strings.HasSuffix(got, " -w\n") {
+				t.Fatal("command still relies on security's interactive password prompt")
+			}
+		})
+	}
+}
+
+func TestSetRejectsEmptySecret(t *testing.T) {
+	fake := &fakeCommandRunner{}
+	store := newStore(filepath.Join(t.TempDir(), "cred-labels"), fake.run)
+	if err := store.Set(context.Background(), "lbl", nil); err == nil {
+		t.Fatal("storing an empty secret must fail — Get reports such an item absent")
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("security calls = %d, want 0 (rejected before exec)", len(fake.calls))
+	}
+}
+
+// An item left empty by the pre-fix Set must read as ABSENT, so the next
+// request prompts for a real secret instead of serving nothing forever.
+func TestGetReportsEmptyItemAsAbsent(t *testing.T) {
+	for _, stored := range []string{"", "\n", "\r\n"} {
+		fake := &fakeCommandRunner{results: []commandResult{{stdout: []byte(stored)}}}
+		store := newStore(filepath.Join(t.TempDir(), "cred-labels"), fake.run)
+		secret, found, err := store.Get(context.Background(), "lbl")
+		if err != nil {
+			t.Fatalf("Get(%q): %v", stored, err)
+		}
+		if found || len(secret) != 0 {
+			t.Fatalf("Get(%q) = (%q, %v), want absent", stored, secret, found)
+		}
 	}
 }

@@ -53,26 +53,38 @@ func newStore(indexPath string, runner commandRunner) *Store {
 }
 
 // Set adds or updates label's Keychain item, then adds label to the local
-// index. The password is supplied to security's interactive -w prompt on stdin
-// and never appears in a process argument.
+// index. The secret is a quoted argument of the command line fed to security's
+// interactive mode on stdin: security parses that line itself, so the value
+// never becomes a process argument and never appears in `ps`.
+//
+// A bare `-w` (letting security prompt) does NOT work here and silently stores
+// the WRONG value: in -i mode both the password and retype prompts consume the
+// remainder of the current command line — which is empty — so they agree on an
+// empty password, create the item with it, and only then fail on the next line
+// with `unknown command`. The caller sees an error while a useless empty-secret
+// item is left behind, which is exactly what shipped before this.
 func (s *Store) Set(ctx context.Context, label string, secret []byte) error {
 	quotedLabel, err := securityCommandArg(label)
 	if err != nil {
 		return err
 	}
-	if bytes.IndexAny(secret, "\r\n\x00") >= 0 {
+	if bytes.ContainsAny(secret, "\r\n\x00") {
 		return errors.New("keychain: remembered secret contains an unsupported control byte")
+	}
+	if len(secret) == 0 {
+		// Get reports an empty item as absent, so storing one would create a
+		// credential that can never be served.
+		return errors.New("keychain: refusing to remember an empty secret")
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	command := "add-generic-password -U -s " + credentialService + " -a " + quotedLabel + " -w\n"
-	stdin := make([]byte, 0, len(command)+len(secret)+1)
-	stdin = append(stdin, command...)
-	stdin = append(stdin, secret...)
-	stdin = append(stdin, '\n')
-	result := s.run(ctx, securityBinary, []string{"-i"}, stdin)
-	clear(stdin)
+	command := make([]byte, 0, 64+len(quotedLabel)+len(secret))
+	command = append(command, "add-generic-password -U -s "+credentialService+" -a "+quotedLabel+" -w "...)
+	command = appendSecurityQuoted(command, secret)
+	command = append(command, '\n')
+	result := s.run(ctx, securityBinary, []string{"-i"}, command)
+	clear(command)
 	if err := commandError(ctx, "add", result); err != nil {
 		return err
 	}
@@ -81,6 +93,11 @@ func (s *Store) Set(ctx context.Context, label string, secret []byte) error {
 
 // Get returns label's secret and whether a matching Keychain item exists.
 // Keychain exit status 44 is treated as an ordinary absent item.
+//
+// An item holding an EMPTY secret is also reported absent. No credential worth
+// serving is empty, and releases before this one could leave such an item
+// behind (see Set); reporting it absent makes the next request prompt for a
+// real secret instead of serving nothing forever.
 func (s *Store) Get(ctx context.Context, label string) ([]byte, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -98,6 +115,9 @@ func (s *Store) Get(ctx context.Context, label string) ([]byte, bool, error) {
 		if len(secret) > 0 && secret[len(secret)-1] == '\r' {
 			secret = secret[:len(secret)-1]
 		}
+	}
+	if len(secret) == 0 {
+		return nil, false, nil
 	}
 	return secret, true, nil
 }
@@ -148,6 +168,21 @@ func securityCommandArg(value string) (string, error) {
 	value = strings.ReplaceAll(value, `\`, `\\`)
 	value = strings.ReplaceAll(value, `"`, `\"`)
 	return `"` + value + `"`, nil
+}
+
+// appendSecurityQuoted appends secret to dst as a double-quoted argument for
+// security's interactive command parser, escaping the two characters that parser
+// treats specially. It works on bytes and builds no intermediate string so the
+// secret lands in exactly one buffer the caller can clear.
+func appendSecurityQuoted(dst, secret []byte) []byte {
+	dst = append(dst, '"')
+	for _, b := range secret {
+		if b == '\\' || b == '"' {
+			dst = append(dst, '\\')
+		}
+		dst = append(dst, b)
+	}
+	return append(dst, '"')
 }
 
 func (s *Store) addLabelLocked(label string) error {
