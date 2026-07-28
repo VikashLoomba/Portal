@@ -106,6 +106,11 @@ type Client struct {
 	// must not evict it. Never closed by Run; runCredHandler exits on ctx.
 	credEvents chan EngineEvent
 
+	// clipWriteEvents is a DEDICATED cap-8 channel for KindClipWriteRequest,
+	// sized like clipEvents because the agent's maxInflight bound is 4 and
+	// runClipWriteHandler's worker semaphore is 1. Never closed by Run.
+	clipWriteEvents chan EngineEvent
+
 	// registry is the client-side service registry: it demuxes inbound Msg
 	// frames to per-service handlers and advertises the client's handlers in
 	// Hello. Auto-populated in
@@ -145,11 +150,12 @@ func New(cfg Config) *Client {
 		cfg.ReconnectMax = 10 * time.Second
 	}
 	c := &Client{
-		cfg:          cfg,
-		events:       make(chan EngineEvent, 64),
-		clipEvents:   make(chan EngineEvent, 8),
-		notifyEvents: make(chan EngineEvent, 16),
-		credEvents:   make(chan EngineEvent, 2),
+		cfg:             cfg,
+		events:          make(chan EngineEvent, 64),
+		clipEvents:      make(chan EngineEvent, 8),
+		notifyEvents:    make(chan EngineEvent, 16),
+		credEvents:      make(chan EngineEvent, 2),
+		clipWriteEvents: make(chan EngineEvent, 8),
 	}
 	// Auto-register the compiled-in openurl handler so cmd/portal/run.go stays
 	// unchanged: it decodes the OpenURL payload and delivers via the shared
@@ -217,6 +223,22 @@ func New(cfg Config) *Client {
 		},
 		Deliver: c.publishClip,
 	})
+	c.registry.register(HandlerSpec{
+		Service:    "clipwrite",
+		Version:    1,
+		MaxPayload: 4096,
+		Decode: func(_ uint64, payload cbor.RawMessage) (EngineEvent, error) {
+			cw, err := protocol.UnmarshalPayload[protocol.ClipWriteRequest](payload)
+			if err != nil {
+				return EngineEvent{}, err
+			}
+			return EngineEvent{Kind: KindClipWriteRequest, ClipWrite: &ClipWriteEvent{
+				Nonce: cw.Nonce, Epoch: cw.Epoch, Kind: cw.Kind, Format: cw.Format,
+				SHA: cw.SHA, Size: cw.Size,
+			}}, nil
+		},
+		Deliver: c.publishClipWrite,
+	})
 	// Auto-register the credential handler: CredRequest payloads use their own
 	// cap-2 channel because a human prompt may remain pending for 120 seconds.
 	// The Mac answers through SendCredResponse after an explicit decision.
@@ -252,6 +274,13 @@ func (c *Client) Events() <-chan EngineEvent { return c.events }
 // a send to a closed channel.
 func (c *Client) ClipEvents() <-chan EngineEvent { return c.clipEvents }
 
+// ClipWriteEvents returns the dedicated KindClipWriteRequest channel.
+// runClipWriteHandler in cmd/portal drains it on its own goroutine. It is NEVER
+// closed by Run (only Events() is) — the handler exits on ctx cancellation, not
+// channel close — so a late ClipWriteRequest racing shutdown cannot panic on a
+// send to a closed channel.
+func (c *Client) ClipWriteEvents() <-chan EngineEvent { return c.clipWriteEvents }
+
 // NotifyEvents returns the dedicated KindNotify channel. runNotifyHandler in
 // cmd/portal/run.go drains it on its own goroutine. Like ClipEvents() it is
 // NEVER closed by Run — the handler exits on ctx cancellation, not channel
@@ -281,6 +310,21 @@ func (c *Client) SendClipResponse(resp *protocol.ClipResponse) error {
 		return err
 	}
 	return c.registry.send(enc, "clip", "resp", payload)
+}
+
+// SendClipWriteResponse writes a ClipWriteResponse up the current pipe,
+// correlating the agent's outstanding waiter by (Nonce,Epoch). Returns an error
+// if no connection is up, leaving the agent to time out its pending clipboard
+// write request.
+func (c *Client) SendClipWriteResponse(resp *protocol.ClipWriteResponse) error {
+	c.streamMu.Lock()
+	enc := c.enc
+	c.streamMu.Unlock()
+	payload, err := protocol.MarshalPayload(*resp)
+	if err != nil {
+		return err
+	}
+	return c.registry.send(enc, "clipwrite", "resp", payload)
 }
 
 // SendCredResponse writes a CredResponse up the current pipe, correlating the
@@ -480,6 +524,17 @@ func (c *Client) LastDisconnectErr() string {
 func (c *Client) publishClip(ev EngineEvent) {
 	select {
 	case c.clipEvents <- ev:
+	default:
+	}
+}
+
+// publishClipWrite sends to the dedicated clipboard-write channel.
+// Non-blocking (so the demux loop never stalls) but to its OWN channel so a
+// port-event burst on c.events can't drop the write. clipWriteEvents is never
+// closed, so no recover is needed.
+func (c *Client) publishClipWrite(ev EngineEvent) {
+	select {
+	case c.clipWriteEvents <- ev:
 	default:
 	}
 }
