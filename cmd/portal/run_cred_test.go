@@ -65,10 +65,11 @@ func (f *fakeCredKeychain) Delete(_ context.Context, label string) error {
 }
 
 type credTestState struct {
-	mu      sync.Mutex
-	now     time.Time
-	enabled bool
-	logs    []string
+	mu             sync.Mutex
+	now            time.Time
+	enabled        bool
+	touchIDEnabled bool
+	logs           []string
 }
 
 func (s *credTestState) nowTime() time.Time {
@@ -84,17 +85,27 @@ func (s *credTestState) setNow(now time.Time) {
 }
 
 func (s *credTestState) featureEnabled(feature string) bool {
-	if feature != config.FeatureCred {
-		return false
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.enabled
+	switch feature {
+	case config.FeatureCred:
+		return s.enabled
+	case credTouchIDFeature:
+		return s.touchIDEnabled
+	default:
+		return false
+	}
 }
 
 func (s *credTestState) setEnabled(enabled bool) {
 	s.mu.Lock()
 	s.enabled = enabled
+	s.mu.Unlock()
+}
+
+func (s *credTestState) setTouchIDEnabled(enabled bool) {
+	s.mu.Lock()
+	s.touchIDEnabled = enabled
 	s.mu.Unlock()
 }
 
@@ -113,8 +124,9 @@ func (s *credTestState) logLines() []string {
 func newCredTestDeps(t *testing.T, prompter prompt.Prompter, kc *fakeCredKeychain) (credServeDeps, *credTestState) {
 	t.Helper()
 	state := &credTestState{
-		now:     time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC),
-		enabled: true,
+		now:            time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC),
+		enabled:        true,
+		touchIDEnabled: true,
 	}
 	return credServeDeps{
 		Prompter:       prompter,
@@ -363,6 +375,85 @@ func TestServeCredRequest_AllowRememberSetFailureStillServes(t *testing.T) {
 	assertSecretNotRecorded(t, deps, state, secret)
 }
 
+func TestServeCredRequest_TouchIDEnrollFlag(t *testing.T) {
+	tests := []struct {
+		name       string
+		mode       string
+		gate       bool
+		biometry   prompt.Biometry
+		wantEnroll bool
+		wantChecks int
+	}{
+		{
+			name:       "askpass fresh gate on available",
+			mode:       "askpass",
+			gate:       true,
+			biometry:   &prompt.BiometryFake{AvailableResult: true},
+			wantEnroll: true,
+			wantChecks: 1,
+		},
+		{
+			name:     "env fresh",
+			mode:     "env",
+			gate:     true,
+			biometry: &prompt.BiometryFake{AvailableResult: true},
+		},
+		{
+			name:     "askpass gate off",
+			mode:     "askpass",
+			biometry: &prompt.BiometryFake{AvailableResult: true},
+		},
+		{
+			name: "askpass biometry absent",
+			mode: "askpass",
+			gate: true,
+		},
+		{
+			name:       "askpass biometry unavailable",
+			mode:       "askpass",
+			gate:       true,
+			biometry:   &prompt.BiometryFake{AvailableResult: false},
+			wantChecks: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			secret := []byte("enrollment-fake")
+			p := &prompt.Fake{Decision: prompt.Decision{
+				Outcome: prompt.OutcomeAllowOnce,
+				Secret:  secret,
+			}}
+			deps, state := newCredTestDeps(t, p, &fakeCredKeychain{})
+			state.setTouchIDEnabled(tt.gate)
+			deps.Biometry = tt.biometry
+			req := baseCredEvent()
+			req.Mode = tt.mode
+
+			resp := serveCredRequest(context.Background(), deps, req)
+			assertCredResponse(t, resp, &protocol.CredResponse{
+				Nonce: 41, Epoch: 7, OK: true, Secret: secret,
+			})
+			requests := p.Requests()
+			if len(requests) != 1 {
+				t.Fatalf("prompt requests = %d, want 1", len(requests))
+			}
+			if requests[0].TouchIDEnroll != tt.wantEnroll {
+				t.Fatalf("TouchIDEnroll = %v, want %v", requests[0].TouchIDEnroll, tt.wantEnroll)
+			}
+			if requests[0].Remembered {
+				t.Fatal("fresh enrollment test selected Dialog B")
+			}
+			if requests[0].TimeoutSecs != 115 {
+				t.Fatalf("prompt timeout = %d, want 115", requests[0].TimeoutSecs)
+			}
+			if b, ok := tt.biometry.(*prompt.BiometryFake); ok && b.AvailabilityChecks() != tt.wantChecks {
+				t.Fatalf("availability checks = %d, want %d", b.AvailabilityChecks(), tt.wantChecks)
+			}
+			assertSecretNotRecorded(t, deps, state, secret)
+		})
+	}
+}
+
 func TestServeCredRequest_RememberedAllow(t *testing.T) {
 	initial := []byte("initial-fake")
 	current := []byte("current-fake")
@@ -388,6 +479,277 @@ func TestServeCredRequest_RememberedAllow(t *testing.T) {
 		t.Fatal("remembered approval did not re-read the Keychain exactly once")
 	}
 	assertSecretNotRecorded(t, deps, state, current)
+}
+
+func TestServeCredRequest_TouchIDApproved(t *testing.T) {
+	initial := []byte("initial-touch-id-fake")
+	current := []byte("current-touch-id-fake")
+	p := &prompt.Fake{Decision: prompt.Decision{Outcome: prompt.OutcomeUnavailable}}
+	b := &prompt.BiometryFake{
+		AvailableResult: true,
+		Outcome:         prompt.BiometryApproved,
+	}
+	kc := &fakeCredKeychain{getResults: []fakeCredGetResult{
+		{secret: initial, found: true},
+		{secret: current, found: true},
+	}}
+	deps, state := newCredTestDeps(t, p, kc)
+	deps.Biometry = b
+	started := state.nowTime()
+
+	resp := serveCredRequest(context.Background(), deps, baseCredEvent())
+	assertCredResponse(t, resp, &protocol.CredResponse{
+		Nonce: 41, Epoch: 7, OK: true, Secret: current,
+	})
+	assertCredAudit(t, deps.Audit, []string{
+		"cred-served", "host=box", "label=database", "mode=env", "source=keychain-touchid", "dur=0s",
+	})
+	if len(p.Requests()) != 0 {
+		t.Fatal("Touch ID approval opened Dialog B")
+	}
+	if len(kc.getCalls) != 2 {
+		t.Fatalf("Keychain reads = %d, want existence check plus post-approval read", len(kc.getCalls))
+	}
+	if b.AvailabilityChecks() != 1 {
+		t.Fatalf("availability checks = %d, want 1", b.AvailabilityChecks())
+	}
+	requests := b.Requests()
+	wantRequest := prompt.BiometryRequest{
+		Reason:   `portal: approve credential "database" for box`,
+		Deadline: started.Add(credDialogBudget),
+	}
+	if len(requests) != 1 || requests[0] != wantRequest {
+		t.Fatalf("biometry requests = %#v, want %#v", requests, []prompt.BiometryRequest{wantRequest})
+	}
+	if strings.Contains(requests[0].Reason, string(initial)) ||
+		strings.Contains(requests[0].Reason, string(current)) {
+		t.Fatal("secret bytes appeared in the Touch ID reason")
+	}
+	assertSecretNotRecorded(t, deps, state, current)
+}
+
+func TestServeCredRequest_TouchIDCanceledRecordsCooldown(t *testing.T) {
+	p := &prompt.Fake{Decision: prompt.Decision{Outcome: prompt.OutcomeUnavailable}}
+	b := &prompt.BiometryFake{
+		AvailableResult: true,
+		Outcome:         prompt.BiometryCanceled,
+	}
+	kc := &fakeCredKeychain{getResults: []fakeCredGetResult{{
+		secret: []byte("remembered-touch-id-fake"), found: true,
+	}}}
+	deps, state := newCredTestDeps(t, p, kc)
+	deps.Biometry = b
+	base := state.nowTime()
+
+	resp := serveCredRequest(context.Background(), deps, baseCredEvent())
+	assertCredResponse(t, resp, &protocol.CredResponse{Nonce: 41, Epoch: 7, Err: "denied"})
+
+	state.setNow(base.Add(9 * time.Second))
+	retry := baseCredEvent()
+	retry.Nonce = 42
+	resp = serveCredRequest(context.Background(), deps, retry)
+	assertCredResponse(t, resp, &protocol.CredResponse{Nonce: 42, Epoch: 7, Err: "cooldown"})
+	if len(p.Requests()) != 0 {
+		t.Fatal("Touch ID cancel or cooldown opened Dialog B")
+	}
+	if len(b.Requests()) != 1 {
+		t.Fatalf("Touch ID approvals = %d, want no retry during cooldown", len(b.Requests()))
+	}
+	assertCredAudit(t, deps.Audit,
+		[]string{"cred-denied", "host=box", "label=database", "mode=env", "reason=denied"},
+		[]string{"cred-denied", "host=box", "label=database", "mode=env", "reason=cooldown"},
+	)
+}
+
+func TestServeCredRequest_TouchIDTimeoutHasNoCooldown(t *testing.T) {
+	p := &prompt.Fake{Decision: prompt.Decision{Outcome: prompt.OutcomeUnavailable}}
+	b := &prompt.BiometryFake{
+		AvailableResult: true,
+		Outcome:         prompt.BiometryTimeout,
+	}
+	kc := &fakeCredKeychain{getResults: []fakeCredGetResult{
+		{secret: []byte("remembered-one"), found: true},
+		{secret: []byte("remembered-two"), found: true},
+	}}
+	deps, _ := newCredTestDeps(t, p, kc)
+	deps.Biometry = b
+
+	for nonce := uint64(51); nonce <= 52; nonce++ {
+		req := baseCredEvent()
+		req.Nonce = nonce
+		resp := serveCredRequest(context.Background(), deps, req)
+		assertCredResponse(t, resp, &protocol.CredResponse{Nonce: nonce, Epoch: 7, Err: "timeout"})
+	}
+	if len(p.Requests()) != 0 {
+		t.Fatal("Touch ID timeout opened Dialog B")
+	}
+	if len(b.Requests()) != 2 {
+		t.Fatalf("Touch ID approvals = %d, want timeout not to activate cooldown", len(b.Requests()))
+	}
+	assertCredAudit(t, deps.Audit,
+		[]string{"cred-denied", "host=box", "label=database", "mode=env", "reason=timeout"},
+		[]string{"cred-denied", "host=box", "label=database", "mode=env", "reason=timeout"},
+	)
+}
+
+func TestServeCredRequest_TouchIDFallbackUsesDialogBRemainingBudget(t *testing.T) {
+	tests := []struct {
+		name    string
+		outcome prompt.BiometryOutcome
+		err     error
+	}{
+		{name: "fallback outcome", outcome: prompt.BiometryFallback},
+		{name: "approve error", outcome: prompt.BiometryApproved, err: errors.New("approval failed")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			current := []byte("fallback-current-fake")
+			p := &prompt.Fake{Decision: prompt.Decision{Outcome: prompt.OutcomeAllowRemember}}
+			var state *credTestState
+			b := &prompt.BiometryFake{
+				AvailableResult: true,
+				ApproveFunc: func(context.Context, string, time.Time) (prompt.BiometryOutcome, error) {
+					state.setNow(state.nowTime().Add(100 * time.Second))
+					return tt.outcome, tt.err
+				},
+			}
+			kc := &fakeCredKeychain{getResults: []fakeCredGetResult{
+				{secret: []byte("fallback-initial-fake"), found: true},
+				{secret: current, found: true},
+			}}
+			deps, testState := newCredTestDeps(t, p, kc)
+			state = testState
+			deps.Biometry = b
+			started := state.nowTime()
+
+			resp := serveCredRequest(context.Background(), deps, baseCredEvent())
+			assertCredResponse(t, resp, &protocol.CredResponse{
+				Nonce: 41, Epoch: 7, OK: true, Secret: current,
+			})
+			wantPrompt := prompt.Request{
+				Label: "database", Requester: "pid 42: sh", Host: "box",
+				Delivery:    `will be set as env var "PW" for the requested command`,
+				Remembered:  true,
+				TimeoutSecs: 15,
+			}
+			requests := p.Requests()
+			if len(requests) != 1 || requests[0] != wantPrompt {
+				t.Fatalf("Dialog B requests = %#v, want %#v", requests, []prompt.Request{wantPrompt})
+			}
+			biometryRequests := b.Requests()
+			wantBiometry := prompt.BiometryRequest{
+				Reason:   `portal: approve credential "database" for box`,
+				Deadline: started.Add(credDialogBudget),
+			}
+			if len(biometryRequests) != 1 || biometryRequests[0] != wantBiometry {
+				t.Fatalf("biometry requests = %#v, want %#v", biometryRequests, []prompt.BiometryRequest{wantBiometry})
+			}
+			assertCredAudit(t, deps.Audit, []string{
+				"cred-served", "host=box", "label=database", "mode=env", "source=keychain", "dur=1m40s",
+			})
+			assertSecretNotRecorded(t, deps, state, current)
+		})
+	}
+}
+
+func TestServeCredRequest_TouchIDFallbackBelowMinimumBudgetTimesOut(t *testing.T) {
+	p := &prompt.Fake{Decision: prompt.Decision{Outcome: prompt.OutcomeAllowRemember}}
+	var state *credTestState
+	b := &prompt.BiometryFake{
+		AvailableResult: true,
+		ApproveFunc: func(context.Context, string, time.Time) (prompt.BiometryOutcome, error) {
+			state.setNow(state.nowTime().Add(112 * time.Second))
+			return prompt.BiometryFallback, nil
+		},
+	}
+	kc := &fakeCredKeychain{getResults: []fakeCredGetResult{{
+		secret: []byte("remembered-fake"), found: true,
+	}}}
+	deps, testState := newCredTestDeps(t, p, kc)
+	state = testState
+	deps.Biometry = b
+
+	resp := serveCredRequest(context.Background(), deps, baseCredEvent())
+	assertCredResponse(t, resp, &protocol.CredResponse{Nonce: 41, Epoch: 7, Err: "timeout"})
+	if len(p.Requests()) != 0 {
+		t.Fatal("Touch ID fallback opened Dialog B below the five-second minimum")
+	}
+	assertCredAudit(t, deps.Audit, []string{
+		"cred-denied", "host=box", "label=database", "mode=env", "reason=timeout",
+	})
+}
+
+func TestServeCredRequest_TouchIDV1Paths(t *testing.T) {
+	tests := []struct {
+		name            string
+		configure       func(*credTestState) prompt.Biometry
+		wantChecks      int
+		wantDuration    string
+		wantTimeoutSecs int
+	}{
+		{
+			name: "gate off",
+			configure: func(state *credTestState) prompt.Biometry {
+				state.setTouchIDEnabled(false)
+				return &prompt.BiometryFake{AvailableResult: true}
+			},
+			wantDuration:    "0s",
+			wantTimeoutSecs: 115,
+		},
+		{
+			name: "biometry absent",
+			configure: func(*credTestState) prompt.Biometry {
+				return nil
+			},
+			wantDuration:    "0s",
+			wantTimeoutSecs: 115,
+		},
+		{
+			name: "biometry unavailable probe excluded from budget",
+			configure: func(state *credTestState) prompt.Biometry {
+				return &prompt.BiometryFake{AvailableFunc: func(context.Context) bool {
+					state.setNow(state.nowTime().Add(100 * time.Second))
+					return false
+				}}
+			},
+			wantChecks:      1,
+			wantDuration:    "1m40s",
+			wantTimeoutSecs: 115,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			current := []byte("v1-current-fake")
+			p := &prompt.Fake{Decision: prompt.Decision{Outcome: prompt.OutcomeAllowRemember}}
+			kc := &fakeCredKeychain{getResults: []fakeCredGetResult{
+				{secret: []byte("v1-initial-fake"), found: true},
+				{secret: current, found: true},
+			}}
+			deps, state := newCredTestDeps(t, p, kc)
+			deps.Biometry = tt.configure(state)
+
+			resp := serveCredRequest(context.Background(), deps, baseCredEvent())
+			assertCredResponse(t, resp, &protocol.CredResponse{
+				Nonce: 41, Epoch: 7, OK: true, Secret: current,
+			})
+			wantPrompt := prompt.Request{
+				Label: "database", Requester: "pid 42: sh", Host: "box",
+				Delivery:    `will be set as env var "PW" for the requested command`,
+				Remembered:  true,
+				TimeoutSecs: tt.wantTimeoutSecs,
+			}
+			requests := p.Requests()
+			if len(requests) != 1 || requests[0] != wantPrompt {
+				t.Fatalf("v1 Dialog B requests = %#v, want %#v", requests, []prompt.Request{wantPrompt})
+			}
+			if b, ok := deps.Biometry.(*prompt.BiometryFake); ok && b.AvailabilityChecks() != tt.wantChecks {
+				t.Fatalf("availability checks = %d, want %d", b.AvailabilityChecks(), tt.wantChecks)
+			}
+			assertCredAudit(t, deps.Audit, []string{
+				"cred-served", "host=box", "label=database", "mode=env", "source=keychain", "dur=" + tt.wantDuration,
+			})
+		})
+	}
 }
 
 func TestServeCredRequest_RememberedItemVanishes(t *testing.T) {
@@ -631,6 +993,31 @@ func TestServeCredRequest_OversizeSecretDenied(t *testing.T) {
 		assertCredAudit(t, deps.Audit, []string{
 			"cred-denied", "host=box", "label=database", "mode=env", "reason=denied",
 		})
+		assertSecretNotRecorded(t, deps, state, secret)
+	})
+
+	t.Run("touch id approved", func(t *testing.T) {
+		secret := bytes.Repeat([]byte{'T'}, credSecretMaxBytes+1)
+		p := &prompt.Fake{Decision: prompt.Decision{Outcome: prompt.OutcomeUnavailable}}
+		b := &prompt.BiometryFake{
+			AvailableResult: true,
+			Outcome:         prompt.BiometryApproved,
+		}
+		kc := &fakeCredKeychain{getResults: []fakeCredGetResult{
+			{secret: []byte("initial-fake"), found: true},
+			{secret: secret, found: true},
+		}}
+		deps, state := newCredTestDeps(t, p, kc)
+		deps.Biometry = b
+
+		resp := serveCredRequest(context.Background(), deps, baseCredEvent())
+		assertCredResponse(t, resp, &protocol.CredResponse{Nonce: 41, Epoch: 7, Err: "denied"})
+		assertCredAudit(t, deps.Audit, []string{
+			"cred-denied", "host=box", "label=database", "mode=env", "reason=denied",
+		})
+		if len(p.Requests()) != 0 {
+			t.Fatal("oversize post-Touch ID Keychain secret opened Dialog B")
+		}
 		assertSecretNotRecorded(t, deps, state, secret)
 	})
 }

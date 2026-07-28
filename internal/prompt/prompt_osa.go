@@ -44,15 +44,23 @@ func dialogScript(req Request) string {
 	message := osa.StringLiteral(req.Label) + " & return & return & " +
 		osa.StringLiteral("requested by "+req.Requester+" on "+req.Host) +
 		" & return & return & " + osa.StringLiteral(req.Delivery)
+	if req.TouchIDEnroll {
+		message += " & return & return & " +
+			osa.StringLiteral("Remember stores this in your Mac Keychain; future approvals for this credential use Touch ID.")
+	}
 	timeout := strconv.Itoa(dialogTimeoutSecs(req.TimeoutSecs))
 	if req.Remembered {
 		return "display dialog " + message +
 			` buttons {"Deny","Forget","Allow"} default button "Allow"` +
 			` cancel button "Deny" giving up after ` + timeout + ` with title "portal"`
 	}
+	defaultButton := "Allow Once"
+	if req.TouchIDEnroll {
+		defaultButton = "Allow & Remember"
+	}
 	return "display dialog " + message +
 		` default answer "" buttons {"Cancel","Allow Once","Allow & Remember"}` +
-		` default button "Allow Once" cancel button "Cancel" with hidden answer` +
+		` default button "` + defaultButton + `" cancel button "Cancel" with hidden answer` +
 		` giving up after ` + timeout + ` with title "portal"`
 }
 

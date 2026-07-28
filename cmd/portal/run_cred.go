@@ -27,6 +27,7 @@ const (
 	credDialogBudget    = 115 * time.Second
 	credDialogMinSecs   = 5
 	credDialogMaxSecs   = 120
+	credTouchIDFeature  = "cred-touchid"
 	// C1 has no "oversize" wire reason; an oversized secret fails closed under
 	// the generic denied token rather than inventing a new protocol value.
 	credInvalidSecretReason = "denied"
@@ -92,6 +93,7 @@ func (c *credCooldown) record(label string, now time.Time) {
 // Log receives only fixed context and dependency errors, never secret bytes.
 type credServeDeps struct {
 	Prompter       prompt.Prompter
+	Biometry       prompt.Biometry
 	KC             credKeychain
 	FeatureEnabled func(string) bool
 	Audit          *audit.Log
@@ -142,6 +144,7 @@ func runCredHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a *a
 	}
 	deps := credServeDeps{
 		Prompter:       prompt.New(),
+		Biometry:       prompt.NewBiometry(),
 		KC:             store,
 		FeatureEnabled: a.Cfg.FeatureEnabled,
 		Audit:          a.Audit,
@@ -235,10 +238,47 @@ func serveCredRequest(ctx context.Context, deps credServeDeps, req *agentclient.
 		_, found, err := deps.KC.Get(ctx, label)
 		remembered = err == nil && found
 	}
+	touchIDAvailable := false
+	if (remembered || req.Mode == "askpass") &&
+		deps.Biometry != nil && deps.FeatureEnabled(credTouchIDFeature) {
+		touchIDAvailable = deps.Biometry.Available(ctx)
+		// The availability probe is not part of the consent-sheet budget.
+		deadline = credNow(deps).Add(credDialogBudget)
+	}
 	promptReq.Remembered = remembered
+	promptReq.TouchIDEnroll = !remembered && req.Mode == "askpass" && touchIDAvailable
 	timeoutSecs, ok := credPromptTimeoutSecs(deps, deadline)
 	if !ok {
 		return denyCredResponse(deps, resp, label, req.Mode, "timeout")
+	}
+
+	if remembered && touchIDAvailable {
+		approveCtx, cancel := context.WithTimeout(ctx, deadline.Sub(credNow(deps)))
+		outcome, err := deps.Biometry.Approve(
+			approveCtx,
+			`portal: approve credential "`+label+`" for `+deps.Host,
+			deadline,
+		)
+		cancel()
+		if err == nil {
+			switch outcome {
+			case prompt.BiometryApproved:
+				secret, found, err := deps.KC.Get(ctx, label)
+				if err != nil || !found || len(secret) > credSecretMaxBytes {
+					return denyCredResponse(deps, resp, label, req.Mode, credInvalidSecretReason)
+				}
+				return serveCredResponse(deps, resp, label, req.Mode, "keychain-touchid", started, secret)
+			case prompt.BiometryCanceled:
+				deps.Cooldown.record(label, credNow(deps))
+				return denyCredResponse(deps, resp, label, req.Mode, "denied")
+			case prompt.BiometryTimeout:
+				return denyCredResponse(deps, resp, label, req.Mode, "timeout")
+			}
+		}
+		timeoutSecs, ok = credPromptTimeoutSecs(deps, deadline)
+		if !ok {
+			return denyCredResponse(deps, resp, label, req.Mode, "timeout")
+		}
 	}
 	promptReq.TimeoutSecs = timeoutSecs
 	decision := credPrompt(ctx, deps.Prompter, promptReq)
@@ -263,6 +303,7 @@ func serveCredRequest(ctx context.Context, deps credServeDeps, req *agentclient.
 			return denyCredResponse(deps, resp, label, req.Mode, "timeout")
 		}
 		promptReq.TimeoutSecs = timeoutSecs
+		promptReq.TouchIDEnroll = req.Mode == "askpass" && touchIDAvailable
 		decision = credPrompt(ctx, deps.Prompter, promptReq)
 		return resolveFreshCredDecision(ctx, deps, req.Mode, label, started, resp, decision)
 	case prompt.OutcomeDeny:

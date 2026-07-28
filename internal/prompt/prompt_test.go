@@ -51,6 +51,23 @@ func TestDialogACommandConstruction(t *testing.T) {
 	}
 }
 
+func TestDialogAEnrollmentCommandConstruction(t *testing.T) {
+	script := dialogScript(Request{
+		Label: "sudo", Requester: "pid 9: sudo", Host: "box",
+		Delivery: "will be sent to sudo/askpass on the box", TouchIDEnroll: true,
+	})
+	for _, want := range []string{
+		`buttons {"Cancel","Allow Once","Allow & Remember"}`,
+		`default button "Allow & Remember"`,
+		`cancel button "Cancel"`,
+		osa.StringLiteral("Remember stores this in your Mac Keychain; future approvals for this credential use Touch ID."),
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("Dialog A enrollment script missing %q:\n%s", want, script)
+		}
+	}
+}
+
 func TestDialogTimeoutClamp(t *testing.T) {
 	tests := []struct {
 		name      string
