@@ -22,13 +22,15 @@ var ErrNotConnected = errors.New("agentclient: not connected")
 // publishClip cap-8, notify ⇒ publishNotify cap-16, cred ⇒ publishCred cap-2;
 // openurl ⇒ publish shared events). Channel capacity + drop policy are thus
 // DECLARED per handler via its Deliver target (the dedicated channels created in
-// Client.New). Handlers that do not correlate on seq ignore it.
+// Client.New). InboundKind, when non-empty, rejects every other frame kind
+// before decode. Handlers that do not correlate on seq ignore it.
 type HandlerSpec struct {
-	Service    string
-	Version    uint32
-	MaxPayload int
-	Decode     func(seq uint64, payload cbor.RawMessage) (EngineEvent, error)
-	Deliver    func(EngineEvent)
+	Service     string
+	Version     uint32
+	InboundKind string
+	MaxPayload  int
+	Decode      func(seq uint64, payload cbor.RawMessage) (EngineEvent, error)
+	Deliver     func(EngineEvent)
 }
 
 // handlerEntry is the registry's per-service bookkeeping. dormant is set when
@@ -103,6 +105,11 @@ func (r *registry) dispatch(m *protocol.Msg) {
 	r.mu.Unlock()
 	if !ok || dormant {
 		r.log.Warn("dropping Msg for unknown/dormant service", "service", m.Service, "kind", m.Kind)
+		return
+	}
+	if h.spec.InboundKind != "" && m.Kind != h.spec.InboundKind {
+		r.log.Warn("dropping Msg with unexpected kind", "service", m.Service,
+			"kind", m.Kind, "want", h.spec.InboundKind)
 		return
 	}
 	if len(m.Payload) > h.spec.MaxPayload {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -374,7 +376,17 @@ type clipWriteResponseSender func(*protocol.ClipWriteResponse) error
 // runClipWriteHandler drains the dedicated clipboard-write channel and
 // delegates to the injectable handler loop. The writer and banner live for the
 // lifetime of this stack.
-func runClipWriteHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a *app.App, wg goroutineTracker) {
+func runClipWriteHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a *app.App,
+	wg goroutineTracker, makeDeps func(*app.App) clipWriteDeps) {
+
+	if makeDeps == nil {
+		makeDeps = newClipWriteDeps
+	}
+	deps := makeDeps(a)
+	runClipWriteHandlerWithDeps(ctx, ch, deps, a.AgentClient.SendClipWriteResponse, wg)
+}
+
+func newClipWriteDeps(a *app.App) clipWriteDeps {
 	logLine := func(line string) {
 		if a.Log != nil {
 			a.Log.Logf("%s", line)
@@ -391,7 +403,7 @@ func runClipWriteHandler(ctx context.Context, ch <-chan agentclient.EngineEvent,
 		Log:            logLine,
 		ApplyTimeout:   clipWriteApplyTimeout,
 	}
-	runClipWriteHandlerWithDeps(ctx, ch, deps, a.AgentClient.SendClipWriteResponse, wg)
+	return deps
 }
 
 // runClipWriteHandlerWithDeps serializes pasteboard writers with a cap-1
@@ -416,6 +428,17 @@ func runClipWriteHandlerWithDeps(ctx context.Context, ch <-chan agentclient.Engi
 				continue
 			}
 			req := ev.ClipWrite
+			if deps.FeatureEnabled == nil || !deps.FeatureEnabled(config.FeatureClipWrite) {
+				kind := clipWriteAuditKind(req.Kind)
+				resp := denyClipWriteResponse(deps, &protocol.ClipWriteResponse{
+					Nonce: req.Nonce, Epoch: req.Epoch,
+				}, kind, "disabled")
+				if err := send(resp); err != nil {
+					logClipWriteLine(deps, fmt.Sprintf(
+						"clip-write: send response failed (nonce=%d): %v", req.Nonce, err))
+				}
+				continue
+			}
 			select {
 			case sem <- struct{}{}:
 			default:
@@ -569,25 +592,121 @@ func clipWriteShape(kind, format, sha string, size int64) (ext string, pull bool
 	return ext, true, ""
 }
 
+const clipWriteStderrLimit = 512
+
+type clipWriteStreamResult struct {
+	data     []byte
+	err      error
+	tooLarge bool
+}
+
 // pullClipWrite reconstructs the only permitted remote path from validated
-// fields and bounds stdout remotely. Transport.Exec buffers stdout, so a bare
-// cat would let a same-uid file swap inflate daemon memory before Go could
-// enforce the cap. The symlink check is the remote counterpart to portald's
-// O_NOFOLLOW open; --noprofile/--norc keeps rc noise out of binary stdout.
+// fields. Stream keeps both outputs under local caps even if the target's
+// command environment is hostile. The symlink check is the remote counterpart
+// to portald's O_NOFOLLOW open.
 func pullClipWrite(ctx context.Context, t transport.Transport, sha, ext string, size int64) ([]byte, error) {
+	if size < 0 || size > clipWriteMaxBytes {
+		return nil, fmt.Errorf("pull clipboard bytes: invalid size %d", size)
+	}
 	script := fmt.Sprintf(
-		`f="$HOME/.cache/portal/clip/copy-%s%s"; if [ -L "$f" ] || [ ! -f "$f" ]; then exit 1; fi; exec head -c %d < "$f"`,
+		`f="$HOME/.cache/portal/clip/copy-%s%s"; if [ -L "$f" ] || [ ! -f "$f" ]; then exit 1; fi; exec /usr/bin/head -c %d < "$f"`,
 		sha, ext, size,
 	)
-	stdout, stderr, err := t.Exec(ctx, nil,
-		"bash", "--noprofile", "--norc", "-c", clipWriteShellQuote(script))
+
+	pullCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stdin, stdout, stderr, wait, err := t.Stream(pullCtx,
+		"BASH_ENV=/dev/null", "/bin/bash", "--noprofile", "--norc", "-c",
+		clipWriteShellQuote(script))
 	if err != nil {
-		if stderr = strings.TrimSpace(stderr); stderr != "" {
-			return nil, fmt.Errorf("pull clipboard bytes: %w: %s", err, stderr)
-		}
 		return nil, fmt.Errorf("pull clipboard bytes: %w", err)
 	}
-	return []byte(stdout), nil
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	defer stdout.Close()
+	defer stderr.Close()
+
+	stdoutResult := make(chan clipWriteStreamResult, 1)
+	stderrResult := make(chan clipWriteStreamResult, 1)
+	go func() { stdoutResult <- readClipWriteStream(stdout, size) }()
+	go func() { stderrResult <- readClipWriteStream(stderr, clipWriteStderrLimit) }()
+
+	var out, errOut clipWriteStreamResult
+	for stdoutResult != nil || stderrResult != nil {
+		select {
+		case out = <-stdoutResult:
+			stdoutResult = nil
+			if out.tooLarge || out.err != nil {
+				cancel()
+			}
+		case errOut = <-stderrResult:
+			stderrResult = nil
+			if errOut.tooLarge || errOut.err != nil {
+				cancel()
+			}
+		}
+	}
+	waitErr := wait()
+
+	if out.tooLarge {
+		return nil, fmt.Errorf("pull clipboard bytes: stdout exceeded declared size %d", size)
+	}
+	if errOut.tooLarge {
+		detail := sanitizeClipWriteStderr(string(errOut.data))
+		if detail != "" {
+			return nil, fmt.Errorf("pull clipboard bytes: stderr exceeded %d bytes: %s",
+				clipWriteStderrLimit, detail)
+		}
+		return nil, fmt.Errorf("pull clipboard bytes: stderr exceeded %d bytes", clipWriteStderrLimit)
+	}
+	if out.err != nil {
+		return nil, fmt.Errorf("pull clipboard bytes: read stdout: %w", out.err)
+	}
+	if errOut.err != nil {
+		return nil, fmt.Errorf("pull clipboard bytes: read stderr: %w", errOut.err)
+	}
+	if waitErr != nil {
+		if detail := sanitizeClipWriteStderr(string(errOut.data)); detail != "" {
+			return nil, fmt.Errorf("pull clipboard bytes: %w: %s", waitErr, detail)
+		}
+		return nil, fmt.Errorf("pull clipboard bytes: %w", waitErr)
+	}
+	return out.data, nil
+}
+
+func readClipWriteStream(r io.Reader, limit int64) clipWriteStreamResult {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if int64(len(data)) > limit {
+		return clipWriteStreamResult{data: data[:limit], tooLarge: true}
+	}
+	return clipWriteStreamResult{data: data, err: err}
+}
+
+func sanitizeClipWriteStderr(s string) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	b.Grow(min(len(s), clipWriteStderrLimit))
+	truncated := false
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			r = ' '
+		}
+		if b.Len()+utf8.RuneLen(r) > clipWriteStderrLimit {
+			truncated = true
+			break
+		}
+		b.WriteRune(r)
+	}
+	if !truncated {
+		return b.String()
+	}
+	out := b.String()
+	for len(out)+3 > clipWriteStderrLimit {
+		_, n := utf8.DecodeLastRuneInString(out)
+		out = out[:len(out)-n]
+	}
+	return out + "..."
 }
 
 // clipWriteAuditKind closes the audit field over the protocol's three valid

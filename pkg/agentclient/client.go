@@ -231,9 +231,10 @@ func New(cfg Config) *Client {
 		Deliver: c.publishClip,
 	})
 	c.registry.register(HandlerSpec{
-		Service:    "clipwrite",
-		Version:    1,
-		MaxPayload: 4096,
+		Service:     "clipwrite",
+		Version:     1,
+		InboundKind: "req",
+		MaxPayload:  4096,
 		Decode: func(_ uint64, payload cbor.RawMessage) (EngineEvent, error) {
 			cw, err := protocol.UnmarshalPayload[protocol.ClipWriteRequest](payload)
 			if err != nil {

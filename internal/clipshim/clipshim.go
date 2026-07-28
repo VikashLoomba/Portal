@@ -131,6 +131,7 @@ _mode=write
 _sel=primary
 _target=""
 _trim=0
+_filter=0
 _ok=1
 _want=""
 for _a in "$@"; do
@@ -152,6 +153,7 @@ for _a in "$@"; do
       -r|-rm|-rml|-rmla|-rmlas|-rmlast|-rmlastn|-rmlastnl) _trim=1 ;;
       -d|-di|-dis|-disp|-displ|-displa|-display) _want=skip ;;
       -l|-lo|-loo|-loop|-loops) _want=skip ;;
+      -f|-fi|-fil|-filt|-filte|-filter) _filter=1 ;;
       -n|-no|-nou|-nout|-noutf|-noutf8) : ;;
       -q|-qu|-qui|-quie|-quiet) : ;;
       -si|-sil|-sile|-silen|-silent) : ;;
@@ -161,6 +163,7 @@ for _a in "$@"; do
     esac
 done
 [ -z "$_want" ] || _ok=0
+[ "$_filter" = 0 ] || [ "$_mode" = read ] || _ok=0
 if [ "$_ok" = 1 ]; then
     _sl=$(printf '%s' "$_sel" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz' 2>/dev/null)
     case "$_sl" in
@@ -342,6 +345,10 @@ _fail() {
     printf '%s\n' '` + clipWriteFailMsg + `' >&2
     exit 1
 }
+_buffer_fail() {
+    printf '%s\n' 'portal: clipboard write failed (cannot buffer input)' >&2
+    exit 1
+}
 [ -x "$_portald" ] || _fail
 _tmp=$(mktemp "${TMPDIR:-/tmp}/portal-pbcopy.XXXXXX" 2>/dev/null)
 if [ -z "$_tmp" ]; then
@@ -349,7 +356,7 @@ if [ -z "$_tmp" ]; then
     _fail
 fi
 trap 'rm -f "$_tmp"' EXIT HUP INT TERM
-cat > "$_tmp" || _fail
+cat > "$_tmp" || _buffer_fail
 if [ -s "$_tmp" ]; then
     "$_portald" clip copy text < "$_tmp" 2>/dev/null && exit 0
 else
@@ -384,7 +391,7 @@ for _a in "$@"; do
       --input) _has_i=1 ;;
       --output) _has_o=1 ;;
       --clear) _clear=1 ;;
-      --append|--follow|--delete|--exchange) _write_intent=1; _ok=0 ;;
+      --append|--follow|--delete|--exchange|--zeroflush) _write_intent=1; _ok=0 ;;
       --clipboard|--primary|--secondary|--nodetach) : ;;
       --help|--version) _info=1; _ok=0 ;;
       --*) _ok=0 ;;
@@ -394,7 +401,7 @@ for _a in "$@"; do
         case "${_a#-}" in *i*) _has_i=1 ;; esac
         case "${_a#-}" in *o*) _has_o=1 ;; esac
         case "${_a#-}" in *c*) _clear=1 ;; esac
-        case "${_a#-}" in *[afdx]*) _write_intent=1 ;; esac ;;
+        case "${_a#-}" in *[afdxz]*) _write_intent=1 ;; esac ;;
       *) _ok=0 ;;
     esac
 done
@@ -404,6 +411,9 @@ elif [ "$_has_i" = 1 ] && [ "$_has_o" = 1 ]; then
     _mode=write
     _ok=0
 elif [ "$_clear" = 1 ] && [ "$_has_i" = 1 ]; then
+    _mode=write
+    _ok=0
+elif [ "$_clear" = 1 ] && [ "$_has_o" = 1 ]; then
     _mode=write
     _ok=0
 elif [ "$_clear" = 1 ]; then

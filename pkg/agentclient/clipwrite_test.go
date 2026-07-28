@@ -1,6 +1,7 @@
 package agentclient
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -147,6 +148,63 @@ func TestClientClipWrite_DropsWhenFull(t *testing.T) {
 		}
 	default:
 		t.Fatal("full clipboard-write channel interfered with ClipEvents delivery")
+	}
+}
+
+func TestClientClipWrite_DropsUnexpectedMessageKinds(t *testing.T) {
+	c := New(Config{})
+	req := protocol.ClipWriteRequest{Nonce: 45, Epoch: 46, Kind: "clear"}
+	payload := clipWritePayload(t, req)
+	for _, kind := range []string{"", "event", "resp"} {
+		c.registry.dispatch(&protocol.Msg{
+			Service: "clipwrite", Kind: kind, Payload: payload,
+		})
+	}
+	select {
+	case ev := <-c.ClipWriteEvents():
+		t.Fatalf("unexpected-kind clipboard-write frame was delivered: %+v", ev)
+	default:
+	}
+
+	c.registry.dispatch(&protocol.Msg{
+		Service: "clipwrite", Kind: "req", Payload: payload,
+	})
+	select {
+	case ev := <-c.ClipWriteEvents():
+		if ev.ClipWrite == nil || ev.ClipWrite.Nonce != req.Nonce {
+			t.Fatalf("valid clipboard-write frame after drops = %+v", ev)
+		}
+	default:
+		t.Fatal("valid clipboard-write frame was not delivered after unexpected-kind drops")
+	}
+}
+
+func TestClientClipWrite_LateDeliveryAfterRunTeardown(t *testing.T) {
+	c := New(Config{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run after cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not tear down")
+	}
+
+	req := protocol.ClipWriteRequest{Nonce: 47, Epoch: 48, Kind: "clear"}
+	c.registry.dispatch(&protocol.Msg{
+		Service: "clipwrite", Kind: "req", Payload: clipWritePayload(t, req),
+	})
+	select {
+	case ev := <-c.ClipWriteEvents():
+		if ev.ClipWrite == nil || ev.ClipWrite.Nonce != req.Nonce {
+			t.Fatalf("late clipboard-write event = %+v", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late clipboard-write frame was not delivered after Run teardown")
 	}
 }
 

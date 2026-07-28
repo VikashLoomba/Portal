@@ -261,6 +261,56 @@ func waitForCall(t *testing.T, log *callLog, want string) {
 	t.Fatalf("calls = %v, missing %q", log.snapshot(), want)
 }
 
+func TestSupervisorLaunchesClipWriteHandlerThroughMutation(t *testing.T) {
+	base := newSupervisorBase(t, "A")
+	ctx, cancel := context.WithCancel(context.Background())
+	s := newSupervisor(ctx, base, io.Discard)
+	tr := &recordingStackTransport{host: "A"}
+	stack := newSupervisorStack(base, "A", tr)
+	s.newStack = func(context.Context, string) (*app.Stack, error) { return stack, nil }
+
+	events := make(chan agentclient.EngineEvent, 1)
+	s.clipWriteEvents = func(*agentclient.Client) <-chan agentclient.EngineEvent {
+		return events
+	}
+	writer := &fakeClipWriter{}
+	banner, bannerHarness := newClipWriteBannerHarness("A", nil)
+	s.clipWriteDeps = func(a *app.App) clipWriteDeps {
+		return clipWriteDeps{
+			Writer:         writer,
+			Transport:      a.Transport,
+			FeatureEnabled: func(string) bool { return true },
+			Audit:          a.Audit,
+			Host:           "A",
+			Banner:         banner,
+		}
+	}
+
+	if err := s.startInitial(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		s.waitCurrent()
+	}()
+
+	events <- agentclient.EngineEvent{
+		Kind: agentclient.KindClipWriteRequest,
+		ClipWrite: &agentclient.ClipWriteEvent{
+			Nonce: 1, Epoch: 2, Kind: "clear",
+		},
+	}
+	bannerHarness.waitRaised(t)
+
+	calls := writer.snapshot()
+	if len(calls) != 1 || calls[0].kind != "clear" {
+		t.Fatalf("supervisor clip-write mutation calls = %+v, want one clear", calls)
+	}
+	assertCredAudit(t, base.Audit, []string{
+		"clip-written", "host=A", "kind=clear", "cleared",
+	})
+}
+
 func TestSupervisorActivateOrderingAndHubSignal(t *testing.T) {
 	base := newSupervisorBase(t, "A")
 	ctx, cancel := context.WithCancel(context.Background())

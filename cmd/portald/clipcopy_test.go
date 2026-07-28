@@ -431,23 +431,27 @@ func TestGCStaleCopies(t *testing.T) {
 		"copy-fedcba9876543210fedcba9876543210.png",
 		"clip-0123456789abcdef0123456789abcdef.png",
 		"text-0123456789abcdef0123456789abcdef.txt",
+		".copy.tmp.stale",
+		".copy.tmp.fresh",
 	}
 	for _, name := range names {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{names[0], names[2], names[3]} {
+	for _, name := range []string{names[0], names[2], names[3], names[4]} {
 		if err := os.Chtimes(filepath.Join(dir, name), old, old); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	gcStaleCopies(dir, now, time.Hour)
-	if _, err := os.Stat(filepath.Join(dir, names[0])); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("stale copy file stat error = %v, want not-exist", err)
+	for _, name := range []string{names[0], names[4]} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stale %s stat error = %v, want not-exist", name, err)
+		}
 	}
-	for _, name := range names[1:] {
+	for _, name := range []string{names[1], names[2], names[3], names[5]} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 			t.Fatalf("preserved %s: %v", name, err)
 		}

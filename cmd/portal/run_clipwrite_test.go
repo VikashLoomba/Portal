@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -141,10 +142,53 @@ func (f *fakeClipWriteTransport) Exec(ctx context.Context, stdin []byte, argv ..
 	return stdout, stderr, err
 }
 
-func (f *fakeClipWriteTransport) Stream(context.Context, ...string) (
+func (f *fakeClipWriteTransport) Stream(ctx context.Context, argv ...string) (
 	io.WriteCloser, io.ReadCloser, io.ReadCloser, func() error, error,
 ) {
-	return nil, nil, nil, nil, nil
+	f.order.add("pull")
+	if f.started != nil {
+		f.start.Do(func() { close(f.started) })
+	}
+	f.mu.Lock()
+	f.argv = append(f.argv, append([]string(nil), argv...))
+	f.stdin = append(f.stdin, nil)
+	stdoutData, stderrData, runErr, release := f.stdout, f.stderr, f.err, f.release
+	f.mu.Unlock()
+
+	stdout, stdoutWriter := io.Pipe()
+	stderr, stderrWriter := io.Pipe()
+	waited := make(chan error, 1)
+	go func() {
+		<-ctx.Done()
+		_ = stdoutWriter.CloseWithError(ctx.Err())
+		_ = stderrWriter.CloseWithError(ctx.Err())
+	}()
+	go func() {
+		if release != nil {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				_ = stdoutWriter.CloseWithError(ctx.Err())
+				_ = stderrWriter.CloseWithError(ctx.Err())
+				waited <- ctx.Err()
+				return
+			}
+		}
+		_, stdoutErr := stdoutWriter.Write([]byte(stdoutData))
+		_ = stdoutWriter.Close()
+		_, stderrErr := stderrWriter.Write([]byte(stderrData))
+		_ = stderrWriter.Close()
+		if ctx.Err() != nil {
+			waited <- ctx.Err()
+		} else if stdoutErr != nil {
+			waited <- stdoutErr
+		} else if stderrErr != nil {
+			waited <- stderrErr
+		} else {
+			waited <- runErr
+		}
+	}()
+	return discardClipWriteStdin{}, stdout, stderr, func() error { return <-waited }, nil
 }
 
 func (f *fakeClipWriteTransport) Close(context.Context) (bool, error) { return false, nil }
@@ -168,6 +212,11 @@ func (f *fakeClipWriteTransport) calls() ([][]string, [][]byte) {
 }
 
 var _ transport.Transport = (*fakeClipWriteTransport)(nil)
+
+type discardClipWriteStdin struct{}
+
+func (discardClipWriteStdin) Write(p []byte) (int, error) { return len(p), nil }
+func (discardClipWriteStdin) Close() error                { return nil }
 
 type clipWriteLogs struct {
 	mu    sync.Mutex
@@ -500,7 +549,7 @@ func TestClipWriteDenyReasonVocabulary(t *testing.T) {
 		{
 			name: "shamismatch", req: clipWriteTextEvent(data),
 			prepare: func(_ *clipWriteDeps, tr *fakeClipWriteTransport) {
-				tr.stdout = "same-length"
+				tr.stdout = "xocabulary"
 			},
 		},
 	}
@@ -635,14 +684,15 @@ func TestServeClipWriteRequest_TextHappy(t *testing.T) {
 	if len(argv) != 1 || len(stdin) != 1 || stdin[0] != nil {
 		t.Fatalf("pull calls argv=%v stdin=%v", argv, stdin)
 	}
-	if len(argv[0]) != 5 || argv[0][0] != "bash" || argv[0][1] != "--noprofile" ||
-		argv[0][2] != "--norc" || argv[0][3] != "-c" {
+	if len(argv[0]) != 6 || argv[0][0] != "BASH_ENV=/dev/null" ||
+		argv[0][1] != "/bin/bash" || argv[0][2] != "--noprofile" ||
+		argv[0][3] != "--norc" || argv[0][4] != "-c" {
 		t.Fatalf("pull argv = %v", argv[0])
 	}
 	joined := strings.Join(argv[0], " ")
 	wantPath := `$HOME/.cache/portal/clip/copy-` + req.SHA + `.txt`
 	if !strings.Contains(joined, wantPath) ||
-		!strings.Contains(joined, "exec head -c "+strconv.FormatInt(req.Size, 10)) ||
+		!strings.Contains(joined, "exec /usr/bin/head -c "+strconv.FormatInt(req.Size, 10)) ||
 		!strings.Contains(joined, `[ -L "$f" ]`) ||
 		!strings.Contains(joined, `[ ! -f "$f" ]`) {
 		t.Fatalf("pull command did not pin path/size/file shape: %q", joined)
@@ -678,7 +728,7 @@ func TestServeClipWriteRequest_PullAndWriterErrors(t *testing.T) {
 	t.Run("pull", func(t *testing.T) {
 		deps, tr, writer, logs, _ := newClipWriteTestDeps(t, data)
 		tr.err = errors.New("exec failed")
-		tr.stderr = "remote failure"
+		tr.stderr = "remote\nforged\t\x00failure"
 		req := clipWriteTextEvent(data)
 
 		resp := serveClipWriteRequest(context.Background(), deps, req)
@@ -690,8 +740,13 @@ func TestServeClipWriteRequest_PullAndWriterErrors(t *testing.T) {
 		if len(writer.snapshot()) != 0 {
 			t.Fatal("pull failure reached writer")
 		}
-		if len(logs.snapshot()) != 1 {
-			t.Fatalf("pull failure logs = %v", logs.snapshot())
+		lines := logs.snapshot()
+		if len(lines) != 1 {
+			t.Fatalf("pull failure logs = %v", lines)
+		}
+		if strings.ContainsAny(lines[0], "\r\n\t\x00") ||
+			!strings.Contains(lines[0], "remote forged  failure") {
+			t.Fatalf("pull failure log was not sanitized: %q", lines[0])
 		}
 	})
 
@@ -834,6 +889,49 @@ func TestPullClipWrite_ExecutesPinnedShellGuards(t *testing.T) {
 	}
 }
 
+func TestPullClipWrite_LocalOutputBounds(t *testing.T) {
+	data := []byte("bounded")
+	deps, tr, writer, logs, _ := newClipWriteTestDeps(t, data)
+	tr.stdout = string(data) + strings.Repeat("x", 4096)
+	req := clipWriteTextEvent(data)
+
+	resp := serveClipWriteRequest(context.Background(), deps, req)
+
+	assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
+	if len(writer.snapshot()) != 0 {
+		t.Fatal("overlong pulled stream reached writer")
+	}
+	lines := logs.snapshot()
+	if len(lines) != 1 || !strings.Contains(lines[0], "stdout exceeded declared size") {
+		t.Fatalf("overlong pull logs = %v", lines)
+	}
+}
+
+func TestPullClipWrite_StderrSanitizedAndBounded(t *testing.T) {
+	data := []byte("stderr-bound")
+	deps, tr, writer, logs, _ := newClipWriteTestDeps(t, data)
+	tr.err = errors.New("exec failed")
+	tr.stderr = "first\nforged\t\x00" + strings.Repeat("z", clipWriteStderrLimit*4)
+	req := clipWriteTextEvent(data)
+
+	resp := serveClipWriteRequest(context.Background(), deps, req)
+
+	assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
+	if len(writer.snapshot()) != 0 {
+		t.Fatal("stderr-overflow pull reached writer")
+	}
+	lines := logs.snapshot()
+	if len(lines) != 1 {
+		t.Fatalf("stderr-overflow logs = %v", lines)
+	}
+	if strings.ContainsAny(lines[0], "\r\n\t\x00") {
+		t.Fatalf("stderr-overflow log contains control bytes: %q", lines[0])
+	}
+	if len(lines[0]) > clipWriteStderrLimit+256 {
+		t.Fatalf("stderr-overflow log length = %d, want bounded", len(lines[0]))
+	}
+}
+
 func TestRunClipWriteHandler_Inflight(t *testing.T) {
 	data := []byte("blocked")
 	deps, _, writer, _, banner := newClipWriteTestDeps(t, data)
@@ -894,6 +992,68 @@ func TestRunClipWriteHandler_Inflight(t *testing.T) {
 	)
 }
 
+func TestRunClipWriteHandler_DisabledPrecedesInflight(t *testing.T) {
+	data := []byte("gate-before-semaphore")
+	deps, _, writer, _, banner := newClipWriteTestDeps(t, data)
+	var enabled atomic.Bool
+	enabled.Store(true)
+	deps.FeatureEnabled = func(string) bool { return enabled.Load() }
+	started := make(chan struct{})
+	release := make(chan struct{})
+	writer.started = started
+	writer.release = release
+
+	events := make(chan agentclient.EngineEvent, 2)
+	responses := make(chan *protocol.ClipWriteResponse, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runClipWriteHandlerWithDeps(ctx, events, deps, func(resp *protocol.ClipWriteResponse) error {
+			copyResp := *resp
+			responses <- &copyResp
+			return nil
+		}, nil)
+	}()
+
+	first := clipWriteTextEvent(data)
+	first.Nonce = 83
+	events <- agentclient.EngineEvent{Kind: agentclient.KindClipWriteRequest, ClipWrite: first}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first clipboard writer did not start")
+	}
+
+	enabled.Store(false)
+	second := clipWriteTextEvent(data)
+	second.Nonce = 84
+	events <- agentclient.EngineEvent{Kind: agentclient.KindClipWriteRequest, ClipWrite: second}
+	select {
+	case resp := <-responses:
+		assertClipWriteResponse(t, resp, 84, 7, false, "disabled")
+	case <-time.After(time.Second):
+		t.Fatal("disabled response did not precede semaphore refusal")
+	}
+
+	close(release)
+	select {
+	case resp := <-responses:
+		assertClipWriteResponse(t, resp, 83, 7, true, "")
+	case <-time.After(time.Second):
+		t.Fatal("first clipboard-write response did not arrive")
+	}
+	banner.waitRaised(t)
+	cancel()
+	waitClipWriteHandler(t, done)
+
+	assertCredAudit(t, deps.Audit,
+		[]string{"clip-write-denied", "host=box", "kind=text", "reason=disabled"},
+		[]string{"clip-written", "host=box", "kind=text",
+			"sha=" + first.SHA + " size=" + strconv.FormatInt(first.Size, 10)},
+	)
+}
+
 func TestRunClipWriteHandler_Ordering(t *testing.T) {
 	data := []byte("ordering")
 	deps, tr, writer, _, _ := newClipWriteTestDeps(t, data)
@@ -934,6 +1094,38 @@ func TestRunClipWriteHandler_Ordering(t *testing.T) {
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("clipboard-write order = %v, want %v", got, want)
 	}
+}
+
+func TestRunClipWriteHandler_SendFailureStillAuditsAndBanners(t *testing.T) {
+	data := []byte("send-failure")
+	deps, _, writer, logs, banner := newClipWriteTestDeps(t, data)
+	events := make(chan agentclient.EngineEvent, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runClipWriteHandlerWithDeps(ctx, events, deps,
+			func(*protocol.ClipWriteResponse) error { return errors.New("connection closed") }, nil)
+	}()
+
+	req := clipWriteTextEvent(data)
+	events <- agentclient.EngineEvent{Kind: agentclient.KindClipWriteRequest, ClipWrite: req}
+	banner.waitRaised(t)
+	cancel()
+	waitClipWriteHandler(t, done)
+
+	if calls := writer.snapshot(); len(calls) != 1 || calls[0].kind != "text" {
+		t.Fatalf("send-failure writer calls = %+v, want one text mutation", calls)
+	}
+	lines := logs.snapshot()
+	if len(lines) != 1 || !strings.Contains(lines[0],
+		"clip-write: send response failed (nonce=41): connection closed") {
+		t.Fatalf("send-failure logs = %v", lines)
+	}
+	assertCredAudit(t, deps.Audit, []string{
+		"clip-written", "host=box", "kind=text",
+		"sha=" + req.SHA + " size=" + strconv.FormatInt(req.Size, 10),
+	})
 }
 
 func TestClipWriteBanner_Coalescing(t *testing.T) {

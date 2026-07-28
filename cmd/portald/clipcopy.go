@@ -204,14 +204,16 @@ func gcStaleCopies(dir string, now time.Time, maxAge time.Duration) {
 		return
 	}
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "copy-") {
+		name := entry.Name()
+		if entry.IsDir() ||
+			(!strings.HasPrefix(name, "copy-") && !strings.HasPrefix(name, ".copy.tmp.")) {
 			continue
 		}
 		info, err := entry.Info()
 		if err != nil || now.Sub(info.ModTime()) <= maxAge {
 			continue
 		}
-		_ = os.Remove(filepath.Join(dir, entry.Name()))
+		_ = os.Remove(filepath.Join(dir, name))
 	}
 }
 
