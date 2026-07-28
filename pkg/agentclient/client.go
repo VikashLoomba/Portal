@@ -121,6 +121,13 @@ type Client struct {
 	streamMu sync.Mutex
 	enc      *protocol.Encoder
 	stdin    io.WriteCloser
+	// sessAck is this session's HelloAck. It is latched and cleared in the
+	// same streamMu critical sections as enc so Handshake can return one
+	// coherent snapshot. It is distinct from helloAck, which remains cached
+	// across disconnects for portal status.
+	//
+	// INVARIANT: every assignment to enc must assign sessAck beside it.
+	sessAck *protocol.HelloAck
 
 	// lastDiscErr holds the string form of the most recent KindDisconnected
 	// error ("" when the disconnect carried no error). It is the only
@@ -375,6 +382,33 @@ func (c *Client) HelloAck() *protocol.HelloAck {
 	}
 	cp := *c.helloAck
 	return &cp
+}
+
+// Handshake returns the current session's HelloAck and whether that session is
+// live as one atomic snapshot. It does not compose Connected with HelloAck:
+// teardown between those separately locked reads could pair a last-seen ack
+// with stale liveness. The returned struct is a shallow copy; Services is
+// read-only.
+func (c *Client) Handshake() (*protocol.HelloAck, bool) {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	if c.enc == nil || c.sessAck == nil {
+		return nil, false
+	}
+	cp := *c.sessAck
+	return &cp, true
+}
+
+// Connected reports whether a send-side session is live right now.
+func (c *Client) Connected() bool {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	return c.enc != nil
+}
+
+// Services returns a copy of the client-side service advertisement.
+func (c *Client) Services() map[string]uint32 {
+	return c.registry.services()
 }
 
 // Subscribe pushes a new desired filter to the agent. Idempotent — if the
@@ -662,11 +696,13 @@ func (c *Client) runOnce(ctx context.Context) error {
 	c.streamMu.Lock()
 	c.enc = enc
 	c.stdin = stdin
+	c.sessAck = first.HelloAck
 	c.streamMu.Unlock()
 	defer func() {
 		c.streamMu.Lock()
 		c.enc = nil
 		c.stdin = nil
+		c.sessAck = nil
 		c.streamMu.Unlock()
 	}()
 

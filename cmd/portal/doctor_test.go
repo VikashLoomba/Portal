@@ -11,6 +11,8 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/clipshim"
+	"github.com/VikashLoomba/Portal/internal/doctorprobe"
+	"github.com/VikashLoomba/Portal/pkg/agentclient"
 	"github.com/VikashLoomba/Portal/pkg/doctor"
 	"github.com/VikashLoomba/Portal/pkg/run"
 	"github.com/VikashLoomba/Portal/pkg/transport"
@@ -83,38 +85,27 @@ func (f *doctorFakeTransport) Exec(_ context.Context, _ []byte, argv ...string) 
 
 var _ transport.Transport = (*doctorFakeTransport)(nil)
 
-// TestRunDoctor_AllGreen exercises the happy path: master up, both shims win
-// PATH, current shim version, portald present advertising both verbs, and a
+// TestRunDoctor_AllGreen exercises the happy path: master up, all shims win
+// PATH, current shim version, portald present advertising all verbs, and a
 // clipboard with content served by the smoke probe.
 func TestRunDoctor_AllGreen(t *testing.T) {
+	order, reply := greenReplies()
 	tr := &doctorFakeTransport{
-		pid: 4242,
-		// Keys are substrings unique to each doctor probe's script. Order so that
-		// the most specific probes match before the generic ones.
-		matchOrder: []string{
-			"command -v xclip",
-			"command -v wl-paste",
-			"line=$(grep -F", // shim version
-			"PORTALD_OK",     // verb probe (echoes PORTALD_OK on success)
-			"clip targets xclip; echo",
-		},
-		execReply: map[string]string{
-			"command -v xclip":         "SHIM /home/u/.local/bin/xclip",
-			"command -v wl-paste":      "SHIM /home/u/.local/bin/wl-paste",
-			"line=$(grep -F":           clipshim.Version + ". Intercepts",
-			"PORTALD_OK":               "PORTALD_OK\nCLIP_OK\nNOTIFY_OK\n",
-			"clip targets xclip; echo": "image/png\nEXIT=0",
-		},
+		pid:        4242,
+		matchOrder: order,
+		execReply:  reply,
 	}
 	rep := runDoctor(context.Background(), "fakehost", tr)
 	if !rep.OK() {
 		t.Fatalf("expected PASS, got report:\n%s", reportString(rep))
 	}
 	// Spot-check the make-or-break PATH-winner lines passed.
-	assertCheck(t, rep, "PATH winner: xclip", doctor.Pass)
-	assertCheck(t, rep, "PATH winner: wl-paste", doctor.Pass)
+	for _, tool := range []string{"xclip", "wl-paste", "wl-copy", "pbcopy", "pbpaste", "xsel"} {
+		assertCheck(t, rep, "PATH winner: "+tool, doctor.Pass)
+	}
 	assertCheck(t, rep, "shim version", doctor.Pass)
 	assertCheck(t, rep, "agent verb: clip", doctor.Pass)
+	assertCheck(t, rep, "agent verb: clip copy", doctor.Pass)
 	assertCheck(t, rep, "agent verb: notify", doctor.Pass)
 }
 
@@ -196,19 +187,12 @@ func TestRunDoctor_SystemNeverEnsures(t *testing.T) {
 // real /usr/bin/xclip resolves ahead of the shim, so the feature is silently
 // dead. The doctor MUST flag this as FAIL, not pass it off.
 func TestRunDoctor_RealBinaryWinsPATH(t *testing.T) {
+	order, reply := greenReplies()
+	reply["command -v xclip"] = "REAL /usr/bin/xclip"
 	tr := &doctorFakeTransport{
-		pid: 1,
-		matchOrder: []string{
-			"command -v xclip", "command -v wl-paste",
-			"line=$(grep -F", "PORTALD_OK", "clip targets xclip; echo",
-		},
-		execReply: map[string]string{
-			"command -v xclip":         "REAL /usr/bin/xclip", // real binary wins!
-			"command -v wl-paste":      "SHIM /home/u/.local/bin/wl-paste",
-			"line=$(grep -F":           clipshim.Version,
-			"PORTALD_OK":               "PORTALD_OK\nCLIP_OK\nNOTIFY_OK\n",
-			"clip targets xclip; echo": "EXIT=1",
-		},
+		pid:        1,
+		matchOrder: order,
+		execReply:  reply,
 	}
 	rep := runDoctor(context.Background(), "fakehost", tr)
 	if rep.OK() {
@@ -225,19 +209,13 @@ func TestRunDoctor_RealBinaryWinsPATH(t *testing.T) {
 // TestRunDoctor_NoShimResolves covers ~/.local/bin not on PATH (or the shim
 // never deployed): nothing resolves for the tool. That is a FAIL.
 func TestRunDoctor_NoShimResolves(t *testing.T) {
+	order, reply := greenReplies()
+	reply["command -v xclip"] = "NONE"
+	reply["command -v wl-paste"] = "NONE"
 	tr := &doctorFakeTransport{
-		pid: 1,
-		matchOrder: []string{
-			"command -v xclip", "command -v wl-paste",
-			"line=$(grep -F", "PORTALD_OK", "clip targets xclip; echo",
-		},
-		execReply: map[string]string{
-			"command -v xclip":         "NONE",
-			"command -v wl-paste":      "NONE",
-			"line=$(grep -F":           clipshim.Version,
-			"PORTALD_OK":               "PORTALD_OK\nCLIP_OK\nNOTIFY_OK\n",
-			"clip targets xclip; echo": "EXIT=1",
-		},
+		pid:        1,
+		matchOrder: order,
+		execReply:  reply,
 	}
 	rep := runDoctor(context.Background(), "fakehost", tr)
 	if rep.OK() {
@@ -246,21 +224,43 @@ func TestRunDoctor_NoShimResolves(t *testing.T) {
 	assertCheck(t, rep, "PATH winner: xclip", doctor.Fail)
 }
 
+func TestRunDoctor_WriteShimMissing(t *testing.T) {
+	order, reply := greenReplies()
+	reply["command -v pbcopy"] = "NONE"
+	rep := runDoctor(context.Background(), "fakehost", &doctorFakeTransport{
+		pid: 1, matchOrder: order, execReply: reply,
+	})
+
+	assertCheck(t, rep, "PATH winner: pbcopy", doctor.Fail)
+	check := findCheck(rep, "PATH winner: pbcopy")
+	if check == nil || !strings.Contains(check.Detail, "~/.local/bin not on PATH") {
+		t.Fatalf("pbcopy missing detail = %q, want PATH cause", detailOf(check))
+	}
+}
+
+func TestRunDoctor_WriteShimRealBinaryWins(t *testing.T) {
+	order, reply := greenReplies()
+	reply["command -v xsel"] = "REAL /usr/bin/xsel"
+	rep := runDoctor(context.Background(), "fakehost", &doctorFakeTransport{
+		pid: 1, matchOrder: order, execReply: reply,
+	})
+
+	assertCheck(t, rep, "PATH winner: xsel", doctor.Fail)
+	check := findCheck(rep, "PATH winner: xsel")
+	if check == nil || !strings.Contains(check.Detail, "real binary wins") {
+		t.Fatalf("xsel real-binary detail = %q, want named PATH cause", detailOf(check))
+	}
+}
+
 // TestRunDoctor_PortaldMissing: the agent binary isn't uploaded yet (dangling
 // symlink window). portald is a FAIL; the smoke probe is skipped.
 func TestRunDoctor_PortaldMissing(t *testing.T) {
+	order, reply := greenReplies()
+	reply["PORTALD_OK"] = "NO_PORTALD"
 	tr := &doctorFakeTransport{
-		pid: 1,
-		matchOrder: []string{
-			"command -v xclip", "command -v wl-paste",
-			"line=$(grep -F", "PORTALD_OK", "clip targets xclip; echo",
-		},
-		execReply: map[string]string{
-			"command -v xclip":    "SHIM /home/u/.local/bin/xclip",
-			"command -v wl-paste": "SHIM /home/u/.local/bin/wl-paste",
-			"line=$(grep -F":      clipshim.Version,
-			"PORTALD_OK":          "NO_PORTALD", // no PORTALD_OK token
-		},
+		pid:        1,
+		matchOrder: order,
+		execReply:  reply,
 	}
 	rep := runDoctor(context.Background(), "fakehost", tr)
 	if rep.OK() {
@@ -276,19 +276,12 @@ func TestRunDoctor_PortaldMissing(t *testing.T) {
 // Mac clipboard, so the smoke probe exits 1. That is the EXPECTED clean
 // fall-through state — a WARN, not a FAIL.
 func TestRunDoctor_EmptyClipboardSmoke(t *testing.T) {
+	order, reply := greenReplies()
+	reply["clip targets xclip; echo"] = "EXIT=1"
 	tr := &doctorFakeTransport{
-		pid: 1,
-		matchOrder: []string{
-			"command -v xclip", "command -v wl-paste",
-			"line=$(grep -F", "PORTALD_OK", "clip targets xclip; echo",
-		},
-		execReply: map[string]string{
-			"command -v xclip":         "SHIM /home/u/.local/bin/xclip",
-			"command -v wl-paste":      "SHIM /home/u/.local/bin/wl-paste",
-			"line=$(grep -F":           clipshim.Version,
-			"PORTALD_OK":               "PORTALD_OK\nCLIP_OK\nNOTIFY_OK\n",
-			"clip targets xclip; echo": "EXIT=1",
-		},
+		pid:        1,
+		matchOrder: order,
+		execReply:  reply,
 	}
 	rep := runDoctor(context.Background(), "fakehost", tr)
 	if !rep.OK() {
@@ -300,25 +293,83 @@ func TestRunDoctor_EmptyClipboardSmoke(t *testing.T) {
 // TestRunDoctor_ShimVersionDrift: a deployed shim older than embedded is a WARN
 // (still usable), not a FAIL.
 func TestRunDoctor_ShimVersionDrift(t *testing.T) {
+	order, reply := greenReplies()
+	reply["line=$(grep -F"] = "0. old marker text"
 	tr := &doctorFakeTransport{
-		pid: 1,
-		matchOrder: []string{
-			"command -v xclip", "command -v wl-paste",
-			"line=$(grep -F", "PORTALD_OK", "clip targets xclip; echo",
-		},
-		execReply: map[string]string{
-			"command -v xclip":         "SHIM /home/u/.local/bin/xclip",
-			"command -v wl-paste":      "SHIM /home/u/.local/bin/wl-paste",
-			"line=$(grep -F":           "0. old marker text", // version "0"
-			"PORTALD_OK":               "PORTALD_OK\nCLIP_OK\nNOTIFY_OK\n",
-			"clip targets xclip; echo": "EXIT=1",
-		},
+		pid:        1,
+		matchOrder: order,
+		execReply:  reply,
 	}
 	rep := runDoctor(context.Background(), "fakehost", tr)
 	if !rep.OK() {
 		t.Fatalf("version drift should be a WARN (still PASS overall), got:\n%s", reportString(rep))
 	}
 	assertCheck(t, rep, "shim version", doctor.Warn)
+}
+
+func TestRunDoctor_ClipCopyVerbMissing(t *testing.T) {
+	order, reply := greenReplies()
+	reply["PORTALD_OK"] = "PORTALD_OK\nCLIP_OK\nNOTIFY_OK\n"
+	rep := runDoctor(context.Background(), "fakehost", &doctorFakeTransport{
+		pid: 1, matchOrder: order, execReply: reply,
+	})
+
+	assertCheck(t, rep, "agent verb: clip copy", doctor.Warn)
+	if !rep.OK() {
+		t.Fatal("old-agent clip-copy warning must not fail the report")
+	}
+}
+
+func TestRunDoctor_ClipWriteOptionsReachProbe(t *testing.T) {
+	order, reply := greenReplies()
+	tr := &doctorFakeTransport{pid: 1, matchOrder: order, execReply: reply}
+	service := doctorprobe.WithServices(func() doctorprobe.ServiceView {
+		return doctorprobe.ServiceView{
+			Connected: true,
+			Agent:     map[string]uint32{"clipwrite": 1},
+			Client:    map[string]uint32{"clipwrite": 1},
+		}
+	})
+
+	t.Run("service_and_feature_on", func(t *testing.T) {
+		rep := runDoctor(context.Background(), "fakehost", tr, service,
+			doctorprobe.WithFeatures(func(string) bool { return true }))
+		assertCheck(t, rep, "service: clipwrite@1", doctor.Pass)
+		assertCheck(t, rep, "feature: clip-write", doctor.Pass)
+	})
+	t.Run("feature_off", func(t *testing.T) {
+		rep := runDoctor(context.Background(), "fakehost", tr,
+			doctorprobe.WithFeatures(func(string) bool { return false }))
+		assertCheck(t, rep, "feature: clip-write", doctor.Warn)
+		if check := findCheck(rep, "feature: clip-write"); check == nil ||
+			!strings.Contains(check.Detail, "features clip-write on") {
+			t.Fatalf("feature-off detail = %q, want enable command", detailOf(check))
+		}
+		if !rep.OK() {
+			t.Fatal("feature-off warning must not fail the report")
+		}
+	})
+	t.Run("no_options", func(t *testing.T) {
+		rep := runDoctor(context.Background(), "fakehost", tr)
+		if findCheck(rep, "service: clipwrite@1") != nil ||
+			findCheck(rep, "feature: clip-write") != nil {
+			t.Fatalf("option-owned checks present without options:\n%s", reportString(rep))
+		}
+	})
+}
+
+func TestServicesOptFailsClosedOnDisconnectedClient(t *testing.T) {
+	order, reply := greenReplies()
+	ac := agentclient.New(agentclient.Config{})
+	rep := runDoctor(context.Background(), "fakehost", &doctorFakeTransport{
+		pid: 1, matchOrder: order, execReply: reply,
+	}, servicesOpt(ac))
+
+	assertCheck(t, rep, "service: clipwrite@1", doctor.Warn)
+	check := findCheck(rep, "service: clipwrite@1")
+	if check == nil || !strings.Contains(check.Detail, "no agent handshake yet") {
+		t.Fatalf("disconnected service detail = %q, want fail-closed handshake warning", detailOf(check))
+	}
 }
 
 // TestRenderDoctor_Golden pins the CLI rendering byte-for-byte (EC7). Scripts
@@ -383,6 +434,10 @@ func greenReplies() (order []string, reply map[string]string) {
 	order = []string{
 		"command -v xclip",
 		"command -v wl-paste",
+		"command -v wl-copy",
+		"command -v pbcopy",
+		"command -v pbpaste",
+		"command -v xsel",
 		"line=$(grep -F",
 		"PORTALD_OK",
 		"clip targets xclip; echo",
@@ -390,8 +445,12 @@ func greenReplies() (order []string, reply map[string]string) {
 	reply = map[string]string{
 		"command -v xclip":         "SHIM /home/u/.local/bin/xclip",
 		"command -v wl-paste":      "SHIM /home/u/.local/bin/wl-paste",
+		"command -v wl-copy":       "SHIM /home/u/.local/bin/wl-copy",
+		"command -v pbcopy":        "SHIM /home/u/.local/bin/pbcopy",
+		"command -v pbpaste":       "SHIM /home/u/.local/bin/pbpaste",
+		"command -v xsel":          "SHIM /home/u/.local/bin/xsel",
 		"line=$(grep -F":           clipshim.Version + ". Intercepts",
-		"PORTALD_OK":               "PORTALD_OK\nCLIP_OK\nNOTIFY_OK\n",
+		"PORTALD_OK":               "PORTALD_OK\nCLIP_OK\nCLIPCOPY_OK\nNOTIFY_OK\n",
 		"clip targets xclip; echo": "image/png\nEXIT=0",
 	}
 	return order, reply

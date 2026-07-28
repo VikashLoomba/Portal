@@ -120,9 +120,9 @@ Usage: %[1]s <command>
                     shell under a full PTY (resize and job control work);
                     -t forces a PTY for a command, -T disables it.
     ssh <host> ...  Deprecated alias for plain ssh (forwards all args verbatim).
-                    Clipboard-image paste now works over PLAIN ssh: the daemon
-                    deploys xclip/wl-paste read shims so a coding agent's own
-                    Ctrl+V serves your Mac clipboard — no special command needed.
+                    Clipboard paste and copy work over PLAIN ssh: the daemon
+                    deploys xclip/wl-paste/wl-copy/pbcopy/pbpaste/xsel shims —
+                    no special command needed.
 
   Credentials
     keychain list   List credential labels remembered in this Mac's Keychain.
@@ -136,8 +136,8 @@ Usage: %[1]s <command>
     ports           List the loopback dev ports currently listening on the box.
     logs [-f|N]     Show recent log lines; -f to follow, N for last N lines.
     doctor          Self-test the clipboard/notify path over ssh: verifies the
-                    xclip/wl-paste shims win PATH, the agent supports the verbs,
-                    and runs an end-to-end clip-targets smoke.
+                    read/copy shims win PATH, portald advertises clip copy,
+                    clipwrite@1 is live, and runs a clip-targets smoke.
     clip-check      Diagnose Mac clipboard image detection (--upload to test).
     version         Print the portal version and build commit (also -v/--version).
 

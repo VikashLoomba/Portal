@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -372,6 +373,144 @@ func (s *e2eSession) waitSock(t *testing.T) {
 func (s *e2eSession) close() {
 	s.cancel()
 	s.wg.Wait()
+}
+
+func TestHandshakeAnswersFromTheSessionLockAlone(t *testing.T) {
+	c := New(Config{})
+	ack := &protocol.HelloAck{
+		BootID:   "boot-1",
+		Services: map[string]uint32{"clipwrite": 1},
+	}
+	c.snapMu.Lock()
+	c.helloAck = ack
+	c.snapMu.Unlock()
+	c.streamMu.Lock()
+	c.enc = protocol.NewEncoder(io.Discard)
+	c.sessAck = ack
+	c.streamMu.Unlock()
+
+	// This deliberately pins that Handshake answers from the session lock
+	// domain alone. A Connected()+HelloAck() composition blocks on snapMu here
+	// and reintroduces the teardown gap this accessor exists to close.
+	c.snapMu.Lock()
+	type result struct {
+		ack *protocol.HelloAck
+		ok  bool
+	}
+	done := make(chan result, 1)
+	go func() {
+		got, ok := c.Handshake()
+		done <- result{ack: got, ok: ok}
+	}()
+	select {
+	case got := <-done:
+		c.snapMu.Unlock()
+		if !got.ok || got.ack == nil || got.ack.BootID != "boot-1" {
+			t.Fatalf("Handshake = (%#v, %v), want boot-1, true", got.ack, got.ok)
+		}
+	case <-time.After(2 * time.Second):
+		c.snapMu.Unlock()
+		t.Fatal("Handshake blocked on snapMu; it must answer from streamMu alone")
+	}
+}
+
+func TestHandshakeUnderSessionChurn(t *testing.T) {
+	c := New(Config{})
+	var stop atomic.Bool
+	var readers sync.WaitGroup
+	ready := make(chan struct{}, 4)
+	start := make(chan struct{})
+	active := make(chan struct{}, 4)
+	for range 4 {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			ready <- struct{}{}
+			<-start
+			_, _ = c.Handshake()
+			active <- struct{}{}
+			for !stop.Load() {
+				ack, ok := c.Handshake()
+				if ok != (ack != nil) {
+					t.Errorf("torn Handshake result: ack=%#v ok=%v", ack, ok)
+				}
+				if ok && ack.BootID == "" {
+					t.Errorf("live Handshake returned empty BootID: %#v", ack)
+				}
+				_ = c.Connected()
+				_ = c.HelloAck()
+			}
+		}()
+	}
+	for range 4 {
+		<-ready
+	}
+	close(start)
+	for range 4 {
+		<-active
+	}
+
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for i := range 500 {
+			ack := &protocol.HelloAck{
+				BootID:   fmt.Sprintf("boot-%d", i),
+				Services: map[string]uint32{"clipwrite": 1},
+			}
+			c.snapMu.Lock()
+			c.helloAck = ack
+			c.snapMu.Unlock()
+
+			c.streamMu.Lock()
+			c.enc = protocol.NewEncoder(io.Discard)
+			c.sessAck = ack
+			c.streamMu.Unlock()
+
+			c.streamMu.Lock()
+			c.enc = nil
+			c.sessAck = nil
+			c.streamMu.Unlock()
+		}
+	}()
+	<-writerDone
+	stop.Store(true)
+	readers.Wait()
+
+	if ack, ok := c.Handshake(); ok || ack != nil {
+		t.Fatalf("settled Handshake = (%#v, %v), want nil, false", ack, ok)
+	}
+	if c.HelloAck() == nil {
+		t.Fatal("last-seen HelloAck must survive settled disconnect")
+	}
+}
+
+func TestHandshakeIsFalseAfterSessionEnds(t *testing.T) {
+	sess := newE2ESession(t, nil, nil, nil)
+	defer sess.close()
+
+	ack, ok := sess.c.Handshake()
+	if !ok || ack == nil {
+		t.Fatalf("live Handshake = (%#v, %v), want non-nil, true", ack, ok)
+	}
+	if got := ack.Services["clipwrite"]; got != 1 {
+		t.Fatalf("live HelloAck clipwrite service = %d, want 1", got)
+	}
+	if !sess.c.Connected() {
+		t.Fatal("Connected = false during live session")
+	}
+
+	sess.close()
+
+	if sess.c.Connected() {
+		t.Fatal("Connected = true after session ended")
+	}
+	if ack, ok := sess.c.Handshake(); ok || ack != nil {
+		t.Fatalf("post-disconnect Handshake = (%#v, %v), want nil, false", ack, ok)
+	}
+	if sess.c.HelloAck() == nil {
+		t.Fatal("last-seen HelloAck was cleared when the session ended")
+	}
 }
 
 // ask dials the agent's cmd socket, writes line, and returns the raw reply.

@@ -488,7 +488,8 @@ func (p *pinnedStack) doctor(ctx context.Context) *doctor.Report {
 		rep.Add("transport", doctor.Fail, "transport unavailable: "+err.Error())
 		return rep
 	}
-	return runDoctor(sctx, p.ls.stack.Host, tr)
+	return runDoctor(sctx, p.ls.stack.Host, tr,
+		featureOpt(&sa), servicesOpt(p.ls.stack.AgentClient))
 }
 
 type supervisorAgent struct{ s *supervisor }
@@ -686,5 +687,6 @@ func (s *supervisor) doctor(ctx context.Context) *doctor.Report {
 		rep.Add("transport", doctor.Fail, "transport unavailable: "+err.Error())
 		return rep
 	}
-	return runDoctor(sctx, ls.stack.Host, tr)
+	return runDoctor(sctx, ls.stack.Host, tr,
+		featureOpt(&sa), servicesOpt(ls.stack.AgentClient))
 }

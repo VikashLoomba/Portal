@@ -14,6 +14,7 @@ import (
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/clipshim"
 	"github.com/VikashLoomba/Portal/internal/config"
+	"github.com/VikashLoomba/Portal/internal/doctorprobe"
 	"github.com/VikashLoomba/Portal/internal/localapi"
 	"github.com/VikashLoomba/Portal/pkg/api"
 	"github.com/VikashLoomba/Portal/pkg/client"
@@ -177,22 +178,11 @@ func TestRunDoctorCmd_DaemonUp_ErrorNoFallback(t *testing.T) {
 // doctorFakeTransport scripting the exact all-green run from
 // TestRunDoctor_AllGreen and assert the rendered block and rep.OK().
 func TestRunDoctor_LocalRenderAllGreen(t *testing.T) {
+	order, reply := greenReplies()
 	tr := &doctorFakeTransport{
-		pid: 4242,
-		matchOrder: []string{
-			"command -v xclip",
-			"command -v wl-paste",
-			"line=$(grep -F",
-			"PORTALD_OK",
-			"clip targets xclip; echo",
-		},
-		execReply: map[string]string{
-			"command -v xclip":         "SHIM /home/u/.local/bin/xclip",
-			"command -v wl-paste":      "SHIM /home/u/.local/bin/wl-paste",
-			"line=$(grep -F":           clipshim.Version + ". Intercepts",
-			"PORTALD_OK":               "PORTALD_OK\nCLIP_OK\nNOTIFY_OK\n",
-			"clip targets xclip; echo": "image/png\nEXIT=0",
-		},
+		pid:        4242,
+		matchOrder: order,
+		execReply:  reply,
 	}
 	rep := runDoctor(context.Background(), "fakehost", tr)
 	if !rep.OK() {
@@ -202,14 +192,61 @@ func TestRunDoctor_LocalRenderAllGreen(t *testing.T) {
 		"  [PASS] ssh master: UP (pid=4242)\n" +
 		"  [PASS] PATH winner: xclip: /home/u/.local/bin/xclip (portal shim)\n" +
 		"  [PASS] PATH winner: wl-paste: /home/u/.local/bin/wl-paste (portal shim)\n" +
+		"  [PASS] PATH winner: wl-copy: /home/u/.local/bin/wl-copy (portal shim)\n" +
+		"  [PASS] PATH winner: pbcopy: /home/u/.local/bin/pbcopy (portal shim)\n" +
+		"  [PASS] PATH winner: pbpaste: /home/u/.local/bin/pbpaste (portal shim)\n" +
+		"  [PASS] PATH winner: xsel: /home/u/.local/bin/xsel (portal shim)\n" +
 		fmt.Sprintf("  [PASS] shim version: v%s (current)\n", clipshim.Version) +
 		"  [PASS] portald binary: ~/.cache/portal/portald present + executable\n" +
 		"  [PASS] agent verb: clip\n" +
+		"  [PASS] agent verb: clip copy\n" +
 		"  [PASS] agent verb: notify\n" +
 		"  [PASS] smoke: clip targets: Mac clipboard served (image/png)\n" +
 		"\nRESULT: PASS — clipboard paste should work over plain ssh.\n"
 	if got := reportString(rep); got != want {
 		t.Errorf("local all-green render mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+func TestRunDoctor_LocalRenderWithWriteSeams(t *testing.T) {
+	order, reply := greenReplies()
+	tr := &doctorFakeTransport{
+		pid:        4242,
+		matchOrder: order,
+		execReply:  reply,
+	}
+	rep := runDoctor(context.Background(), "fakehost", tr,
+		doctorprobe.WithServices(func() doctorprobe.ServiceView {
+			return doctorprobe.ServiceView{
+				Connected: true,
+				Agent:     map[string]uint32{"clipwrite": 1},
+				Client:    map[string]uint32{"clipwrite": 1},
+			}
+		}),
+		doctorprobe.WithFeatures(func(string) bool { return true }),
+	)
+	if !rep.OK() {
+		t.Fatalf("expected PASS, got report:\n%s", reportString(rep))
+	}
+	want := "portal doctor — fakehost\n" +
+		"  [PASS] ssh master: UP (pid=4242)\n" +
+		"  [PASS] PATH winner: xclip: /home/u/.local/bin/xclip (portal shim)\n" +
+		"  [PASS] PATH winner: wl-paste: /home/u/.local/bin/wl-paste (portal shim)\n" +
+		"  [PASS] PATH winner: wl-copy: /home/u/.local/bin/wl-copy (portal shim)\n" +
+		"  [PASS] PATH winner: pbcopy: /home/u/.local/bin/pbcopy (portal shim)\n" +
+		"  [PASS] PATH winner: pbpaste: /home/u/.local/bin/pbpaste (portal shim)\n" +
+		"  [PASS] PATH winner: xsel: /home/u/.local/bin/xsel (portal shim)\n" +
+		fmt.Sprintf("  [PASS] shim version: v%s (current)\n", clipshim.Version) +
+		"  [PASS] portald binary: ~/.cache/portal/portald present + executable\n" +
+		"  [PASS] agent verb: clip\n" +
+		"  [PASS] agent verb: clip copy\n" +
+		"  [PASS] agent verb: notify\n" +
+		"  [PASS] service: clipwrite@1: agent=1 client=1\n" +
+		"  [PASS] feature: clip-write: on\n" +
+		"  [PASS] smoke: clip targets: Mac clipboard served (image/png)\n" +
+		"\nRESULT: PASS — clipboard paste should work over plain ssh.\n"
+	if got := reportString(rep); got != want {
+		t.Errorf("local write-seam render mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 }
 
