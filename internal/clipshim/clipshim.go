@@ -174,13 +174,15 @@ if [ "$_ok" = 1 ]; then
       *) _ok=0 ;;
     esac
 fi
-_wrapper_dir=$(cd "$(dirname "$0")" && pwd)
+_wrapper_dir=$(cd "$(dirname "$0")" && pwd -P)
 _real=""
 _oifs=$IFS; IFS=:
 for _d in $PATH; do
-    [ "$_d" = "$_wrapper_dir" ] && continue
     [ -n "$_d" ] || continue
-    if [ -x "$_d/xclip" ]; then _real="$_d/xclip"; break; fi
+    _candidate_dir=$(cd "$_d" 2>/dev/null && pwd -P)
+    [ -n "$_candidate_dir" ] || continue
+    [ "$_candidate_dir" = "$_wrapper_dir" ] && continue
+    if [ -x "$_candidate_dir/xclip" ]; then _real="$_candidate_dir/xclip"; break; fi
 done
 IFS=$_oifs
 ` + clipWriteRelay + `if [ "$_ok" = 1 ]; then
@@ -190,7 +192,7 @@ IFS=$_oifs
       read:image/png)
         [ -x "$_portald" ] && "$_portald" clip image png 2>/dev/null && exit 0 ;;
       read:image/*) : ;;
-      read:|read:UTF8_STRING|read:TEXT|read:STRING|read:text/*)
+      read:|read:UTF8_STRING|read:TEXT|read:STRING|read:text/plain|read:text/plain\;*)
         if [ -x "$_portald" ]; then
             if [ "$_trim" = 1 ]; then
                 "$_portald" clip text --trim 2>/dev/null && exit 0
@@ -205,9 +207,9 @@ IFS=$_oifs
       write:|write:UTF8_STRING|write:TEXT|write:STRING|write:text/*)
         _copy() {
             if [ "$_trim" = 1 ]; then
-                "$_portald" clip copy text --trim
+                "$_portald" clip copy text --trim --empty-clears
             else
-                "$_portald" clip copy text
+                "$_portald" clip copy text --empty-clears
             fi
         }
         _relay_stdin ;;
@@ -243,13 +245,15 @@ case "$_args" in
   *"--type text/"*|*"-t text/"*|"")
     [ -x "$_portald" ] && "$_portald" clip text 2>/dev/null && exit 0 ;;
 esac
-_wrapper_dir=$(cd "$(dirname "$0")" && pwd)
+_wrapper_dir=$(cd "$(dirname "$0")" && pwd -P)
 _real=""
 _oifs=$IFS; IFS=:
 for _d in $PATH; do
-    [ "$_d" = "$_wrapper_dir" ] && continue
     [ -n "$_d" ] || continue
-    if [ -x "$_d/wl-paste" ]; then _real="$_d/wl-paste"; break; fi
+    _candidate_dir=$(cd "$_d" 2>/dev/null && pwd -P)
+    [ -n "$_candidate_dir" ] || continue
+    [ "$_candidate_dir" = "$_wrapper_dir" ] && continue
+    if [ -x "$_candidate_dir/wl-paste" ]; then _real="$_candidate_dir/wl-paste"; break; fi
 done
 IFS=$_oifs
 if [ -z "$_real" ]; then
@@ -312,15 +316,21 @@ for _a in "$@"; do
 done
 [ -z "$_want" ] || _ok=0
 _wrapper_dir=$(cd "$(dirname "$0")" && pwd -P)
+_backup="$_wrapper_dir/wl-copy.portal-backup"
 _real=""
+if [ "${PORTAL_WL_COPY_FALLBACK:-}" != 1 ] && [ -x "$_backup" ]; then
+    _real=$_backup
+fi
 _oifs=$IFS; IFS=:
-for _d in $PATH; do
-    [ -n "$_d" ] || continue
-    _candidate_dir=$(cd "$_d" 2>/dev/null && pwd -P)
-    [ -n "$_candidate_dir" ] || continue
-    [ "$_candidate_dir" = "$_wrapper_dir" ] && continue
-    if [ -x "$_candidate_dir/wl-copy" ]; then _real="$_candidate_dir/wl-copy"; break; fi
-done
+if [ -z "$_real" ]; then
+    for _d in $PATH; do
+        [ -n "$_d" ] || continue
+        _candidate_dir=$(cd "$_d" 2>/dev/null && pwd -P)
+        [ -n "$_candidate_dir" ] || continue
+        [ "$_candidate_dir" = "$_wrapper_dir" ] && continue
+        if [ -x "$_candidate_dir/wl-copy" ]; then _real="$_candidate_dir/wl-copy"; break; fi
+    done
+fi
 IFS=$_oifs
 ` + clipWriteRelay + `if [ "$_ok" = 1 ]; then
     if [ "$_clear" = 1 ]; then
@@ -331,9 +341,9 @@ IFS=$_oifs
           ""|UTF8_STRING|TEXT|STRING|text/*)
             _copy() {
                 if [ "$_trim" = 1 ]; then
-                    "$_portald" clip copy text --trim
+                    "$_portald" clip copy text --trim --empty-clears
                 else
-                    "$_portald" clip copy text
+                    "$_portald" clip copy text --empty-clears
                 fi
             }
             if [ "$_has_text" = 1 ]; then _relay_argv; else _relay_stdin; fi ;;
@@ -342,6 +352,9 @@ IFS=$_oifs
             if [ "$_has_text" = 1 ]; then _relay_argv; else _relay_stdin; fi ;;
         esac
     fi
+fi
+if [ "$_real" = "$_backup" ]; then
+    PORTAL_WL_COPY_FALLBACK=1 exec "$_real" "$@"
 fi
 ` + clipWriteTail
 
@@ -435,26 +448,35 @@ else
     _mode=write
 fi
 _wrapper_dir=$(cd "$(dirname "$0")" && pwd -P)
+_backup="$_wrapper_dir/xsel.portal-backup"
 _real=""
+if [ "${PORTAL_XSEL_FALLBACK:-}" != 1 ] && [ -x "$_backup" ]; then
+    _real=$_backup
+fi
 _oifs=$IFS; IFS=:
-for _d in $PATH; do
-    [ -n "$_d" ] || continue
-    _candidate_dir=$(cd "$_d" 2>/dev/null && pwd -P)
-    [ -n "$_candidate_dir" ] || continue
-    [ "$_candidate_dir" = "$_wrapper_dir" ] && continue
-    if [ -x "$_candidate_dir/xsel" ]; then _real="$_candidate_dir/xsel"; break; fi
-done
+if [ -z "$_real" ]; then
+    for _d in $PATH; do
+        [ -n "$_d" ] || continue
+        _candidate_dir=$(cd "$_d" 2>/dev/null && pwd -P)
+        [ -n "$_candidate_dir" ] || continue
+        [ "$_candidate_dir" = "$_wrapper_dir" ] && continue
+        if [ -x "$_candidate_dir/xsel" ]; then _real="$_candidate_dir/xsel"; break; fi
+    done
+fi
 IFS=$_oifs
 ` + clipWriteRelay + `if [ "$_ok" = 1 ]; then
     if [ "$_clear" = 1 ]; then
         _copy() { "$_portald" clip copy clear; }
         _relay_noinput
     elif [ "$_mode" = write ]; then
-        _copy() { "$_portald" clip copy text; }
+        _copy() { "$_portald" clip copy text --empty-clears; }
         _relay_stdin
     elif [ "$_mode" = read ]; then
         [ -x "$_portald" ] && "$_portald" clip text 2>/dev/null && exit 0
     fi
+fi
+if [ "$_real" = "$_backup" ]; then
+    PORTAL_XSEL_FALLBACK=1 exec "$_real" "$@"
 fi
 ` + clipWriteTail
 

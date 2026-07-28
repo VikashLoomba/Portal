@@ -63,6 +63,9 @@ func parseClipCopyArgs(args []string) (clipCopyArgs, bool) {
 		return clipCopyArgs{kind: "text", trim: true}, true
 	case len(args) == 2 && args[0] == "text" && args[1] == "--empty-clears":
 		return clipCopyArgs{kind: "text", emptyClears: true}, true
+	case len(args) == 3 && args[0] == "text" &&
+		args[1] == "--trim" && args[2] == "--empty-clears":
+		return clipCopyArgs{kind: "text", trim: true, emptyClears: true}, true
 	case len(args) == 2 && args[0] == "image" && args[1] == "png":
 		return clipCopyArgs{kind: "image", format: "png"}, true
 	case len(args) == 1 && args[0] == "clear":
@@ -97,7 +100,7 @@ func clipCopyLine(kind, format, sha string, size int) string {
 func runClipCopy(args []string, rt clipCopyRuntime) int {
 	req, ok := parseClipCopyArgs(args)
 	if !ok {
-		fmt.Fprintln(rt.stderr, "usage: portald clip copy <text [--trim|--empty-clears]|image png|clear>")
+		fmt.Fprintln(rt.stderr, "usage: portald clip copy <text [--trim] [--empty-clears]|image png|clear>")
 		return 1
 	}
 	if rt.clipDir == "" {

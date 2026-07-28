@@ -3,12 +3,16 @@ package doctorprobe
 import (
 	"context"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/VikashLoomba/Portal/internal/clipshim"
 	"github.com/VikashLoomba/Portal/pkg/doctor"
 	"github.com/VikashLoomba/Portal/pkg/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport/localexec"
 )
 
 type versionTransport struct{ out string }
@@ -127,6 +131,66 @@ func TestRun_ProbesAllSixPathWinnersInOrder(t *testing.T) {
 	want := []string{"xclip", "wl-paste", "wl-copy", "pbcopy", "pbpaste", "xsel"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("PATH probe order = %v, want %v", got, want)
+	}
+}
+
+func TestGeneratedRemoteProbeCommandsExecute(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash is unavailable")
+	}
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".local", "bin")
+	cacheDir := filepath.Join(home, ".cache", "portal")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := binDir + string(os.PathListSeparator) + os.Getenv("PATH")
+	profile := "export PATH=" + doctorShellQuote(path) + "\n"
+	if err := os.WriteFile(filepath.Join(home, ".bash_profile"), []byte(profile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range []string{"xclip", "wl-paste", "wl-copy", "pbcopy", "pbpaste", "xsel"} {
+		script := "#!/bin/sh\n# " + clipshim.Marker + "\nexit 0\n"
+		if err := os.WriteFile(filepath.Join(binDir, tool), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	portald := `#!/bin/sh
+if [ "$1:$2" = "clip:targets" ]; then
+    printf '%s\n' text/plain
+    exit 0
+fi
+case "$1" in
+  clip) printf '%s\n' 'usage: portald clip copy' >&2; exit 1 ;;
+  notify) printf '%s\n' 'usage: portald notify' >&2; exit 1 ;;
+esac
+exit 1
+`
+	if err := os.WriteFile(filepath.Join(cacheDir, "portald"), []byte(portald), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", path)
+	tr := localexec.New()
+
+	for _, tool := range []string{"xclip", "wl-paste", "wl-copy", "pbcopy", "pbpaste", "xsel"} {
+		got, isShim := resolveShimWinner(context.Background(), tr, tool)
+		if got != filepath.Join(binDir, tool) || !isShim {
+			t.Fatalf("resolveShimWinner(%q) = %q, %v", tool, got, isShim)
+		}
+	}
+	if got, ok := deployedShimVersion(context.Background(), tr); !ok || got != clipshim.Version {
+		t.Fatalf("deployedShimVersion = %q, %v", got, ok)
+	}
+	present, verbs := probePortaldVerbs(context.Background(), tr)
+	if !present || !verbs.clip || !verbs.clipCopy || !verbs.notify {
+		t.Fatalf("probePortaldVerbs = %v, %+v", present, verbs)
+	}
+	if out, code := smokeClipTargets(context.Background(), tr); out != "text/plain" || code != 0 {
+		t.Fatalf("smokeClipTargets = %q, %d", out, code)
 	}
 }
 

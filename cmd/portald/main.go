@@ -154,7 +154,7 @@ func printPortaldUsage() {
 	fmt.Fprintln(os.Stderr, `Usage:
   portald [agent flags]
   portald open <url>
-  portald clip <targets [xclip|wl-paste]|image png|text [--trim]|copy text [--trim|--empty-clears]|copy image png|copy clear>
+  portald clip <targets [xclip|wl-paste]|image png|text [--trim]|copy text [--trim] [--empty-clears]|copy image png|copy clear>
   portald notify --hook | --title <title> [options]
   portald keychain <run|askpass> [options]
 
@@ -278,7 +278,7 @@ func runClip(args []string) {
 	case len(args) == 2 && args[0] == "image" && args[1] == "png":
 		verb, format = "image", "png"
 	default:
-		fmt.Fprintln(os.Stderr, "usage: portald clip <targets [xclip|wl-paste]|image png|text [--trim]|copy text [--trim|--empty-clears]|copy image png|copy clear>")
+		fmt.Fprintln(os.Stderr, "usage: portald clip <targets [xclip|wl-paste]|image png|text [--trim]|copy text [--trim] [--empty-clears]|copy image png|copy clear>")
 		os.Exit(1)
 	}
 

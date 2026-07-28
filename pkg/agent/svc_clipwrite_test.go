@@ -647,9 +647,36 @@ func TestClipWrite_ResponseDecodeFailureDropped(t *testing.T) {
 	h := newClipWriteHarness(t, nil)
 	defer h.close()
 
+	resultCh := make(chan clipWriteSocketResult, 1)
+	go func() {
+		reply, err := h.ask("copy\tclear\n")
+		resultCh <- clipWriteSocketResult{reply: reply, err: err}
+	}()
+	req := h.nextRequest(t)
+	h.waitInflight(t, 1)
+
 	h.srv.clipWrite.HandleMsg("resp", []byte{0xff})
-	if got := h.inflight(); got != 0 {
-		t.Fatalf("unexpected inflight count after malformed response: %d", got)
+	select {
+	case result := <-resultCh:
+		t.Fatalf("malformed response completed request: %+v", result)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if got := h.inflight(); got != 1 {
+		t.Fatalf("inflight after malformed response = %d, want 1", got)
+	}
+
+	if err := sendClipWriteResp(h.enc, protocol.ClipWriteResponse{
+		Nonce: req.Nonce, Epoch: req.Epoch, OK: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-resultCh:
+		if result.err != nil || result.reply != "ok\n" {
+			t.Fatalf("valid response result = %+v, want ok", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("valid response did not complete request")
 	}
 }
 

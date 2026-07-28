@@ -101,6 +101,8 @@ func TestShimArgvMatcher(t *testing.T) {
 			[]string{"-selection", "clipboard", "-t", "STRING", "-o"}, clipSentinel},
 		{"xclip -t text/plain -o intercepted", "xclip",
 			[]string{"-selection", "clipboard", "-t", "text/plain", "-o"}, clipSentinel},
+		{"xclip -t text/html -o falls through", "xclip",
+			[]string{"-selection", "clipboard", "-t", "text/html", "-o"}, realSentinel},
 		{"xclip image write (-i) intercepted", "xclip",
 			[]string{"-selection", "clipboard", "-t", "image/png", "-i"}, clipSentinel},
 		{"xclip text write (-i) intercepted", "xclip",
@@ -228,8 +230,8 @@ func TestShimResolversSkipEmptyEntriesAndRejectSelf(t *testing.T) {
 		canonical bool
 	}{
 		{name: "xdg-open", script: XDGOpenWrapper, tool: "xdg-open"},
-		{name: "xclip", script: xclipShim, tool: "xclip"},
-		{name: "wl-paste", script: wlPasteShim, tool: "wl-paste"},
+		{name: "xclip", script: xclipShim, tool: "xclip", canonical: true},
+		{name: "wl-paste", script: wlPasteShim, tool: "wl-paste", canonical: true},
 		{name: "wl-copy", script: wlCopyShim, tool: "wl-copy", canonical: true},
 		{name: "pbpaste", script: pbPasteShim, tool: "pbpaste", canonical: true},
 		{name: "xsel", script: xselShim, tool: "xsel", canonical: true},

@@ -199,6 +199,9 @@ func TestParseClipCopyArgs(t *testing.T) {
 		{[]string{"text"}, clipCopyArgs{kind: "text"}},
 		{[]string{"text", "--trim"}, clipCopyArgs{kind: "text", trim: true}},
 		{[]string{"text", "--empty-clears"}, clipCopyArgs{kind: "text", emptyClears: true}},
+		{[]string{"text", "--trim", "--empty-clears"}, clipCopyArgs{
+			kind: "text", trim: true, emptyClears: true,
+		}},
 		{[]string{"image", "png"}, clipCopyArgs{kind: "image", format: "png"}},
 		{[]string{"clear"}, clipCopyArgs{kind: "clear"}},
 	}
@@ -213,6 +216,7 @@ func TestParseClipCopyArgs(t *testing.T) {
 		nil,
 		{"--trim"},
 		{"text", "extra"},
+		{"text", "--empty-clears", "--trim"},
 		{"--trim", "text"},
 		{"image"},
 		{"image", "jpeg"},
@@ -709,6 +713,7 @@ func TestRunClipCopy_EmptyStdinPolicy(t *testing.T) {
 		{"text empty rejected", []string{"text"}, nil, 1, ""},
 		{"trimmed empty rejected", []string{"text", "--trim"}, []byte("\n"), 1, ""},
 		{"pbcopy empty clears", []string{"text", "--empty-clears"}, nil, 0, "copy\tclear\n"},
+		{"trimmed empty clears", []string{"text", "--trim", "--empty-clears"}, []byte("\n"), 0, "copy\tclear\n"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -889,7 +894,7 @@ func TestRunClipCopy_GCSweepsStaleCopies(t *testing.T) {
 func TestRunClipCopy_Usage(t *testing.T) {
 	src := buildPortald(t)
 	home, bin := setupClipHome(t, src)
-	want := "usage: portald clip copy <text [--trim|--empty-clears]|image png|clear>\n"
+	want := "usage: portald clip copy <text [--trim] [--empty-clears]|image png|clear>\n"
 	for _, args := range [][]string{
 		nil,
 		{"image", "jpeg"},

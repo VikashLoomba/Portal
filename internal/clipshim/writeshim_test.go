@@ -2,15 +2,18 @@ package clipshim
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/VikashLoomba/Portal/pkg/transport/ptyx"
 )
@@ -118,14 +121,20 @@ exit "${PORTALD_RC:-0}"
 	}
 	if spec.withReal {
 		writeExec(t, filepath.Join(realDir, spec.bin), "%s", `#!/bin/sh
-printf '%s\n' "$*" >> "$PORTAL_REAL_ARGS"
+{
+    printf '%s\n' "$#"
+    for _arg in "$@"; do printf '%s\000' "$_arg"; done
+} > "$PORTAL_REAL_ARGS"
 cat > "$PORTAL_REAL_STDIN"
 exit 0
 `)
 	}
 	if spec.withBackup {
 		writeExec(t, filepath.Join(shimDir, spec.bin+".portal-backup"), "%s", `#!/bin/sh
-printf '%s\n' "$*" >> "$PORTAL_REAL_ARGS"
+{
+    printf '%s\n' "$#"
+    for _arg in "$@"; do printf '%s\000' "$_arg"; done
+} > "$PORTAL_REAL_ARGS"
 cat > "$PORTAL_REAL_STDIN"
 exit 0
 `)
@@ -156,7 +165,9 @@ exit 0
 	argv := append([]string{}, shell.argv[1:]...)
 	argv = append(argv, shimPath)
 	argv = append(argv, spec.args...)
-	cmd := exec.Command(shell.argv[0], argv...)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, shell.argv[0], argv...)
 	cmd.Dir = home
 	cmd.Stdin = bytes.NewReader(spec.stdin)
 	cmd.Env = []string{
@@ -173,6 +184,9 @@ exit 0
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("%s via %s did not terminate", spec.bin, shell.name)
+	}
 	exitCode := 0
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -243,6 +257,34 @@ func assertNoShimTempLitter(t *testing.T, result shimRunResult) {
 	}
 }
 
+func assertRealArgv(t *testing.T, result shimRunResult, want []string) {
+	t.Helper()
+	if len(result.realArgs) == 0 {
+		t.Fatal("real binary did not run")
+	}
+	lineEnd := bytes.IndexByte(result.realArgs, '\n')
+	if lineEnd < 0 {
+		t.Fatalf("real argv record has no count: %q", result.realArgs)
+	}
+	count, err := strconv.Atoi(string(result.realArgs[:lineEnd]))
+	if err != nil {
+		t.Fatalf("real argv count: %v", err)
+	}
+	var got []string
+	rest := result.realArgs[lineEnd+1:]
+	for len(rest) > 0 {
+		argEnd := bytes.IndexByte(rest, 0)
+		if argEnd < 0 {
+			t.Fatalf("real argv record has unterminated argument: %q", result.realArgs)
+		}
+		got = append(got, string(rest[:argEnd]))
+		rest = rest[argEnd+1:]
+	}
+	if count != len(got) || !slices.Equal(got, want) {
+		t.Fatalf("real argv = %#v (count %d), want %#v", got, count, want)
+	}
+}
+
 func TestWriteShimXclipV7ReadParity(t *testing.T) {
 	tests := []struct {
 		name string
@@ -256,6 +298,7 @@ func TestWriteShimXclipV7ReadParity(t *testing.T) {
 		{"TEXT", []string{"-selection", "clipboard", "-t", "TEXT", "-o"}, "clip text"},
 		{"STRING", []string{"-selection", "clipboard", "-t", "STRING", "-o"}, "clip text"},
 		{"text/plain", []string{"-selection", "clipboard", "-t", "text/plain", "-o"}, "clip text"},
+		{"text/plain charset", []string{"-selection", "clipboard", "-t", "text/plain;charset=utf-8", "-o"}, "clip text"},
 		{"output first", []string{"-o", "-selection", "clipboard"}, "clip text"},
 		{"target before output", []string{"-t", "UTF8_STRING", "-o", "-selection", "clipboard"}, "clip text"},
 		{"primary abbreviation", []string{"-sel", "p", "-o"}, "clip text"},
@@ -295,49 +338,52 @@ func TestWriteShimRouting(t *testing.T) {
 		wantArgs  string
 		wantStdin []byte
 	}{
-		{"xclip clipboard", "xclip", xclipShim, []string{"-sel", "c", "-i"}, payload, "clip copy text", payload},
-		{"xclip full selection", "xclip", xclipShim, []string{"-selection", "clipboard", "-i"}, payload, "clip copy text", payload},
-		{"xclip primary", "xclip", xclipShim, []string{"-sel", "p", "-i"}, payload, "clip copy text", payload},
-		{"xclip default input primary", "xclip", xclipShim, nil, payload, "clip copy text", payload},
-		{"xclip input abbreviation", "xclip", xclipShim, []string{"-in"}, payload, "clip copy text", payload},
-		{"xclip selection abbreviation", "xclip", xclipShim, []string{"-selec", "c", "-i"}, payload, "clip copy text", payload},
-		{"xclip uppercase selection", "xclip", xclipShim, []string{"-sel", "CLIPBOARD", "-i"}, payload, "clip copy text", payload},
-		{"xclip display argument", "xclip", xclipShim, []string{"-d", ":0", "-sel", "c", "-i"}, payload, "clip copy text", payload},
-		{"xclip loop argument", "xclip", xclipShim, []string{"-l", "1", "-sel", "c", "-i"}, payload, "clip copy text", payload},
-		{"xclip silent", "xclip", xclipShim, []string{"-si", "-sel", "c", "-i"}, payload, "clip copy text", payload},
-		{"xclip noutf8", "xclip", xclipShim, []string{"-noutf8", "-sel", "c", "-i"}, payload, "clip copy text", payload},
+		{"xclip clipboard", "xclip", xclipShim, []string{"-sel", "c", "-i"}, payload, "clip copy text --empty-clears", payload},
+		{"xclip full selection", "xclip", xclipShim, []string{"-selection", "clipboard", "-i"}, payload, "clip copy text --empty-clears", payload},
+		{"xclip primary", "xclip", xclipShim, []string{"-sel", "p", "-i"}, payload, "clip copy text --empty-clears", payload},
+		{"xclip default input primary", "xclip", xclipShim, nil, payload, "clip copy text --empty-clears", payload},
+		{"xclip empty input", "xclip", xclipShim, []string{"-sel", "c", "-i"}, nil, "clip copy text --empty-clears", nil},
+		{"xclip input abbreviation", "xclip", xclipShim, []string{"-in"}, payload, "clip copy text --empty-clears", payload},
+		{"xclip selection abbreviation", "xclip", xclipShim, []string{"-selec", "c", "-i"}, payload, "clip copy text --empty-clears", payload},
+		{"xclip uppercase selection", "xclip", xclipShim, []string{"-sel", "CLIPBOARD", "-i"}, payload, "clip copy text --empty-clears", payload},
+		{"xclip display argument", "xclip", xclipShim, []string{"-d", ":0", "-sel", "c", "-i"}, payload, "clip copy text --empty-clears", payload},
+		{"xclip loop argument", "xclip", xclipShim, []string{"-l", "1", "-sel", "c", "-i"}, payload, "clip copy text --empty-clears", payload},
+		{"xclip silent", "xclip", xclipShim, []string{"-si", "-sel", "c", "-i"}, payload, "clip copy text --empty-clears", payload},
+		{"xclip noutf8", "xclip", xclipShim, []string{"-noutf8", "-sel", "c", "-i"}, payload, "clip copy text --empty-clears", payload},
 		{"xclip png", "xclip", xclipShim, []string{"-i", "-t", "image/png", "-sel", "c"}, payload, "clip copy image png", payload},
 		{"xclip png canonical order", "xclip", xclipShim, []string{"-selection", "clipboard", "-t", "image/png", "-i"}, payload, "clip copy image png", payload},
-		{"xclip trim long", "xclip", xclipShim, []string{"-rmlastnl", "-sel", "c", "-i"}, payload, "clip copy text --trim", payload},
-		{"xclip trim short", "xclip", xclipShim, []string{"-r", "-i"}, payload, "clip copy text --trim", payload},
-		{"xclip text mime", "xclip", xclipShim, []string{"-t", "text/plain;charset=utf-8", "-sel", "c", "-i"}, payload, "clip copy text", payload},
-		{"wl-copy stdin", "wl-copy", wlCopyShim, nil, payload, "clip copy text", payload},
-		{"wl-copy argv", "wl-copy", wlCopyShim, []string{"some", "words"}, []byte("ignored"), "clip copy text", []byte("some words")},
-		{"wl-copy empty argv", "wl-copy", wlCopyShim, []string{""}, []byte("ignored"), "clip copy text", nil},
-		{"wl-copy leading empty argv", "wl-copy", wlCopyShim, []string{"", "X"}, []byte("ignored"), "clip copy text", []byte(" X")},
+		{"xclip trim long", "xclip", xclipShim, []string{"-rmlastnl", "-sel", "c", "-i"}, payload, "clip copy text --trim --empty-clears", payload},
+		{"xclip trim short", "xclip", xclipShim, []string{"-r", "-i"}, payload, "clip copy text --trim --empty-clears", payload},
+		{"xclip text mime", "xclip", xclipShim, []string{"-t", "text/plain;charset=utf-8", "-sel", "c", "-i"}, payload, "clip copy text --empty-clears", payload},
+		{"wl-copy stdin", "wl-copy", wlCopyShim, nil, payload, "clip copy text --empty-clears", payload},
+		{"wl-copy empty stdin", "wl-copy", wlCopyShim, nil, nil, "clip copy text --empty-clears", nil},
+		{"wl-copy argv", "wl-copy", wlCopyShim, []string{"some", "words"}, []byte("ignored"), "clip copy text --empty-clears", []byte("some words")},
+		{"wl-copy empty argv", "wl-copy", wlCopyShim, []string{""}, []byte("ignored"), "clip copy text --empty-clears", nil},
+		{"wl-copy leading empty argv", "wl-copy", wlCopyShim, []string{"", "X"}, []byte("ignored"), "clip copy text --empty-clears", []byte(" X")},
 		{"wl-copy clear long", "wl-copy", wlCopyShim, []string{"--clear"}, payload, "clip copy clear", nil},
 		{"wl-copy clear short", "wl-copy", wlCopyShim, []string{"-c"}, payload, "clip copy clear", nil},
-		{"wl-copy primary", "wl-copy", wlCopyShim, []string{"-p"}, payload, "clip copy text", payload},
-		{"wl-copy trim", "wl-copy", wlCopyShim, []string{"-n"}, payload, "clip copy text --trim", payload},
-		{"wl-copy bundled trim", "wl-copy", wlCopyShim, []string{"-pn"}, payload, "clip copy text --trim", payload},
-		{"wl-copy bundled trim foreground", "wl-copy", wlCopyShim, []string{"-pnf"}, payload, "clip copy text --trim", payload},
-		{"wl-copy text type", "wl-copy", wlCopyShim, []string{"--type=text/plain"}, payload, "clip copy text", payload},
+		{"wl-copy primary", "wl-copy", wlCopyShim, []string{"-p"}, payload, "clip copy text --empty-clears", payload},
+		{"wl-copy trim", "wl-copy", wlCopyShim, []string{"-n"}, payload, "clip copy text --trim --empty-clears", payload},
+		{"wl-copy bundled trim", "wl-copy", wlCopyShim, []string{"-pn"}, payload, "clip copy text --trim --empty-clears", payload},
+		{"wl-copy bundled trim foreground", "wl-copy", wlCopyShim, []string{"-pnf"}, payload, "clip copy text --trim --empty-clears", payload},
+		{"wl-copy text type", "wl-copy", wlCopyShim, []string{"--type=text/plain"}, payload, "clip copy text --empty-clears", payload},
 		{"wl-copy png type", "wl-copy", wlCopyShim, []string{"-t", "image/png"}, payload, "clip copy image png", payload},
-		{"wl-copy end options", "wl-copy", wlCopyShim, []string{"--", "-n", "text"}, payload, "clip copy text", []byte("-n text")},
-		{"wl-copy seat and argv", "wl-copy", wlCopyShim, []string{"-s", "seat0", "hello"}, payload, "clip copy text", []byte("hello")},
+		{"wl-copy end options", "wl-copy", wlCopyShim, []string{"--", "-n", "text"}, payload, "clip copy text --empty-clears", []byte("-n text")},
+		{"wl-copy seat and argv", "wl-copy", wlCopyShim, []string{"-s", "seat0", "hello"}, payload, "clip copy text --empty-clears", []byte("hello")},
 		{"pbcopy text", "pbcopy", pbCopyShim, nil, payload, "clip copy text --empty-clears", payload},
 		{"pbcopy empty clears", "pbcopy", pbCopyShim, nil, nil, "clip copy text --empty-clears", nil},
 		{"pbpaste reads", "pbpaste", pbPasteShim, nil, nil, "clip text", nil},
-		{"xsel bundled input", "xsel", xselShim, []string{"-ib"}, payload, "clip copy text", payload},
+		{"xsel bundled input", "xsel", xselShim, []string{"-ib"}, payload, "clip copy text --empty-clears", payload},
 		{"xsel bundled output", "xsel", xselShim, []string{"-ob"}, nil, "clip text", nil},
 		{"xsel clear", "xsel", xselShim, []string{"-c"}, payload, "clip copy clear", nil},
-		{"xsel long input", "xsel", xselShim, []string{"--input"}, payload, "clip copy text", payload},
+		{"xsel long input", "xsel", xselShim, []string{"--input"}, payload, "clip copy text --empty-clears", payload},
+		{"xsel empty input", "xsel", xselShim, []string{"--input"}, nil, "clip copy text --empty-clears", nil},
 		{"xsel long output", "xsel", xselShim, []string{"--output"}, nil, "clip text", nil},
-		{"xsel input nodetach", "xsel", xselShim, []string{"-in"}, payload, "clip copy text", payload},
-		{"xsel long nodetach input", "xsel", xselShim, []string{"--nodetach", "-i"}, payload, "clip copy text", payload},
-		{"xsel piped default", "xsel", xselShim, nil, payload, "clip copy text", payload},
-		{"xsel clipboard piped default", "xsel", xselShim, []string{"-b"}, payload, "clip copy text", payload},
-		{"xsel primary piped default", "xsel", xselShim, []string{"-p"}, payload, "clip copy text", payload},
+		{"xsel input nodetach", "xsel", xselShim, []string{"-in"}, payload, "clip copy text --empty-clears", payload},
+		{"xsel long nodetach input", "xsel", xselShim, []string{"--nodetach", "-i"}, payload, "clip copy text --empty-clears", payload},
+		{"xsel piped default", "xsel", xselShim, nil, payload, "clip copy text --empty-clears", payload},
+		{"xsel clipboard piped default", "xsel", xselShim, []string{"-b"}, payload, "clip copy text --empty-clears", payload},
+		{"xsel primary piped default", "xsel", xselShim, []string{"-p"}, payload, "clip copy text --empty-clears", payload},
 	}
 	for _, shell := range shimShells() {
 		t.Run(shell.name, func(t *testing.T) {
@@ -365,7 +411,8 @@ func TestWriteShimInvalidTokensFallThrough(t *testing.T) {
 		script string
 		args   []string
 	}{
-		{"xclip invalid", "xclip", xclipShim, []string{"-invalid"}},
+		{"xclip invalid preserves boundaries", "xclip", xclipShim,
+			[]string{"-invalid", "", "space arg", "line\nbreak"}},
 		{"xclip input same prefix", "xclip", xclipShim, []string{"-inp"}},
 		{"xclip output same prefix", "xclip", xclipShim, []string{"-oops"}},
 		{"xclip output too long", "xclip", xclipShim, []string{"-outt"}},
@@ -424,9 +471,7 @@ func TestWriteShimInvalidTokensFallThrough(t *testing.T) {
 					if len(result.portalArgs) != 0 {
 						t.Fatalf("invalid argv routed to portald: %q", result.portalArgs)
 					}
-					if len(result.realArgs) == 0 {
-						t.Fatal("invalid argv did not fall through to the real binary")
-					}
+					assertRealArgv(t, result, tc.args)
 					if !bytes.Equal(result.realStdin, payload) {
 						t.Fatalf("real stdin = %q, want pristine %q", result.realStdin, payload)
 					}
@@ -544,9 +589,10 @@ func TestWriteShimFailureSemantics(t *testing.T) {
 							portaldRC:   1,
 							withReal:    true,
 						})
-						if result.exitCode != 0 || len(result.stderr) != 0 || len(result.realArgs) == 0 {
+						if result.exitCode != 0 || len(result.stderr) != 0 {
 							t.Fatalf("fallback leg exit/stderr/real = %d/%q/%q", result.exitCode, result.stderr, result.realArgs)
 						}
+						assertRealArgv(t, result, tc.args)
 						assertNoShimTempLitter(t, result)
 					})
 					t.Run("portal failure no real", func(t *testing.T) {
@@ -628,10 +674,11 @@ func TestWriteShimFailureSemantics(t *testing.T) {
 					portaldRC:   1,
 					withReal:    true,
 				})
-				if result.exitCode != 0 || len(result.stderr) != 0 || len(result.realArgs) == 0 {
+				if result.exitCode != 0 || len(result.stderr) != 0 {
 					t.Fatalf("pbpaste fallback exit/stderr/real = %d/%q/%q",
 						result.exitCode, result.stderr, result.realArgs)
 				}
+				assertRealArgv(t, result, nil)
 			})
 			t.Run("pbpaste backup fallback", func(t *testing.T) {
 				result := runShimScript(t, shell, shimRunSpec{
@@ -642,10 +689,11 @@ func TestWriteShimFailureSemantics(t *testing.T) {
 					portaldRC:   1,
 					withBackup:  true,
 				})
-				if result.exitCode != 0 || string(result.realArgs) != "-Prefer txt\n" {
+				if result.exitCode != 0 {
 					t.Fatalf("pbpaste backup exit/args = %d/%q",
 						result.exitCode, result.realArgs)
 				}
+				assertRealArgv(t, result, []string{"-Prefer", "txt"})
 			})
 
 			for _, tc := range []struct {
@@ -654,6 +702,8 @@ func TestWriteShimFailureSemantics(t *testing.T) {
 				script string
 				args   []string
 			}{
+				{"xclip", "xclip", xclipShim, []string{"-sel", "c", "-i"}},
+				{"wl-paste", "wl-paste", wlPasteShim, []string{"--clear"}},
 				{"wl-copy", "wl-copy", wlCopyShim, nil},
 				{"xsel", "xsel", xselShim, []string{"-ib"}},
 			} {
@@ -668,10 +718,76 @@ func TestWriteShimFailureSemantics(t *testing.T) {
 						withReal:    true,
 						pathAlias:   true,
 					})
-					if result.exitCode != 0 || len(result.realArgs) == 0 {
+					if result.exitCode != 0 {
 						t.Fatalf("alias fallback exit/real = %d/%q",
 							result.exitCode, result.realArgs)
 					}
+					assertRealArgv(t, result, tc.args)
+				})
+			}
+		})
+	}
+}
+
+func TestWriteShimPreservedBackupFallback(t *testing.T) {
+	payload := []byte("backup stdin")
+	tests := []struct {
+		name    string
+		bin     string
+		script  string
+		valid   []string
+		invalid []string
+	}{
+		{
+			name: "wl-copy", bin: "wl-copy", script: wlCopyShim,
+			valid: nil, invalid: []string{"--unsupported", "", "space arg"},
+		},
+		{
+			name: "xsel", bin: "xsel", script: xselShim,
+			valid: []string{"-ib"}, invalid: []string{"--append", "", "space arg"},
+		},
+	}
+	for _, shell := range shimShells() {
+		t.Run(shell.name, func(t *testing.T) {
+			requireShimShell(t, shell)
+			for _, tc := range tests {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Run("portal failure", func(t *testing.T) {
+						result := runShimScript(t, shell, shimRunSpec{
+							bin:         tc.bin,
+							script:      tc.script,
+							args:        tc.valid,
+							stdin:       payload,
+							withPortald: true,
+							portaldRC:   1,
+							withBackup:  true,
+						})
+						if result.exitCode != 0 || len(result.stderr) != 0 {
+							t.Fatalf("backup fallback exit/stderr = %d/%q", result.exitCode, result.stderr)
+						}
+						assertRealArgv(t, result, tc.valid)
+						if !bytes.Equal(result.realStdin, payload) {
+							t.Fatalf("backup stdin = %q, want %q", result.realStdin, payload)
+						}
+					})
+					t.Run("unrecognized argv", func(t *testing.T) {
+						result := runShimScript(t, shell, shimRunSpec{
+							bin:         tc.bin,
+							script:      tc.script,
+							args:        tc.invalid,
+							stdin:       payload,
+							withPortald: true,
+							withBackup:  true,
+						})
+						if result.exitCode != 0 || len(result.stderr) != 0 || len(result.portalArgs) != 0 {
+							t.Fatalf("backup invalid exit/stderr/portal = %d/%q/%q",
+								result.exitCode, result.stderr, result.portalArgs)
+						}
+						assertRealArgv(t, result, tc.invalid)
+						if !bytes.Equal(result.realStdin, payload) {
+							t.Fatalf("backup stdin = %q, want %q", result.realStdin, payload)
+						}
+					})
 				})
 			}
 		})
@@ -708,6 +824,7 @@ func TestWriteShimByteExactFallback(t *testing.T) {
 						if result.exitCode != 0 {
 							t.Fatalf("exit = %d, stderr=%q", result.exitCode, result.stderr)
 						}
+						assertRealArgv(t, result, tc.args)
 						if !bytes.Equal(result.portalStdin, payload) || !bytes.Equal(result.realStdin, payload) {
 							t.Fatalf("portal/real stdin = %q/%q, want byte-exact %q", result.portalStdin, result.realStdin, payload)
 						}
@@ -724,6 +841,7 @@ func TestWriteShimByteExactFallback(t *testing.T) {
 						if result.exitCode != 0 || !bytes.Equal(result.realStdin, payload) {
 							t.Fatalf("exit/real stdin = %d/%q, want 0/%q", result.exitCode, result.realStdin, payload)
 						}
+						assertRealArgv(t, result, tc.args)
 						assertNoShimTempLitter(t, result)
 					})
 					t.Run("mktemp failure leaves stdin pristine", func(t *testing.T) {
@@ -740,6 +858,7 @@ func TestWriteShimByteExactFallback(t *testing.T) {
 						if result.exitCode != 0 || !bytes.Equal(result.realStdin, payload) {
 							t.Fatalf("exit/real stdin = %d/%q, want 0/%q", result.exitCode, result.realStdin, payload)
 						}
+						assertRealArgv(t, result, tc.args)
 						if len(result.portalArgs) != 0 {
 							t.Fatalf("portald ran after mktemp failure: %q", result.portalArgs)
 						}

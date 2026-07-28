@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -690,14 +691,14 @@ func TestServeClipWriteRequest_TextHappy(t *testing.T) {
 		t.Fatalf("pull calls argv=%v stdin=%v", argv, stdin)
 	}
 	if len(argv[0]) != 6 || argv[0][0] != "BASH_ENV=/dev/null" ||
-		argv[0][1] != "/bin/bash" || argv[0][2] != "--noprofile" ||
+		argv[0][1] != "bash" || argv[0][2] != "--noprofile" ||
 		argv[0][3] != "--norc" || argv[0][4] != "-c" {
 		t.Fatalf("pull argv = %v", argv[0])
 	}
 	joined := strings.Join(argv[0], " ")
 	wantPath := `$HOME/.cache/portal/clip/copy-` + req.SHA + `.txt`
 	if !strings.Contains(joined, wantPath) ||
-		!strings.Contains(joined, "exec /usr/bin/head -c "+strconv.FormatInt(req.Size, 10)) ||
+		!strings.Contains(joined, "exec head -c "+strconv.FormatInt(req.Size, 10)) ||
 		!strings.Contains(joined, `[ -L "$f" ]`) ||
 		!strings.Contains(joined, `[ ! -f "$f" ]`) {
 		t.Fatalf("pull command did not pin path/size/file shape: %q", joined)
@@ -738,7 +739,9 @@ func TestServeClipWriteRequest_PullAndWriterErrors(t *testing.T) {
 		resp := serveClipWriteRequest(context.Background(), deps, req)
 
 		assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
-		assertNoClipWriteAudit(t, deps.Audit)
+		assertCredAudit(t, deps.Audit, []string{
+			"clip-write-denied", "host=box", "kind=text", "reason=shamismatch",
+		})
 		if len(writer.snapshot()) != 0 {
 			t.Fatal("stream startup failure reached writer")
 		}
@@ -757,7 +760,9 @@ func TestServeClipWriteRequest_PullAndWriterErrors(t *testing.T) {
 		resp := serveClipWriteRequest(context.Background(), deps, req)
 
 		assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
-		assertNoClipWriteAudit(t, deps.Audit)
+		assertCredAudit(t, deps.Audit, []string{
+			"clip-write-denied", "host=box", "kind=text", "reason=shamismatch",
+		})
 		if len(writer.snapshot()) != 0 {
 			t.Fatal("pull failure reached writer")
 		}
@@ -805,7 +810,9 @@ func TestServeClipWriteRequest_ApplyTimeout(t *testing.T) {
 			t.Fatalf("pull timeout took %v", elapsed)
 		}
 		assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
-		assertNoClipWriteAudit(t, deps.Audit)
+		assertCredAudit(t, deps.Audit, []string{
+			"clip-write-denied", "host=box", "kind=text", "reason=shamismatch",
+		})
 		if len(writer.snapshot()) != 0 {
 			t.Fatal("timed-out pull reached writer")
 		}
@@ -856,7 +863,9 @@ func TestServeClipWriteRequest_CancellationStopsPull(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("canceled clipboard pull did not return")
 	}
-	assertNoClipWriteAudit(t, deps.Audit)
+	assertCredAudit(t, deps.Audit, []string{
+		"clip-write-denied", "host=box", "kind=text", "reason=shamismatch",
+	})
 	if len(writer.snapshot()) != 0 {
 		t.Fatal("canceled pull reached writer")
 	}
@@ -945,11 +954,13 @@ func TestRunClipWriteHandler_DisconnectCancelsInflightPull(t *testing.T) {
 	if len(writer.snapshot()) != 0 {
 		t.Fatal("dead-session pull reached writer")
 	}
-	assertNoClipWriteAudit(t, deps.Audit)
+	assertCredAudit(t, deps.Audit, []string{
+		"clip-write-denied", "host=box", "kind=text", "reason=shamismatch",
+	})
 }
 
 func TestPullClipWrite_ExecutesPinnedShellGuards(t *testing.T) {
-	if _, err := os.Stat("/bin/bash"); err != nil {
+	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash is unavailable")
 	}
 	home := t.TempDir()
@@ -1000,6 +1011,9 @@ func TestPullClipWrite_LocalOutputBounds(t *testing.T) {
 	if len(writer.snapshot()) != 0 {
 		t.Fatal("overlong pulled stream reached writer")
 	}
+	assertCredAudit(t, deps.Audit, []string{
+		"clip-write-denied", "host=box", "kind=text", "reason=shamismatch",
+	})
 	lines := logs.snapshot()
 	if len(lines) != 1 || !strings.Contains(lines[0], "stdout exceeded declared size") {
 		t.Fatalf("overlong pull logs = %v", lines)
@@ -1019,6 +1033,9 @@ func TestPullClipWrite_StderrSanitizedAndBounded(t *testing.T) {
 	if len(writer.snapshot()) != 0 {
 		t.Fatal("stderr-overflow pull reached writer")
 	}
+	assertCredAudit(t, deps.Audit, []string{
+		"clip-write-denied", "host=box", "kind=text", "reason=shamismatch",
+	})
 	lines := logs.snapshot()
 	if len(lines) != 1 {
 		t.Fatalf("stderr-overflow logs = %v", lines)

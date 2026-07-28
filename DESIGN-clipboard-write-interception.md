@@ -184,7 +184,7 @@ never be silent.
   1. Capability gate `feature.clip-write` (re-read per op, Mac-side — READ §7.1(3)); disabled →
      `OK=false` + `ClipWriteDenied(host, kind, "disabled")`.
   2. `size > cap` or SHA malformed → `OK=false` + audit (`oversize` / `badsha`).
-  3. Pull + verify (§3). Mismatch → `OK=false` + audit `shamismatch`.
+  3. Pull + verify (§3). Pull failure or mismatch → `OK=false` + audit `shamismatch`.
   4. Set the pasteboard via a new `clip.Writer` (see §11): text → `pbcopy` (argv-free, stdin);
      PNG → 0600 temp file + `osascript` `«class PNGf»` read, temp removed after; clear → empty
      set. All cgo-free (CGO_ENABLED=0 cross-compile constraint holds).
@@ -245,9 +245,11 @@ trailing newline), and known no-arg/arg flags. Outcomes:
 - Read shapes route exactly as today (READ §6.2 behavior preserved byte-for-byte for the shapes
   it matched; the parser strictly widens coverage).
 - Write to selection `clipboard` **or `primary`** with target text/none →
-  `portald clip copy text` (with `--trim` when `-rmlastnl`). macOS has one pasteboard; X primary
-  vs clipboard is meaningless on a headless box, and `echo x | xclip` (defaults: input, PRIMARY)
-  is exactly the muscle-memory case that must work. §8.1 records this mapping.
+  `portald clip copy text --empty-clears` (also `--trim` when `-rmlastnl`). macOS has one
+  pasteboard; X primary vs clipboard is meaningless on a headless box, and `echo x | xclip`
+  (defaults: input, PRIMARY) is exactly the muscle-memory case that must work. Empty input clears
+  the pasteboard and exits 0, preserving xclip's legal empty-write behavior. §8.1 records this
+  mapping.
 - Write with `-t image/png` → `portald clip copy image png`.
 - Write with any other `-t image/*` → fall through (format honesty, mirror of the read rule).
 - **Any token the parser does not recognize → fall through to the real binary** (never misroute;
@@ -256,9 +258,10 @@ trailing newline), and known no-arg/arg flags. Outcomes:
 ### 6.3 `wl-copy` shim — new
 
 All wl-copy invocations are writes. Flag surface: `-p`/`--primary` (same mapping as §6.2),
-`-n`/`--trim-newline` → `--trim`, `-t`/`--type` (text/* and none → text; `image/png` → png; other
-image → **exit 1 + stderr**, there is no real wl-copy to fall through to on most boxes and
-silently dropping is forbidden), `-c`/`--clear` → `portald clip copy clear` (supports the
+`-n`/`--trim-newline` → `--trim`, `-t`/`--type` (text/* and none → text with
+`--empty-clears`; `image/png` → png; other image → **exit 1 + stderr**, there is no real wl-copy
+to fall through to on most boxes and silently dropping is forbidden), `-c`/`--clear` →
+`portald clip copy clear` (supports the
 `wl-copy secret; sleep 30; wl-copy --clear` hygiene pattern), `-o`/`--paste-once` and `-f` →
 ignore (daemon semantics don't apply). **Positional args are the text** (wl-copy joins argv with
 spaces): the shim routes `printf '%s' "$*-remainder"` into the copy; otherwise stdin.
@@ -266,8 +269,9 @@ spaces): the shim routes `printf '%s' "$*-remainder"` into the copy; otherwise s
 ### 6.4 `pbcopy` / `pbpaste` shims — new
 
 - `pbcopy`: stdin → `portald clip copy text --empty-clears`. Failure → stderr + exit 1 (rule 3).
-  The internal flag maps empty stdin to `copy clear` (matches macOS pbcopy semantics) while the
-  ordinary text entrypoint rejects empty input.
+  The internal flag maps empty stdin to `copy clear` (matches macOS pbcopy semantics and the
+  legal empty-write behavior of the Linux writers); the text entrypoint rejects empty input when
+  the flag is absent.
 - `pbpaste`: → `portald clip text`; on failure, execute a preserved pre-shim binary or a real
   binary later on PATH when present; otherwise use the empty-stdout, exit-0 read degrade.
 - Caveat, accepted: a script that probes `command -v pbcopy` to *platform-detect macOS* would now
@@ -280,14 +284,13 @@ READ skipped xsel because agents don't *read* with it; humans *write* with it. S
 directions so the deployed shim is never worse than the (usually absent) real binary:
 `-i`/`--input` or (no mode flag AND stdin is not a tty — xsel's own default rule, testable in the
 shim via `[ -t 0 ]`) → write; `-o`/`--output` → `portald clip text` read; `-b`/`-p`/`-s`
-selections all map to the one Mac pasteboard; `-c`/`--clear` → clear; unrecognized → fall
-through.
+selections all map to the one Mac pasteboard; empty write input maps to clear; `-c`/`--clear` →
+clear; unrecognized → fall through.
 
 ### 6.6 `portald clip copy` (the write-side arbiter)
 
 ```
-portald clip copy text  [--trim]   reads stdin, ≤ text cap
-portald clip copy text --empty-clears   pbcopy-only empty-input mapping
+portald clip copy text [--trim] [--empty-clears]   reads stdin, ≤ text cap; empty may map to clear
 portald clip copy image png        reads stdin, ≤ 8 MiB, verifies PNG magic BEFORE sending
 portald clip copy clear
 ```

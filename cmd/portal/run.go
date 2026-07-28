@@ -530,6 +530,9 @@ func serveClipWriteRequest(ctx context.Context, deps clipWriteDeps,
 		if err != nil {
 			logClipWriteLine(deps, fmt.Sprintf(
 				"clip-write: pull failed (nonce=%d kind=%s): %v", req.Nonce, kind, err))
+			// The fixed denial vocabulary classifies unavailable side-channel
+			// bytes as shamismatch.
+			deps.Audit.ClipWriteDenied(deps.Host, kind, "shamismatch")
 			return resp
 		}
 		if int64(len(data)) != req.Size || clipupload.ShortSHA(data) != req.SHA {
@@ -548,6 +551,8 @@ func serveClipWriteRequest(ctx context.Context, deps clipWriteDeps,
 		err = deps.Writer.SetImagePNG(cctx, data)
 	case "clear":
 		err = deps.Writer.Clear(cctx)
+	default:
+		return denyClipWriteResponse(deps, resp, kind, "badsha")
 	}
 	if err != nil {
 		logClipWriteLine(deps, fmt.Sprintf(
@@ -617,14 +622,14 @@ func pullClipWrite(ctx context.Context, t transport.Transport, sha, ext string, 
 		return nil, fmt.Errorf("pull clipboard bytes: invalid size %d", size)
 	}
 	script := fmt.Sprintf(
-		`f="$HOME/.cache/portal/clip/copy-%s%s"; if [ -L "$f" ] || [ ! -f "$f" ]; then exit 1; fi; exec /usr/bin/head -c %d < "$f"`,
+		`f="$HOME/.cache/portal/clip/copy-%s%s"; if [ -L "$f" ] || [ ! -f "$f" ]; then exit 1; fi; exec head -c %d < "$f"`,
 		sha, ext, size,
 	)
 
 	pullCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stdin, stdout, stderr, wait, err := t.Stream(pullCtx,
-		"BASH_ENV=/dev/null", "/bin/bash", "--noprofile", "--norc", "-c",
+		"BASH_ENV=/dev/null", "bash", "--noprofile", "--norc", "-c",
 		clipWriteShellQuote(script))
 	if err != nil {
 		return nil, fmt.Errorf("pull clipboard bytes: %w", err)
