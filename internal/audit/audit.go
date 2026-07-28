@@ -75,8 +75,10 @@ func (l *Log) ClipWriteDenied(host, kind, reason string) {
 }
 
 // CredServed records that a credential was delivered after user approval.
-// source is "prompt", "prompt-remembered", or "keychain"; dur is the full
-// approval latency. The secret is deliberately outside this API.
+// source is "prompt", "prompt-remembered", "keychain" (remembered item
+// released by a Dialog B click), or "keychain-touchid" (remembered item
+// released by a Touch ID / Apple Watch approval); dur is the full approval
+// latency. The secret is deliberately outside this API.
 func (l *Log) CredServed(host, label, mode, source string, dur time.Duration) {
 	l.write("cred-served", "host="+host, "label="+oneLine(label), "mode="+mode,
 		"source="+source, "dur="+dur.String())

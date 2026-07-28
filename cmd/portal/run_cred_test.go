@@ -948,6 +948,112 @@ func TestServeCredRequest_RememberedForgetRepromptEnablesTouchIDEnrollment(t *te
 	assertSecretNotRecorded(t, deps, state, secret)
 }
 
+// The T6 guard is a conjunction: biometry availability alone must not enroll a
+// non-askpass credential, including on the Forget re-prompt path.
+func TestServeCredRequest_RememberedForgetRepromptNonAskpassSkipsEnrollment(t *testing.T) {
+	secret := []byte("replacement-env-fake")
+	call := 0
+	p := &prompt.Fake{PromptFunc: func(_ context.Context, req prompt.Request) (prompt.Decision, error) {
+		call++
+		switch call {
+		case 1:
+			if !req.Remembered || req.TouchIDEnroll {
+				t.Fatalf("first prompt = %+v, want remembered Dialog B without enrollment", req)
+			}
+			return prompt.Decision{Outcome: prompt.OutcomeForget}, nil
+		case 2:
+			if req.Remembered || req.TouchIDEnroll {
+				t.Fatalf("replacement prompt = %+v, want fresh Dialog A WITHOUT Touch ID enrollment", req)
+			}
+			return prompt.Decision{Outcome: prompt.OutcomeAllowOnce, Secret: secret}, nil
+		default:
+			t.Fatal("unexpected third credential prompt")
+			return prompt.Decision{Outcome: prompt.OutcomeUnavailable}, nil
+		}
+	}}
+	b := &prompt.BiometryFake{
+		AvailableResult: true,
+		Outcome:         prompt.BiometryFallback,
+	}
+	kc := &fakeCredKeychain{getResults: []fakeCredGetResult{{
+		secret: []byte("remembered-env-fake"), found: true,
+	}}}
+	deps, state := newCredTestDeps(t, p, kc)
+	deps.Biometry = b
+
+	resp := serveCredRequest(context.Background(), deps, baseCredEvent())
+	assertCredResponse(t, resp, &protocol.CredResponse{
+		Nonce: 41, Epoch: 7, OK: true, Secret: secret,
+	})
+	if len(p.Requests()) != 2 {
+		t.Fatalf("prompt requests = %d, want remembered then replacement", len(p.Requests()))
+	}
+	assertSecretNotRecorded(t, deps, state, secret)
+}
+
+// T7: the Touch ID attempt spends from the ONE 115s request budget. Time the
+// availability probe consumes must come out of the approval's deadline — a
+// regression granting Touch ID a fresh full budget must fail here.
+func TestServeCredRequest_TouchIDBudgetExcludesProbeTime(t *testing.T) {
+	current := []byte("touchid-budget-fake")
+	var state *credTestState
+	var approveContextDeadline time.Time
+	var approveContextHasDeadline bool
+	b := &prompt.BiometryFake{
+		AvailableFunc: func(context.Context) bool {
+			// The probe consumes 30 seconds of the shared dialog budget.
+			state.setNow(state.nowTime().Add(30 * time.Second))
+			return true
+		},
+		ApproveFunc: func(ctx context.Context, _ string, _ time.Time) (prompt.BiometryOutcome, error) {
+			approveContextDeadline, approveContextHasDeadline = ctx.Deadline()
+			return prompt.BiometryApproved, nil
+		},
+	}
+	p := &prompt.Fake{}
+	kc := &fakeCredKeychain{getResults: []fakeCredGetResult{
+		{secret: current, found: true},
+		{secret: current, found: true},
+	}}
+	deps, testState := newCredTestDeps(t, p, kc)
+	state = testState
+	deps.Biometry = b
+	started := state.nowTime()
+
+	before := time.Now()
+	resp := serveCredRequest(context.Background(), deps, baseCredEvent())
+	after := time.Now()
+	assertCredResponse(t, resp, &protocol.CredResponse{
+		Nonce: 41, Epoch: 7, OK: true, Secret: current,
+	})
+	biometryRequests := b.Requests()
+	wantBiometry := prompt.BiometryRequest{
+		Reason: `portal: approve credential "database" for box`,
+		// Anchored to the REQUEST start, not the post-probe clock: 30 probe
+		// seconds leave 85, never a fresh 115.
+		Deadline: started.Add(credDialogBudget),
+	}
+	if len(biometryRequests) != 1 || biometryRequests[0] != wantBiometry {
+		t.Fatalf("biometry requests = %#v, want %#v", biometryRequests, []prompt.BiometryRequest{wantBiometry})
+	}
+	if !approveContextHasDeadline {
+		t.Fatal("Touch ID approval context has no deadline")
+	}
+	remaining := credDialogBudget - 30*time.Second
+	if approveContextDeadline.Before(before.Add(remaining)) ||
+		approveContextDeadline.After(after.Add(remaining)) {
+		t.Fatalf("Touch ID approval context deadline = %v, want call time + %v (budget minus probe time)",
+			approveContextDeadline, remaining)
+	}
+	if len(p.Requests()) != 0 {
+		t.Fatalf("approved Touch ID request still prompted: %#v", p.Requests())
+	}
+	assertCredAudit(t, deps.Audit, []string{
+		"cred-served", "host=box", "label=database", "mode=env", "source=keychain-touchid", "dur=30s",
+	})
+	assertSecretNotRecorded(t, deps, state, current)
+}
+
 func TestServeCredRequest_ForgetRepromptUsesRemainingDialogBudget(t *testing.T) {
 	secret := []byte("budgeted-replacement-fake")
 	var state *credTestState
