@@ -1,11 +1,10 @@
 // Package clipshim deploys (and removes) portal's transparent dev-box shims:
-// xdg-open, clipboard readers xclip/wl-paste, and the credential-facing portal,
-// portal-askpass, and sudo wrappers. Shell rc blocks put ~/.local/bin first on
-// PATH and select portal-askpass only while it is executable and the user has
-// not configured another SUDO_ASKPASS. A coding agent's own Ctrl+V execs
-// xclip/wl-paste; those shims relay the read to the Mac via `portald clip`,
-// which serves the Mac clipboard over the existing portal connection (DESIGN
-// §6).
+// xdg-open; clipboard readers and writers xclip/wl-paste/wl-copy/pbcopy/
+// pbpaste/xsel; and the credential-facing portal, portal-askpass, and sudo
+// wrappers. Shell rc blocks put ~/.local/bin first on PATH and select
+// portal-askpass only while it is executable and the user has not configured
+// another SUDO_ASKPASS. Clipboard shims relay reads from and writes to the Mac
+// via `portald clip` over the existing portal connection (DESIGN §6).
 //
 // The deploy is idempotent and DAEMON-DRIVEN (DESIGN §9.1): both `portal
 // install` (first run) and the agentclient reconnect loop call Ensure after the
@@ -32,9 +31,9 @@ import (
 // reconnect without a manual reinstall (DESIGN §9.1). Bump this whenever any
 // shim script below changes.
 //
-// v7 covers bash login and sshd-sourced non-interactive shells, and lets the
-// sudo shim select portal-askpass when no startup file exported it.
-const Version = "7"
+// v8 adds conservative clipboard-write argv parsing and the wl-copy, pbcopy,
+// pbpaste, and xsel shims without changing the read-side degrade.
+const Version = "8"
 
 // Marker is the exact string grep -qF searches for to decide whether the
 // currently-deployed shim is already at Version (skip re-deploy).
@@ -75,46 +74,102 @@ exec "$_real" "$@"
 exit 0
 `
 
-// xclipShim is installed at ~/.local/bin/xclip. It intercepts a coding agent's
-// clipboard IMAGE and TEXT reads (and TARGETS probes) and relays them to the
-// Mac via `portald clip`. Modeled on the xdg-open wrapper (DESIGN §6.2) and on
-// cc-clip's xclip shim flag surface.
-//
-// Scope: TARGETS probes, image/png reads, and text reads (UTF8_STRING / TEXT /
-// STRING / text/plain, plus the bare `-selection clipboard -o`). The Mac
-// decides image-vs-text on a TARGETS probe and gates text behind its capability
-// + concealed-clipboard skip (DESIGN §7.1); a disabled/concealed text read
-// answers "none" and falls through here. An -t image/bmp (or any non-png image)
-// request falls through rather than receiving PNG bytes mislabeled as another
-// format (format honesty).
-//
-// Every interception is `… && exit 0`: a non-zero `portald clip` (no client,
-// rejected, empty clipboard, dial failure — all of it) short-circuits to the
-// real-binary fallback, so the agent never sees a spurious error and never
-// hangs beyond portald clip's own deadline. Recursion is avoided by resolving
-// the real xclip with a quoted IFS loop that treats PATH entries strictly as
-// data, skips our own dir and empty entries, and rejects a logical-path alias
-// of this wrapper. A headless box with no real xclip degrades to empty stdout =
-// "no content", which is the correct answer.
+const clipWriteFailMsg = "portal: clipboard write failed (no Mac client connected)"
+
+// clipWriteRelay preserves stdin for a real-binary fallback. Clipboard bytes
+// touch disk only when such a fallback exists, and the 0600 file is opened
+// before unlink so the exec'd binary receives the original byte stream.
+const clipWriteRelay = `_relay_stdin() {
+    [ -x "$_portald" ] || return 1
+    if [ -z "$_real" ]; then
+        _copy 2>/dev/null && exit 0
+        return 1
+    fi
+    _tmp=$(mktemp "${TMPDIR:-/tmp}/portal-clip.XXXXXX" 2>/dev/null) || return 1
+    trap 'rm -f "$_tmp"' EXIT HUP INT TERM
+    if ! cat > "$_tmp"; then
+        rm -f "$_tmp"
+        printf '%s\n' 'portal: clipboard write failed (cannot buffer input)' >&2
+        exit 1
+    fi
+    if _copy < "$_tmp" 2>/dev/null; then
+        rm -f "$_tmp"
+        exit 0
+    fi
+    exec 0< "$_tmp"
+    rm -f "$_tmp"
+    return 1
+}
+_relay_argv() {
+    [ -x "$_portald" ] || return 1
+    printf '%s' "$_text" | _copy 2>/dev/null && exit 0
+    return 1
+}
+_relay_noinput() {
+    [ -x "$_portald" ] || return 1
+    _copy < /dev/null 2>/dev/null && exit 0
+    return 1
+}
+`
+
+const clipWriteTail = `if [ -n "$_real" ]; then exec "$_real" "$@"; fi
+if [ "$_mode" = write ]; then
+    printf '%s\n' '` + clipWriteFailMsg + `' >&2
+    exit 1
+fi
+exit 0
+`
+
+// xclipShim parses only enumerated legal prefixes of xclip's canonical
+// options. Unknown or ambiguous tokens permanently disable interception, while
+// later mode flags still select the correct read/write failure behavior.
 const xclipShim = `#!/bin/sh
-# ` + Marker + `. Intercepts clipboard IMAGE and TEXT reads for coding agents
-# and relays them to the Mac via portald; falls through to the real xclip on
-# clipboard writes, anything unrecognized, or any failure.
+# ` + Marker + `. Intercepts clipboard reads and writes for coding agents
+# and relays them to the Mac via portald; unrecognized forms fall through.
 _portald="${HOME}/.cache/portal/portald"
-_args="$*"
-case "$_args" in
-  *"-t TARGETS"*"-o"*)
-    [ -x "$_portald" ] && "$_portald" clip targets xclip 2>/dev/null && exit 0 ;;
-  *"-t image/png"*"-o"*)
-    [ -x "$_portald" ] && "$_portald" clip image png 2>/dev/null && exit 0 ;;
-  # image/bmp (and any non-png image): portal only serves PNG — do NOT hand
-  # PNG bytes mislabeled as another type. Fall through so the agent's png
-  # branch wins or it concludes no-image cleanly.
-  *"-t UTF8_STRING"*-o*|*"-t TEXT"*-o*|*"-t STRING"*-o*|*"-t text/plain"*-o*|*"-selection clipboard -o"*|*"-o -selection clipboard"*)
-    [ -x "$_portald" ] && "$_portald" clip text 2>/dev/null && exit 0 ;;
-esac
-# Fallback: inspect PATH entries as data, excluding our own dir and empty
-# entries. Never feed PATH through a shell parser.
+_mode=write
+_sel=primary
+_target=""
+_trim=0
+_ok=1
+_want=""
+for _a in "$@"; do
+    if [ -n "$_want" ]; then
+        case "$_want" in
+          sel) _sel=$_a ;;
+          target) _target=$_a ;;
+          skip) : ;;
+        esac
+        _want=""
+        continue
+    fi
+    case "$_a" in
+      -*=*) _ok=0 ;;
+      -o|-ou|-out) _mode=read ;;
+      -i|-in) _mode=write ;;
+      -se|-sel|-sele|-selec|-select|-selecti|-selectio|-selection) _want=sel ;;
+      -t|-ta|-tar|-targ|-targe|-target) _want=target ;;
+      -r|-rm|-rml|-rmla|-rmlas|-rmlast|-rmlastn|-rmlastnl) _trim=1 ;;
+      -d|-di|-dis|-disp|-displ|-displa|-display) _want=skip ;;
+      -l|-lo|-loo|-loop|-loops) _want=skip ;;
+      -n|-no|-nou|-nout|-noutf|-noutf8) : ;;
+      -q|-qu|-qui|-quie|-quiet) : ;;
+      -si|-sil|-sile|-silen|-silent) : ;;
+      -verb|-verbo|-verbos|-verbose) : ;;
+      -h|-he|-hel|-help|-vers|-versi|-versio|-version) _mode=info; _ok=0 ;;
+      *) _ok=0 ;;
+    esac
+done
+[ -z "$_want" ] || _ok=0
+if [ "$_ok" = 1 ]; then
+    _sl=$(printf '%s' "$_sel" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz' 2>/dev/null)
+    case "$_sl" in
+      p|pr|pri|prim|prima|primar|primary) : ;;
+      s|se|sec|seco|secon|second|seconda|secondar|secondary) : ;;
+      c|cl|cli|clip|clipb|clipbo|clipboa|clipboar|clipboard) : ;;
+      *) _ok=0 ;;
+    esac
+fi
 _wrapper_dir=$(cd "$(dirname "$0")" && pwd)
 _real=""
 _oifs=$IFS; IFS=:
@@ -124,12 +179,31 @@ for _d in $PATH; do
     if [ -x "$_d/xclip" ]; then _real="$_d/xclip"; break; fi
 done
 IFS=$_oifs
-if [ -z "$_real" ]; then
-    exit 0
+` + clipWriteRelay + `if [ "$_ok" = 1 ]; then
+    case "$_mode:$_target" in
+      read:TARGETS)
+        [ -x "$_portald" ] && "$_portald" clip targets xclip 2>/dev/null && exit 0 ;;
+      read:image/png)
+        [ -x "$_portald" ] && "$_portald" clip image png 2>/dev/null && exit 0 ;;
+      read:image/*) : ;;
+      read:|read:UTF8_STRING|read:TEXT|read:STRING|read:text/*)
+        [ -x "$_portald" ] && "$_portald" clip text 2>/dev/null && exit 0 ;;
+      write:image/png)
+        _copy() { "$_portald" clip copy image png; }
+        _relay_stdin ;;
+      write:image/*) : ;;
+      write:|write:UTF8_STRING|write:TEXT|write:STRING|write:text/*)
+        _copy() {
+            if [ "$_trim" = 1 ]; then
+                "$_portald" clip copy text --trim
+            else
+                "$_portald" clip copy text
+            fi
+        }
+        _relay_stdin ;;
+    esac
 fi
-exec "$_real" "$@"
-exit 0   # headless box, no real xclip: empty stdout = "no image" (correct degrade)
-`
+` + clipWriteTail
 
 // wlPasteShim is installed at ~/.local/bin/wl-paste. wl-paste is opencode's
 // PRIMARY image path (it tries `wl-paste -t image/png` BEFORE xclip), so this
@@ -175,6 +249,193 @@ exec "$_real" "$@"
 exit 0   # headless box, no real wl-paste: empty stdout = "no image" (correct degrade)
 `
 
+// wlCopyShim implements wl-copy's write-only surface. Positional presence is
+// tracked separately from content so empty argv elements remain part of the
+// space-joined payload instead of being mistaken for absent argv.
+const wlCopyShim = `#!/bin/sh
+# ` + Marker + `. Intercepts wl-copy clipboard writes and relays them to the Mac
+# via portald; unrecognized forms fall through to the real wl-copy.
+_portald="${HOME}/.cache/portal/portald"
+_mode=write
+_type=""
+_trim=0
+_clear=0
+_ok=1
+_want=""
+_endopts=0
+_text=""
+_has_text=0
+for _a in "$@"; do
+    if [ -n "$_want" ]; then
+        case "$_want" in
+          type) _type=$_a ;;
+          skip) : ;;
+        esac
+        _want=""
+        continue
+    fi
+    if [ "$_endopts" = 1 ]; then
+        if [ "$_has_text" = 1 ]; then _text="$_text $_a"; else _text=$_a; fi
+        _has_text=1
+        continue
+    fi
+    case "$_a" in
+      --) _endopts=1 ;;
+      --type=*) _type=${_a#--type=} ;;
+      -t|--type) _want=type ;;
+      -s|--seat) _want=skip ;;
+      --seat=*) : ;;
+      -n|--trim-newline) _trim=1 ;;
+      -c|--clear) _clear=1 ;;
+      -p|--primary|-o|--paste-once|-f|--foreground) : ;;
+      -h|--help|-v|--version) _mode=info; _ok=0 ;;
+      --*) _ok=0 ;;
+      -) _ok=0 ;;
+      -?*)
+        case "${_a#-}" in *[!pnocf]*) _ok=0 ;; esac
+        case "${_a#-}" in *n*) _trim=1 ;; esac
+        case "${_a#-}" in *c*) _clear=1 ;; esac ;;
+      *)
+        if [ "$_has_text" = 1 ]; then _text="$_text $_a"; else _text=$_a; fi
+        _has_text=1 ;;
+    esac
+done
+[ -z "$_want" ] || _ok=0
+_wrapper_dir=$(cd "$(dirname "$0")" && pwd)
+_real=""
+_oifs=$IFS; IFS=:
+for _d in $PATH; do
+    [ "$_d" = "$_wrapper_dir" ] && continue
+    [ -n "$_d" ] || continue
+    if [ -x "$_d/wl-copy" ]; then _real="$_d/wl-copy"; break; fi
+done
+IFS=$_oifs
+` + clipWriteRelay + `if [ "$_ok" = 1 ]; then
+    if [ "$_clear" = 1 ]; then
+        _copy() { "$_portald" clip copy clear; }
+        _relay_noinput
+    else
+        case "$_type" in
+          ""|UTF8_STRING|TEXT|STRING|text/*)
+            _copy() {
+                if [ "$_trim" = 1 ]; then
+                    "$_portald" clip copy text --trim
+                else
+                    "$_portald" clip copy text
+                fi
+            }
+            if [ "$_has_text" = 1 ]; then _relay_argv; else _relay_stdin; fi ;;
+          image/png)
+            _copy() { "$_portald" clip copy image png; }
+            if [ "$_has_text" = 1 ]; then _relay_argv; else _relay_stdin; fi ;;
+        esac
+    fi
+fi
+` + clipWriteTail
+
+// pbCopyShim buffers once to distinguish empty stdin, which maps to clear.
+// pbcopy has no real-binary fallback on the target Linux dev boxes.
+const pbCopyShim = `#!/bin/sh
+# ` + Marker + `. Intercepts pbcopy clipboard writes and relays them to the Mac.
+_portald="${HOME}/.cache/portal/portald"
+_fail() {
+    printf '%s\n' '` + clipWriteFailMsg + `' >&2
+    exit 1
+}
+[ -x "$_portald" ] || _fail
+_tmp=$(mktemp "${TMPDIR:-/tmp}/portal-pbcopy.XXXXXX" 2>/dev/null)
+if [ -z "$_tmp" ]; then
+    "$_portald" clip copy text 2>/dev/null && exit 0
+    _fail
+fi
+trap 'rm -f "$_tmp"' EXIT HUP INT TERM
+cat > "$_tmp" || _fail
+if [ -s "$_tmp" ]; then
+    "$_portald" clip copy text < "$_tmp" 2>/dev/null && exit 0
+else
+    "$_portald" clip copy clear < /dev/null 2>/dev/null && exit 0
+fi
+_fail
+`
+
+// pbPasteShim keeps read-side failure semantics: no clipboard content is an
+// empty stdout stream with a successful exit.
+const pbPasteShim = `#!/bin/sh
+# ` + Marker + `. Intercepts pbpaste clipboard reads and relays them from the Mac.
+_portald="${HOME}/.cache/portal/portald"
+[ -x "$_portald" ] && "$_portald" clip text 2>/dev/null && exit 0
+exit 0
+`
+
+// xselShim supports the conservative input/output/clear surface, including
+// xsel's stdin-tty default and bundled selection/mode flags.
+const xselShim = `#!/bin/sh
+# ` + Marker + `. Intercepts xsel clipboard reads and writes and relays them
+# to the Mac via portald; unrecognized forms fall through to the real xsel.
+_portald="${HOME}/.cache/portal/portald"
+_has_i=0
+_has_o=0
+_clear=0
+_info=0
+_ok=1
+for _a in "$@"; do
+    case "$_a" in
+      --input) _has_i=1 ;;
+      --output) _has_o=1 ;;
+      --clear) _clear=1 ;;
+      --clipboard|--primary|--secondary|--nodetach) : ;;
+      --help|--version) _info=1; _ok=0 ;;
+      --*) _ok=0 ;;
+      -) _ok=0 ;;
+      -?*)
+        case "${_a#-}" in *[!iobpscn]*) _ok=0 ;; esac
+        case "${_a#-}" in *i*) _has_i=1 ;; esac
+        case "${_a#-}" in *o*) _has_o=1 ;; esac
+        case "${_a#-}" in *c*) _clear=1 ;; esac ;;
+      *) _ok=0 ;;
+    esac
+done
+if [ "$_info" = 1 ]; then
+    _mode=info
+elif [ "$_has_i" = 1 ] && [ "$_has_o" = 1 ]; then
+    _mode=write
+    _ok=0
+elif [ "$_clear" = 1 ] && [ "$_has_i" = 1 ]; then
+    _mode=write
+    _ok=0
+elif [ "$_clear" = 1 ]; then
+    _mode=write
+elif [ "$_has_i" = 1 ]; then
+    _mode=write
+elif [ "$_has_o" = 1 ]; then
+    _mode=read
+elif [ -t 0 ]; then
+    _mode=read
+else
+    _mode=write
+fi
+_wrapper_dir=$(cd "$(dirname "$0")" && pwd)
+_real=""
+_oifs=$IFS; IFS=:
+for _d in $PATH; do
+    [ "$_d" = "$_wrapper_dir" ] && continue
+    [ -n "$_d" ] || continue
+    if [ -x "$_d/xsel" ]; then _real="$_d/xsel"; break; fi
+done
+IFS=$_oifs
+` + clipWriteRelay + `if [ "$_ok" = 1 ]; then
+    if [ "$_clear" = 1 ]; then
+        _copy() { "$_portald" clip copy clear; }
+        _relay_noinput
+    elif [ "$_mode" = write ]; then
+        _copy() { "$_portald" clip copy text; }
+        _relay_stdin
+    elif [ "$_mode" = read ]; then
+        [ -x "$_portald" ] && "$_portald" clip text 2>/dev/null && exit 0
+    fi
+fi
+` + clipWriteTail
+
 // NotifyHookMarker is the portal-ownership marker on the Claude Code hook
 // command line in settings.json AND on the notify-hook script. It mirrors
 // cc-clip's CC_CLIP_MANAGED=1 prefix: the settings.json merge strips any hook
@@ -214,6 +475,10 @@ var shims = []struct {
 	{"xdg-open", XDGOpenWrapper},
 	{"xclip", xclipShim},
 	{"wl-paste", wlPasteShim},
+	{"wl-copy", wlCopyShim},
+	{"pbcopy", pbCopyShim},
+	{"pbpaste", pbPasteShim},
+	{"xsel", xselShim},
 	{"portal", portalShim},
 	{"portal-askpass", portalAskpassShim},
 	{"sudo", sudoShim},
@@ -245,8 +510,8 @@ const (
 // ~/.bash_profile and ~/.bash_login files receive it too so bash login shells
 // that select either file do not bypass the shims.
 const pathPrependSnippet = PathMarkerStart + `
-# Ensures portal's shims (~/.local/bin/xdg-open, xclip, wl-paste, portal,
-# portal-askpass, sudo) win on PATH.
+# Ensures portal's shims (~/.local/bin/xdg-open, xclip, wl-paste, wl-copy,
+# pbcopy, pbpaste, xsel, portal, portal-askpass, sudo) win on PATH.
 PATH="$HOME/.local/bin:$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$HOME/.local/bin" | paste -sd: -)"
 export PATH
 ` + PathMarkerEnd
@@ -339,6 +604,15 @@ func currentShimsProbe() string {
 		checks = append(checks, fmt.Sprintf(`grep -qF %q ~/.local/bin/%s 2>/dev/null`, Marker, sh.name))
 	}
 	return strings.Join(checks, " && ") + " && echo current || echo stale"
+}
+
+// shimNames returns the deployment table's basenames for uninstall.
+func shimNames() string {
+	names := make([]string, 0, len(shims))
+	for _, sh := range shims {
+		names = append(names, sh.name)
+	}
+	return strings.Join(names, " ")
 }
 
 // ensureNotifyHook deploys the notify-hook script to ~/.local/bin and merges
@@ -521,11 +795,11 @@ done`, rcList, PathMarkerStart, conditionalRCList, PathMarkerStart)
 }
 
 // Remove deletes everything portal deploys to the dev box's ~/.local/bin and
-// shell rc files: the xdg-open wrapper; the xclip, wl-paste, portal,
-// portal-askpass, and sudo shims; the portald symlink; the env snippet; and all
-// three shell marker blocks. It restores any pre-existing binaries backed up
-// at install (preserving type via `mv`, which keeps a backed-up symlink a
-// symlink) and never touches /usr/bin (DESIGN §9.3/§9.4).
+// shell rc files: every entry in the shims deployment table; the portald
+// symlink; the env snippet; and all three shell marker blocks. It restores any
+// pre-existing binaries backed up at install (preserving type via `mv`, which
+// keeps a backed-up symlink a symlink) and never touches /usr/bin (DESIGN
+// §9.3/§9.4).
 //
 // Each rc-file edit strips the env.sh source line and all marker blocks
 // (start..end inclusive) with awk range deletes keyed on the stable markers.
@@ -537,7 +811,7 @@ func Remove(ctx context.Context, tr transport.Transport) {
 # symlink type via mv. A backup carrying the portal ownership marker is our
 # own shim (copied there by an older release's versioned backup grep): delete
 # it with the shim so uninstall never resurrects a stale portal shim.
-for bin in xdg-open xclip wl-paste portal portal-askpass sudo; do
+for bin in %[8]s; do
     if [ -e ~/.local/bin/"$bin".portal-backup ] && ! grep -qF %[7]q ~/.local/bin/"$bin".portal-backup 2>/dev/null; then
         mv ~/.local/bin/"$bin".portal-backup ~/.local/bin/"$bin"
     else
@@ -597,7 +871,7 @@ for rc in ~/.bashrc ~/.zshrc ~/.zshenv ~/.profile ~/.bash_profile ~/.bash_login;
         { print }
     ' "$rc" > "$tmp" && cat "$tmp" > "$rc"
     rm -f "$tmp"
-done`, EarlyPathMarkerStart, EarlyPathMarkerEnd, PathMarkerStart, PathMarkerEnd, AskpassMarkerStart, AskpassMarkerEnd, ownershipMarker)
+done`, EarlyPathMarkerStart, EarlyPathMarkerEnd, PathMarkerStart, PathMarkerEnd, AskpassMarkerStart, AskpassMarkerEnd, ownershipMarker, shimNames())
 	_, _, _ = tr.Exec(ctx, nil, "bash", "-c", shellQuote(script))
 }
 
