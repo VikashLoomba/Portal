@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -374,6 +375,144 @@ func (s *e2eSession) close() {
 	s.wg.Wait()
 }
 
+func TestHandshakeAnswersFromTheSessionLockAlone(t *testing.T) {
+	c := New(Config{})
+	ack := &protocol.HelloAck{
+		BootID:   "boot-1",
+		Services: map[string]uint32{"clipwrite": 1},
+	}
+	c.snapMu.Lock()
+	c.helloAck = ack
+	c.snapMu.Unlock()
+	c.streamMu.Lock()
+	c.enc = protocol.NewEncoder(io.Discard)
+	c.sessAck = ack
+	c.streamMu.Unlock()
+
+	// This deliberately pins that Handshake answers from the session lock
+	// domain alone. A Connected()+HelloAck() composition blocks on snapMu here
+	// and reintroduces the teardown gap this accessor exists to close.
+	c.snapMu.Lock()
+	type result struct {
+		ack *protocol.HelloAck
+		ok  bool
+	}
+	done := make(chan result, 1)
+	go func() {
+		got, ok := c.Handshake()
+		done <- result{ack: got, ok: ok}
+	}()
+	select {
+	case got := <-done:
+		c.snapMu.Unlock()
+		if !got.ok || got.ack == nil || got.ack.BootID != "boot-1" {
+			t.Fatalf("Handshake = (%#v, %v), want boot-1, true", got.ack, got.ok)
+		}
+	case <-time.After(2 * time.Second):
+		c.snapMu.Unlock()
+		t.Fatal("Handshake blocked on snapMu; it must answer from streamMu alone")
+	}
+}
+
+func TestHandshakeUnderSessionChurn(t *testing.T) {
+	c := New(Config{})
+	var stop atomic.Bool
+	var readers sync.WaitGroup
+	ready := make(chan struct{}, 4)
+	start := make(chan struct{})
+	active := make(chan struct{}, 4)
+	for range 4 {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			ready <- struct{}{}
+			<-start
+			_, _ = c.Handshake()
+			active <- struct{}{}
+			for !stop.Load() {
+				ack, ok := c.Handshake()
+				if ok != (ack != nil) {
+					t.Errorf("torn Handshake result: ack=%#v ok=%v", ack, ok)
+				}
+				if ok && ack.BootID == "" {
+					t.Errorf("live Handshake returned empty BootID: %#v", ack)
+				}
+				_ = c.Connected()
+				_ = c.HelloAck()
+			}
+		}()
+	}
+	for range 4 {
+		<-ready
+	}
+	close(start)
+	for range 4 {
+		<-active
+	}
+
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for i := range 500 {
+			ack := &protocol.HelloAck{
+				BootID:   fmt.Sprintf("boot-%d", i),
+				Services: map[string]uint32{"clipwrite": 1},
+			}
+			c.snapMu.Lock()
+			c.helloAck = ack
+			c.snapMu.Unlock()
+
+			c.streamMu.Lock()
+			c.enc = protocol.NewEncoder(io.Discard)
+			c.sessAck = ack
+			c.streamMu.Unlock()
+
+			c.streamMu.Lock()
+			c.enc = nil
+			c.sessAck = nil
+			c.streamMu.Unlock()
+		}
+	}()
+	<-writerDone
+	stop.Store(true)
+	readers.Wait()
+
+	if ack, ok := c.Handshake(); ok || ack != nil {
+		t.Fatalf("settled Handshake = (%#v, %v), want nil, false", ack, ok)
+	}
+	if c.HelloAck() == nil {
+		t.Fatal("last-seen HelloAck must survive settled disconnect")
+	}
+}
+
+func TestHandshakeIsFalseAfterSessionEnds(t *testing.T) {
+	sess := newE2ESession(t, nil, nil, nil)
+	defer sess.close()
+
+	ack, ok := sess.c.Handshake()
+	if !ok || ack == nil {
+		t.Fatalf("live Handshake = (%#v, %v), want non-nil, true", ack, ok)
+	}
+	if got := ack.Services["clipwrite"]; got != 1 {
+		t.Fatalf("live HelloAck clipwrite service = %d, want 1", got)
+	}
+	if !sess.c.Connected() {
+		t.Fatal("Connected = false during live session")
+	}
+
+	sess.close()
+
+	if sess.c.Connected() {
+		t.Fatal("Connected = true after session ended")
+	}
+	if ack, ok := sess.c.Handshake(); ok || ack != nil {
+		t.Fatalf("post-disconnect Handshake = (%#v, %v), want nil, false", ack, ok)
+	}
+	if sess.c.HelloAck() == nil {
+		t.Fatal("last-seen HelloAck was cleared when the session ended")
+	}
+}
+
 // ask dials the agent's cmd socket, writes line, and returns the raw reply.
 func (s *e2eSession) ask(t *testing.T, line string) string {
 	t.Helper()
@@ -409,6 +548,31 @@ func (s *e2eSession) serveClip(ctx context.Context, sha string) {
 			}
 		}
 	}()
+}
+
+func (s *e2eSession) serveClipWrite(ctx context.Context) <-chan protocol.ClipWriteRequest {
+	requests := make(chan protocol.ClipWriteRequest, 1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev := <-s.c.ClipWriteEvents():
+				if ev.ClipWrite == nil {
+					continue
+				}
+				requests <- protocol.ClipWriteRequest{
+					Nonce: ev.ClipWrite.Nonce, Epoch: ev.ClipWrite.Epoch,
+					Kind: ev.ClipWrite.Kind, Format: ev.ClipWrite.Format,
+					SHA: ev.ClipWrite.SHA, Size: ev.ClipWrite.Size,
+				}
+				_ = s.c.SendClipWriteResponse(&protocol.ClipWriteResponse{
+					Nonce: ev.ClipWrite.Nonce, Epoch: ev.ClipWrite.Epoch, OK: true,
+				})
+			}
+		}
+	}()
+	return requests
 }
 
 // serveCred drains the client's dedicated credential channel and approves each
@@ -496,13 +660,14 @@ func openurlHandler(version uint32, deliver func(EngineEvent)) HandlerSpec {
 	}
 }
 
-// TestE2EAllFourServicesRoundTrip drives openurl, notify, clip, and cred end to
-// end over a real agent+client pipe, both auto-registering all four services.
+// TestE2EAllFiveServicesRoundTrip drives openurl, notify, clip, clipwrite, and
+// cred end to end over a real agent+client pipe, both auto-registering all five
+// services.
 // Every feature crosses via Msg frames ONLY (the legacy Envelope fields are
 // deleted — compiler-enforced, and asserted by the agent's deletion-invariant
 // test). HelloAck.Services proves the reverse-direction advertisement; the cmd
 // replies prove the agent recorded the client's services (forward).
-func TestE2EAllFourServicesRoundTrip(t *testing.T) {
+func TestE2EAllFiveServicesRoundTrip(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef"
 	secret := []byte("s3kr3t-vector")
 	sess := newE2ESession(t, nil, nil, nil)
@@ -512,7 +677,7 @@ func TestE2EAllFourServicesRoundTrip(t *testing.T) {
 	if ack == nil {
 		t.Fatal("no HelloAck")
 	}
-	for _, svc := range []string{"openurl", "notify", "clip", "cred"} {
+	for _, svc := range []string{"openurl", "notify", "clip", "clipwrite", "cred"} {
 		if v, ok := ack.Services[svc]; !ok || v != 1 {
 			t.Fatalf("HelloAck.Services[%q] = %d (present %v), want 1", svc, v, ok)
 		}
@@ -521,6 +686,7 @@ func TestE2EAllFourServicesRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess.serveClip(ctx, sha)
+	clipWrites := sess.serveClipWrite(ctx)
 	sess.serveCred(ctx, secret)
 
 	// openurl.
@@ -542,6 +708,20 @@ func TestE2EAllFourServicesRoundTrip(t *testing.T) {
 	// clip.
 	if got := sess.ask(t, "clip\timage\tpng\n"); got != "ok\t"+sha+"\n" {
 		t.Fatalf("clip = %q, want ok\\t<sha>\\n", got)
+	}
+
+	// clipwrite.
+	if got := sess.ask(t, "copy\ttext\t"+sha+"\t42\n"); got != "ok\n" {
+		t.Fatalf("clipwrite = %q, want ok\\n", got)
+	}
+	select {
+	case req := <-clipWrites:
+		if req.Nonce == 0 || req.Epoch == 0 || req.Kind != "text" ||
+			req.Format != "" || req.SHA != sha || req.Size != 42 {
+			t.Fatalf("clipwrite request = %+v", req)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no connected clipboard-write request")
 	}
 
 	// cred.

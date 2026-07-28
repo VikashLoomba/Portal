@@ -178,6 +178,35 @@ func echoHandler(version uint32, delivered chan<- string) agentclient.HandlerSpe
 	}
 }
 
+func TestPublicClientServicesAdvertisesRegisteredHandlers(t *testing.T) {
+	c := agentclient.New(agentclient.Config{
+		Handlers: []agentclient.HandlerSpec{echoHandler(1, nil)},
+	})
+
+	services := c.Services()
+	for _, name := range []string{"openurl", "notify", "clip", "cred", "clipwrite", "echo"} {
+		if got := services[name]; got != 1 {
+			t.Errorf("Services()[%q] = %d, want 1", name, got)
+		}
+	}
+	services["clipwrite"] = 99
+	delete(services, "echo")
+	again := c.Services()
+	if got := again["clipwrite"]; got != 1 {
+		t.Fatalf("mutating returned Services map changed registry: clipwrite=%d", got)
+	}
+	if got := again["echo"]; got != 1 {
+		t.Fatalf("mutating returned Services map changed registry: echo=%d", got)
+	}
+
+	if c.Connected() {
+		t.Fatal("never-dialed client reports connected")
+	}
+	if ack, ok := c.Handshake(); ok || ack != nil {
+		t.Fatalf("never-dialed Handshake = (%#v, %v), want nil, false", ack, ok)
+	}
+}
+
 func TestPublicCustomServiceEchoRoundTrip(t *testing.T) {
 	sha := bootstrap.EmbeddedSHA()
 	if sha == "" {

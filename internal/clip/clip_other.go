@@ -16,6 +16,8 @@ type Unsupported struct{}
 
 func New() Clipboard { return Unsupported{} }
 
+func NewWriter() Writer { return Unsupported{} }
+
 func (Unsupported) HasImage() bool { return false }
 func (Unsupported) ImagePNG(context.Context) ([]byte, error) {
 	return nil, ErrUnsupported
@@ -26,3 +28,12 @@ func (Unsupported) Text(context.Context) ([]byte, error) {
 	return nil, ErrUnsupported
 }
 func (Unsupported) Describe() string { return "clipboard access only supported on macOS" }
+func (Unsupported) SetText(context.Context, []byte) error {
+	return ErrUnsupported
+}
+func (Unsupported) SetImagePNG(context.Context, []byte) error {
+	return ErrUnsupported
+}
+func (Unsupported) Clear(context.Context) error {
+	return ErrUnsupported
+}

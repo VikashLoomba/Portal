@@ -3,6 +3,8 @@
 // emits high-level EngineEvents to the reconcile loop.
 package agentclient
 
+import "context"
+
 // EngineEventKind discriminates the lifecycle events the engine cares about.
 type EngineEventKind uint8
 
@@ -44,6 +46,12 @@ const (
 	// channel so shared engine traffic cannot evict a pending human prompt.
 	// runCredHandler answers it through Client.SendCredResponse.
 	KindCredRequest
+	// KindClipWriteRequest fires when a remote shim asks the Mac to SET its
+	// clipboard (cmd socket → ClipWriteRequest frame). Like KindClipRequest it
+	// is NOT routed through the shared, drop-on-full events channel —
+	// runClipWriteHandler reads it from a dedicated channel; the demuxer sends
+	// it on ClipWriteEvents(), not Events().
+	KindClipWriteRequest
 )
 
 // EngineEvent is the unit of communication from agentclient → engine.
@@ -57,6 +65,10 @@ type EngineEvent struct {
 	// handler answers by calling Client.SendClipResponse with the echoed
 	// Nonce/Epoch (DESIGN §4.4).
 	Clip *ClipEvent
+	// ClipWrite carries the fields of a KindClipWriteRequest event. nil
+	// otherwise. The handler answers by calling Client.SendClipWriteResponse
+	// with the echoed Nonce/Epoch (DESIGN §4.4).
+	ClipWrite *ClipWriteEvent
 	// Notify carries the fields of a KindNotify event. nil otherwise. Notify is
 	// fire-and-forget (no response frame), so the handler just raises the
 	// native notification.
@@ -89,6 +101,24 @@ type ClipEvent struct {
 	Epoch  uint64
 	Kind   string
 	Format string
+}
+
+// ClipWriteEvent is the payload of a KindClipWriteRequest. Nonce/Epoch are
+// echoed back verbatim in the ClipWriteResponse so the agent can correlate it;
+// Kind is one of "text"|"image"|"clear"; Format is "png" for images; SHA/Size
+// are empty/0 for "clear". SHA is the ^[0-9a-f]{32}$ content address the Mac
+// reconstructs its pull path from, and Size is the byte count used to refuse an
+// oversized payload before pulling.
+type ClipWriteEvent struct {
+	Nonce  uint64
+	Epoch  uint64
+	Kind   string
+	Format string
+	SHA    string
+	Size   int64
+	// Session is canceled when the agent process that emitted this request
+	// disconnects. It is nil for events constructed outside a live Client.
+	Session context.Context
 }
 
 // CredEvent is the payload of a KindCredRequest. Nonce/Epoch are echoed in the

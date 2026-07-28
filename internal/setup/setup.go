@@ -69,11 +69,13 @@ func New(paths app.Paths, cfg *config.Store, sink Sink) *Runner {
 		sink:      sink,
 		runner:    run.OSRunner{},
 		setupSock: filepath.Join(paths.ConfigDir, fmt.Sprintf("setup-cm-%d-%d.sock", os.Getpid(), setupRunID.Add(1))),
-		doctor:    doctorprobe.Run,
 	}
 	r.newTransport = r.defaultNewTransport
 	r.newValidator = func() validator {
 		return sshctl.New(r.setupSock, "", app.SSHOpts, r.runner)
+	}
+	r.doctor = func(ctx context.Context, host string, tr transport.Transport) *doctor.Report {
+		return doctorprobe.Run(ctx, host, tr, doctorprobe.WithFeatures(cfg.FeatureEnabled))
 	}
 	return r
 }

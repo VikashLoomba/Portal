@@ -95,6 +95,11 @@ const (
 	// manager marking the pasteboard org.nspasteboard.ConcealedType is never
 	// served even when this is on) — that check is independent of this toggle.
 	FeatureClipText = "clip-text"
+	// FeatureClipWrite gates the entire remote-to-Mac clipboard write path,
+	// including the pasteboard set and per-write notification. There is no
+	// separate banner toggle: silencing the security control requires turning
+	// this default-on gate off. The gate is re-read for every write.
+	FeatureClipWrite = "clip-write"
 	// FeatureNotify gates raising a native macOS notification from a relayed
 	// remote event (Claude Code hook / generic `portald notify`).
 	FeatureNotify = "notify"

@@ -35,6 +35,7 @@ func TestFeatures_DaemonUp_ListDeterministicOrder(t *testing.T) {
 	setFeatures(t, daemonCfg, map[string]bool{
 		config.FeatureClipImage: true,
 		config.FeatureClipText:  false,
+		config.FeatureClipWrite: true,
 		config.FeatureNotify:    true,
 		config.FeatureExec:      false,
 		config.FeatureCred:      true,
@@ -43,6 +44,7 @@ func TestFeatures_DaemonUp_ListDeterministicOrder(t *testing.T) {
 	setFeatures(t, cliCfg, map[string]bool{
 		config.FeatureClipImage: false,
 		config.FeatureClipText:  true,
+		config.FeatureClipWrite: false,
 		config.FeatureNotify:    false,
 		config.FeatureExec:      true,
 		config.FeatureCred:      false,
@@ -59,7 +61,7 @@ func TestFeatures_DaemonUp_ListDeterministicOrder(t *testing.T) {
 	}
 
 	// The daemon's posture, NOT the CLI store's inverted one.
-	want := "clip-image: on\nclip-text: off\nnotify: on\nexec: off\ncred: on\n"
+	want := "clip-image: on\nclip-text: off\nclip-write: on\nnotify: on\nexec: off\ncred: on\n"
 	if out.String() != want {
 		t.Errorf("list output:\n--- got ---\n%s--- want ---\n%s", out.String(), want)
 	}
@@ -134,7 +136,7 @@ func TestFeatures_UnknownName(t *testing.T) {
 	if !errors.As(err, &ue) {
 		t.Fatalf("err = %v, want usageErr", err)
 	}
-	if want := "unknown feature: bogus (known: clip-image, clip-text, notify, exec, cred)\n"; errw.String() != want {
+	if want := "unknown feature: bogus (known: clip-image, clip-text, clip-write, notify, exec, cred)\n"; errw.String() != want {
 		t.Errorf("stderr = %q, want %q", errw.String(), want)
 	}
 	if out.Len() != 0 {
@@ -150,6 +152,7 @@ func TestFeatures_DaemonDown_Fallback(t *testing.T) {
 	setFeatures(t, cfg, map[string]bool{
 		config.FeatureClipImage: false,
 		config.FeatureClipText:  true,
+		config.FeatureClipWrite: false,
 		config.FeatureNotify:    true,
 		config.FeatureExec:      true,
 		config.FeatureCred:      false,
@@ -165,7 +168,7 @@ func TestFeatures_DaemonDown_Fallback(t *testing.T) {
 	if err := runFeatures(ctx, &out, &errw, a, nil); err != nil {
 		t.Fatalf("runFeatures list (down): %v", err)
 	}
-	if want := "clip-image: off\nclip-text: on\nnotify: on\nexec: on\ncred: off\n"; out.String() != want {
+	if want := "clip-image: off\nclip-text: on\nclip-write: off\nnotify: on\nexec: on\ncred: off\n"; out.String() != want {
 		t.Errorf("fallback list:\n--- got ---\n%s--- want ---\n%s", out.String(), want)
 	}
 	if errw.Len() != 0 {

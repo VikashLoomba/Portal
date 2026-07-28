@@ -1,10 +1,9 @@
-// Package clip reads image data from the local (Mac) clipboard. It is used
-// by `portal ssh` to intercept Ctrl+V: when the clipboard holds an image,
-// the proxy uploads it to the remote and injects the resulting path instead
-// of passing the keystroke through.
+// Package clip reads data from and sets the local (Mac) clipboard. Clipboard
+// reads serve remote paste requests; writes set the pasteboard on behalf of an
+// intercepted remote copy.
 //
-// The darwin implementation shells out to osascript so there is no cgo
-// dependency — important because the release binaries are cross-compiled
+// The darwin implementations shell out to pbcopy and osascript so there is no
+// cgo dependency — important because the release binaries are cross-compiled
 // for darwin on Linux CI runners (CGO_ENABLED=0).
 package clip
 

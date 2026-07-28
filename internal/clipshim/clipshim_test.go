@@ -101,10 +101,12 @@ func TestShimArgvMatcher(t *testing.T) {
 			[]string{"-selection", "clipboard", "-t", "STRING", "-o"}, clipSentinel},
 		{"xclip -t text/plain -o intercepted", "xclip",
 			[]string{"-selection", "clipboard", "-t", "text/plain", "-o"}, clipSentinel},
-		{"xclip write (-i) falls through", "xclip",
-			[]string{"-selection", "clipboard", "-t", "image/png", "-i"}, realSentinel},
-		{"xclip text write (-i) falls through", "xclip",
-			[]string{"-selection", "clipboard", "-t", "UTF8_STRING", "-i"}, realSentinel},
+		{"xclip -t text/html -o falls through", "xclip",
+			[]string{"-selection", "clipboard", "-t", "text/html", "-o"}, realSentinel},
+		{"xclip image write (-i) intercepted", "xclip",
+			[]string{"-selection", "clipboard", "-t", "image/png", "-i"}, clipSentinel},
+		{"xclip text write (-i) intercepted", "xclip",
+			[]string{"-selection", "clipboard", "-t", "UTF8_STRING", "-i"}, clipSentinel},
 
 		// --- wl-paste: opencode's shapes ---
 		{"wl-paste list-types intercepted", "wl-paste",
@@ -165,12 +167,14 @@ func TestShimResolversTreatPATHAsData(t *testing.T) {
 	}
 
 	const sentinel = "SAFE_REAL_BINARY"
-	for _, name := range []string{"xdg-open", "xclip", "wl-paste", "sudo"} {
+	for _, name := range []string{"xdg-open", "xclip", "wl-paste", "wl-copy", "xsel", "sudo"} {
 		writeExec(t, filepath.Join(realDir, name), "#!/bin/sh\nprintf '%s'\n", sentinel)
 	}
 	writeExec(t, filepath.Join(shimDir, "xdg-open"), "%s", XDGOpenWrapper)
 	writeExec(t, filepath.Join(shimDir, "xclip"), "%s", xclipShim)
 	writeExec(t, filepath.Join(shimDir, "wl-paste"), "%s", wlPasteShim)
+	writeExec(t, filepath.Join(shimDir, "wl-copy"), "%s", wlCopyShim)
+	writeExec(t, filepath.Join(shimDir, "xsel"), "%s", xselShim)
 	writeExec(t, filepath.Join(shimDir, "sudo"), "%s", sudoShim)
 	askpass := filepath.Join(home, "portal-askpass")
 	writeExec(t, askpass, "#!/bin/sh\nexit 0\n")
@@ -183,8 +187,10 @@ func TestShimResolversTreatPATHAsData(t *testing.T) {
 		args []string
 	}{
 		{name: "xdg-open", args: []string{"https://example.invalid"}},
-		{name: "xclip", args: []string{"-selection", "clipboard", "-i"}},
+		{name: "xclip", args: []string{"-invalid"}},
 		{name: "wl-paste", args: []string{"--clear"}},
+		{name: "wl-copy", args: []string{"-t", "image/gif"}},
+		{name: "xsel", args: []string{"--append"}},
 		{name: "sudo", args: []string{"whoami"}},
 	}
 	for _, tc := range tests {
@@ -218,26 +224,37 @@ func TestShimResolversTreatPATHAsData(t *testing.T) {
 
 func TestShimResolversSkipEmptyEntriesAndRejectSelf(t *testing.T) {
 	tests := []struct {
-		name   string
-		script string
-		tool   string
+		name      string
+		script    string
+		tool      string
+		canonical bool
 	}{
 		{name: "xdg-open", script: XDGOpenWrapper, tool: "xdg-open"},
-		{name: "xclip", script: xclipShim, tool: "xclip"},
-		{name: "wl-paste", script: wlPasteShim, tool: "wl-paste"},
+		{name: "xclip", script: xclipShim, tool: "xclip", canonical: true},
+		{name: "wl-paste", script: wlPasteShim, tool: "wl-paste", canonical: true},
+		{name: "wl-copy", script: wlCopyShim, tool: "wl-copy", canonical: true},
+		{name: "pbpaste", script: pbPasteShim, tool: "pbpaste", canonical: true},
+		{name: "xsel", script: xselShim, tool: "xsel", canonical: true},
 		{name: "sudo", script: sudoShim, tool: "sudo"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			dirVar := "_d"
+			if tc.canonical {
+				dirVar = "_candidate_dir"
+			}
 			for _, want := range []string{
 				`for _d in $PATH; do`,
 				`[ -n "$_d" ] || continue`,
-				`[ -x "$_d/` + tc.tool + `" ]`,
+				`[ -x "$` + dirVar + `/` + tc.tool + `" ]`,
 				`[ -z "$_real" ]`,
 			} {
 				if !strings.Contains(tc.script, want) {
 					t.Errorf("%s resolver missing %q", tc.name, want)
 				}
+			}
+			if tc.canonical && !strings.Contains(tc.script, `[ "$_candidate_dir" = "$_wrapper_dir" ] && continue`) {
+				t.Errorf("%s resolver does not reject canonical wrapper aliases", tc.name)
 			}
 			for _, forbidden := range []string{"xargs -I", "sh -c 'PATH={}"} {
 				if strings.Contains(tc.script, forbidden) {

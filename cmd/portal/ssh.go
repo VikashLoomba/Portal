@@ -19,10 +19,10 @@ import (
 // the Ctrl+V keystroke and typed an uploaded remote path into the agent. That
 // approach was fragile (per-terminal keystroke matching) and forced users
 // through `portal ssh`. It is REPLACED by transparent clipboard-READ
-// interception: deploy `xclip`/`wl-paste` shims on the dev box (see
-// internal/setup) and serve the Mac clipboard over the existing
-// daemon pipe. With that in place a coding agent reads the clipboard through
-// plain `ssh <host>` — no special command, no PTY, no keystroke matching.
+// interception: deploy clipboard read and copy shims on the dev box (see
+// internal/setup) and relay clipboard data over the existing daemon pipe. With
+// that in place clipboard paste and copy work through plain `ssh <host>` — no
+// special command, no PTY, no keystroke matching.
 //
 // So `portal ssh <args...>` now simply execs the real ssh with the args
 // verbatim, replacing this process image (no extra PTY layer, no interception).
@@ -31,15 +31,15 @@ import (
 func newSSHCmd(a *app.App) *cobra.Command {
 	return &cobra.Command{
 		Use:   "ssh <host> [ssh-args...]",
-		Short: "Deprecated alias for plain `ssh` (clipboard paste now works over plain ssh)",
+		Short: "Deprecated alias for plain `ssh` (clipboard paste and copy work over plain ssh)",
 		Long: `Execs the system ssh with your args verbatim — a thin passthrough kept as
 an alias for continuity.
 
 DEPRECATED: prefer plain ` + "`ssh <host>`" + `. portal no longer wraps ssh in a
-PTY to intercept Ctrl+V. Clipboard-image (and opt-in text) paste now works
-transparently over plain ssh: the daemon deploys xclip/wl-paste read shims on
-the dev box and serves your Mac clipboard over the existing portal connection,
-so a coding agent's own Ctrl+V "just works" with no special command.
+PTY to intercept Ctrl+V. Clipboard paste and copy work transparently over plain
+ssh: the daemon deploys read and copy shims on the dev box and relays clipboard
+data over the existing portal connection, so coding agents and shell tools work
+with no special command.
 
 All arguments are forwarded to ssh unchanged.`,
 		DisableFlagParsing: true, // pass all flags straight to ssh

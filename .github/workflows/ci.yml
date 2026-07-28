@@ -19,7 +19,19 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends dash busybox-static
       - run: make test
+        env:
+          PORTAL_SHIM_SHELLS_STRICT: "1"
+
+  test-darwin-clipboard:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./internal/clip
 
   test-ts:
     runs-on: ubuntu-latest

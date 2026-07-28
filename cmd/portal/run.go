@@ -3,18 +3,23 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
 	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/internal/audit"
 	"github.com/VikashLoomba/Portal/internal/bootstrap"
 	"github.com/VikashLoomba/Portal/internal/clip"
 	"github.com/VikashLoomba/Portal/internal/clipupload"
@@ -25,6 +30,7 @@ import (
 	"github.com/VikashLoomba/Portal/pkg/api"
 	"github.com/VikashLoomba/Portal/pkg/client"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
+	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
 func newRunCmd(a *app.App) *cobra.Command {
@@ -264,6 +270,17 @@ const clipProbeTTL = 10 * time.Second
 // within this 8s slot.
 const clipCoerceTimeout = 8 * time.Second
 
+const (
+	// clipWriteApplyTimeout covers the remote pull and local pasteboard set.
+	// It stays below the agent's 9s clipWriteTimeout so a response is available
+	// before the agent gives up (WRITE DESIGN §4.4).
+	clipWriteApplyTimeout = 8 * time.Second
+	clipWriteMaxBytes     = clipupload.MaxUploadBytes
+	clipWriteBannerWindow = 5 * time.Second
+)
+
+var clipWriteSHARE = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
 // clipEntry caches the result of an eager `targets` read so a back-to-back
 // `image`/`text` fetch reuses it instead of re-coercing the clipboard.
 type clipEntry struct {
@@ -339,6 +356,520 @@ func runClipHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a *a
 			}(req)
 		}
 	}
+}
+
+// clipWriteDeps is the injectable boundary for the remote pull, pasteboard
+// mutation, policy gate, audit, and post-response security banner.
+type clipWriteDeps struct {
+	Writer         clip.Writer
+	Transport      transport.Transport
+	FeatureEnabled func(string) bool
+	Audit          *audit.Log
+	Host           string
+	Banner         *clipWriteBanner
+	Log            func(string)
+	ApplyTimeout   time.Duration
+}
+
+type clipWriteResponseSender func(*protocol.ClipWriteResponse) error
+
+// runClipWriteHandler drains the dedicated clipboard-write channel and
+// delegates to the injectable handler loop. The writer and banner live for the
+// lifetime of this stack.
+func runClipWriteHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a *app.App,
+	wg goroutineTracker, makeDeps func(*app.App) clipWriteDeps) {
+
+	if makeDeps == nil {
+		makeDeps = newClipWriteDeps
+	}
+	deps := makeDeps(a)
+	runClipWriteHandlerWithDeps(ctx, ch, deps, a.AgentClient.SendClipWriteResponse, wg)
+}
+
+func newClipWriteDeps(a *app.App) clipWriteDeps {
+	logLine := func(line string) {
+		if a.Log != nil {
+			a.Log.Logf("%s", line)
+		}
+	}
+	host := a.Transport.Describe().Host
+	deps := clipWriteDeps{
+		Writer:         clip.NewWriter(),
+		Transport:      a.Transport,
+		FeatureEnabled: a.Cfg.FeatureEnabled,
+		Audit:          a.Audit,
+		Host:           host,
+		Banner:         newClipWriteBanner(host),
+		Log:            logLine,
+		ApplyTimeout:   clipWriteApplyTimeout,
+	}
+	return deps
+}
+
+// runClipWriteHandlerWithDeps serializes pasteboard writers with a cap-1
+// semaphore. A request arriving while one is active is refused immediately;
+// queueing it could exceed the agent's response budget.
+func runClipWriteHandlerWithDeps(ctx context.Context, ch <-chan agentclient.EngineEvent,
+	deps clipWriteDeps, send clipWriteResponseSender, wg goroutineTracker) {
+
+	if deps.Banner != nil {
+		defer deps.Banner.close()
+	}
+	sem := make(chan struct{}, 1)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			if ev.ClipWrite == nil {
+				continue
+			}
+			req := ev.ClipWrite
+			reqCtx := ctx
+			if req.Session != nil {
+				reqCtx = req.Session
+			}
+			if reqCtx.Err() != nil {
+				continue
+			}
+			if deps.FeatureEnabled == nil || !deps.FeatureEnabled(config.FeatureClipWrite) {
+				kind := clipWriteAuditKind(req.Kind)
+				resp := denyClipWriteResponse(deps, &protocol.ClipWriteResponse{
+					Nonce: req.Nonce, Epoch: req.Epoch,
+				}, kind, "disabled")
+				if err := send(resp); err != nil {
+					logClipWriteLine(deps, fmt.Sprintf(
+						"clip-write: send response failed (nonce=%d): %v", req.Nonce, err))
+				}
+				continue
+			}
+			select {
+			case sem <- struct{}{}:
+			default:
+				kind := clipWriteAuditKind(req.Kind)
+				deps.Audit.ClipWriteDenied(deps.Host, kind, "inflight")
+				resp := &protocol.ClipWriteResponse{
+					Nonce: req.Nonce, Epoch: req.Epoch, OK: false, Err: "inflight",
+				}
+				if err := send(resp); err != nil {
+					logClipWriteLine(deps, fmt.Sprintf(
+						"clip-write: send response failed (nonce=%d): %v", req.Nonce, err))
+				}
+				continue
+			}
+			if wg != nil {
+				wg.Add(1)
+			}
+			go func(reqCtx context.Context, req *agentclient.ClipWriteEvent) {
+				if wg != nil {
+					defer wg.Done()
+				}
+				defer func() { <-sem }()
+
+				resp := serveClipWriteRequest(reqCtx, deps, req)
+				if err := send(resp); err != nil {
+					logClipWriteLine(deps, fmt.Sprintf(
+						"clip-write: send response failed (nonce=%d): %v", req.Nonce, err))
+				}
+				if !resp.OK {
+					return
+				}
+
+				kind := clipWriteAuditKind(req.Kind)
+				detail := fmt.Sprintf("sha=%s size=%d", req.SHA, req.Size)
+				if req.Kind == "clear" {
+					detail = "cleared"
+				}
+				// The synchronous audit is ground truth. The banner is dispatched
+				// only after the response, outside the 8s apply budget.
+				deps.Audit.ClipWritten(deps.Host, kind, detail)
+				if deps.Banner != nil {
+					deps.Banner.note(req.Kind, req.Format, req.Size)
+				}
+			}(reqCtx, req)
+		}
+	}
+}
+
+// serveClipWriteRequest re-reads policy, validates the exact wire tuple, pulls
+// and verifies bytes, and mutates the pasteboard. It NEVER returns nil and
+// echoes Nonce/Epoch on every path. Successful auditing and notification occur
+// after the caller sends this response.
+func serveClipWriteRequest(ctx context.Context, deps clipWriteDeps,
+	req *agentclient.ClipWriteEvent) *protocol.ClipWriteResponse {
+
+	if req == nil {
+		req = &agentclient.ClipWriteEvent{}
+	}
+	resp := &protocol.ClipWriteResponse{Nonce: req.Nonce, Epoch: req.Epoch}
+	kind := clipWriteAuditKind(req.Kind)
+
+	if deps.FeatureEnabled == nil || !deps.FeatureEnabled(config.FeatureClipWrite) {
+		return denyClipWriteResponse(deps, resp, kind, "disabled")
+	}
+
+	ext, pull, reason := clipWriteShape(req.Kind, req.Format, req.SHA, req.Size)
+	if reason != "" {
+		return denyClipWriteResponse(deps, resp, kind, reason)
+	}
+
+	applyTimeout := deps.ApplyTimeout
+	if applyTimeout <= 0 {
+		applyTimeout = clipWriteApplyTimeout
+	}
+	cctx, cancel := context.WithTimeout(ctx, applyTimeout)
+	defer cancel()
+
+	var data []byte
+	if pull {
+		var err error
+		data, err = pullClipWrite(cctx, deps.Transport, req.SHA, ext, req.Size)
+		if err != nil {
+			logClipWriteLine(deps, fmt.Sprintf(
+				"clip-write: pull failed (nonce=%d kind=%s): %v", req.Nonce, kind, err))
+			// The fixed denial vocabulary classifies unavailable side-channel
+			// bytes as shamismatch.
+			deps.Audit.ClipWriteDenied(deps.Host, kind, "shamismatch")
+			return resp
+		}
+		if int64(len(data)) != req.Size || clipupload.ShortSHA(data) != req.SHA {
+			return denyClipWriteResponse(deps, resp, kind, "shamismatch")
+		}
+	}
+
+	if cctx.Err() != nil {
+		return resp
+	}
+	var err error
+	switch req.Kind {
+	case "text":
+		err = deps.Writer.SetText(cctx, data)
+	case "image":
+		err = deps.Writer.SetImagePNG(cctx, data)
+	case "clear":
+		err = deps.Writer.Clear(cctx)
+	default:
+		return denyClipWriteResponse(deps, resp, kind, "badsha")
+	}
+	if err != nil {
+		logClipWriteLine(deps, fmt.Sprintf(
+			"clip-write: pasteboard set failed (nonce=%d kind=%s): %v", req.Nonce, kind, err))
+		return resp
+	}
+
+	resp.OK = true
+	return resp
+}
+
+// clipWriteShape enforces WRITE DESIGN §4.1's exact per-kind field semantics
+// and returns the extension for byte-carrying requests.
+//
+// NO NEW VOCABULARY: §7.1 fixes exactly {disabled, oversize, badsha,
+// shamismatch, inflight}. Every field-shape violation folds into badsha
+// because the content address used to reconstruct the pull path is the
+// (kind, format, sha) tuple. oversize is reserved for an in-shape size that is
+// out of range on a byte-carrying kind. The agent grammar rejects these shapes
+// first; this check is the Mac-side defense against a forged or drifted frame.
+//
+// Precedence is fixed: kind/format shape, then SHA, then size. A frame violating
+// more than one rule therefore produces one deterministic reason.
+func clipWriteShape(kind, format, sha string, size int64) (ext string, pull bool, reason string) {
+	switch kind {
+	case "clear":
+		if format != "" || sha != "" || size != 0 {
+			return "", false, "badsha"
+		}
+		return "", false, ""
+	case "text":
+		if format != "" {
+			return "", false, "badsha"
+		}
+		ext = ".txt"
+	case "image":
+		if format != "png" {
+			return "", false, "badsha"
+		}
+		ext = ".png"
+	default:
+		return "", false, "badsha"
+	}
+	if !clipWriteSHARE.MatchString(sha) {
+		return "", false, "badsha"
+	}
+	if size <= 0 || size > clipWriteMaxBytes {
+		return "", false, "oversize"
+	}
+	return ext, true, ""
+}
+
+const clipWriteStderrLimit = 512
+
+type clipWriteStreamResult struct {
+	data     []byte
+	err      error
+	tooLarge bool
+}
+
+// pullClipWrite reconstructs the only permitted remote path from validated
+// fields. Stream keeps both outputs under local caps even if the target's
+// command environment is hostile. The symlink check is the remote counterpart
+// to portald's O_NOFOLLOW open.
+func pullClipWrite(ctx context.Context, t transport.Transport, sha, ext string, size int64) ([]byte, error) {
+	if size < 0 || size > clipWriteMaxBytes {
+		return nil, fmt.Errorf("pull clipboard bytes: invalid size %d", size)
+	}
+	script := fmt.Sprintf(
+		`f="$HOME/.cache/portal/clip/copy-%s%s"; if [ -L "$f" ] || [ ! -f "$f" ]; then exit 1; fi; exec head -c %d < "$f"`,
+		sha, ext, size,
+	)
+
+	pullCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stdin, stdout, stderr, wait, err := t.Stream(pullCtx,
+		"BASH_ENV=/dev/null", "bash", "--noprofile", "--norc", "-c",
+		clipWriteShellQuote(script))
+	if err != nil {
+		return nil, fmt.Errorf("pull clipboard bytes: %w", err)
+	}
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	defer stdout.Close()
+	defer stderr.Close()
+
+	stdoutResult := make(chan clipWriteStreamResult, 1)
+	stderrResult := make(chan clipWriteStreamResult, 1)
+	go func() { stdoutResult <- readClipWriteStream(stdout, size) }()
+	go func() { stderrResult <- readClipWriteStream(stderr, clipWriteStderrLimit) }()
+
+	var out, errOut clipWriteStreamResult
+	for stdoutResult != nil || stderrResult != nil {
+		select {
+		case out = <-stdoutResult:
+			stdoutResult = nil
+			if out.tooLarge || out.err != nil {
+				cancel()
+			}
+		case errOut = <-stderrResult:
+			stderrResult = nil
+			if errOut.tooLarge || errOut.err != nil {
+				cancel()
+			}
+		}
+	}
+	waitErr := wait()
+
+	if out.tooLarge {
+		return nil, fmt.Errorf("pull clipboard bytes: stdout exceeded declared size %d", size)
+	}
+	if errOut.tooLarge {
+		detail := sanitizeClipWriteStderr(string(errOut.data))
+		if detail != "" {
+			return nil, fmt.Errorf("pull clipboard bytes: stderr exceeded %d bytes: %s",
+				clipWriteStderrLimit, detail)
+		}
+		return nil, fmt.Errorf("pull clipboard bytes: stderr exceeded %d bytes", clipWriteStderrLimit)
+	}
+	if out.err != nil {
+		return nil, fmt.Errorf("pull clipboard bytes: read stdout: %w", out.err)
+	}
+	if errOut.err != nil {
+		return nil, fmt.Errorf("pull clipboard bytes: read stderr: %w", errOut.err)
+	}
+	if waitErr != nil {
+		if detail := sanitizeClipWriteStderr(string(errOut.data)); detail != "" {
+			return nil, fmt.Errorf("pull clipboard bytes: %w: %s", waitErr, detail)
+		}
+		return nil, fmt.Errorf("pull clipboard bytes: %w", waitErr)
+	}
+	return out.data, nil
+}
+
+func readClipWriteStream(r io.Reader, limit int64) clipWriteStreamResult {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if int64(len(data)) > limit {
+		return clipWriteStreamResult{data: data[:limit], tooLarge: true}
+	}
+	return clipWriteStreamResult{data: data, err: err}
+}
+
+func sanitizeClipWriteStderr(s string) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	b.Grow(min(len(s), clipWriteStderrLimit))
+	truncated := false
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			r = ' '
+		}
+		if b.Len()+utf8.RuneLen(r) > clipWriteStderrLimit {
+			truncated = true
+			break
+		}
+		b.WriteRune(r)
+	}
+	if !truncated {
+		return b.String()
+	}
+	out := b.String()
+	for len(out)+3 > clipWriteStderrLimit {
+		_, n := utf8.DecodeLastRuneInString(out)
+		out = out[:len(out)-n]
+	}
+	return out + "..."
+}
+
+// clipWriteAuditKind closes the audit field over the protocol's three valid
+// kinds even before shape validation runs (notably on the inflight path).
+func clipWriteAuditKind(kind string) string {
+	switch kind {
+	case "text", "image", "clear":
+		return kind
+	default:
+		return "unknown"
+	}
+}
+
+func denyClipWriteResponse(deps clipWriteDeps, resp *protocol.ClipWriteResponse,
+	kind, reason string) *protocol.ClipWriteResponse {
+
+	resp.OK = false
+	resp.Err = reason
+	deps.Audit.ClipWriteDenied(deps.Host, kind, reason)
+	return resp
+}
+
+func logClipWriteLine(deps clipWriteDeps, line string) {
+	if deps.Log != nil {
+		deps.Log(line)
+	}
+}
+
+// clipWriteShellQuote preserves one script argv element across Transport's
+// remote-shell join contract.
+func clipWriteShellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// Once the pasteboard has been mutated, its banner is owed. Notification
+// dispatch is deliberately independent of the stack context and bounded only
+// by raiseNotification's own timeout.
+type clipWriteBanner struct {
+	host       string
+	window     time.Duration
+	raise      func(title, subtitle string)
+	dispatch   func(func())
+	after      func(time.Duration, func()) func() bool
+	mu         sync.Mutex
+	open       bool
+	closed     bool
+	suppressed int
+	stop       func() bool
+}
+
+func newClipWriteBanner(host string) *clipWriteBanner {
+	return &clipWriteBanner{
+		host:   host,
+		window: clipWriteBannerWindow,
+		raise: func(title, subtitle string) {
+			// This security banner never consults feature.notify. The only
+			// supported way to silence remote-write banners is to disable
+			// feature.clip-write itself (WRITE DESIGN §5.1/§8.5).
+			raiseSecurityNotification(context.Background(), title, "", subtitle, "")
+		},
+		// These raises and the pending timer are intentionally detached from the
+		// lifecycle group. Both can live for 5s while stackDrainTimeout is 2s;
+		// tracking them would create a false old-stack drain failure and would
+		// still risk discarding an owed banner. At process exit, the synchronous
+		// audit remains the ground truth if a detached child has not yet spawned.
+		dispatch: func(fn func()) { go fn() },
+		after: func(d time.Duration, fn func()) func() bool {
+			timer := time.AfterFunc(d, fn)
+			return timer.Stop
+		},
+	}
+}
+
+func (b *clipWriteBanner) note(kind, format string, size int64) {
+	title := "Clipboard set from " + b.host
+	subtitle := clipWriteSubtitle(kind, format, size)
+
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		b.dispatchRaise(title, subtitle)
+		return
+	}
+	if b.open {
+		b.suppressed++
+		b.mu.Unlock()
+		return
+	}
+	b.open = true
+	b.suppressed = 0
+	b.stop = b.after(b.window, b.flushWindow)
+	b.mu.Unlock()
+	b.dispatchRaise(title, subtitle)
+}
+
+func (b *clipWriteBanner) flushWindow() {
+	b.mu.Lock()
+	n := b.suppressed
+	b.suppressed = 0
+	b.open = false
+	b.stop = nil
+	b.mu.Unlock()
+
+	if n > 0 {
+		b.dispatchRaise(fmt.Sprintf("%d more clipboard writes from %s", n, b.host), "")
+	}
+}
+
+// close flushes rather than discards an owed trailing summary. The callback
+// and close zero suppressed under the same lock, so a lost Stop race cannot
+// raise the summary twice.
+func (b *clipWriteBanner) close() {
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return
+	}
+	b.closed = true
+	if b.stop != nil {
+		b.stop()
+		b.stop = nil
+	}
+	n := b.suppressed
+	b.suppressed = 0
+	b.open = false
+	b.mu.Unlock()
+
+	if n > 0 {
+		b.dispatchRaise(fmt.Sprintf("%d more clipboard writes from %s", n, b.host), "")
+	}
+}
+
+func (b *clipWriteBanner) dispatchRaise(title, subtitle string) {
+	b.dispatch(func() {
+		b.raise(title, subtitle)
+	})
+}
+
+func clipWriteSubtitle(kind, format string, size int64) string {
+	if kind == "clear" {
+		return "cleared"
+	}
+	label := kind
+	if format != "" {
+		label += "/" + format
+	}
+	if size < 1024 {
+		return fmt.Sprintf("%s, %d bytes", label, size)
+	}
+	return fmt.Sprintf("%s, %d KB", label, (size+1023)/1024)
 }
 
 // serveClipRequest reads/uploads the clipboard for a single ClipRequest and

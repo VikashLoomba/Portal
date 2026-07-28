@@ -170,7 +170,7 @@ func TestRunInstallOutputRegression(t *testing.T) {
 		"service loaded and started (%s)\n"+
 		"WARNING: could not install xdg-open wrapper on user@box: wrapper denied\n"+
 		"WARNING: could not install clipboard shims on user@box: shim denied\n"+
-		"         clipboard paste into coding agents will NOT work until this succeeds.\n"+
+		"         clipboard paste and copy will NOT work until this succeeds.\n"+
 		"         fix the cause above and re-run: portal install user@box\n"+
 		"NOTE: %s is not on your PATH. Add it to your shell profile:\n"+
 		"      export PATH=\"$HOME/.local/bin:$PATH\"\n"+
@@ -208,9 +208,11 @@ func TestRunInstallRemoteSuccessOutput(t *testing.T) {
 		t.Fatalf("runInstall: %v", err)
 	}
 	want := "installed xdg-open wrapper on box\n" +
-		"installed clipboard shims (xclip/wl-paste) on box\n" +
-		"NOTE: keep your terminal's OSC 52 clipboard-WRITE disabled — a remote\n" +
-		"      could otherwise write your Mac clipboard and read it back.\n"
+		"installed clipboard shims (xclip/wl-paste/wl-copy/pbcopy/pbpaste/xsel) on box\n" +
+		"NOTE: remote copies now set THIS Mac's clipboard — every write is audited and\n" +
+		"      raises a notification. Kill switch: portal features clip-write off\n" +
+		"      Keep your terminal's own OSC 52 clipboard-WRITE disabled; portal's path\n" +
+		"      is the audited replacement.\n"
 	if !strings.Contains(out.String(), want) {
 		t.Fatalf("clipboard success output = %q, want contiguous %q", out.String(), want)
 	}

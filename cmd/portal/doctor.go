@@ -9,25 +9,25 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/doctorprobe"
+	"github.com/VikashLoomba/Portal/pkg/agentclient"
 	"github.com/VikashLoomba/Portal/pkg/client"
 	"github.com/VikashLoomba/Portal/pkg/doctor"
 	"github.com/VikashLoomba/Portal/pkg/transport"
 	"github.com/VikashLoomba/Portal/pkg/transport/sshnative"
 )
 
-// newDoctorCmd self-tests the clipboard + notification path end to end over ssh
+// newDoctorCmd self-tests clipboard paste, copy, and notification over ssh
 // (SPEC D). cc-clip verifies its setup at install time; we match that
 // confidence with a standalone `portal doctor` that the install flow also runs.
-// The single make-or-break is the PATH-winner check — that `command -v xclip` /
-// `wl-paste` in a representative shell resolve to OUR shim and not a real
-// /usr/bin binary later on PATH. We also confirm the master is up + the agent
-// supports the clip+notify verbs, report the shim Version vs the embedded one,
-// and run an end-to-end `portald clip targets` smoke (plus a real image/text
-// fetch when something is on the Mac clipboard).
+// The single make-or-break is the PATH-winner check — that each clipboard tool
+// in a representative shell resolves to OUR shim and not a real binary later
+// on PATH. We also confirm the master is up, the agent supports clip copy and
+// notify, report service/feature state and shim version, and run the
+// non-destructive `portald clip targets` smoke.
 func newDoctorCmd(a *app.App) *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
-		Short: "Self-test the clipboard + notification path over ssh (PATH winner, shim version, agent verbs, smoke)",
+		Short: "Self-test clipboard paste, copy, and notifications over ssh (PATH, services, features, smoke)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runDoctorCmd(cmd.Context(), cmd.OutOrStdout(), a)
 		},
@@ -80,7 +80,7 @@ func runDoctorCmd(ctx context.Context, w io.Writer, a *app.App, nativeOpts ...ss
 	if err != nil {
 		return err
 	}
-	rep := runDoctor(ctx, host, tr)
+	rep := runDoctor(ctx, host, tr, featureOpt(a))
 	// This branch is only reached with the daemon confirmed DOWN
 	// (lc.Available==false above). Force the daemon-down verdict to be honest
 	// under a non-system transport — see markDaemonDown.
@@ -170,6 +170,27 @@ func renderDoctor(w io.Writer, rep *doctor.Report) {
 	}
 }
 
-func runDoctor(ctx context.Context, host string, tr transport.Transport) *doctor.Report {
-	return doctorprobe.Run(ctx, host, tr)
+func featureOpt(a *app.App) doctorprobe.Option {
+	return doctorprobe.WithFeatures(a.Cfg.FeatureEnabled)
+}
+
+func servicesOpt(ac *agentclient.Client) doctorprobe.Option {
+	if ac == nil {
+		return nil
+	}
+	return doctorprobe.WithServices(func() doctorprobe.ServiceView {
+		ack, connected := ac.Handshake()
+		if !connected || ack == nil {
+			return doctorprobe.ServiceView{}
+		}
+		return doctorprobe.ServiceView{
+			Connected: true,
+			Agent:     ack.Services,
+			Client:    ac.Services(),
+		}
+	})
+}
+
+func runDoctor(ctx context.Context, host string, tr transport.Transport, opts ...doctorprobe.Option) *doctor.Report {
+	return doctorprobe.Run(ctx, host, tr, opts...)
 }

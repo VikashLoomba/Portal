@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/VikashLoomba/Portal/internal/app"
+	"github.com/VikashLoomba/Portal/pkg/agentclient"
 	"github.com/VikashLoomba/Portal/pkg/doctor"
 	"github.com/VikashLoomba/Portal/pkg/hub"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
@@ -74,14 +75,22 @@ type supervisor struct {
 	ref       atomic.Pointer[liveStack]
 	mu        sync.Mutex
 
-	newStack       func(context.Context, string) (*app.Stack, error)
-	shutdownStack  func(context.Context, *app.Stack) error
-	pushAllowStack func(*app.Stack, []int) error
-	drainTimeout   time.Duration
+	newStack        func(context.Context, string) (*app.Stack, error)
+	shutdownStack   func(context.Context, *app.Stack) error
+	pushAllowStack  func(*app.Stack, []int) error
+	clipWriteEvents func(*agentclient.Client) <-chan agentclient.EngineEvent
+	clipWriteDeps   func(*app.App) clipWriteDeps
+	drainTimeout    time.Duration
 }
 
 func newSupervisor(ctx context.Context, base *app.App, sshStderr io.Writer) *supervisor {
-	s := &supervisor{daemonCtx: ctx, base: base, drainTimeout: stackDrainTimeout}
+	s := &supervisor{
+		daemonCtx: ctx, base: base, drainTimeout: stackDrainTimeout,
+		clipWriteEvents: func(c *agentclient.Client) <-chan agentclient.EngineEvent {
+			return c.ClipWriteEvents()
+		},
+		clipWriteDeps: newClipWriteDeps,
+	}
 	s.newStack = func(ctx context.Context, host string) (*app.Stack, error) {
 		return app.NewStack(ctx, base.Paths, base.Cfg, base.Hub, host,
 			base.Runner, base.Clk, base.Log, sshStderr)
@@ -162,6 +171,9 @@ func (s *supervisor) start(ls *liveStack) {
 	launch(func() { ls.stack.RunAgentEventPump(ls.ctx) })
 	launch(func() { runOpenURLHandler(ls.ctx, ls.stack.OpenURLCh, &sa) })
 	launch(func() { runClipHandler(ls.ctx, ls.stack.AgentClient.ClipEvents(), &sa, &ls.wg) })
+	launch(func() {
+		runClipWriteHandler(ls.ctx, s.clipWriteEvents(ls.stack.AgentClient), &sa, &ls.wg, s.clipWriteDeps)
+	})
 	launch(func() { runCredHandler(ls.ctx, ls.stack.AgentClient.CredEvents(), &sa, &ls.wg) })
 	launch(func() { runNotifyHandler(ls.ctx, ls.stack.AgentClient.NotifyEvents(), &sa) })
 }
@@ -487,7 +499,8 @@ func (p *pinnedStack) doctor(ctx context.Context) *doctor.Report {
 		rep.Add("transport", doctor.Fail, "transport unavailable: "+err.Error())
 		return rep
 	}
-	return runDoctor(sctx, p.ls.stack.Host, tr)
+	return runDoctor(sctx, p.ls.stack.Host, tr,
+		featureOpt(&sa), servicesOpt(p.ls.stack.AgentClient))
 }
 
 type supervisorAgent struct{ s *supervisor }
@@ -685,5 +698,6 @@ func (s *supervisor) doctor(ctx context.Context) *doctor.Report {
 		rep.Add("transport", doctor.Fail, "transport unavailable: "+err.Error())
 		return rep
 	}
-	return runDoctor(sctx, ls.stack.Host, tr)
+	return runDoctor(sctx, ls.stack.Host, tr,
+		featureOpt(&sa), servicesOpt(ls.stack.AgentClient))
 }

@@ -92,7 +92,7 @@ type SetupRunner interface {
 // Deps is the dependency set for a Server. The interface fields are narrow so
 // tests fake them without constructing an App; PinStack and the operation
 // closures are wired by run.go so localapi never imports package app.
-// FeatureNames defaults to [clip-image, clip-text, notify, exec, cred] when empty.
+// FeatureNames defaults to [clip-image, clip-text, clip-write, notify, exec, cred] when empty.
 type Deps struct {
 	Version       api.VersionInfo
 	Host          func() (string, error)

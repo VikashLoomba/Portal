@@ -8,12 +8,53 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/clipshim"
+	"github.com/VikashLoomba/Portal/internal/config"
 	"github.com/VikashLoomba/Portal/pkg/doctor"
 	"github.com/VikashLoomba/Portal/pkg/transport"
 )
 
-// Run performs every remote doctor probe over tr and returns the assembled report.
-func Run(ctx context.Context, host string, tr transport.Transport) *doctor.Report {
+// ServiceView is the current agent/client service-negotiation state. Agent and
+// Client are read-only for the duration of the probe.
+type ServiceView struct {
+	Connected bool
+	Agent     map[string]uint32
+	Client    map[string]uint32
+}
+
+type options struct {
+	services       func() ServiceView
+	featureEnabled func(string) bool
+}
+
+// Option adds caller-owned diagnostic state to a doctor run.
+type Option func(*options)
+
+// WithServices reports the live agent/client service-negotiation state.
+func WithServices(services func() ServiceView) Option {
+	return func(o *options) {
+		o.services = services
+	}
+}
+
+// WithFeatures reports the current Mac-side capability state.
+func WithFeatures(featureEnabled func(string) bool) Option {
+	return func(o *options) {
+		o.featureEnabled = featureEnabled
+	}
+}
+
+// Run performs every remote doctor probe over tr and returns the assembled
+// report. It deliberately has no clipboard-write smoke: a default doctor run
+// must not overwrite the user's real Mac clipboard. The write round trip stays
+// in the manual checklist; an opt-in write smoke is out of v1.
+func Run(ctx context.Context, host string, tr transport.Transport, opts ...Option) *doctor.Report {
+	var cfg options
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+
 	rep := &doctor.Report{Host: host}
 	if ctx.Err() != nil {
 		return rep
@@ -46,7 +87,7 @@ func Run(ctx context.Context, host string, tr transport.Transport) *doctor.Repor
 		return rep
 	}
 
-	for _, tool := range []string{"xclip", "wl-paste"} {
+	for _, tool := range []string{"xclip", "wl-paste", "wl-copy", "pbcopy", "pbpaste", "xsel"} {
 		path, isShim := resolveShimWinner(ctx, tr, tool)
 		switch {
 		case path == "":
@@ -89,6 +130,12 @@ func Run(ctx context.Context, host string, tr transport.Transport) *doctor.Repor
 	} else if portaldOK {
 		rep.Add("agent verb: clip", doctor.Warn, "portald does not advertise the clip subcommand (old agent?)")
 	}
+	if verbs.clipCopy {
+		rep.Add("agent verb: clip copy", doctor.Pass, "")
+	} else if portaldOK {
+		rep.Add("agent verb: clip copy", doctor.Warn,
+			"portald does not advertise the clip copy subcommand (old agent?)")
+	}
 	if verbs.notify {
 		rep.Add("agent verb: notify", doctor.Pass, "")
 	} else if portaldOK {
@@ -96,6 +143,33 @@ func Run(ctx context.Context, host string, tr transport.Transport) *doctor.Repor
 	}
 	if ctx.Err() != nil {
 		return rep
+	}
+
+	if cfg.services != nil {
+		view := cfg.services()
+		switch {
+		case !view.Connected:
+			rep.Add("service: clipwrite@1", doctor.Warn,
+				"no agent handshake yet — reconnect and re-run")
+		case view.Client["clipwrite"] != 1:
+			rep.Add("service: clipwrite@1", doctor.Warn,
+				"this Mac client advertises clipwrite="+serviceVersion(view.Client, "clipwrite")+
+					" — upgrade portal on the Mac")
+		case view.Agent["clipwrite"] != 1:
+			rep.Add("service: clipwrite@1", doctor.Warn,
+				"agent advertises clipwrite="+serviceVersion(view.Agent, "clipwrite")+
+					" — old portald; remote copies fall through until it reconnects (re-run install if it persists)")
+		default:
+			rep.Add("service: clipwrite@1", doctor.Pass, "agent=1 client=1")
+		}
+	}
+	if cfg.featureEnabled != nil {
+		if cfg.featureEnabled(config.FeatureClipWrite) {
+			rep.Add("feature: "+config.FeatureClipWrite, doctor.Pass, "on")
+		} else {
+			rep.Add("feature: "+config.FeatureClipWrite, doctor.Warn,
+				"off — remote copies fall through; enable: "+app.Tool+" features "+config.FeatureClipWrite+" on")
+		}
 	}
 
 	if portaldOK {
@@ -112,6 +186,14 @@ func Run(ctx context.Context, host string, tr transport.Transport) *doctor.Repor
 	}
 
 	return rep
+}
+
+func serviceVersion(services map[string]uint32, name string) string {
+	version, ok := services[name]
+	if !ok {
+		return "absent"
+	}
+	return fmt.Sprint(version)
 }
 
 func resolveShimWinner(ctx context.Context, tr transport.Transport, tool string) (path string, isShim bool) {
@@ -166,8 +248,9 @@ func deployedShimVersion(ctx context.Context, tr transport.Transport) (version s
 }
 
 type agentVerbs struct {
-	clip   bool
-	notify bool
+	clip     bool
+	clipCopy bool
+	notify   bool
 }
 
 func probePortaldVerbs(ctx context.Context, tr transport.Transport) (present bool, verbs agentVerbs) {
@@ -177,6 +260,7 @@ pd="$HOME/.cache/portal/portald"
 echo "PORTALD_OK"
 cu=$("$pd" clip 2>&1 1>/dev/null; true)
 case "$cu" in *"usage: portald clip"*) echo "CLIP_OK";; esac
+case "$cu" in *copy*) echo "CLIPCOPY_OK";; esac
 nu=$("$pd" notify 2>&1 1>/dev/null; true)
 case "$nu" in *"usage: portald notify"*) echo "NOTIFY_OK";; esac
 `
@@ -185,6 +269,7 @@ case "$nu" in *"usage: portald notify"*) echo "NOTIFY_OK";; esac
 		return false, verbs
 	}
 	verbs.clip = strings.Contains(out, "CLIP_OK")
+	verbs.clipCopy = strings.Contains(out, "CLIPCOPY_OK")
 	verbs.notify = strings.Contains(out, "NOTIFY_OK")
 	return true, verbs
 }

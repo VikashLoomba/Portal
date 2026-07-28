@@ -203,6 +203,26 @@ func TestCurrentShimsProbeCoversDeploymentTable(t *testing.T) {
 	if strings.Contains(probe, "clip-shim v6") {
 		t.Fatal("current marker probe still accepts the pre-u10 v6 shims")
 	}
+	if strings.Contains(probe, "clip-shim v7") {
+		t.Fatal("current marker probe still accepts the pre-u6 v7 shims")
+	}
+}
+
+func TestRemoveCoversDeploymentTable(t *testing.T) {
+	names := shimNames()
+	tr := &recordTransport{}
+	Remove(context.Background(), tr)
+	if want := "for bin in " + names + "; do"; !strings.Contains(tr.allScripts(), want) {
+		t.Fatalf("Remove script missing deployment-table loop %q", want)
+	}
+	for _, sh := range shims {
+		if !strings.Contains(" "+names+" ", " "+sh.name+" ") {
+			t.Errorf("Remove shim-name loop missing %s", sh.name)
+		}
+	}
+	if got, want := len(strings.Fields(names)), len(shims); got != want {
+		t.Fatalf("Remove shim-name loop has %d entries, want %d", got, want)
+	}
 }
 
 // TestRemove_StripsEverything asserts Remove issues a script that removes the
@@ -226,7 +246,7 @@ func TestRemove_StripsEverything(t *testing.T) {
 		"~/.bash_profile",
 		"~/.bash_login",
 		"PORTAL_MANAGED=1",
-		"xdg-open xclip wl-paste portal portal-askpass sudo",
+		"xdg-open xclip wl-paste wl-copy pbcopy pbpaste xsel portal portal-askpass sudo",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("Remove script missing %q\nscript:\n%s", want, got)

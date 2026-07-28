@@ -10,11 +10,11 @@ import (
 )
 
 func TestCredentialShimVersionAndMarkers(t *testing.T) {
-	if Version != "7" {
-		t.Fatalf("Version = %q, want 7", Version)
+	if Version != "8" {
+		t.Fatalf("Version = %q, want 8", Version)
 	}
-	if Marker != "Installed by portal clip-shim v7" {
-		t.Fatalf("Marker = %q, want v7 marker", Marker)
+	if Marker != "Installed by portal clip-shim v8" {
+		t.Fatalf("Marker = %q, want v8 marker", Marker)
 	}
 
 	tests := []struct {

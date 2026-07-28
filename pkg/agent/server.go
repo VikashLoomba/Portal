@@ -51,10 +51,10 @@ type Server struct {
 	dec    *protocol.Decoder
 
 	// reg is the service registry. It auto-registers the compiled-in openurl,
-	// notify, clip, and cred services in New and owns the per-service outbox the
-	// Serve loop drains, inbound Msg dispatch, and generalized Call/epoch/nonce
-	// correlation machinery. It never holds an *Encoder — the Serve loop stays
-	// the sole agent→client writer.
+	// notify, clip, cred, and clipwrite services in New and owns the per-service
+	// outbox the Serve loop drains, inbound Msg dispatch, and generalized
+	// Call/epoch/nonce correlation machinery. It never holds an *Encoder — the
+	// Serve loop stays the sole agent→client writer.
 	reg *registry
 	// clip is the registered clip service. It is retained ONLY as a construction
 	// handle and a white-box test accessor (the timeout-budget test shortens its
@@ -66,6 +66,11 @@ type Server struct {
 	// cred is the registered cred service, retained for the same construction
 	// and white-box timeout-field access as clip.
 	cred *credService
+	// clipWrite is the registered clipwrite service. It is retained ONLY as a
+	// construction handle and white-box test accessor; the SAME instance is
+	// registered in reg, so fields shortened here are read live by
+	// routeVerb/reg.call.
+	clipWrite *clipWriteService
 
 	mu          sync.Mutex
 	seq         uint64
@@ -114,8 +119,8 @@ func New(cfg Config) *Server {
 	// Build the registry and bind the Server's guarded subscription reader so
 	// services can gate on `hasClient() && clientHas(svc)` without ever touching
 	// s.mu directly. Then auto-register all compiled-in services (openurl,
-	// notify, clip, cred). The registry owns the epoch/nonce/waiter correlation
-	// machinery (newRegistry seeds the epoch via newEpoch).
+	// notify, clip, cred, clipwrite). The registry owns the epoch/nonce/waiter
+	// correlation machinery (newRegistry seeds the epoch via newEpoch).
 	s.reg = newRegistry(cfg.Log)
 	s.reg.bindHasClient(func() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.hasClient })
 	host := &serviceHost{r: s.reg}
@@ -125,6 +130,8 @@ func New(cfg Config) *Server {
 	s.reg.register(s.clip)
 	s.cred = newCredService(host, cfg.Log)
 	s.reg.register(s.cred)
+	s.clipWrite = newClipWriteService(host, cfg.Log)
+	s.reg.register(s.clipWrite)
 	for _, f := range cfg.Services {
 		s.reg.register(f(host, cfg.Log))
 	}
@@ -186,9 +193,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	go s.readLoop(ctx, cmdCh, readErrCh)
 
 	// 5. Start cmd Unix socket if configured. The socket relays cmd-verb
-	// requests (open/clip/notify/cred) from `portald <verb>` on the box. It is only
-	// live while a client is actively subscribed; the service handlers gate on
-	// hasClient, which is set in handleSubscribe.
+	// requests (open/clip/notify/cred/copy) from `portald <verb>` on the box. It
+	// is only live while a client is actively subscribed; the service handlers
+	// gate on hasClient, which is set in handleSubscribe.
 	if s.cfg.CmdSockPath != "" {
 		go s.serveCmdSock(ctx)
 	}
@@ -488,6 +495,9 @@ func (s *Server) serveCmdSock(ctx context.Context) {
 //	clip\ttargets\n      → "ok\timage/png\n" | "none\n"
 //	clip\timage\tpng\n   → "ok\t<sha>\n" | "none\n"
 //	clip\ttext\n         → "ok\t<sha>\n" | "none\n"
+//	copy\ttext\t<sha>\t<size>\n       → "ok\n" | "none\n" | "rejected\n"
+//	copy\timage\tpng\t<sha>\t<size>\n → "ok\n" | "none\n" | "rejected\n"
+//	copy\tclear\n                     → "ok\n" | "none\n" | "rejected\n"
 //	notify\t<json>\n     → relay a notification to the Mac; "ok\n"|"no-client\n"|"dropped\n"
 //	cred\t<base64>\n      → "ok\t<base64-secret>\n" | "deny\t<reason>\n"
 //	<anything else>      → "rejected\n"
@@ -507,8 +517,8 @@ func (s *Server) handleCmdConn(ctx context.Context, conn net.Conn) {
 	}
 	verb, rest, _ := strings.Cut(line, "\t")
 	// Claimed verbs route to their registered service ("open" → openurl,
-	// "notify" → notify, "clip" → clip, "cred" → cred), applying the
-	// service's live per-verb deadline. Unknown verbs default-deny.
+	// "notify" → notify, "clip" → clip, "cred" → cred, "copy" → clipwrite),
+	// applying the service's live per-verb deadline. Unknown verbs default-deny.
 	if s.reg.routeVerb(ctx, conn, verb, rest) {
 		return
 	}

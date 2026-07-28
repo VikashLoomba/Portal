@@ -153,12 +153,14 @@ func renderSetupEvent(w io.Writer, host string, paths app.Paths, ev api.SetupEve
 	case "clip-shims":
 		switch ev.Status {
 		case "ok":
-			fmt.Fprintf(w, "installed clipboard shims (xclip/wl-paste) on %s\n", host)
-			fmt.Fprintln(w, "NOTE: keep your terminal's OSC 52 clipboard-WRITE disabled — a remote")
-			fmt.Fprintln(w, "      could otherwise write your Mac clipboard and read it back.")
+			fmt.Fprintf(w, "installed clipboard shims (xclip/wl-paste/wl-copy/pbcopy/pbpaste/xsel) on %s\n", host)
+			fmt.Fprintln(w, "NOTE: remote copies now set THIS Mac's clipboard — every write is audited and")
+			fmt.Fprintln(w, "      raises a notification. Kill switch: portal features clip-write off")
+			fmt.Fprintln(w, "      Keep your terminal's own OSC 52 clipboard-WRITE disabled; portal's path")
+			fmt.Fprintln(w, "      is the audited replacement.")
 		case "warn":
 			fmt.Fprintf(w, "WARNING: could not install clipboard shims on %s: %s\n", host, setupErrorMessage(ev))
-			fmt.Fprintln(w, "         clipboard paste into coding agents will NOT work until this succeeds.")
+			fmt.Fprintln(w, "         clipboard paste and copy will NOT work until this succeeds.")
 			fmt.Fprintf(w, "         fix the cause above and re-run: %s install %s\n", app.Tool, host)
 		}
 	case "agent-symlink":
