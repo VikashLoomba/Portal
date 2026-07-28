@@ -4,6 +4,7 @@ package clip
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -40,7 +41,14 @@ func TestRunPasteboardCmd(t *testing.T) {
 }
 
 func TestNewWriter(t *testing.T) {
-	if NewWriter() == nil {
-		t.Fatal("NewWriter returned nil")
+	got, ok := NewWriter().(writer)
+	if !ok {
+		t.Fatalf("NewWriter type = %T, want writer", NewWriter())
+	}
+	if got.run == nil {
+		t.Fatal("NewWriter returned a writer with no command runner")
+	}
+	if reflect.ValueOf(got.run).Pointer() != reflect.ValueOf(runPasteboardCmd).Pointer() {
+		t.Fatal("NewWriter did not wire the production pasteboard command runner")
 	}
 }

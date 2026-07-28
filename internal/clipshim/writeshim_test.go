@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/VikashLoomba/Portal/pkg/transport/ptyx"
 )
 
 type shimShell struct {
@@ -647,49 +649,95 @@ func TestWriteShimByteExactFallback(t *testing.T) {
 }
 
 func TestWriteShimXselTTYDefault(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("Darwin script(1) command form provides the hermetic tty")
+	tests := []struct {
+		name       string
+		args       []string
+		wantCode   int
+		wantPortal string
+		wantOutput string
+	}{
+		{name: "default read", wantPortal: "clip text\n"},
+		{name: "short append is write", args: []string{"-a"}, wantCode: 1, wantOutput: clipWriteFailMsg + "\n"},
+		{name: "long append is write", args: []string{"--append"}, wantCode: 1, wantOutput: clipWriteFailMsg + "\n"},
 	}
-	scriptBin, err := exec.LookPath("script")
-	if err != nil {
-		t.Skip("script(1) is unavailable")
-	}
-
-	home := t.TempDir()
-	shimDir := filepath.Join(home, "shims")
-	cacheDir := filepath.Join(home, ".cache", "portal")
-	for _, dir := range []string{shimDir, cacheDir} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	shimPath := filepath.Join(shimDir, "xsel")
-	argsPath := filepath.Join(home, "portal-args")
-	stdoutPath := filepath.Join(home, "stdout")
-	stderrPath := filepath.Join(home, "stderr")
-	writeExec(t, shimPath, "%s", xselShim)
-	writeExec(t, filepath.Join(cacheDir, "portald"), "%s", `#!/bin/sh
+	for _, shell := range shimShells() {
+		t.Run(shell.name, func(t *testing.T) {
+			requireShimShell(t, shell)
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					home := t.TempDir()
+					shimDir := filepath.Join(home, "shims")
+					cacheDir := filepath.Join(home, ".cache", "portal")
+					toolDir := filepath.Join(home, "tools")
+					for _, dir := range []string{shimDir, cacheDir, toolDir} {
+						if err := os.MkdirAll(dir, 0o755); err != nil {
+							t.Fatal(err)
+						}
+					}
+					shimPath := filepath.Join(shimDir, "xsel")
+					argsPath := filepath.Join(home, "portal-args")
+					stdoutPath := filepath.Join(home, "stdout")
+					stderrPath := filepath.Join(home, "stderr")
+					writeExec(t, shimPath, "%s", xselShim)
+					writeExec(t, filepath.Join(cacheDir, "portald"), "%s", `#!/bin/sh
 printf '%s\n' "$*" >> "$PORTAL_ARGS"
 exit 0
 `)
+					dirname, err := exec.LookPath("dirname")
+					if err != nil {
+						t.Skip("dirname is unavailable")
+					}
+					if err := os.Symlink(dirname, filepath.Join(toolDir, "dirname")); err != nil {
+						t.Fatal(err)
+					}
 
-	command := shellQuote(shimPath) + " > " + shellQuote(stdoutPath) + " 2> " + shellQuote(stderrPath)
-	cmd := exec.Command(scriptBin, "-q", "/dev/null", "/bin/sh", "-c", command)
-	cmd.Stdin = bytes.NewReader(nil)
-	cmd.Env = []string{
-		"HOME=" + home,
-		"PATH=" + strings.Join([]string{shimDir, "/usr/bin", "/bin"}, ":"),
-		"PORTAL_ARGS=" + argsPath,
-	}
-	transcript, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("xsel tty default: %v (transcript=%q)", err, transcript)
-	}
-	if got, want := string(readOptional(t, argsPath)), "clip text\n"; got != want {
-		t.Fatalf("portald argv = %q, want %q", got, want)
-	}
-	if got := readOptional(t, stderrPath); len(got) != 0 {
-		t.Fatalf("stderr = %q, want empty", got)
+					commandArgs := append([]string{}, shell.argv...)
+					commandArgs = append(commandArgs, shimPath)
+					commandArgs = append(commandArgs, tt.args...)
+					quoted := make([]string, 0, len(commandArgs))
+					for _, arg := range commandArgs {
+						quoted = append(quoted, shellQuote(arg))
+					}
+					command := strings.Join(quoted, " ") +
+						" > " + shellQuote(stdoutPath) + " 2> " + shellQuote(stderrPath)
+					argv := append([]string{}, shell.argv[1:]...)
+					argv = append(argv, "-c", command)
+					cmd := exec.Command(shell.argv[0], argv...)
+					cmd.Env = []string{
+						"HOME=" + home,
+						"PATH=" + strings.Join([]string{shimDir, toolDir}, ":"),
+						"PORTAL_ARGS=" + argsPath,
+					}
+					master, err := ptyx.Start(cmd, 24, 80)
+					if err != nil {
+						t.Fatalf("start xsel under tty: %v", err)
+					}
+					waitErr := cmd.Wait()
+					_ = master.Close()
+					exitCode := 0
+					if waitErr != nil {
+						var exitErr *exec.ExitError
+						if !errors.As(waitErr, &exitErr) {
+							t.Fatalf("wait xsel under tty: %v", waitErr)
+						}
+						exitCode = exitErr.ExitCode()
+					}
+					if exitCode != tt.wantCode {
+						t.Fatalf("exit = %d, want %d (stderr=%q)", exitCode, tt.wantCode, readOptional(t, stderrPath))
+					}
+					if got := string(readOptional(t, argsPath)); got != tt.wantPortal {
+						t.Fatalf("portald argv = %q, want %q", got, tt.wantPortal)
+					}
+					if got := readOptional(t, stdoutPath); len(got) != 0 {
+						t.Fatalf("stdout = %q, want empty", got)
+					}
+					gotOutput := string(readOptional(t, stderrPath))
+					if gotOutput != tt.wantOutput {
+						t.Fatalf("stderr = %q, want %q", gotOutput, tt.wantOutput)
+					}
+				})
+			}
+		})
 	}
 }
 

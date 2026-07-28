@@ -550,6 +550,31 @@ func (s *e2eSession) serveClip(ctx context.Context, sha string) {
 	}()
 }
 
+func (s *e2eSession) serveClipWrite(ctx context.Context) <-chan protocol.ClipWriteRequest {
+	requests := make(chan protocol.ClipWriteRequest, 1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev := <-s.c.ClipWriteEvents():
+				if ev.ClipWrite == nil {
+					continue
+				}
+				requests <- protocol.ClipWriteRequest{
+					Nonce: ev.ClipWrite.Nonce, Epoch: ev.ClipWrite.Epoch,
+					Kind: ev.ClipWrite.Kind, Format: ev.ClipWrite.Format,
+					SHA: ev.ClipWrite.SHA, Size: ev.ClipWrite.Size,
+				}
+				_ = s.c.SendClipWriteResponse(&protocol.ClipWriteResponse{
+					Nonce: ev.ClipWrite.Nonce, Epoch: ev.ClipWrite.Epoch, OK: true,
+				})
+			}
+		}
+	}()
+	return requests
+}
+
 // serveCred drains the client's dedicated credential channel and approves each
 // request with the supplied fake bytes through SendCredResponse.
 func (s *e2eSession) serveCred(ctx context.Context, secret []byte) {
@@ -635,13 +660,14 @@ func openurlHandler(version uint32, deliver func(EngineEvent)) HandlerSpec {
 	}
 }
 
-// TestE2EAllFourServicesRoundTrip drives openurl, notify, clip, and cred end to
-// end over a real agent+client pipe, both auto-registering all four services.
+// TestE2EAllFiveServicesRoundTrip drives openurl, notify, clip, clipwrite, and
+// cred end to end over a real agent+client pipe, both auto-registering all five
+// services.
 // Every feature crosses via Msg frames ONLY (the legacy Envelope fields are
 // deleted — compiler-enforced, and asserted by the agent's deletion-invariant
 // test). HelloAck.Services proves the reverse-direction advertisement; the cmd
 // replies prove the agent recorded the client's services (forward).
-func TestE2EAllFourServicesRoundTrip(t *testing.T) {
+func TestE2EAllFiveServicesRoundTrip(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef"
 	secret := []byte("s3kr3t-vector")
 	sess := newE2ESession(t, nil, nil, nil)
@@ -651,7 +677,7 @@ func TestE2EAllFourServicesRoundTrip(t *testing.T) {
 	if ack == nil {
 		t.Fatal("no HelloAck")
 	}
-	for _, svc := range []string{"openurl", "notify", "clip", "cred"} {
+	for _, svc := range []string{"openurl", "notify", "clip", "clipwrite", "cred"} {
 		if v, ok := ack.Services[svc]; !ok || v != 1 {
 			t.Fatalf("HelloAck.Services[%q] = %d (present %v), want 1", svc, v, ok)
 		}
@@ -660,6 +686,7 @@ func TestE2EAllFourServicesRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess.serveClip(ctx, sha)
+	clipWrites := sess.serveClipWrite(ctx)
 	sess.serveCred(ctx, secret)
 
 	// openurl.
@@ -681,6 +708,20 @@ func TestE2EAllFourServicesRoundTrip(t *testing.T) {
 	// clip.
 	if got := sess.ask(t, "clip\timage\tpng\n"); got != "ok\t"+sha+"\n" {
 		t.Fatalf("clip = %q, want ok\\t<sha>\\n", got)
+	}
+
+	// clipwrite.
+	if got := sess.ask(t, "copy\ttext\t"+sha+"\t42\n"); got != "ok\n" {
+		t.Fatalf("clipwrite = %q, want ok\\n", got)
+	}
+	select {
+	case req := <-clipWrites:
+		if req.Nonce == 0 || req.Epoch == 0 || req.Kind != "text" ||
+			req.Format != "" || req.SHA != sha || req.Size != 42 {
+			t.Fatalf("clipwrite request = %+v", req)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no connected clipboard-write request")
 	}
 
 	// cred.

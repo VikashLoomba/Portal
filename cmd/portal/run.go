@@ -366,6 +366,7 @@ type clipWriteDeps struct {
 	Host           string
 	Banner         *clipWriteBanner
 	Log            func(string)
+	ApplyTimeout   time.Duration
 }
 
 type clipWriteResponseSender func(*protocol.ClipWriteResponse) error
@@ -388,6 +389,7 @@ func runClipWriteHandler(ctx context.Context, ch <-chan agentclient.EngineEvent,
 		Host:           host,
 		Banner:         newClipWriteBanner(host),
 		Log:            logLine,
+		ApplyTimeout:   clipWriteApplyTimeout,
 	}
 	runClipWriteHandlerWithDeps(ctx, ch, deps, a.AgentClient.SendClipWriteResponse, wg)
 }
@@ -484,7 +486,11 @@ func serveClipWriteRequest(ctx context.Context, deps clipWriteDeps,
 		return denyClipWriteResponse(deps, resp, kind, reason)
 	}
 
-	cctx, cancel := context.WithTimeout(ctx, clipWriteApplyTimeout)
+	applyTimeout := deps.ApplyTimeout
+	if applyTimeout <= 0 {
+		applyTimeout = clipWriteApplyTimeout
+	}
+	cctx, cancel := context.WithTimeout(ctx, applyTimeout)
 	defer cancel()
 
 	var data []byte
@@ -494,6 +500,7 @@ func serveClipWriteRequest(ctx context.Context, deps clipWriteDeps,
 		if err != nil {
 			logClipWriteLine(deps, fmt.Sprintf(
 				"clip-write: pull failed (nonce=%d kind=%s): %v", req.Nonce, kind, err))
+			deps.Audit.ClipWriteFailed(deps.Host, kind, "pull")
 			return resp
 		}
 		if int64(len(data)) != req.Size || clipupload.ShortSHA(data) != req.SHA {
@@ -513,6 +520,7 @@ func serveClipWriteRequest(ctx context.Context, deps clipWriteDeps,
 	if err != nil {
 		logClipWriteLine(deps, fmt.Sprintf(
 			"clip-write: pasteboard set failed (nonce=%d kind=%s): %v", req.Nonce, kind, err))
+		deps.Audit.ClipWriteFailed(deps.Host, kind, "pasteboard")
 		return resp
 	}
 

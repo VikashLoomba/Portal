@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"github.com/VikashLoomba/Portal/pkg/agentclient"
 	"github.com/VikashLoomba/Portal/pkg/protocol"
 	"github.com/VikashLoomba/Portal/pkg/transport"
+	"github.com/VikashLoomba/Portal/pkg/transport/localexec"
 )
 
 type clipWriteOrder struct {
@@ -58,24 +60,28 @@ type fakeClipWriter struct {
 	order    *clipWriteOrder
 }
 
-func (f *fakeClipWriter) SetText(_ context.Context, data []byte) error {
-	return f.apply("text", data, f.textErr)
+func (f *fakeClipWriter) SetText(ctx context.Context, data []byte) error {
+	return f.apply(ctx, "text", data, f.textErr)
 }
 
-func (f *fakeClipWriter) SetImagePNG(_ context.Context, data []byte) error {
-	return f.apply("png", data, f.imageErr)
+func (f *fakeClipWriter) SetImagePNG(ctx context.Context, data []byte) error {
+	return f.apply(ctx, "png", data, f.imageErr)
 }
 
-func (f *fakeClipWriter) Clear(context.Context) error {
-	return f.apply("clear", nil, f.clearErr)
+func (f *fakeClipWriter) Clear(ctx context.Context) error {
+	return f.apply(ctx, "clear", nil, f.clearErr)
 }
 
-func (f *fakeClipWriter) apply(kind string, data []byte, err error) error {
+func (f *fakeClipWriter) apply(ctx context.Context, kind string, data []byte, err error) error {
 	if f.started != nil {
 		f.start.Do(func() { close(f.started) })
 	}
 	if f.release != nil {
-		<-f.release
+		select {
+		case <-f.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	f.order.add("set")
 	f.mu.Lock()
@@ -106,6 +112,7 @@ type fakeClipWriteTransport struct {
 	order   *clipWriteOrder
 	started chan struct{}
 	start   sync.Once
+	release <-chan struct{}
 }
 
 func (f *fakeClipWriteTransport) Ensure(context.Context) (bool, error) { return false, nil }
@@ -114,7 +121,7 @@ func (f *fakeClipWriteTransport) Health(context.Context) (transport.Health, erro
 	return transport.Health{Up: true}, nil
 }
 
-func (f *fakeClipWriteTransport) Exec(_ context.Context, stdin []byte, argv ...string) (string, string, error) {
+func (f *fakeClipWriteTransport) Exec(ctx context.Context, stdin []byte, argv ...string) (string, string, error) {
 	f.order.add("pull")
 	if f.started != nil {
 		f.start.Do(func() { close(f.started) })
@@ -124,6 +131,13 @@ func (f *fakeClipWriteTransport) Exec(_ context.Context, stdin []byte, argv ...s
 	f.stdin = append(f.stdin, append([]byte(nil), stdin...))
 	stdout, stderr, err := f.stdout, f.stderr, f.err
 	f.mu.Unlock()
+	if f.release != nil {
+		select {
+		case <-f.release:
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		}
+	}
 	return stdout, stderr, err
 }
 
@@ -188,6 +202,7 @@ type clipWriteBannerHarness struct {
 	raised      chan struct{}
 	dispatches  int
 	timerStarts int
+	beforeRaise func()
 }
 
 func newClipWriteBannerHarness(host string, order *clipWriteOrder) (*clipWriteBanner, *clipWriteBannerHarness) {
@@ -212,6 +227,9 @@ func newClipWriteBannerHarness(host string, order *clipWriteOrder) (*clipWriteBa
 }
 
 func (h *clipWriteBannerHarness) raise(title, subtitle string) {
+	if h.beforeRaise != nil {
+		h.beforeRaise()
+	}
 	h.order.add("banner")
 	h.mu.Lock()
 	h.calls = append(h.calls, clipWriteBannerCall{title: title, subtitle: subtitle})
@@ -316,6 +334,24 @@ func assertNoClipWriteAudit(t *testing.T, log *audit.Log) {
 	}
 	if len(data) != 0 {
 		t.Fatalf("unexpected clipboard-write audit: %q", data)
+	}
+}
+
+func waitClipWriteAuditLines(t *testing.T, log *audit.Log, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		data, err := os.ReadFile(log.Path())
+		if err == nil && bytes.Count(data, []byte{'\n'}) == want {
+			return
+		}
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("clipboard-write audit did not reach %d lines", want)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -648,7 +684,9 @@ func TestServeClipWriteRequest_PullAndWriterErrors(t *testing.T) {
 		resp := serveClipWriteRequest(context.Background(), deps, req)
 
 		assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
-		assertNoClipWriteAudit(t, deps.Audit)
+		assertCredAudit(t, deps.Audit, []string{
+			"clip-write-failed", "host=box", "kind=text", "stage=pull",
+		})
 		if len(writer.snapshot()) != 0 {
 			t.Fatal("pull failure reached writer")
 		}
@@ -665,11 +703,135 @@ func TestServeClipWriteRequest_PullAndWriterErrors(t *testing.T) {
 		resp := serveClipWriteRequest(context.Background(), deps, req)
 
 		assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
-		assertNoClipWriteAudit(t, deps.Audit)
+		assertCredAudit(t, deps.Audit, []string{
+			"clip-write-failed", "host=box", "kind=text", "stage=pasteboard",
+		})
 		if len(logs.snapshot()) != 1 {
 			t.Fatalf("writer failure logs = %v", logs.snapshot())
 		}
 	})
+}
+
+func TestServeClipWriteRequest_ApplyTimeout(t *testing.T) {
+	if clipWriteApplyTimeout != 8*time.Second {
+		t.Fatalf("clipboard-write apply timeout = %v, want 8s", clipWriteApplyTimeout)
+	}
+	data := []byte("timeout")
+
+	t.Run("pull", func(t *testing.T) {
+		deps, tr, writer, _, _ := newClipWriteTestDeps(t, data)
+		deps.ApplyTimeout = 20 * time.Millisecond
+		tr.release = make(chan struct{})
+		req := clipWriteTextEvent(data)
+
+		start := time.Now()
+		resp := serveClipWriteRequest(context.Background(), deps, req)
+
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("pull timeout took %v", elapsed)
+		}
+		assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
+		assertCredAudit(t, deps.Audit, []string{
+			"clip-write-failed", "host=box", "kind=text", "stage=pull",
+		})
+		if len(writer.snapshot()) != 0 {
+			t.Fatal("timed-out pull reached writer")
+		}
+	})
+
+	t.Run("pasteboard", func(t *testing.T) {
+		deps, _, writer, _, _ := newClipWriteTestDeps(t, data)
+		deps.ApplyTimeout = 20 * time.Millisecond
+		writer.release = make(chan struct{})
+		req := clipWriteTextEvent(data)
+
+		start := time.Now()
+		resp := serveClipWriteRequest(context.Background(), deps, req)
+
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("pasteboard timeout took %v", elapsed)
+		}
+		assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
+		assertCredAudit(t, deps.Audit, []string{
+			"clip-write-failed", "host=box", "kind=text", "stage=pasteboard",
+		})
+		if len(writer.snapshot()) != 0 {
+			t.Fatal("timed-out fake writer reported a completed mutation")
+		}
+	})
+}
+
+func TestServeClipWriteRequest_CancellationStopsPull(t *testing.T) {
+	data := []byte("canceled")
+	deps, tr, writer, _, _ := newClipWriteTestDeps(t, data)
+	tr.started = make(chan struct{})
+	tr.release = make(chan struct{})
+	req := clipWriteTextEvent(data)
+	ctx, cancel := context.WithCancel(context.Background())
+	responses := make(chan *protocol.ClipWriteResponse, 1)
+	go func() {
+		responses <- serveClipWriteRequest(ctx, deps, req)
+	}()
+
+	select {
+	case <-tr.started:
+	case <-time.After(time.Second):
+		t.Fatal("clipboard pull did not start")
+	}
+	cancel()
+
+	select {
+	case resp := <-responses:
+		assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
+	case <-time.After(time.Second):
+		t.Fatal("canceled clipboard pull did not return")
+	}
+	assertCredAudit(t, deps.Audit, []string{
+		"clip-write-failed", "host=box", "kind=text", "stage=pull",
+	})
+	if len(writer.snapshot()) != 0 {
+		t.Fatal("canceled pull reached writer")
+	}
+}
+
+func TestPullClipWrite_ExecutesPinnedShellGuards(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("bash is unavailable")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".cache", "portal", "clip")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("guarded clipboard data")
+	sha := clipupload.ShortSHA(data)
+	path := filepath.Join(dir, "copy-"+sha+".txt")
+	if err := os.WriteFile(path, append(append([]byte(nil), data...), []byte("ignored suffix")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := pullClipWrite(context.Background(), localexec.New(), sha, ".txt", int64(len(data)))
+	if err != nil {
+		t.Fatalf("guarded pull failed: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("bounded pull = %q, want %q", got, data)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "swap-target")
+	if err := os.WriteFile(target, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pullClipWrite(context.Background(), localexec.New(), sha, ".txt", int64(len(data))); err == nil {
+		t.Fatal("pull accepted a symlinked content-addressed file")
+	}
 }
 
 func TestRunClipWriteHandler_Inflight(t *testing.T) {
@@ -740,6 +902,14 @@ func TestRunClipWriteHandler_Ordering(t *testing.T) {
 	writer.order = order
 	banner, bannerHarness := newClipWriteBannerHarness("box", order)
 	deps.Banner = banner
+	bannerHarness.beforeRaise = func() {
+		data, err := os.ReadFile(deps.Audit.Path())
+		if err == nil && bytes.Contains(data, []byte("\tclip-written\t")) {
+			order.add("audit")
+			return
+		}
+		order.add("audit-missing")
+	}
 
 	events := make(chan agentclient.EngineEvent, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -747,6 +917,9 @@ func TestRunClipWriteHandler_Ordering(t *testing.T) {
 	go func() {
 		defer close(done)
 		runClipWriteHandlerWithDeps(ctx, events, deps, func(*protocol.ClipWriteResponse) error {
+			if data, err := os.ReadFile(deps.Audit.Path()); err == nil && len(data) != 0 {
+				order.add("audit-before-send")
+			}
 			order.add("send")
 			return nil
 		}, nil)
@@ -756,7 +929,7 @@ func TestRunClipWriteHandler_Ordering(t *testing.T) {
 	cancel()
 	waitClipWriteHandler(t, done)
 
-	want := []string{"pull", "set", "send", "banner"}
+	want := []string{"pull", "set", "send", "audit", "banner"}
 	got := order.snapshot()
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("clipboard-write order = %v, want %v", got, want)
@@ -799,6 +972,57 @@ func TestClipWriteBanner_Coalescing(t *testing.T) {
 		t.Fatalf("fresh leading banner calls = %+v", calls)
 	}
 	banner.close()
+}
+
+func TestRunClipWriteHandler_CoalescingAuditsEveryWrite(t *testing.T) {
+	data := []byte("coalesced")
+	deps, _, _, _, banner := newClipWriteTestDeps(t, data)
+	events := make(chan agentclient.EngineEvent, 1)
+	responses := make(chan *protocol.ClipWriteResponse, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var workers sync.WaitGroup
+	go func() {
+		defer close(done)
+		runClipWriteHandlerWithDeps(ctx, events, deps, func(resp *protocol.ClipWriteResponse) error {
+			copyResp := *resp
+			responses <- &copyResp
+			return nil
+		}, &workers)
+	}()
+
+	req := clipWriteTextEvent(data)
+	for i := 0; i < 4; i++ {
+		copyReq := *req
+		copyReq.Nonce += uint64(i)
+		events <- agentclient.EngineEvent{Kind: agentclient.KindClipWriteRequest, ClipWrite: &copyReq}
+		select {
+		case resp := <-responses:
+			assertClipWriteResponse(t, resp, copyReq.Nonce, copyReq.Epoch, true, "")
+		case <-time.After(time.Second):
+			t.Fatal("clipboard-write response did not arrive")
+		}
+		workers.Wait()
+		waitClipWriteAuditLines(t, deps.Audit, i+1)
+	}
+
+	banner.waitRaised(t)
+	if calls := banner.snapshot(); len(calls) != 1 {
+		t.Fatalf("coalesced leading banners = %+v, want one", calls)
+	}
+	banner.callback(t, 0)()
+	calls := banner.snapshot()
+	if len(calls) != 2 || calls[1].title != "3 more clipboard writes from box" {
+		t.Fatalf("coalesced handler banners = %+v", calls)
+	}
+	wantAudit := []string{
+		"clip-written", "host=box", "kind=text",
+		"sha=" + req.SHA + " size=" + strconv.FormatInt(req.Size, 10),
+	}
+	assertCredAudit(t, deps.Audit, wantAudit, wantAudit, wantAudit, wantAudit)
+
+	cancel()
+	waitClipWriteHandler(t, done)
 }
 
 func TestClipWriteBanner_NoSummaryWhenNoneSuppressed(t *testing.T) {
@@ -873,10 +1097,8 @@ func TestClipWriteBanner_NotesAfterCloseStillRaise(t *testing.T) {
 func TestRunClipWriteHandler_BannerSurvivesCancellation(t *testing.T) {
 	data := []byte("cancel-race")
 	deps, _, writer, _, banner := newClipWriteTestDeps(t, data)
-	started := make(chan struct{})
-	release := make(chan struct{})
-	writer.started = started
-	writer.release = release
+	sendStarted := make(chan struct{})
+	releaseSend := make(chan struct{})
 
 	events := make(chan agentclient.EngineEvent, 1)
 	responses := make(chan *protocol.ClipWriteResponse, 1)
@@ -887,20 +1109,22 @@ func TestRunClipWriteHandler_BannerSurvivesCancellation(t *testing.T) {
 		runClipWriteHandlerWithDeps(ctx, events, deps, func(resp *protocol.ClipWriteResponse) error {
 			copyResp := *resp
 			responses <- &copyResp
+			close(sendStarted)
+			<-releaseSend
 			return nil
 		}, nil)
 	}()
 	req := clipWriteTextEvent(data)
 	events <- agentclient.EngineEvent{Kind: agentclient.KindClipWriteRequest, ClipWrite: req}
 	select {
-	case <-started:
+	case <-sendStarted:
 	case <-time.After(time.Second):
-		t.Fatal("clipboard writer did not start")
+		t.Fatal("clipboard-write response send did not start")
 	}
 
 	cancel()
 	waitClipWriteHandler(t, done)
-	close(release)
+	close(releaseSend)
 
 	select {
 	case resp := <-responses:
@@ -909,6 +1133,9 @@ func TestRunClipWriteHandler_BannerSurvivesCancellation(t *testing.T) {
 		t.Fatal("post-cancellation response did not arrive")
 	}
 	banner.waitRaised(t)
+	if calls := writer.snapshot(); len(calls) != 1 || calls[0].kind != "text" {
+		t.Fatalf("clipboard mutation before cancellation = %+v, want one text write", calls)
+	}
 	assertCredAudit(t, deps.Audit, []string{
 		"clip-written", "host=box", "kind=text",
 		"sha=" + req.SHA + " size=" + strconv.FormatInt(req.Size, 10),

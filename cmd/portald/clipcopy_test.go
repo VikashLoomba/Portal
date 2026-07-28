@@ -74,6 +74,40 @@ func startFakeCopySocketWithInspect(
 	}
 }
 
+func startStalledCopySocket(t *testing.T, dir, name string) fakeCopySocket {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen %s: %v", name, err)
+	}
+	requests := make(chan string, 1)
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		line, _ := bufio.NewReader(conn).ReadString('\n')
+		if line != "" {
+			requests <- line
+		}
+		<-release
+		_ = conn.Close()
+	}()
+	return fakeCopySocket{
+		path:     path,
+		requests: requests,
+		stop: func() {
+			_ = listener.Close()
+			close(release)
+			<-done
+		},
+	}
+}
+
 func shortCopySocketDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "cps")
@@ -427,6 +461,35 @@ func TestClipCopyTimeoutBudget(t *testing.T) {
 	}
 	if clipReadTimeout != 13*time.Second {
 		t.Fatalf("clip read timeout = %v, want 13s", clipReadTimeout)
+	}
+}
+
+func TestRunClipCopy_StalledSocketTimesOutAndUnlinks(t *testing.T) {
+	socketDir := shortCopySocketDir(t)
+	fake := startStalledCopySocket(t, socketDir, "cmd-stalled.sock")
+	defer fake.stop()
+	rt := clipCopyRuntime{
+		stdin:       strings.NewReader("clipboard"),
+		stderr:      io.Discard,
+		clipDir:     filepath.Join(socketDir, "clip"),
+		sockets:     func() []string { return []string{fake.path} },
+		now:         time.Now,
+		dialTimeout: 100 * time.Millisecond,
+		readTimeout: 20 * time.Millisecond,
+	}
+
+	start := time.Now()
+	if code := runClipCopy([]string{"text"}, rt); code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("stalled socket timeout took %v", elapsed)
+	}
+	if line := waitCopyRequest(t, fake); !strings.HasPrefix(line, "copy\ttext\t") {
+		t.Fatalf("request = %q, want copy text framing", line)
+	}
+	if artifacts := copyArtifacts(t, rt.clipDir); len(artifacts) != 0 {
+		t.Fatalf("copy artifacts after timeout = %v", artifacts)
 	}
 }
 

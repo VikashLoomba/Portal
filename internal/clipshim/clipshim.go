@@ -377,12 +377,14 @@ _has_i=0
 _has_o=0
 _clear=0
 _info=0
+_write_intent=0
 _ok=1
 for _a in "$@"; do
     case "$_a" in
       --input) _has_i=1 ;;
       --output) _has_o=1 ;;
       --clear) _clear=1 ;;
+      --append|--follow|--delete|--exchange) _write_intent=1; _ok=0 ;;
       --clipboard|--primary|--secondary|--nodetach) : ;;
       --help|--version) _info=1; _ok=0 ;;
       --*) _ok=0 ;;
@@ -391,7 +393,8 @@ for _a in "$@"; do
         case "${_a#-}" in *[!iobpscn]*) _ok=0 ;; esac
         case "${_a#-}" in *i*) _has_i=1 ;; esac
         case "${_a#-}" in *o*) _has_o=1 ;; esac
-        case "${_a#-}" in *c*) _clear=1 ;; esac ;;
+        case "${_a#-}" in *c*) _clear=1 ;; esac
+        case "${_a#-}" in *[afdx]*) _write_intent=1 ;; esac ;;
       *) _ok=0 ;;
     esac
 done
@@ -406,6 +409,8 @@ elif [ "$_clear" = 1 ] && [ "$_has_i" = 1 ]; then
 elif [ "$_clear" = 1 ]; then
     _mode=write
 elif [ "$_has_i" = 1 ]; then
+    _mode=write
+elif [ "$_write_intent" = 1 ]; then
     _mode=write
 elif [ "$_has_o" = 1 ]; then
     _mode=read

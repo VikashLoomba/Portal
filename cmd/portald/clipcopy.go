@@ -26,11 +26,13 @@ type clipCopyArgs struct {
 }
 
 type clipCopyRuntime struct {
-	stdin   io.Reader
-	stderr  io.Writer
-	clipDir string
-	sockets func() []string
-	now     func() time.Time
+	stdin       io.Reader
+	stderr      io.Writer
+	clipDir     string
+	sockets     func() []string
+	now         func() time.Time
+	dialTimeout time.Duration
+	readTimeout time.Duration
 }
 
 func productionClipCopyRuntime() clipCopyRuntime {
@@ -40,11 +42,13 @@ func productionClipCopyRuntime() clipCopyRuntime {
 		dir = filepath.Join(home, ".cache", "portal", "clip")
 	}
 	return clipCopyRuntime{
-		stdin:   os.Stdin,
-		stderr:  os.Stderr,
-		clipDir: dir,
-		sockets: cmdSocketEntries,
-		now:     time.Now,
+		stdin:       os.Stdin,
+		stderr:      os.Stderr,
+		clipDir:     dir,
+		sockets:     cmdSocketEntries,
+		now:         time.Now,
+		dialTimeout: clipDialTimeout,
+		readTimeout: clipReadTimeout,
 	}
 }
 
@@ -132,8 +136,16 @@ func runClipCopy(args []string, rt clipCopyRuntime) int {
 	}
 
 send:
+	dialTimeout := rt.dialTimeout
+	if dialTimeout <= 0 {
+		dialTimeout = clipDialTimeout
+	}
+	readTimeout := rt.readTimeout
+	if readTimeout <= 0 {
+		readTimeout = clipReadTimeout
+	}
 	answer, state := copyFanout(
-		rt.sockets(), line, clipDialTimeout, clipReadTimeout,
+		rt.sockets(), line, dialTimeout, readTimeout,
 	)
 	if state != fanoutOneAgent || !parseCopyReply(answer.raw, answer.readErr) {
 		return 1

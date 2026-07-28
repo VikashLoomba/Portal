@@ -160,13 +160,15 @@ func TestLog_ClipWriteEvents(t *testing.T) {
 
 	l.ClipWritten("box", "text", "sha=abc123 size=42")
 	l.ClipWriteDenied("box", "image", "oversize")
+	l.ClipWriteFailed("box", "clear", "pasteboard")
 
 	b, err := os.ReadFile(l.Path())
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := "2026-07-27T09:08:07Z\tclip-written\thost=box\tkind=text\tsha=abc123 size=42\n" +
-		"2026-07-27T09:08:07Z\tclip-write-denied\thost=box\tkind=image\treason=oversize\n"
+		"2026-07-27T09:08:07Z\tclip-write-denied\thost=box\tkind=image\treason=oversize\n" +
+		"2026-07-27T09:08:07Z\tclip-write-failed\thost=box\tkind=clear\tstage=pasteboard\n"
 	got := string(b)
 	if got != want {
 		t.Errorf("clipboard-write audit lines:\n%s\nwant:\n%s", got, want)
@@ -198,6 +200,7 @@ func TestLog_NilSafe(t *testing.T) {
 	l.ClipServed("h", "image", "x")
 	l.ClipWritten("h", "text", "x")
 	l.ClipWriteDenied("h", "clear", "disabled")
+	l.ClipWriteFailed("h", "image", "pull")
 	l.CredServed("h", "label", "env", "prompt", time.Millisecond)
 	l.CredDenied("h", "label", "env", "denied")
 	l.CredForgotten("h", "label")
