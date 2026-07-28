@@ -104,16 +104,17 @@ func (f *fakeClipWriter) snapshot() []fakeClipWriteCall {
 var _ clip.Writer = (*fakeClipWriter)(nil)
 
 type fakeClipWriteTransport struct {
-	mu      sync.Mutex
-	stdout  string
-	stderr  string
-	err     error
-	argv    [][]string
-	stdin   [][]byte
-	order   *clipWriteOrder
-	started chan struct{}
-	start   sync.Once
-	release <-chan struct{}
+	mu        sync.Mutex
+	stdout    string
+	stderr    string
+	err       error
+	streamErr error
+	argv      [][]string
+	stdin     [][]byte
+	order     *clipWriteOrder
+	started   chan struct{}
+	start     sync.Once
+	release   <-chan struct{}
 }
 
 func (f *fakeClipWriteTransport) Ensure(context.Context) (bool, error) { return false, nil }
@@ -152,8 +153,12 @@ func (f *fakeClipWriteTransport) Stream(ctx context.Context, argv ...string) (
 	f.mu.Lock()
 	f.argv = append(f.argv, append([]string(nil), argv...))
 	f.stdin = append(f.stdin, nil)
-	stdoutData, stderrData, runErr, release := f.stdout, f.stderr, f.err, f.release
+	stdoutData, stderrData, runErr, streamErr, release :=
+		f.stdout, f.stderr, f.err, f.streamErr, f.release
 	f.mu.Unlock()
+	if streamErr != nil {
+		return nil, nil, nil, nil, streamErr
+	}
 
 	stdout, stdoutWriter := io.Pipe()
 	stderr, stderrWriter := io.Pipe()
@@ -725,6 +730,24 @@ func TestServeClipWriteRequest_ImagePNG(t *testing.T) {
 
 func TestServeClipWriteRequest_PullAndWriterErrors(t *testing.T) {
 	data := []byte("errors")
+	t.Run("stream startup", func(t *testing.T) {
+		deps, tr, writer, logs, _ := newClipWriteTestDeps(t, data)
+		tr.streamErr = errors.New("stream startup failed")
+		req := clipWriteTextEvent(data)
+
+		resp := serveClipWriteRequest(context.Background(), deps, req)
+
+		assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
+		assertNoClipWriteAudit(t, deps.Audit)
+		if len(writer.snapshot()) != 0 {
+			t.Fatal("stream startup failure reached writer")
+		}
+		lines := logs.snapshot()
+		if len(lines) != 1 || !strings.Contains(lines[0], "stream startup failed") {
+			t.Fatalf("stream startup failure logs = %v", lines)
+		}
+	})
+
 	t.Run("pull", func(t *testing.T) {
 		deps, tr, writer, logs, _ := newClipWriteTestDeps(t, data)
 		tr.err = errors.New("exec failed")
@@ -734,9 +757,7 @@ func TestServeClipWriteRequest_PullAndWriterErrors(t *testing.T) {
 		resp := serveClipWriteRequest(context.Background(), deps, req)
 
 		assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
-		assertCredAudit(t, deps.Audit, []string{
-			"clip-write-failed", "host=box", "kind=text", "stage=pull",
-		})
+		assertNoClipWriteAudit(t, deps.Audit)
 		if len(writer.snapshot()) != 0 {
 			t.Fatal("pull failure reached writer")
 		}
@@ -758,9 +779,7 @@ func TestServeClipWriteRequest_PullAndWriterErrors(t *testing.T) {
 		resp := serveClipWriteRequest(context.Background(), deps, req)
 
 		assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
-		assertCredAudit(t, deps.Audit, []string{
-			"clip-write-failed", "host=box", "kind=text", "stage=pasteboard",
-		})
+		assertNoClipWriteAudit(t, deps.Audit)
 		if len(logs.snapshot()) != 1 {
 			t.Fatalf("writer failure logs = %v", logs.snapshot())
 		}
@@ -786,9 +805,7 @@ func TestServeClipWriteRequest_ApplyTimeout(t *testing.T) {
 			t.Fatalf("pull timeout took %v", elapsed)
 		}
 		assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
-		assertCredAudit(t, deps.Audit, []string{
-			"clip-write-failed", "host=box", "kind=text", "stage=pull",
-		})
+		assertNoClipWriteAudit(t, deps.Audit)
 		if len(writer.snapshot()) != 0 {
 			t.Fatal("timed-out pull reached writer")
 		}
@@ -807,9 +824,7 @@ func TestServeClipWriteRequest_ApplyTimeout(t *testing.T) {
 			t.Fatalf("pasteboard timeout took %v", elapsed)
 		}
 		assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
-		assertCredAudit(t, deps.Audit, []string{
-			"clip-write-failed", "host=box", "kind=text", "stage=pasteboard",
-		})
+		assertNoClipWriteAudit(t, deps.Audit)
 		if len(writer.snapshot()) != 0 {
 			t.Fatal("timed-out fake writer reported a completed mutation")
 		}
@@ -841,12 +856,96 @@ func TestServeClipWriteRequest_CancellationStopsPull(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("canceled clipboard pull did not return")
 	}
-	assertCredAudit(t, deps.Audit, []string{
-		"clip-write-failed", "host=box", "kind=text", "stage=pull",
-	})
+	assertNoClipWriteAudit(t, deps.Audit)
 	if len(writer.snapshot()) != 0 {
 		t.Fatal("canceled pull reached writer")
 	}
+}
+
+func TestRunClipWriteHandler_DeadSessionCannotMutate(t *testing.T) {
+	deps, _, writer, _, _ := newClipWriteTestDeps(t, nil)
+	events := make(chan agentclient.EngineEvent, 2)
+	responses := make(chan *protocol.ClipWriteResponse, 2)
+	ctx, cancelHandler := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runClipWriteHandlerWithDeps(ctx, events, deps, func(resp *protocol.ClipWriteResponse) error {
+			copyResp := *resp
+			responses <- &copyResp
+			return nil
+		}, nil)
+	}()
+
+	deadSession, cancelSession := context.WithCancel(context.Background())
+	cancelSession()
+	stale := &agentclient.ClipWriteEvent{
+		Nonce: 1, Epoch: 1, Kind: "clear", Session: deadSession,
+	}
+	current := &agentclient.ClipWriteEvent{Nonce: 2, Epoch: 2, Kind: "clear"}
+	events <- agentclient.EngineEvent{Kind: agentclient.KindClipWriteRequest, ClipWrite: stale}
+	events <- agentclient.EngineEvent{Kind: agentclient.KindClipWriteRequest, ClipWrite: current}
+
+	select {
+	case resp := <-responses:
+		assertClipWriteResponse(t, resp, current.Nonce, current.Epoch, true, "")
+	case <-time.After(time.Second):
+		t.Fatal("current-session clipboard write did not complete")
+	}
+	cancelHandler()
+	waitClipWriteHandler(t, done)
+
+	calls := writer.snapshot()
+	if len(calls) != 1 || calls[0].kind != "clear" {
+		t.Fatalf("clipboard calls = %+v, want only current-session clear", calls)
+	}
+	select {
+	case resp := <-responses:
+		t.Fatalf("dead-session request received response: %+v", resp)
+	default:
+	}
+}
+
+func TestRunClipWriteHandler_DisconnectCancelsInflightPull(t *testing.T) {
+	data := []byte("session canceled")
+	deps, tr, writer, _, _ := newClipWriteTestDeps(t, data)
+	tr.started = make(chan struct{})
+	tr.release = make(chan struct{})
+	session, cancelSession := context.WithCancel(context.Background())
+	req := clipWriteTextEvent(data)
+	req.Session = session
+
+	events := make(chan agentclient.EngineEvent, 1)
+	responses := make(chan *protocol.ClipWriteResponse, 1)
+	ctx, cancelHandler := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runClipWriteHandlerWithDeps(ctx, events, deps, func(resp *protocol.ClipWriteResponse) error {
+			responses <- resp
+			return nil
+		}, nil)
+	}()
+	events <- agentclient.EngineEvent{Kind: agentclient.KindClipWriteRequest, ClipWrite: req}
+	select {
+	case <-tr.started:
+	case <-time.After(time.Second):
+		t.Fatal("clipboard pull did not start")
+	}
+	cancelSession()
+
+	select {
+	case resp := <-responses:
+		assertClipWriteResponse(t, resp, req.Nonce, req.Epoch, false, "")
+	case <-time.After(time.Second):
+		t.Fatal("session-canceled clipboard pull did not return")
+	}
+	cancelHandler()
+	waitClipWriteHandler(t, done)
+	if len(writer.snapshot()) != 0 {
+		t.Fatal("dead-session pull reached writer")
+	}
+	assertNoClipWriteAudit(t, deps.Audit)
 }
 
 func TestPullClipWrite_ExecutesPinnedShellGuards(t *testing.T) {

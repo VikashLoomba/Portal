@@ -428,6 +428,13 @@ func runClipWriteHandlerWithDeps(ctx context.Context, ch <-chan agentclient.Engi
 				continue
 			}
 			req := ev.ClipWrite
+			reqCtx := ctx
+			if req.Session != nil {
+				reqCtx = req.Session
+			}
+			if reqCtx.Err() != nil {
+				continue
+			}
 			if deps.FeatureEnabled == nil || !deps.FeatureEnabled(config.FeatureClipWrite) {
 				kind := clipWriteAuditKind(req.Kind)
 				resp := denyClipWriteResponse(deps, &protocol.ClipWriteResponse{
@@ -456,13 +463,13 @@ func runClipWriteHandlerWithDeps(ctx context.Context, ch <-chan agentclient.Engi
 			if wg != nil {
 				wg.Add(1)
 			}
-			go func(req *agentclient.ClipWriteEvent) {
+			go func(reqCtx context.Context, req *agentclient.ClipWriteEvent) {
 				if wg != nil {
 					defer wg.Done()
 				}
 				defer func() { <-sem }()
 
-				resp := serveClipWriteRequest(ctx, deps, req)
+				resp := serveClipWriteRequest(reqCtx, deps, req)
 				if err := send(resp); err != nil {
 					logClipWriteLine(deps, fmt.Sprintf(
 						"clip-write: send response failed (nonce=%d): %v", req.Nonce, err))
@@ -482,7 +489,7 @@ func runClipWriteHandlerWithDeps(ctx context.Context, ch <-chan agentclient.Engi
 				if deps.Banner != nil {
 					deps.Banner.note(req.Kind, req.Format, req.Size)
 				}
-			}(req)
+			}(reqCtx, req)
 		}
 	}
 }
@@ -523,7 +530,6 @@ func serveClipWriteRequest(ctx context.Context, deps clipWriteDeps,
 		if err != nil {
 			logClipWriteLine(deps, fmt.Sprintf(
 				"clip-write: pull failed (nonce=%d kind=%s): %v", req.Nonce, kind, err))
-			deps.Audit.ClipWriteFailed(deps.Host, kind, "pull")
 			return resp
 		}
 		if int64(len(data)) != req.Size || clipupload.ShortSHA(data) != req.SHA {
@@ -531,6 +537,9 @@ func serveClipWriteRequest(ctx context.Context, deps clipWriteDeps,
 		}
 	}
 
+	if cctx.Err() != nil {
+		return resp
+	}
 	var err error
 	switch req.Kind {
 	case "text":
@@ -543,7 +552,6 @@ func serveClipWriteRequest(ctx context.Context, deps clipWriteDeps,
 	if err != nil {
 		logClipWriteLine(deps, fmt.Sprintf(
 			"clip-write: pasteboard set failed (nonce=%d kind=%s): %v", req.Nonce, kind, err))
-		deps.Audit.ClipWriteFailed(deps.Host, kind, "pasteboard")
 		return resp
 	}
 
@@ -765,7 +773,7 @@ func newClipWriteBanner(host string) *clipWriteBanner {
 			// This security banner never consults feature.notify. The only
 			// supported way to silence remote-write banners is to disable
 			// feature.clip-write itself (WRITE DESIGN §5.1/§8.5).
-			raiseNotification(context.Background(), title, "", subtitle, "")
+			raiseSecurityNotification(context.Background(), title, "", subtitle, "")
 		},
 		// These raises and the pending timer are intentionally detached from the
 		// lifecycle group. Both can live for 5s while stackDrainTimeout is 2s;

@@ -222,28 +222,37 @@ func TestShimResolversTreatPATHAsData(t *testing.T) {
 
 func TestShimResolversSkipEmptyEntriesAndRejectSelf(t *testing.T) {
 	tests := []struct {
-		name   string
-		script string
-		tool   string
+		name      string
+		script    string
+		tool      string
+		canonical bool
 	}{
 		{name: "xdg-open", script: XDGOpenWrapper, tool: "xdg-open"},
 		{name: "xclip", script: xclipShim, tool: "xclip"},
 		{name: "wl-paste", script: wlPasteShim, tool: "wl-paste"},
-		{name: "wl-copy", script: wlCopyShim, tool: "wl-copy"},
-		{name: "xsel", script: xselShim, tool: "xsel"},
+		{name: "wl-copy", script: wlCopyShim, tool: "wl-copy", canonical: true},
+		{name: "pbpaste", script: pbPasteShim, tool: "pbpaste", canonical: true},
+		{name: "xsel", script: xselShim, tool: "xsel", canonical: true},
 		{name: "sudo", script: sudoShim, tool: "sudo"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			dirVar := "_d"
+			if tc.canonical {
+				dirVar = "_candidate_dir"
+			}
 			for _, want := range []string{
 				`for _d in $PATH; do`,
 				`[ -n "$_d" ] || continue`,
-				`[ -x "$_d/` + tc.tool + `" ]`,
+				`[ -x "$` + dirVar + `/` + tc.tool + `" ]`,
 				`[ -z "$_real" ]`,
 			} {
 				if !strings.Contains(tc.script, want) {
 					t.Errorf("%s resolver missing %q", tc.name, want)
 				}
+			}
+			if tc.canonical && !strings.Contains(tc.script, `[ "$_candidate_dir" = "$_wrapper_dir" ] && continue`) {
+				t.Errorf("%s resolver does not reject canonical wrapper aliases", tc.name)
 			}
 			for _, forbidden := range []string{"xargs -I", "sh -c 'PATH={}"} {
 				if strings.Contains(tc.script, forbidden) {

@@ -77,6 +77,16 @@ func runNotifyHandler(ctx context.Context, ch <-chan agentclient.EngineEvent, a 
 // osascript literal. Best-effort: failures are swallowed (a missed notification
 // is non-fatal).
 func raiseNotification(ctx context.Context, title, body, subtitle, sound string) {
+	raiseNotificationWithGroup(ctx, title, body, subtitle, sound, "portal")
+}
+
+// raiseSecurityNotification leaves terminal-notifier ungrouped so every
+// clipboard-write banner remains independently visible in Notification Center.
+func raiseSecurityNotification(ctx context.Context, title, body, subtitle, sound string) {
+	raiseNotificationWithGroup(ctx, title, body, subtitle, sound, "")
+}
+
+func raiseNotificationWithGroup(ctx context.Context, title, body, subtitle, sound, group string) {
 	dctx, cancel := context.WithTimeout(ctx, notifyDeliverTimeout)
 	defer cancel()
 
@@ -84,15 +94,7 @@ func raiseNotification(ctx context.Context, title, body, subtitle, sound string)
 	// interpolation), so it needs no escaping — but we still strip control bytes
 	// for tidy banners.
 	if path, err := exec.LookPath("terminal-notifier"); err == nil {
-		args := []string{
-			"-title", stripControl(title),
-			"-subtitle", stripControl(subtitle),
-			"-message", stripControl(body),
-			"-group", "portal",
-		}
-		if sound != "" {
-			args = append(args, "-sound", stripControl(sound))
-		}
+		args := terminalNotifierArgs(title, body, subtitle, sound, group)
 		_ = exec.CommandContext(dctx, path, args...).Run()
 		return
 	}
@@ -107,6 +109,21 @@ func raiseNotification(ctx context.Context, title, body, subtitle, sound string)
 		script += " sound name " + osa.StringLiteral(sound)
 	}
 	_ = exec.CommandContext(dctx, "osascript", "-e", script).Run()
+}
+
+func terminalNotifierArgs(title, body, subtitle, sound, group string) []string {
+	args := []string{
+		"-title", stripControl(title),
+		"-subtitle", stripControl(subtitle),
+		"-message", stripControl(body),
+	}
+	if group != "" {
+		args = append(args, "-group", stripControl(group))
+	}
+	if sound != "" {
+		args = append(args, "-sound", stripControl(sound))
+	}
+	return args
 }
 
 // stripControl removes ASCII control bytes (including newline, carriage return,

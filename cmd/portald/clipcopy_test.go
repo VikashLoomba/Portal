@@ -198,6 +198,7 @@ func TestParseClipCopyArgs(t *testing.T) {
 	}{
 		{[]string{"text"}, clipCopyArgs{kind: "text"}},
 		{[]string{"text", "--trim"}, clipCopyArgs{kind: "text", trim: true}},
+		{[]string{"text", "--empty-clears"}, clipCopyArgs{kind: "text", emptyClears: true}},
 		{[]string{"image", "png"}, clipCopyArgs{kind: "image", format: "png"}},
 		{[]string{"clear"}, clipCopyArgs{kind: "clear"}},
 	}
@@ -422,6 +423,37 @@ func TestWriteCopyFileAtomic(t *testing.T) {
 	})
 }
 
+func TestLeaseCopyFileKeepsConcurrentIdenticalCopyAlive(t *testing.T) {
+	dir := t.TempDir()
+	data := []byte("clipboard")
+	sha := clipupload.ShortSHA(data)
+
+	path, releaseFirst, err := leaseCopyFile(dir, sha, ".txt", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPath, releaseSecond, err := leaseCopyFile(dir, sha, ".txt", data)
+	if err != nil {
+		releaseFirst()
+		t.Fatal(err)
+	}
+	if secondPath != path {
+		t.Fatalf("identical copy path = %q, want %q", secondPath, path)
+	}
+
+	releaseFirst()
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("shared path after first release = %q, %v", got, err)
+	}
+	releaseSecond()
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("shared path after final release: %v", err)
+	}
+	if leases, err := filepath.Glob(filepath.Join(dir, ".copy.lease.*")); err != nil || len(leases) != 0 {
+		t.Fatalf("leases after final release = %v, %v", leases, err)
+	}
+}
+
 func TestGCStaleCopies(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
@@ -433,20 +465,21 @@ func TestGCStaleCopies(t *testing.T) {
 		"text-0123456789abcdef0123456789abcdef.txt",
 		".copy.tmp.stale",
 		".copy.tmp.fresh",
+		".copy.lease.0123456789abcdef0123456789abcdef.txt.stale",
 	}
 	for _, name := range names {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{names[0], names[2], names[3], names[4]} {
+	for _, name := range []string{names[0], names[2], names[3], names[4], names[6]} {
 		if err := os.Chtimes(filepath.Join(dir, name), old, old); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	gcStaleCopies(dir, now, time.Hour)
-	for _, name := range []string{names[0], names[4]} {
+	for _, name := range []string{names[0], names[4], names[6]} {
 		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("stale %s stat error = %v, want not-exist", name, err)
 		}
@@ -664,15 +697,18 @@ func TestRunClipCopy_TextTrim(t *testing.T) {
 	}
 }
 
-func TestRunClipCopy_EmptyStdinClears(t *testing.T) {
+func TestRunClipCopy_EmptyStdinPolicy(t *testing.T) {
 	src := buildPortald(t)
 	tests := []struct {
-		name string
-		args []string
-		in   []byte
+		name     string
+		args     []string
+		in       []byte
+		wantCode int
+		wantLine string
 	}{
-		{"empty", []string{"text"}, nil},
-		{"trimmed newline", []string{"text", "--trim"}, []byte("\n")},
+		{"text empty rejected", []string{"text"}, nil, 1, ""},
+		{"trimmed empty rejected", []string{"text", "--trim"}, []byte("\n"), 1, ""},
+		{"pbcopy empty clears", []string{"text", "--empty-clears"}, nil, 0, "copy\tclear\n"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -682,11 +718,13 @@ func TestRunClipCopy_EmptyStdinClears(t *testing.T) {
 			defer fake.stop()
 
 			stdout, stderr, code := runClipCopyBin(t, bin, home, tc.in, tc.args...)
-			if code != 0 || len(stdout) != 0 || len(stderr) != 0 {
+			if code != tc.wantCode || len(stdout) != 0 || len(stderr) != 0 {
 				t.Fatalf("result = code %d stdout %q stderr %q", code, stdout, stderr)
 			}
-			if line := waitCopyRequest(t, fake); line != "copy\tclear\n" {
-				t.Fatalf("request = %q, want copy clear", line)
+			if tc.wantLine == "" {
+				assertNoCopyRequest(t, fake)
+			} else if line := waitCopyRequest(t, fake); line != tc.wantLine {
+				t.Fatalf("request = %q, want %q", line, tc.wantLine)
 			}
 			if artifacts := copyArtifacts(t, clipDir(home)); len(artifacts) != 0 {
 				t.Fatalf("copy artifacts = %v, want none", artifacts)
@@ -746,17 +784,22 @@ func TestRunClipCopy_ImageWrongMagicNeverLeaves(t *testing.T) {
 
 func TestRunClipCopy_OversizeNoSocketRoundTrip(t *testing.T) {
 	src := buildPortald(t)
-	home, bin := setupClipHome(t, src)
-	cacheDir := filepath.Join(home, ".cache", "portal")
-	fake := startFakeCopySocket(t, cacheDir, "cmd-copy.sock", "ok\n")
-	defer fake.stop()
 	data := bytes.Repeat([]byte{'x'}, clipupload.MaxUploadBytes+1)
 
-	stdout, stderr, code := runClipCopyBin(t, bin, home, data, "text")
-	if code != 1 || len(stdout) != 0 || len(stderr) != 0 {
-		t.Fatalf("result = code %d stdout %q stderr %q", code, stdout, stderr)
+	for _, args := range [][]string{{"text"}, {"text", "--empty-clears"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			home, bin := setupClipHome(t, src)
+			cacheDir := filepath.Join(home, ".cache", "portal")
+			fake := startFakeCopySocket(t, cacheDir, "cmd-copy.sock", "ok\n")
+			defer fake.stop()
+
+			stdout, stderr, code := runClipCopyBin(t, bin, home, data, args...)
+			if code != 1 || len(stdout) != 0 || len(stderr) != 0 {
+				t.Fatalf("result = code %d stdout %q stderr %q", code, stdout, stderr)
+			}
+			assertNoCopyRequest(t, fake)
+		})
 	}
-	assertNoCopyRequest(t, fake)
 }
 
 func TestRunClipCopy_TruncatedOkIsFailure(t *testing.T) {
@@ -846,7 +889,7 @@ func TestRunClipCopy_GCSweepsStaleCopies(t *testing.T) {
 func TestRunClipCopy_Usage(t *testing.T) {
 	src := buildPortald(t)
 	home, bin := setupClipHome(t, src)
-	want := "usage: portald clip copy <text [--trim]|image png|clear>\n"
+	want := "usage: portald clip copy <text [--trim|--empty-clears]|image png|clear>\n"
 	for _, args := range [][]string{
 		nil,
 		{"image", "jpeg"},

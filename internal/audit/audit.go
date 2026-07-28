@@ -74,12 +74,6 @@ func (l *Log) ClipWriteDenied(host, kind, reason string) {
 	l.write("clip-write-denied", "host="+host, "kind="+oneLine(kind), "reason="+reason)
 }
 
-// ClipWriteFailed records an infrastructure failure after a remote clipboard
-// write passed policy checks. stage is "pull" or "pasteboard".
-func (l *Log) ClipWriteFailed(host, kind, stage string) {
-	l.write("clip-write-failed", "host="+host, "kind="+oneLine(kind), "stage="+stage)
-}
-
 // CredServed records that a credential was delivered after user approval.
 // source is "prompt", "prompt-remembered", or "keychain"; dur is the full
 // approval latency. The secret is deliberately outside this API.

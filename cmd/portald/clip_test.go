@@ -437,3 +437,25 @@ func TestRunClip_TextValid(t *testing.T) {
 		t.Fatalf("text stdout = %q, want %q", out, body)
 	}
 }
+
+func TestRunClip_TextTrim(t *testing.T) {
+	src := buildPortald(t)
+	home, bin := setupClipHome(t, src)
+	cacheDir := filepath.Join(home, ".cache", "portal")
+
+	body := []byte("hello clipboard text\n\n")
+	sha := "fedcba9876543210fedcba9876543210"
+	if err := os.WriteFile(filepath.Join(clipDir(home), "text-"+sha+".txt"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stop := fakeAgentSock(t, cacheDir, "ok\t"+sha+"\n")
+	defer stop()
+
+	out, code := runClipBin(t, bin, home, "text", "--trim")
+	if code != 0 {
+		t.Fatalf("trimmed text exit = %d, want 0 (stdout=%q)", code, out)
+	}
+	if want := []byte("hello clipboard text\n"); !bytes.Equal(out, want) {
+		t.Fatalf("trimmed text stdout = %q, want %q", out, want)
+	}
+}

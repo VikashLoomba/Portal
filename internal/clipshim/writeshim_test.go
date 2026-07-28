@@ -67,6 +67,8 @@ type shimRunSpec struct {
 	withPortald bool
 	portaldRC   int
 	withReal    bool
+	withBackup  bool
+	pathAlias   bool
 	mktempFails bool
 	catFails    bool
 }
@@ -121,6 +123,13 @@ cat > "$PORTAL_REAL_STDIN"
 exit 0
 `)
 	}
+	if spec.withBackup {
+		writeExec(t, filepath.Join(shimDir, spec.bin+".portal-backup"), "%s", `#!/bin/sh
+printf '%s\n' "$*" >> "$PORTAL_REAL_ARGS"
+cat > "$PORTAL_REAL_STDIN"
+exit 0
+`)
+	}
 	if spec.mktempFails {
 		writeExec(t, filepath.Join(toolDir, "mktemp"), "%s", "#!/bin/sh\nexit 1\n")
 	}
@@ -129,6 +138,9 @@ exit 0
 	}
 
 	pathParts := []string{shimDir}
+	if spec.pathAlias {
+		pathParts = append(pathParts, shimDir+"/")
+	}
 	if spec.mktempFails || spec.catFails {
 		pathParts = append(pathParts, toolDir)
 	}
@@ -251,6 +263,8 @@ func TestWriteShimXclipV7ReadParity(t *testing.T) {
 		{"secondary output", []string{"-out", "-sel", "s"}, "clip text"},
 		{"filter short", []string{"-f", "-selection", "clipboard", "-t", "UTF8_STRING", "-o"}, "clip text"},
 		{"filter long", []string{"-filter", "-selection", "clipboard", "-t", "UTF8_STRING", "-o"}, "clip text"},
+		{"debug", []string{"-debug", "-selection", "clipboard", "-o"}, "clip text"},
+		{"trim", []string{"-rmlastnl", "-selection", "clipboard", "-o"}, "clip text --trim"},
 	}
 	for _, shell := range shimShells() {
 		t.Run(shell.name, func(t *testing.T) {
@@ -311,8 +325,8 @@ func TestWriteShimRouting(t *testing.T) {
 		{"wl-copy png type", "wl-copy", wlCopyShim, []string{"-t", "image/png"}, payload, "clip copy image png", payload},
 		{"wl-copy end options", "wl-copy", wlCopyShim, []string{"--", "-n", "text"}, payload, "clip copy text", []byte("-n text")},
 		{"wl-copy seat and argv", "wl-copy", wlCopyShim, []string{"-s", "seat0", "hello"}, payload, "clip copy text", []byte("hello")},
-		{"pbcopy text", "pbcopy", pbCopyShim, nil, payload, "clip copy text", payload},
-		{"pbcopy empty clears", "pbcopy", pbCopyShim, nil, nil, "clip copy clear", nil},
+		{"pbcopy text", "pbcopy", pbCopyShim, nil, payload, "clip copy text --empty-clears", payload},
+		{"pbcopy empty clears", "pbcopy", pbCopyShim, nil, nil, "clip copy text --empty-clears", nil},
 		{"pbpaste reads", "pbpaste", pbPasteShim, nil, nil, "clip text", nil},
 		{"xsel bundled input", "xsel", xselShim, []string{"-ib"}, payload, "clip copy text", payload},
 		{"xsel bundled output", "xsel", xselShim, []string{"-ob"}, nil, "clip text", nil},
@@ -376,6 +390,8 @@ func TestWriteShimInvalidTokensFallThrough(t *testing.T) {
 		{"wl-copy gif", "wl-copy", wlCopyShim, []string{"-t", "image/gif"}},
 		{"wl-copy application type", "wl-copy", wlCopyShim, []string{"-t", "application/pdf"}},
 		{"wl-copy dangling type", "wl-copy", wlCopyShim, []string{"-t"}},
+		{"wl-copy empty long type", "wl-copy", wlCopyShim, []string{"--type="}},
+		{"wl-copy empty short type", "wl-copy", wlCopyShim, []string{"-t", ""}},
 		{"xsel keep", "xsel", xselShim, []string{"-k"}},
 		{"xsel append", "xsel", xselShim, []string{"-a"}},
 		{"xsel long append", "xsel", xselShim, []string{"--append"}},
@@ -495,6 +511,8 @@ func TestWriteShimFailureSemantics(t *testing.T) {
 	}{
 		{"xclip", "xclip", xclipShim, []string{"-sel", "c", "-i"}},
 		{"wl-copy", "wl-copy", wlCopyShim, nil},
+		{"wl-copy argv", "wl-copy", wlCopyShim, []string{"some", "words"}},
+		{"wl-copy clear", "wl-copy", wlCopyShim, []string{"--clear"}},
 		{"xsel", "xsel", xselShim, []string{"-ib"}},
 	}
 	for _, shell := range shimShells() {
@@ -576,22 +594,6 @@ func TestWriteShimFailureSemantics(t *testing.T) {
 				}
 				assertNoShimTempLitter(t, failure)
 
-				bufferFailure := runShimScript(t, shell, shimRunSpec{
-					bin:         "pbcopy",
-					script:      pbCopyShim,
-					stdin:       payload,
-					withPortald: true,
-					catFails:    true,
-				})
-				if bufferFailure.exitCode != 1 ||
-					string(bufferFailure.stderr) != "portal: clipboard write failed (cannot buffer input)\n" {
-					t.Fatalf("pbcopy buffer failure exit/stderr = %d/%q",
-						bufferFailure.exitCode, bufferFailure.stderr)
-				}
-				if len(bufferFailure.portalArgs) != 0 {
-					t.Fatalf("pbcopy buffer failure reached portald: %q", bufferFailure.portalArgs)
-				}
-				assertNoShimTempLitter(t, bufferFailure)
 			})
 
 			readCases := []struct {
@@ -602,7 +604,6 @@ func TestWriteShimFailureSemantics(t *testing.T) {
 			}{
 				{"xclip", "xclip", xclipShim, []string{"-sel", "c", "-o"}},
 				{"xsel", "xsel", xselShim, []string{"-ob"}},
-				{"pbpaste", "pbpaste", pbPasteShim, nil},
 			}
 			for _, tc := range readCases {
 				t.Run(tc.name+" read degrade", func(t *testing.T) {
@@ -615,6 +616,61 @@ func TestWriteShimFailureSemantics(t *testing.T) {
 					})
 					if result.exitCode != 0 || len(result.stdout) != 0 || len(result.stderr) != 0 {
 						t.Fatalf("read degrade exit/stdout/stderr = %d/%q/%q", result.exitCode, result.stdout, result.stderr)
+					}
+				})
+			}
+
+			t.Run("pbpaste real fallback", func(t *testing.T) {
+				result := runShimScript(t, shell, shimRunSpec{
+					bin:         "pbpaste",
+					script:      pbPasteShim,
+					withPortald: true,
+					portaldRC:   1,
+					withReal:    true,
+				})
+				if result.exitCode != 0 || len(result.stderr) != 0 || len(result.realArgs) == 0 {
+					t.Fatalf("pbpaste fallback exit/stderr/real = %d/%q/%q",
+						result.exitCode, result.stderr, result.realArgs)
+				}
+			})
+			t.Run("pbpaste backup fallback", func(t *testing.T) {
+				result := runShimScript(t, shell, shimRunSpec{
+					bin:         "pbpaste",
+					script:      pbPasteShim,
+					args:        []string{"-Prefer", "txt"},
+					withPortald: true,
+					portaldRC:   1,
+					withBackup:  true,
+				})
+				if result.exitCode != 0 || string(result.realArgs) != "-Prefer txt\n" {
+					t.Fatalf("pbpaste backup exit/args = %d/%q",
+						result.exitCode, result.realArgs)
+				}
+			})
+
+			for _, tc := range []struct {
+				name   string
+				bin    string
+				script string
+				args   []string
+			}{
+				{"wl-copy", "wl-copy", wlCopyShim, nil},
+				{"xsel", "xsel", xselShim, []string{"-ib"}},
+			} {
+				t.Run(tc.name+" path alias skips shim", func(t *testing.T) {
+					result := runShimScript(t, shell, shimRunSpec{
+						bin:         tc.bin,
+						script:      tc.script,
+						args:        tc.args,
+						stdin:       payload,
+						withPortald: true,
+						portaldRC:   1,
+						withReal:    true,
+						pathAlias:   true,
+					})
+					if result.exitCode != 0 || len(result.realArgs) == 0 {
+						t.Fatalf("alias fallback exit/real = %d/%q",
+							result.exitCode, result.realArgs)
 					}
 				})
 			}
@@ -686,6 +742,26 @@ func TestWriteShimByteExactFallback(t *testing.T) {
 						}
 						if len(result.portalArgs) != 0 {
 							t.Fatalf("portald ran after mktemp failure: %q", result.portalArgs)
+						}
+						assertNoShimTempLitter(t, result)
+					})
+					t.Run("buffer failure is loud", func(t *testing.T) {
+						result := runShimScript(t, shell, shimRunSpec{
+							bin:         tc.bin,
+							script:      tc.script,
+							args:        tc.args,
+							stdin:       payload,
+							withPortald: true,
+							withReal:    true,
+							catFails:    true,
+						})
+						if result.exitCode != 1 ||
+							string(result.stderr) != "portal: clipboard write failed (cannot buffer input)\n" {
+							t.Fatalf("exit/stderr = %d/%q", result.exitCode, result.stderr)
+						}
+						if len(result.portalArgs) != 0 || len(result.realArgs) != 0 {
+							t.Fatalf("buffer failure reached portald/real = %q/%q",
+								result.portalArgs, result.realArgs)
 						}
 						assertNoShimTempLitter(t, result)
 					})

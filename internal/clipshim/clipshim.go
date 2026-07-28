@@ -158,6 +158,7 @@ for _a in "$@"; do
       -q|-qu|-qui|-quie|-quiet) : ;;
       -si|-sil|-sile|-silen|-silent) : ;;
       -verb|-verbo|-verbos|-verbose) : ;;
+      -debug) : ;;
       -h|-he|-hel|-help|-vers|-versi|-versio|-version) _mode=info; _ok=0 ;;
       *) _ok=0 ;;
     esac
@@ -190,7 +191,13 @@ IFS=$_oifs
         [ -x "$_portald" ] && "$_portald" clip image png 2>/dev/null && exit 0 ;;
       read:image/*) : ;;
       read:|read:UTF8_STRING|read:TEXT|read:STRING|read:text/*)
-        [ -x "$_portald" ] && "$_portald" clip text 2>/dev/null && exit 0 ;;
+        if [ -x "$_portald" ]; then
+            if [ "$_trim" = 1 ]; then
+                "$_portald" clip text --trim 2>/dev/null && exit 0
+            else
+                "$_portald" clip text 2>/dev/null && exit 0
+            fi
+        fi ;;
       write:image/png)
         _copy() { "$_portald" clip copy image png; }
         _relay_stdin ;;
@@ -271,7 +278,7 @@ _has_text=0
 for _a in "$@"; do
     if [ -n "$_want" ]; then
         case "$_want" in
-          type) _type=$_a ;;
+          type) _type=$_a; [ -n "$_type" ] || _ok=0 ;;
           skip) : ;;
         esac
         _want=""
@@ -284,7 +291,7 @@ for _a in "$@"; do
     fi
     case "$_a" in
       --) _endopts=1 ;;
-      --type=*) _type=${_a#--type=} ;;
+      --type=*) _type=${_a#--type=}; [ -n "$_type" ] || _ok=0 ;;
       -t|--type) _want=type ;;
       -s|--seat) _want=skip ;;
       --seat=*) : ;;
@@ -304,13 +311,15 @@ for _a in "$@"; do
     esac
 done
 [ -z "$_want" ] || _ok=0
-_wrapper_dir=$(cd "$(dirname "$0")" && pwd)
+_wrapper_dir=$(cd "$(dirname "$0")" && pwd -P)
 _real=""
 _oifs=$IFS; IFS=:
 for _d in $PATH; do
-    [ "$_d" = "$_wrapper_dir" ] && continue
     [ -n "$_d" ] || continue
-    if [ -x "$_d/wl-copy" ]; then _real="$_d/wl-copy"; break; fi
+    _candidate_dir=$(cd "$_d" 2>/dev/null && pwd -P)
+    [ -n "$_candidate_dir" ] || continue
+    [ "$_candidate_dir" = "$_wrapper_dir" ] && continue
+    if [ -x "$_candidate_dir/wl-copy" ]; then _real="$_candidate_dir/wl-copy"; break; fi
 done
 IFS=$_oifs
 ` + clipWriteRelay + `if [ "$_ok" = 1 ]; then
@@ -336,41 +345,37 @@ IFS=$_oifs
 fi
 ` + clipWriteTail
 
-// pbCopyShim buffers once to distinguish empty stdin, which maps to clear.
+// pbCopyShim delegates its empty-input distinction to the bounded portald read.
 // pbcopy has no real-binary fallback on the target Linux dev boxes.
 const pbCopyShim = `#!/bin/sh
 # ` + Marker + `. Intercepts pbcopy clipboard writes and relays them to the Mac.
 _portald="${HOME}/.cache/portal/portald"
-_fail() {
-    printf '%s\n' '` + clipWriteFailMsg + `' >&2
-    exit 1
-}
-_buffer_fail() {
-    printf '%s\n' 'portal: clipboard write failed (cannot buffer input)' >&2
-    exit 1
-}
-[ -x "$_portald" ] || _fail
-_tmp=$(mktemp "${TMPDIR:-/tmp}/portal-pbcopy.XXXXXX" 2>/dev/null)
-if [ -z "$_tmp" ]; then
-    "$_portald" clip copy text 2>/dev/null && exit 0
-    _fail
-fi
-trap 'rm -f "$_tmp"' EXIT HUP INT TERM
-cat > "$_tmp" || _buffer_fail
-if [ -s "$_tmp" ]; then
-    "$_portald" clip copy text < "$_tmp" 2>/dev/null && exit 0
-else
-    "$_portald" clip copy clear < /dev/null 2>/dev/null && exit 0
-fi
-_fail
+[ -x "$_portald" ] && "$_portald" clip copy text --empty-clears 2>/dev/null && exit 0
+printf '%s\n' '` + clipWriteFailMsg + `' >&2
+exit 1
 `
 
-// pbPasteShim keeps read-side failure semantics: no clipboard content is an
-// empty stdout stream with a successful exit.
+// pbPasteShim keeps read-side failure semantics when no local binary exists.
 const pbPasteShim = `#!/bin/sh
 # ` + Marker + `. Intercepts pbpaste clipboard reads and relays them from the Mac.
 _portald="${HOME}/.cache/portal/portald"
 [ -x "$_portald" ] && "$_portald" clip text 2>/dev/null && exit 0
+_wrapper_dir=$(cd "$(dirname "$0")" && pwd -P)
+_backup="$_wrapper_dir/pbpaste.portal-backup"
+if [ "${PORTAL_PBPASTE_FALLBACK:-}" != 1 ] && [ -x "$_backup" ]; then
+    PORTAL_PBPASTE_FALLBACK=1 exec "$_backup" "$@"
+fi
+_real=""
+_oifs=$IFS; IFS=:
+for _d in $PATH; do
+    [ -n "$_d" ] || continue
+    _candidate_dir=$(cd "$_d" 2>/dev/null && pwd -P)
+    [ -n "$_candidate_dir" ] || continue
+    [ "$_candidate_dir" = "$_wrapper_dir" ] && continue
+    if [ -x "$_candidate_dir/pbpaste" ]; then _real="$_candidate_dir/pbpaste"; break; fi
+done
+IFS=$_oifs
+[ -z "$_real" ] || exec "$_real" "$@"
 exit 0
 `
 
@@ -429,13 +434,15 @@ elif [ -t 0 ]; then
 else
     _mode=write
 fi
-_wrapper_dir=$(cd "$(dirname "$0")" && pwd)
+_wrapper_dir=$(cd "$(dirname "$0")" && pwd -P)
 _real=""
 _oifs=$IFS; IFS=:
 for _d in $PATH; do
-    [ "$_d" = "$_wrapper_dir" ] && continue
     [ -n "$_d" ] || continue
-    if [ -x "$_d/xsel" ]; then _real="$_d/xsel"; break; fi
+    _candidate_dir=$(cd "$_d" 2>/dev/null && pwd -P)
+    [ -n "$_candidate_dir" ] || continue
+    [ "$_candidate_dir" = "$_wrapper_dir" ] && continue
+    if [ -x "$_candidate_dir/xsel" ]; then _real="$_candidate_dir/xsel"; break; fi
 done
 IFS=$_oifs
 ` + clipWriteRelay + `if [ "$_ok" = 1 ]; then

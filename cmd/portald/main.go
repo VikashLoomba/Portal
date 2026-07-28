@@ -154,7 +154,7 @@ func printPortaldUsage() {
 	fmt.Fprintln(os.Stderr, `Usage:
   portald [agent flags]
   portald open <url>
-  portald clip <targets [xclip|wl-paste]|image png|text|copy text [--trim]|copy image png|copy clear>
+  portald clip <targets [xclip|wl-paste]|image png|text [--trim]|copy text [--trim|--empty-clears]|copy image png|copy clear>
   portald notify --hook | --title <title> [options]
   portald keychain <run|askpass> [options]
 
@@ -261,6 +261,7 @@ func runClip(args []string) {
 	}
 
 	var verb, format, tool string
+	trim := false
 	switch {
 	case len(args) == 2 && args[0] == "targets" && (args[1] == "xclip" || args[1] == "wl-paste"):
 		// `clip targets <tool>`: the tool identity decides which target-name
@@ -272,10 +273,12 @@ func runClip(args []string) {
 		verb, tool = "targets", "xclip"
 	case len(args) == 1 && args[0] == "text":
 		verb = "text"
+	case len(args) == 2 && args[0] == "text" && args[1] == "--trim":
+		verb, trim = "text", true
 	case len(args) == 2 && args[0] == "image" && args[1] == "png":
 		verb, format = "image", "png"
 	default:
-		fmt.Fprintln(os.Stderr, "usage: portald clip <targets [xclip|wl-paste]|image png|text|copy text [--trim]|copy image png|copy clear>")
+		fmt.Fprintln(os.Stderr, "usage: portald clip <targets [xclip|wl-paste]|image png|text [--trim]|copy text [--trim|--empty-clears]|copy image png|copy clear>")
 		os.Exit(1)
 	}
 
@@ -308,9 +311,9 @@ func runClip(args []string) {
 			os.Exit(1)
 		}
 	case "image":
-		emitClipFile(reply.payload, "clip-", ".png", verifyPNG)
+		emitClipFile(reply.payload, "clip-", ".png", false, verifyPNG)
 	case "text":
-		emitClipFile(reply.payload, "text-", ".txt", nil)
+		emitClipFile(reply.payload, "text-", ".txt", trim, nil)
 	}
 }
 
@@ -423,7 +426,7 @@ func parseClipReply(raw string) (clipReply, bool) {
 // stdout. Buffer-then-verify, never stream-then-discover: the agent's `>tmp`
 // already truncated the target, so a half-written stream that fails mid-way
 // cannot be undone (DESIGN §6.1). On ANY doubt → exit 1, emit nothing.
-func emitClipFile(sha, prefix, ext string, check func([]byte) error) {
+func emitClipFile(sha, prefix, ext string, trim bool, check func([]byte) error) {
 	if !shaRE.MatchString(sha) {
 		os.Exit(1)
 	}
@@ -456,6 +459,9 @@ func emitClipFile(sha, prefix, ext string, check func([]byte) error) {
 		if err := check(data); err != nil {
 			os.Exit(1)
 		}
+	}
+	if trim {
+		data = trimOneTrailingNewline(data)
 	}
 	if _, err := os.Stdout.Write(data); err != nil {
 		os.Exit(1)

@@ -161,7 +161,8 @@ budget under `HeartbeatTimeout` (12s): shim/`portald clip copy` read deadline **
 deadline **11s** > agent `clipWriteTimeout` **9s** > Mac total (pull + verify + pasteboard set +
 notification dispatch) **≤ 8s**. The Mac-side pull (~3s worst case at 8 MiB) + `pbcopy`/osascript
 set (~1–2s) fit the 8s slot with margin; the notification is raised **after** the response is
-sent (fire-and-forget) so it never eats the budget.
+sent (fire-and-forget) so it never eats the budget. The 13s deadline covers socket discovery
+and the reply together; per-socket dial time does not accumulate outside it.
 
 ### 4.5 Behavior when daemon/client unavailable
 
@@ -176,7 +177,9 @@ never be silent.
 - New dedicated buffered channel (cap 8) + `runClipWriteHandler` in `run.go`, a sibling of
   `runClipHandler` with the same shape: own goroutine, **worker semaphore 1** (two rapid copies
   can't fork two pasteboard writers; an in-flight write answers `OK=false` immediately → shim
-  falls through), handler work on a tracked worker goroutine.
+  falls through), handler work on a tracked worker goroutine. Each event carries its agent
+  session context; disconnect cancels queued and in-flight work before it can mutate the
+  pasteboard.
 - On `KindClipWriteRequest`:
   1. Capability gate `feature.clip-write` (re-read per op, Mac-side — READ §7.1(3)); disabled →
      `OK=false` + `ClipWriteDenied(host, kind, "disabled")`.
@@ -209,6 +212,9 @@ subtitle: text, 42 bytes        (or: image/png, 118 KB · or: cleared)
   to silence the security mitigation that makes default-on writes acceptable. The only way to
   stop the banners is to turn `clip-write` itself off. (If real-world use demands a separate
   banner knob, it is a follow-up config flag — explicitly out of v1.)
+- **No replacement group.** The `terminal-notifier` path omits the ordinary shared `portal`
+  group so the leading banner and summary coexist in Notification Center and later relay
+  notifications cannot evict either one.
 
 ---
 
@@ -259,11 +265,11 @@ spaces): the shim routes `printf '%s' "$*-remainder"` into the copy; otherwise s
 
 ### 6.4 `pbcopy` / `pbpaste` shims — new
 
-Pure additions (no real binary exists on Linux, so no fall-through leg and no backup concerns):
-
-- `pbcopy`: stdin → `portald clip copy text`. Failure → stderr + exit 1 (rule 3). Empty stdin →
-  `copy clear` (matches macOS pbcopy semantics of setting the empty string).
-- `pbpaste`: → `portald clip text`; failure → empty stdout, exit 0 (read degrade).
+- `pbcopy`: stdin → `portald clip copy text --empty-clears`. Failure → stderr + exit 1 (rule 3).
+  The internal flag maps empty stdin to `copy clear` (matches macOS pbcopy semantics) while the
+  ordinary text entrypoint rejects empty input.
+- `pbpaste`: → `portald clip text`; on failure, execute a preserved pre-shim binary or a real
+  binary later on PATH when present; otherwise use the empty-stdout, exit-0 read degrade.
 - Caveat, accepted: a script that probes `command -v pbcopy` to *platform-detect macOS* would now
   misfire on the dev box. Judged rare and low-harm next to the value of the muscle-memory path;
   documented here so it's a known trade, not a surprise (§8.2).
@@ -281,6 +287,7 @@ through.
 
 ```
 portald clip copy text  [--trim]   reads stdin, ≤ text cap
+portald clip copy text --empty-clears   pbcopy-only empty-input mapping
 portald clip copy image png        reads stdin, ≤ 8 MiB, verifies PNG magic BEFORE sending
 portald clip copy clear
 ```
@@ -290,7 +297,8 @@ READ §7.3's multi-client rule matters *more* for writes (user A's copy must nev
 B's Mac). Sequence: read stdin (fail fast over cap) → for image, check the PNG magic locally
 (format honesty at the source; a mislabeled JPEG never leaves the box) → ShortSHA → atomic 0600
 write of `copy-<sha>.<ext>` → `copy\t…` verb → map `ok` to exit 0, anything else to exit 1 →
-unlink the file either way → opportunistic GC of stale `copy-*` (>1h).
+release the invocation's lease and unlink after the last identical concurrent copy
+finishes → opportunistic GC of stale `copy-*`/leases (>1h).
 
 `--trim` strips exactly one trailing `\n` if present (implements `xclip -rmlastnl` /
 `wl-copy -n` in Go, where trailing-byte handling is exact — `$(…)` in sh is not).

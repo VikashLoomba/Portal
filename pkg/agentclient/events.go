@@ -3,6 +3,8 @@
 // emits high-level EngineEvents to the reconcile loop.
 package agentclient
 
+import "context"
+
 // EngineEventKind discriminates the lifecycle events the engine cares about.
 type EngineEventKind uint8
 
@@ -114,6 +116,9 @@ type ClipWriteEvent struct {
 	Format string
 	SHA    string
 	Size   int64
+	// Session is canceled when the agent process that emitted this request
+	// disconnects. It is nil for events constructed outside a live Client.
+	Session context.Context
 }
 
 // CredEvent is the payload of a KindCredRequest. Nonce/Epoch are echoed in the

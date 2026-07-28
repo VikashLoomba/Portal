@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/VikashLoomba/Portal/internal/osa"
@@ -64,5 +65,16 @@ func TestDefaultSoundForUrgency(t *testing.T) {
 	}
 	if s := defaultSoundForUrgency(0); s != "" {
 		t.Errorf("calm urgency should be silent by default, got %q", s)
+	}
+}
+
+func TestTerminalNotifierSecurityBannerIsUngrouped(t *testing.T) {
+	security := terminalNotifierArgs("title", "", "subtitle", "", "")
+	if slices.Contains(security, "-group") {
+		t.Fatalf("security banner args contain replacement group: %q", security)
+	}
+	ordinary := terminalNotifierArgs("title", "body", "subtitle", "", "portal")
+	if !slices.Contains(ordinary, "-group") || !slices.Contains(ordinary, "portal") {
+		t.Fatalf("ordinary notification args lost portal group: %q", ordinary)
 	}
 }

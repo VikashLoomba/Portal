@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/VikashLoomba/Portal/internal/clipupload"
@@ -20,9 +22,10 @@ const (
 )
 
 type clipCopyArgs struct {
-	kind   string
-	format string
-	trim   bool
+	kind        string
+	format      string
+	trim        bool
+	emptyClears bool
 }
 
 type clipCopyRuntime struct {
@@ -58,6 +61,8 @@ func parseClipCopyArgs(args []string) (clipCopyArgs, bool) {
 		return clipCopyArgs{kind: "text"}, true
 	case len(args) == 2 && args[0] == "text" && args[1] == "--trim":
 		return clipCopyArgs{kind: "text", trim: true}, true
+	case len(args) == 2 && args[0] == "text" && args[1] == "--empty-clears":
+		return clipCopyArgs{kind: "text", emptyClears: true}, true
 	case len(args) == 2 && args[0] == "image" && args[1] == "png":
 		return clipCopyArgs{kind: "image", format: "png"}, true
 	case len(args) == 1 && args[0] == "clear":
@@ -92,7 +97,7 @@ func clipCopyLine(kind, format, sha string, size int) string {
 func runClipCopy(args []string, rt clipCopyRuntime) int {
 	req, ok := parseClipCopyArgs(args)
 	if !ok {
-		fmt.Fprintln(rt.stderr, "usage: portald clip copy <text [--trim]|image png|clear>")
+		fmt.Fprintln(rt.stderr, "usage: portald clip copy <text [--trim|--empty-clears]|image png|clear>")
 		return 1
 	}
 	if rt.clipDir == "" {
@@ -115,7 +120,10 @@ func runClipCopy(args []string, rt clipCopyRuntime) int {
 				data = trimOneTrailingNewline(data)
 			}
 			if len(data) == 0 {
-				goto send
+				if req.emptyClears {
+					goto send
+				}
+				return 1
 			}
 		}
 
@@ -127,11 +135,11 @@ func runClipCopy(args []string, rt clipCopyRuntime) int {
 		if req.kind == "image" {
 			ext = ".png"
 		}
-		path, err := writeCopyFile(rt.clipDir, sha, ext, data)
+		_, release, err := leaseCopyFile(rt.clipDir, sha, ext, data)
 		if err != nil {
 			return 1
 		}
-		defer os.Remove(path)
+		defer release()
 		line = clipCopyLine(req.kind, req.format, sha, len(data))
 	}
 
@@ -151,6 +159,86 @@ send:
 		return 1
 	}
 	return 0
+}
+
+// leaseCopyFile keeps the shared content-addressed path alive until every
+// identical invocation has finished its socket round trip.
+func leaseCopyFile(dir, sha, ext string, data []byte) (string, func(), error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", nil, err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", nil, err
+	}
+
+	lock, err := lockCopyDir(dir)
+	if err != nil {
+		return "", nil, err
+	}
+	defer unlockCopyDir(lock)
+
+	path := filepath.Join(dir, "copy-"+sha+ext)
+	info, statErr := os.Lstat(path)
+	var existing []byte
+	var readErr error
+	if statErr == nil && info.Mode().IsRegular() {
+		existing, readErr = os.ReadFile(path)
+	}
+	if statErr != nil || !info.Mode().IsRegular() || readErr != nil || !bytes.Equal(existing, data) {
+		if _, err := writeCopyFile(dir, sha, ext, data); err != nil {
+			return "", nil, err
+		}
+	}
+	pathInfo, err := os.Stat(path)
+	if err != nil {
+		return "", nil, err
+	}
+
+	lease, err := os.CreateTemp(dir, ".copy.lease."+sha+ext+".*")
+	if err != nil {
+		return "", nil, err
+	}
+	leasePath := lease.Name()
+	if err := lease.Close(); err != nil {
+		_ = os.Remove(leasePath)
+		return "", nil, err
+	}
+
+	release := func() {
+		lock, err := lockCopyDir(dir)
+		if err != nil {
+			return
+		}
+		defer unlockCopyDir(lock)
+
+		_ = os.Remove(leasePath)
+		others, _ := filepath.Glob(filepath.Join(dir, ".copy.lease."+sha+ext+".*"))
+		if len(others) != 0 {
+			return
+		}
+		currentInfo, err := os.Lstat(path)
+		if err == nil && os.SameFile(currentInfo, pathInfo) {
+			_ = os.Remove(path)
+		}
+	}
+	return path, release, nil
+}
+
+func lockCopyDir(dir string) (*os.File, error) {
+	lock, err := os.OpenFile(filepath.Join(dir, ".copy.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	return lock, nil
+}
+
+func unlockCopyDir(lock *os.File) {
+	_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	_ = lock.Close()
 }
 
 // writeCopyFile installs data without ever opening the content-addressed final
@@ -199,6 +287,12 @@ func writeCopyFile(dir, sha, ext string, data []byte) (string, error) {
 }
 
 func gcStaleCopies(dir string, now time.Time, maxAge time.Duration) {
+	lock, err := lockCopyDir(dir)
+	if err != nil {
+		return
+	}
+	defer unlockCopyDir(lock)
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
@@ -206,7 +300,8 @@ func gcStaleCopies(dir string, now time.Time, maxAge time.Duration) {
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() ||
-			(!strings.HasPrefix(name, "copy-") && !strings.HasPrefix(name, ".copy.tmp.")) {
+			(!strings.HasPrefix(name, ".copy.tmp.") &&
+				!strings.HasPrefix(name, ".copy.lease.")) {
 			continue
 		}
 		info, err := entry.Info()
@@ -215,14 +310,39 @@ func gcStaleCopies(dir string, now time.Time, maxAge time.Duration) {
 		}
 		_ = os.Remove(filepath.Join(dir, name))
 	}
+
+	entries, err = os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, "copy-") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || now.Sub(info.ModTime()) <= maxAge {
+			continue
+		}
+		leases, _ := filepath.Glob(filepath.Join(dir,
+			".copy.lease."+strings.TrimPrefix(name, "copy-")+".*"))
+		if len(leases) == 0 {
+			_ = os.Remove(filepath.Join(dir, name))
+		}
+	}
 }
 
 // copyFanout separates connection discovery from the write. With multiple
 // live agents, every connection is closed before any Mac sees a copy request.
 func copyFanout(sockets []string, line string, dialTimeout, readTimeout time.Duration) (singleAgentReply, singleAgentFanoutState) {
 	conns := make([]net.Conn, 0, len(sockets))
+	deadline := time.Now().Add(readTimeout)
 	for _, socket := range sockets {
-		conn, err := net.DialTimeout("unix", socket, dialTimeout)
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		conn, err := net.DialTimeout("unix", socket, min(dialTimeout, remaining))
 		if err != nil {
 			continue
 		}
@@ -242,7 +362,7 @@ func copyFanout(sockets []string, line string, dialTimeout, readTimeout time.Dur
 
 	conn := conns[0]
 	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(readTimeout)); err != nil {
+	if err := conn.SetDeadline(deadline); err != nil {
 		return singleAgentReply{readErr: err}, fanoutOneAgent
 	}
 	if _, err := io.WriteString(conn, line); err != nil {

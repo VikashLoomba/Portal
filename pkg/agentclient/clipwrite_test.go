@@ -62,6 +62,35 @@ func TestClientClipWrite_DecodePublish(t *testing.T) {
 	}
 }
 
+func TestClientClipWrite_EventCarriesSessionLifetime(t *testing.T) {
+	sess := newE2ESession(t, nil, nil, nil)
+	req := protocol.ClipWriteRequest{Nonce: 15, Epoch: 16, Kind: "clear"}
+	sess.c.registry.dispatch(&protocol.Msg{
+		Service: "clipwrite", Kind: "req", Payload: clipWritePayload(t, req),
+	})
+
+	var session context.Context
+	select {
+	case ev := <-sess.c.ClipWriteEvents():
+		if ev.ClipWrite == nil || ev.ClipWrite.Session == nil {
+			t.Fatalf("live clipboard-write event has no session context: %+v", ev)
+		}
+		session = ev.ClipWrite.Session
+		if err := session.Err(); err != nil {
+			t.Fatalf("live clipboard-write session is already canceled: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no live clipboard-write event delivered")
+	}
+
+	sess.close()
+	select {
+	case <-session.Done():
+	case <-time.After(time.Second):
+		t.Fatal("clipboard-write session was not canceled on disconnect")
+	}
+}
+
 func TestClientClipWrite_DedicatedChannelNotEvicted(t *testing.T) {
 	c := New(Config{})
 	if cap(c.clipWriteEvents) != 8 {
@@ -112,8 +141,13 @@ func TestClientClipWrite_ChannelIsDistinctFromClip(t *testing.T) {
 
 func TestClientClipWrite_DropsWhenFull(t *testing.T) {
 	c := New(Config{})
+	want := make(map[uint64]bool, cap(c.clipWriteEvents))
 	for len(c.clipWriteEvents) < cap(c.clipWriteEvents) {
-		c.clipWriteEvents <- EngineEvent{Kind: KindClipWriteRequest}
+		nonce := uint64(len(c.clipWriteEvents) + 1)
+		want[nonce] = true
+		c.clipWriteEvents <- EngineEvent{
+			Kind: KindClipWriteRequest, ClipWrite: &ClipWriteEvent{Nonce: nonce},
+		}
 	}
 
 	req := protocol.ClipWriteRequest{Nonce: 41, Epoch: 42, Kind: "clear"}
@@ -132,6 +166,16 @@ func TestClientClipWrite_DropsWhenFull(t *testing.T) {
 	}
 	if len(c.clipWriteEvents) != cap(c.clipWriteEvents) {
 		t.Fatalf("clipWriteEvents len = %d, want full capacity %d", len(c.clipWriteEvents), cap(c.clipWriteEvents))
+	}
+	for range cap(c.clipWriteEvents) {
+		ev := <-c.clipWriteEvents
+		if ev.ClipWrite == nil || !want[ev.ClipWrite.Nonce] {
+			t.Fatalf("full-channel dispatch replaced an existing event: %+v", ev)
+		}
+		delete(want, ev.ClipWrite.Nonce)
+	}
+	if len(want) != 0 {
+		t.Fatalf("full-channel dispatch evicted nonces: %v", want)
 	}
 
 	clipPayload, err := protocol.MarshalPayload(protocol.ClipRequest{

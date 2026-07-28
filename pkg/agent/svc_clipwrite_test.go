@@ -426,7 +426,7 @@ func TestClipWrite_ResponseNotOKMapsNone(t *testing.T) {
 func TestClipWrite_StaleEpochResponseDropped(t *testing.T) {
 	h := newClipWriteHarness(t, func(req protocol.ClipWriteRequest) []protocol.ClipWriteResponse {
 		return []protocol.ClipWriteResponse{
-			{Nonce: req.Nonce, Epoch: req.Epoch ^ 1, OK: true},
+			{Nonce: req.Nonce, Epoch: req.Epoch ^ 1, OK: false, Err: "stale"},
 			{Nonce: req.Nonce, Epoch: req.Epoch, OK: true},
 		}
 	})
@@ -604,15 +604,42 @@ func TestClipWrite_UnknownResponseKindIgnored(t *testing.T) {
 	h := newClipWriteHarness(t, nil)
 	defer h.close()
 
+	resultCh := make(chan clipWriteSocketResult, 1)
+	go func() {
+		reply, err := h.ask("copy\tclear\n")
+		resultCh <- clipWriteSocketResult{reply: reply, err: err}
+	}()
+	req := h.nextRequest(t)
+	h.waitInflight(t, 1)
+
 	payload, err := protocol.MarshalPayload(protocol.ClipWriteResponse{
-		Nonce: 1, Epoch: h.srv.reg.epoch(), OK: true,
+		Nonce: req.Nonce, Epoch: req.Epoch, OK: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	h.srv.clipWrite.HandleMsg("req", payload)
-	if got := h.inflight(); got != 0 {
-		t.Fatalf("unexpected inflight count after ignored response kind: %d", got)
+	select {
+	case result := <-resultCh:
+		t.Fatalf("unknown response kind completed request: %+v", result)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if got := h.inflight(); got != 1 {
+		t.Fatalf("inflight after ignored response kind = %d, want 1", got)
+	}
+
+	if err := sendClipWriteResp(h.enc, protocol.ClipWriteResponse{
+		Nonce: req.Nonce, Epoch: req.Epoch, OK: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-resultCh:
+		if result.err != nil || result.reply != "ok\n" {
+			t.Fatalf("valid response result = %+v, want ok", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("valid response did not complete request")
 	}
 }
 

@@ -126,8 +126,10 @@ type Client struct {
 	// coherent snapshot. It is distinct from helloAck, which remains cached
 	// across disconnects for portal status.
 	//
-	// INVARIANT: every assignment to enc must assign sessAck beside it.
-	sessAck *protocol.HelloAck
+	// INVARIANT: every assignment to enc must assign sessAck and sessionCtx
+	// beside it.
+	sessAck    *protocol.HelloAck
+	sessionCtx context.Context
 
 	// lastDiscErr holds the string form of the most recent KindDisconnected
 	// error ("" when the disconnect carried no error). It is the only
@@ -568,6 +570,14 @@ func (c *Client) publishClip(ev EngineEvent) {
 // port-event burst on c.events can't drop the write. clipWriteEvents is never
 // closed, so no recover is needed.
 func (c *Client) publishClipWrite(ev EngineEvent) {
+	if ev.ClipWrite != nil {
+		c.streamMu.Lock()
+		sessionCtx := c.sessionCtx
+		c.streamMu.Unlock()
+		req := *ev.ClipWrite
+		req.Session = sessionCtx
+		ev.ClipWrite = &req
+	}
 	select {
 	case c.clipWriteEvents <- ev:
 	default:
@@ -634,6 +644,8 @@ func (c *Client) runOnce(ctx context.Context) error {
 
 	enc := protocol.NewEncoder(stdin)
 	dec := protocol.NewDecoder(stdout)
+	sessionCtx, cancelSession := context.WithCancel(ctx)
+	defer cancelSession()
 
 	// 4. Hello → HelloAck.
 	if err := enc.Write(&protocol.Envelope{Hello: &protocol.Hello{
@@ -698,12 +710,15 @@ func (c *Client) runOnce(ctx context.Context) error {
 	c.enc = enc
 	c.stdin = stdin
 	c.sessAck = first.HelloAck
+	c.sessionCtx = sessionCtx
 	c.streamMu.Unlock()
 	defer func() {
+		cancelSession()
 		c.streamMu.Lock()
 		c.enc = nil
 		c.stdin = nil
 		c.sessAck = nil
+		c.sessionCtx = nil
 		c.streamMu.Unlock()
 	}()
 
