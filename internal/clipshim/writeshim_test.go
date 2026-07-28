@@ -62,6 +62,31 @@ func requireShimShell(t *testing.T, shell shimShell) {
 	t.Skip(shell.missing)
 }
 
+// requirePathStubbing skips subtests that inject tool failures via
+// PATH-resolved stubs when the shell resolves those tools internally instead.
+// BusyBox ash with FEATURE_SH_STANDALONE runs mktemp/cat as applets without a
+// PATH lookup; runShimScript sets BB_OVERRIDE_APPLETS to restore PATH
+// resolution on builds that honor it, and this probe skips the remainder. The
+// shim scripts' own behavior is unaffected either way — only the harness's
+// failure-injection mechanism needs PATH stubbing.
+func requirePathStubbing(t *testing.T, shell shimShell) {
+	t.Helper()
+	requireShimShell(t, shell)
+	stubDir := t.TempDir()
+	writeExec(t, filepath.Join(stubDir, "mktemp"), "%s", "#!/bin/sh\nprintf portal-stub\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	argv := append([]string{}, shell.argv[1:]...)
+	argv = append(argv, "-c", "mktemp")
+	cmd := exec.CommandContext(ctx, shell.argv[0], argv...)
+	cmd.Env = []string{"PATH=" + stubDir + ":/usr/bin:/bin", "BB_OVERRIDE_APPLETS=mktemp cat"}
+	out, err := cmd.Output()
+	if err == nil && strings.Contains(string(out), "portal-stub") {
+		return
+	}
+	t.Skipf("%s resolves tools as standalone applets without consulting PATH; failure-injection subtests need PATH stubbing", shell.name)
+}
+
 type shimRunSpec struct {
 	bin         string
 	script      string
@@ -179,6 +204,13 @@ exit 0
 		"PORTAL_REAL_ARGS=" + realArgs,
 		"PORTAL_REAL_STDIN=" + realStdin,
 		"PORTALD_RC=" + strconv.Itoa(spec.portaldRC),
+		// BusyBox ash built with FEATURE_SH_STANDALONE resolves mktemp/cat as
+		// internal applets without consulting PATH, which bypasses this
+		// harness's failure-injection stubs. BB_OVERRIDE_APPLETS restores PATH
+		// lookup for exactly those tools on builds that honor it; harmless for
+		// every other shell. requirePathStubbing skips the injection subtests
+		// on builds that ignore it.
+		"BB_OVERRIDE_APPLETS=mktemp cat",
 	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -845,6 +877,7 @@ func TestWriteShimByteExactFallback(t *testing.T) {
 						assertNoShimTempLitter(t, result)
 					})
 					t.Run("mktemp failure leaves stdin pristine", func(t *testing.T) {
+						requirePathStubbing(t, shell)
 						result := runShimScript(t, shell, shimRunSpec{
 							bin:         tc.bin,
 							script:      tc.script,
@@ -865,6 +898,7 @@ func TestWriteShimByteExactFallback(t *testing.T) {
 						assertNoShimTempLitter(t, result)
 					})
 					t.Run("buffer failure is loud", func(t *testing.T) {
+						requirePathStubbing(t, shell)
 						result := runShimScript(t, shell, shimRunSpec{
 							bin:         tc.bin,
 							script:      tc.script,
