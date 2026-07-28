@@ -13,13 +13,17 @@ type osascriptBiometry struct {
 	run scriptRunner
 }
 
+const biometryProbeTimeout = 5 * time.Second
+
 func newPlatformBiometry() Biometry {
 	return &osascriptBiometry{run: runOSAScript}
 }
 
 // Available probes the watch-capable policy before plain biometrics.
 func (b *osascriptBiometry) Available(ctx context.Context) bool {
-	result := b.run(ctx, []string{"-l", "JavaScript", "-e", biometryProbeScript})
+	probeCtx, cancel := context.WithTimeout(ctx, biometryProbeTimeout)
+	defer cancel()
+	result := b.run(probeCtx, []string{"-l", "JavaScript", "-e", biometryProbeScript})
 	if result.err != nil || result.exitCode != 0 {
 		return false
 	}
@@ -79,9 +83,7 @@ function run() {
         invalidateContext(c);
         return "unavailable";
     }
-}
-
-run();`
+}`
 
 func biometryApproveScript(reason string, deadline time.Time) string {
 	deadlineMillis := strconv.FormatInt(deadline.Add(-time.Second).UnixMilli(), 10)
@@ -153,7 +155,5 @@ function run() {
         invalidateContext(c);
         return "touchid:fallback:exception";
     }
-}
-
-run();`
+}`
 }

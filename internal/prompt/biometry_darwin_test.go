@@ -50,6 +50,27 @@ func TestBiometryAvailableOutputMapping(t *testing.T) {
 	}
 }
 
+func TestBiometryAvailableBoundsProbe(t *testing.T) {
+	var deadline time.Time
+	b := &osascriptBiometry{run: func(ctx context.Context, _ []string) scriptResult {
+		var ok bool
+		deadline, ok = ctx.Deadline()
+		if !ok {
+			t.Fatal("availability probe context has no deadline")
+		}
+		return scriptResult{stdout: []byte("unavailable\n")}
+	}}
+	before := time.Now()
+	if b.Available(context.Background()) {
+		t.Fatal("availability probe parsed unavailable as available")
+	}
+	after := time.Now()
+	if deadline.Before(before.Add(biometryProbeTimeout)) ||
+		deadline.After(after.Add(biometryProbeTimeout)) {
+		t.Fatalf("availability probe deadline = %v, want call time + %v", deadline, biometryProbeTimeout)
+	}
+}
+
 func TestBiometryProbeRunsWithoutSelectorArityError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -128,9 +149,8 @@ func TestBiometryApproveOutputMapping(t *testing.T) {
 	}
 }
 
-func TestBiometryApproveScriptContractAndSecretIsolation(t *testing.T) {
+func TestBiometryApproveScriptContract(t *testing.T) {
 	reason := `portal: approve credential "database\\admin" for box`
-	secretBearingValue := "must-never-enter-touch-id-script-7f4a"
 	deadline := time.Date(2026, 7, 28, 15, 4, 5, 678000000, time.UTC)
 	var args []string
 	b := &osascriptBiometry{run: func(_ context.Context, got []string) scriptResult {
@@ -174,25 +194,17 @@ func TestBiometryApproveScriptContractAndSecretIsolation(t *testing.T) {
 		t.Fatal("approval script did not probe policy 4 before policy 1")
 	}
 	for _, forbidden := range []string{
-		secretBearingValue,
+		"\nrun();",
 		"c.invalidate()",
 		"alloc.init()",
-		"find-generic-password",
-		"portal-cred",
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Errorf("approval script contains forbidden value %q", forbidden)
 		}
 	}
-	for _, arg := range args {
-		if strings.Contains(arg, secretBearingValue) {
-			t.Fatal("secret-bearing value appeared in osascript argv")
-		}
-	}
 }
 
-func TestBiometryProbeScriptContractAndSecretIsolation(t *testing.T) {
-	secretBearingValue := "must-never-enter-touch-id-probe-1a8d"
+func TestBiometryProbeScriptContract(t *testing.T) {
 	var args []string
 	b := &osascriptBiometry{run: func(_ context.Context, got []string) scriptResult {
 		args = append([]string(nil), got...)
@@ -219,7 +231,7 @@ func TestBiometryProbeScriptContractAndSecretIsolation(t *testing.T) {
 		t.Fatal("probe script did not probe policy 4 before policy 1")
 	}
 	for _, forbidden := range []string{
-		secretBearingValue,
+		"\nrun();",
 		"c.invalidate()",
 		"alloc.init()",
 		"evaluatePolicyLocalizedReasonReply",
@@ -227,6 +239,31 @@ func TestBiometryProbeScriptContractAndSecretIsolation(t *testing.T) {
 		if strings.Contains(script, forbidden) {
 			t.Errorf("probe script contains forbidden value %q", forbidden)
 		}
+	}
+}
+
+func TestBiometryScriptsCannotReadCredentialSecrets(t *testing.T) {
+	scripts := map[string]string{
+		"approve": biometryApproveScript(
+			`portal: approve credential "database" for box`,
+			time.Date(2026, 7, 28, 15, 4, 5, 0, time.UTC),
+		),
+		"probe": biometryProbeScript,
+	}
+	for name, script := range scripts {
+		t.Run(name, func(t *testing.T) {
+			for _, forbidden := range []string{
+				"Keychain",
+				"SecItem",
+				"find-generic-password",
+				"portal-cred",
+				"/usr/bin/security",
+			} {
+				if strings.Contains(script, forbidden) {
+					t.Errorf("biometry script contains credential access %q", forbidden)
+				}
+			}
+		})
 	}
 }
 

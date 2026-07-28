@@ -241,8 +241,6 @@ func serveCredRequest(ctx context.Context, deps credServeDeps, req *agentclient.
 	if (remembered || req.Mode == "askpass") &&
 		deps.Biometry != nil && deps.FeatureEnabled(config.FeatureCredTouchID) {
 		touchIDAvailable = deps.Biometry.Available(ctx)
-		// The availability probe is not part of the consent-sheet budget.
-		deadline = credNow(deps).Add(credDialogBudget)
 	}
 	promptReq.Remembered = remembered
 	promptReq.TouchIDEnroll = !remembered && req.Mode == "askpass" && touchIDAvailable
@@ -255,7 +253,8 @@ func serveCredRequest(ctx context.Context, deps credServeDeps, req *agentclient.
 		approveCtx, cancel := context.WithTimeout(ctx, deadline.Sub(credNow(deps)))
 		outcome, err := deps.Biometry.Approve(
 			approveCtx,
-			`portal: approve credential "`+label+`" for `+deps.Host,
+			`portal: approve credential "`+label+`" for `+
+				truncateCredText(stripCredControls(deps.Host), credContextMaxBytes),
 			deadline,
 		)
 		cancel()
