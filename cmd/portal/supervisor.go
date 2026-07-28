@@ -162,6 +162,7 @@ func (s *supervisor) start(ls *liveStack) {
 	launch(func() { ls.stack.RunAgentEventPump(ls.ctx) })
 	launch(func() { runOpenURLHandler(ls.ctx, ls.stack.OpenURLCh, &sa) })
 	launch(func() { runClipHandler(ls.ctx, ls.stack.AgentClient.ClipEvents(), &sa, &ls.wg) })
+	launch(func() { runClipWriteHandler(ls.ctx, ls.stack.AgentClient.ClipWriteEvents(), &sa, &ls.wg) })
 	launch(func() { runCredHandler(ls.ctx, ls.stack.AgentClient.CredEvents(), &sa, &ls.wg) })
 	launch(func() { runNotifyHandler(ls.ctx, ls.stack.AgentClient.NotifyEvents(), &sa) })
 }
