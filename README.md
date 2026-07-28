@@ -97,7 +97,8 @@ portal <command>
 
   Credentials
     keychain list / keychain forget <label>   Manage remembered credentials
-                                              on the Mac.
+                                              on the Mac; list also reports
+                                              Touch ID availability.
     keychain run / keychain askpass           Dev-box commands agents use to
                                               request a secret; sudo uses the
                                               same approval path transparently.
@@ -115,7 +116,8 @@ portal <command>
 
   Capabilities
     features [name on|off]      Show or toggle the clip-image / clip-text /
-                                clip-write / notify / exec / cred gates
+                                clip-write / notify / exec / cred /
+                                cred-touchid gates
                                 (picked up live).
 ```
 
@@ -207,7 +209,9 @@ For `sudo`, portal's dev-box `sudo` shim and `SUDO_ASKPASS` helper take the same
 path transparently when the agent has no controlling terminal. Any session in
 which a human could still be prompted is a direct passthrough to the real sudo.
 The shim also selects `~/.local/bin/portal-askpass` itself when
-`SUDO_ASKPASS` is empty, without replacing a helper the user configured.
+`SUDO_ASKPASS` is empty, without replacing a helper the user configured. Touch
+ID does not expand that interception scope: portal still does not export
+`SSH_ASKPASS` or intercept non-sudo prompts by default.
 
 Install covers interactive shells, bash login shells (including an existing
 `.bash_profile` or `.bash_login`), and Debian/Ubuntu ssh one-shot bash shells
@@ -223,14 +227,35 @@ portal's shims only if that parent supplied a PATH containing `~/.local/bin`.
 > yourself. This tradeoff prevents portal from hijacking a human password
 > prompt, including when sudo's stdin has been redirected.
 
-Each request opens a native secure-input dialog on the Mac showing which
+The first request opens a native secure-input dialog on the Mac showing which
 process requested it, which box it came from, and how the secret will be
-delivered. Choosing **Allow & Remember** stores the secret in the macOS
-Keychain; later requests for that label are click-to-approve confirmations
-rather than another password entry. On the Mac, `portal keychain list` shows
-remembered labels; `portal keychain forget <label>` removes one. Run
-`portal features cred off` for the immediate kill switch that disables
+delivered. For sudo/askpass on a Mac with usable biometrics, **Allow &
+Remember** is the default: type the password once and press Return to store it
+in the macOS Keychain. **Allow Once** remains one click away, and direct
+`--env` / `--stdin` requests keep **Allow Once** as their default.
+
+Later requests for a remembered label use Touch ID (or Apple Watch) instead of
+another password entry. The system sheet's reason identifies the credential
+label and dev box; after approval, portal reads the secret from Keychain and
+releases it down the existing pipe. Cancel denies the request. If biometrics
+are unavailable, locked out, or fail to evaluate, portal falls back to the
+original click-to-approve dialog. The sheet is attributed to **osascript**,
+not portal, because the cgo-free implementation uses
+`osascript -l JavaScript` to invoke macOS LocalAuthentication.
+
+On the Mac, `portal keychain list` prints `touch id: available` or
+`touch id: unavailable` above the remembered labels;
+`portal keychain forget <label>` removes one. Run
+`portal features cred-touchid off` to keep the original click-only flow, or
+`portal features cred off` for the immediate kill switch that disables all
 credential prompts and delivery.
+
+> **Heads-up — Touch ID gates portal's release decision; it does not re-bind the
+> Keychain item to biometrics.** Remembered items remain ordinary
+> `security`-created generic passwords with their existing Keychain access
+> behavior. This release gate hardens the consent gesture against prompt
+> fatigue, but it is not a defense against another process running as the same
+> Mac user.
 
 > **Heads-up — credential sharing protects the agent transcript, not a hostile
 > same-UID process on the box.** The guarantee is that the secret never enters
@@ -238,15 +263,18 @@ credential prompts and delivery.
 > box's disk; it travels in memory from the Mac Keychain/dialog to the consumer
 > process. It is **not** a defense against an actively malicious process running
 > as the same box user, which can read `/proc/<pid>/environ` or ptrace another
-> process. The consent dialog and audit log are the control points.
+> process, nor against a same-UID Mac process that can already read the legacy
+> Keychain item. The consent dialog or Touch ID release gate and audit log are
+> the control points.
 
 ## Capability gates
 
-Clipboard reads and writes, notifications, exec, and credential requests are
-**on by default** (matching the install experience you'd expect) but are
-individually gated on the Mac. Toggle them with `portal features <name> on|off`
-(or edit the file under `~/.config/portal/` directly); the running daemon picks
-changes up with no restart:
+Clipboard reads and writes, notifications, exec, credential requests, and
+Touch ID approval are **on by default** (matching the install experience you'd
+expect) but are individually gated on the Mac. Toggle them with
+`portal features <name> on|off` (or edit the file under
+`~/.config/portal/` directly); the running daemon picks changes up with no
+restart:
 
 | Gate | File | Gates |
 |---|---|---|
@@ -256,6 +284,7 @@ changes up with no restart:
 | `notify`     | `feature.notify`     | raising notifications relayed from the dev box |
 | `exec`       | `feature.exec`       | running commands on the box via `portal exec` / the control API |
 | `cred` | `feature.cred` | approving credential requests from the dev box (`portal keychain` / sudo askpass) |
+| `cred-touchid` | `feature.cred-touchid` | Touch ID / Apple Watch approval and enroll-by-default sudo askpass prompts; off restores click approval |
 
 Clipboard **text** marked secret by a password manager (the macOS
 `org.nspasteboard.ConcealedType` hint) is never served, regardless of the

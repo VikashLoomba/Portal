@@ -17,8 +17,8 @@ func TestDialogACommandConstruction(t *testing.T) {
 	requester := `pid 42: sh -c "deploy"`
 	delivery := `will be set as env var PW for: sh -c "curl $PW"`
 	var script string
-	p := &osascriptPrompter{run: func(_ context.Context, got string) scriptResult {
-		script = got
+	p := &osascriptPrompter{run: func(_ context.Context, args []string) scriptResult {
+		script = appleScriptSource(t, args)
 		return scriptResult{stdout: []byte("button returned:Allow Once, text returned:s3kr3t, gave up:false\n")}
 	}}
 	decision, err := p.Prompt(context.Background(), Request{
@@ -49,6 +49,26 @@ func TestDialogACommandConstruction(t *testing.T) {
 	if strings.Contains(script, label) {
 		t.Fatalf("attacker-influenced label appeared raw in script:\n%s", script)
 	}
+	if strings.Contains(script, "Remember stores this in your Mac Keychain; future approvals for this credential use Touch ID.") {
+		t.Fatalf("Dialog A script contains Touch ID enrollment message:\n%s", script)
+	}
+}
+
+func TestDialogAEnrollmentCommandConstruction(t *testing.T) {
+	script := dialogScript(Request{
+		Label: "sudo", Requester: "pid 9: sudo", Host: "box",
+		Delivery: "will be sent to sudo/askpass on the box", TouchIDEnroll: true,
+	})
+	for _, want := range []string{
+		`buttons {"Cancel","Allow Once","Allow & Remember"}`,
+		`default button "Allow & Remember"`,
+		`cancel button "Cancel"`,
+		osa.StringLiteral("Remember stores this in your Mac Keychain; future approvals for this credential use Touch ID."),
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("Dialog A enrollment script missing %q:\n%s", want, script)
+		}
+	}
 }
 
 func TestDialogTimeoutClamp(t *testing.T) {
@@ -75,8 +95,8 @@ func TestDialogTimeoutClamp(t *testing.T) {
 
 func TestDialogBCommandConstruction(t *testing.T) {
 	var script string
-	p := &osascriptPrompter{run: func(_ context.Context, got string) scriptResult {
-		script = got
+	p := &osascriptPrompter{run: func(_ context.Context, args []string) scriptResult {
+		script = appleScriptSource(t, args)
 		return scriptResult{stdout: []byte("button returned:Allow, gave up:false\n")}
 	}}
 	decision, err := p.Prompt(context.Background(), Request{
@@ -100,7 +120,11 @@ func TestDialogBCommandConstruction(t *testing.T) {
 			t.Errorf("Dialog B script missing %q:\n%s", want, script)
 		}
 	}
-	for _, forbidden := range []string{"hidden answer", "default answer"} {
+	for _, forbidden := range []string{
+		"hidden answer",
+		"default answer",
+		"Remember stores this in your Mac Keychain; future approvals for this credential use Touch ID.",
+	} {
 		if strings.Contains(script, forbidden) {
 			t.Errorf("Dialog B script contains %q:\n%s", forbidden, script)
 		}
@@ -184,7 +208,7 @@ func TestDialogOutputMapping(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p := &osascriptPrompter{run: func(context.Context, string) scriptResult {
+			p := &osascriptPrompter{run: func(context.Context, []string) scriptResult {
 				return tt.result
 			}}
 			decision, err := p.Prompt(context.Background(), Request{Remembered: tt.remembered})
@@ -199,6 +223,14 @@ func TestDialogOutputMapping(t *testing.T) {
 			}
 		})
 	}
+}
+
+func appleScriptSource(t *testing.T, args []string) string {
+	t.Helper()
+	if len(args) != 2 || args[0] != "-e" {
+		t.Fatalf("AppleScript argv = %q, want [-e <script>]", args)
+	}
+	return args[1]
 }
 
 func TestFakeRecordsRequestsAndCopiesSecret(t *testing.T) {

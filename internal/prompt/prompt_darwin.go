@@ -12,8 +12,8 @@ func newPlatformPrompter() Prompter {
 	return &osascriptPrompter{run: runOSAScript}
 }
 
-func runOSAScript(ctx context.Context, script string) scriptResult {
-	cmd := exec.CommandContext(ctx, "/usr/bin/osascript", "-e", script)
+func runOSAScript(ctx context.Context, args []string) scriptResult {
+	cmd := exec.CommandContext(ctx, "/usr/bin/osascript", args...)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout

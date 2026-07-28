@@ -15,7 +15,7 @@ type scriptResult struct {
 	err      error
 }
 
-type scriptRunner func(context.Context, string) scriptResult
+type scriptRunner func(context.Context, []string) scriptResult
 
 type osascriptPrompter struct {
 	run scriptRunner
@@ -30,7 +30,7 @@ const (
 // Prompt renders the request as the appropriate osascript dialog and maps the
 // process result to a Decision without formatting or retaining secret bytes.
 func (p *osascriptPrompter) Prompt(ctx context.Context, req Request) (Decision, error) {
-	result := p.run(ctx, dialogScript(req))
+	result := p.run(ctx, []string{"-e", dialogScript(req)})
 	if result.err != nil || result.exitCode != 0 {
 		if osascriptCanceled(result) {
 			return Decision{Outcome: OutcomeDeny}, nil
@@ -44,15 +44,23 @@ func dialogScript(req Request) string {
 	message := osa.StringLiteral(req.Label) + " & return & return & " +
 		osa.StringLiteral("requested by "+req.Requester+" on "+req.Host) +
 		" & return & return & " + osa.StringLiteral(req.Delivery)
+	if req.TouchIDEnroll {
+		message += " & return & return & " +
+			osa.StringLiteral("Remember stores this in your Mac Keychain; future approvals for this credential use Touch ID.")
+	}
 	timeout := strconv.Itoa(dialogTimeoutSecs(req.TimeoutSecs))
 	if req.Remembered {
 		return "display dialog " + message +
 			` buttons {"Deny","Forget","Allow"} default button "Allow"` +
 			` cancel button "Deny" giving up after ` + timeout + ` with title "portal"`
 	}
+	defaultButton := "Allow Once"
+	if req.TouchIDEnroll {
+		defaultButton = "Allow & Remember"
+	}
 	return "display dialog " + message +
 		` default answer "" buttons {"Cancel","Allow Once","Allow & Remember"}` +
-		` default button "Allow Once" cancel button "Cancel" with hidden answer` +
+		` default button "` + defaultButton + `" cancel button "Cancel" with hidden answer` +
 		` giving up after ` + timeout + ` with title "portal"`
 }
 

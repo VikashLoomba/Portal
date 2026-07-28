@@ -41,6 +41,8 @@ type Request struct {
 	Delivery string
 	// Remembered selects the confirmation dialog with no secret text field.
 	Remembered bool
+	// TouchIDEnroll selects the askpass enrollment copy and remember-default.
+	TouchIDEnroll bool
 	// TimeoutSecs is the dialog's auto-dismiss interval. Zero selects the
 	// production default; the platform implementation clamps non-zero values.
 	TimeoutSecs int

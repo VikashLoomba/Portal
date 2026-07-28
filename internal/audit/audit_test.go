@@ -134,6 +134,7 @@ func TestLog_CredentialEvents(t *testing.T) {
 	// These APIs intentionally have no secret parameter: an audit call cannot
 	// accidentally format or persist credential material.
 	l.CredServed("box", "staging\tadmin\nroot", "env", "prompt-remembered", 1500*time.Millisecond)
+	l.CredServed("box", "sudo", "askpass", "keychain-touchid", 750*time.Millisecond)
 	l.CredDenied("box", "sudo", "askpass", "user-denied")
 	l.CredForgotten("box", "staging admin")
 
@@ -142,12 +143,13 @@ func TestLog_CredentialEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "2026-07-10T09:08:07Z\tcred-served\thost=box\tlabel=staging admin root\tmode=env\tsource=prompt-remembered\tdur=1.5s\n" +
+		"2026-07-10T09:08:07Z\tcred-served\thost=box\tlabel=sudo\tmode=askpass\tsource=keychain-touchid\tdur=750ms\n" +
 		"2026-07-10T09:08:07Z\tcred-denied\thost=box\tlabel=sudo\tmode=askpass\treason=user-denied\n" +
 		"2026-07-10T09:08:07Z\tcred-forgotten\thost=box\tlabel=staging admin\n"
 	if got := string(b); got != want {
 		t.Errorf("credential audit lines:\n%s\nwant:\n%s", got, want)
 	}
-	if n := strings.Count(string(b), "\n"); n != 3 {
+	if n := strings.Count(string(b), "\n"); n != 4 {
 		t.Fatalf("credential labels forged physical lines: got %d lines", n)
 	}
 }

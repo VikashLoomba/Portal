@@ -10,6 +10,7 @@ import (
 
 	"github.com/VikashLoomba/Portal/internal/app"
 	"github.com/VikashLoomba/Portal/internal/audit"
+	"github.com/VikashLoomba/Portal/internal/prompt"
 )
 
 type fakeRememberedCredentialStore struct {
@@ -42,14 +43,19 @@ func executeMacKeychainCommand(t *testing.T, deps keychainCommandDeps, args ...s
 func TestKeychainListSortedAndEmpty(t *testing.T) {
 	t.Run("sorted", func(t *testing.T) {
 		store := &fakeRememberedCredentialStore{labels: []string{"zeta", "alpha", "database"}}
+		biometry := &prompt.BiometryFake{AvailableResult: true}
 		stdout, stderr, err := executeMacKeychainCommand(t, keychainCommandDeps{
 			openStore: func() (rememberedCredentialStore, error) { return store, nil },
+			biometry:  biometry,
 		}, "list")
 		if err != nil {
 			t.Fatalf("keychain list: %v", err)
 		}
-		if want := "alpha\ndatabase\nzeta\n"; stdout != want {
+		if want := "touch id: available\nalpha\ndatabase\nzeta\n"; stdout != want {
 			t.Fatalf("stdout = %q, want %q", stdout, want)
+		}
+		if biometry.AvailabilityChecks() != 1 {
+			t.Fatalf("Touch ID availability checks = %d, want 1", biometry.AvailabilityChecks())
 		}
 		if stderr != "" {
 			t.Fatalf("stderr = %q, want empty", stderr)
@@ -58,14 +64,19 @@ func TestKeychainListSortedAndEmpty(t *testing.T) {
 
 	t.Run("empty", func(t *testing.T) {
 		store := &fakeRememberedCredentialStore{}
+		biometry := &prompt.BiometryFake{}
 		stdout, stderr, err := executeMacKeychainCommand(t, keychainCommandDeps{
 			openStore: func() (rememberedCredentialStore, error) { return store, nil },
+			biometry:  biometry,
 		}, "list")
 		if err != nil {
 			t.Fatalf("keychain list: %v", err)
 		}
-		if stdout != "" || stderr != "" {
+		if stdout != "touch id: unavailable\n" || stderr != "" {
 			t.Fatalf("empty list streams = stdout %q, stderr %q", stdout, stderr)
+		}
+		if biometry.AvailabilityChecks() != 1 {
+			t.Fatalf("Touch ID availability checks = %d, want 1", biometry.AvailabilityChecks())
 		}
 	})
 }
@@ -127,11 +138,13 @@ func TestKeychainUsageErrorsBeforeOpeningStore(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			opened := 0
+			biometry := &prompt.BiometryFake{AvailableResult: true}
 			_, _, err := executeMacKeychainCommand(t, keychainCommandDeps{
 				openStore: func() (rememberedCredentialStore, error) {
 					opened++
 					return &fakeRememberedCredentialStore{}, nil
 				},
+				biometry: biometry,
 			}, tt.args...)
 			var usage usageErr
 			if !errors.As(err, &usage) {
@@ -142,6 +155,9 @@ func TestKeychainUsageErrorsBeforeOpeningStore(t *testing.T) {
 			}
 			if opened != 0 {
 				t.Fatalf("store opened %d times before usage validation", opened)
+			}
+			if biometry.AvailabilityChecks() != 0 {
+				t.Fatal("Touch ID probe ran before usage validation")
 			}
 		})
 	}
@@ -185,7 +201,8 @@ func TestRootHelpRegistersAndReferencesKeychain(t *testing.T) {
 		"keychain list",
 		"keychain forget <label>",
 		"portal keychain run ...",
-		"cred gates",
+		"cred-touchid gates",
+		"Touch ID",
 	} {
 		if !strings.Contains(help, want) {
 			t.Errorf("root help missing %q:\n%s", want, help)

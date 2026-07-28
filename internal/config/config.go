@@ -108,6 +108,8 @@ const (
 	FeatureExec = "exec"
 	// FeatureCred gates credential prompts and delivery to the remote box.
 	FeatureCred = "cred"
+	// FeatureCredTouchID gates biometric consent and askpass enrollment.
+	FeatureCredTouchID = "cred-touchid"
 )
 
 // FeatureEnabled reports whether the named capability is enabled. The contract
