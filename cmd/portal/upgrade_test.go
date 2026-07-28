@@ -23,7 +23,7 @@ type upgradeFixture struct {
 	out       *bytes.Buffer
 }
 
-const installedMarker = "installed-binary-v0.4.1"
+const installedMarker = "portal v0.4.1 (commit installed)"
 
 func newUpgradeFixture(t *testing.T, tag string, assetBody string, withAsset bool) *upgradeFixture {
 	t.Helper()
@@ -65,6 +65,17 @@ func newUpgradeFixture(t *testing.T, tag string, assetBody string, withAsset boo
 		},
 	}
 	return f
+}
+
+// setInstalled rewrites the installed binary so it reports `version`, and
+// returns the exact bytes written so a test can assert it stayed untouched.
+func (f *upgradeFixture) setInstalled(t *testing.T, version string) string {
+	t.Helper()
+	line := "portal " + version + " (commit installed)"
+	if err := os.WriteFile(f.binPath, []byte(line), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return line
 }
 
 // installedContents reports what currently sits at the installed binary path,
@@ -115,12 +126,12 @@ func TestUpgrade_HappyPath(t *testing.T) {
 
 func TestUpgrade_UpToDateDoesNotDownload(t *testing.T) {
 	f := newUpgradeFixture(t, "v0.7.0", "portal v0.7.0", true)
-	f.deps.Current = "v0.7.0"
+	current := f.setInstalled(t, "v0.7.0")
 
 	if err := runUpgrade(context.Background(), f.out, f.deps, false, false); err != nil {
 		t.Fatalf("runUpgrade: %v", err)
 	}
-	if got := f.installedContents(t); got != installedMarker {
+	if got := f.installedContents(t); got != current {
 		t.Fatalf("installed binary = %q, want it untouched", got)
 	}
 	if f.restarted != 0 {
@@ -135,12 +146,12 @@ func TestUpgrade_UpToDateDoesNotDownload(t *testing.T) {
 // binary backwards, so it must be reported as current.
 func TestUpgrade_DescribeBuildAheadOfTagIsCurrent(t *testing.T) {
 	f := newUpgradeFixture(t, "v0.7.0", "portal v0.7.0", true)
-	f.deps.Current = "v0.7.0-4-gdeadbee"
+	current := f.setInstalled(t, "v0.7.0-4-gdeadbee")
 
 	if err := runUpgrade(context.Background(), f.out, f.deps, false, false); err != nil {
 		t.Fatalf("runUpgrade: %v", err)
 	}
-	if got := f.installedContents(t); got != installedMarker {
+	if got := f.installedContents(t); got != current {
 		t.Fatalf("installed binary = %q, want it untouched", got)
 	}
 	if f.restarted != 0 {
@@ -150,7 +161,7 @@ func TestUpgrade_DescribeBuildAheadOfTagIsCurrent(t *testing.T) {
 
 func TestUpgrade_ForceReinstallsCurrentVersion(t *testing.T) {
 	f := newUpgradeFixture(t, "v0.7.0", "portal v0.7.0 fresh", true)
-	f.deps.Current = "v0.7.0"
+	f.setInstalled(t, "v0.7.0")
 
 	if err := runUpgrade(context.Background(), f.out, f.deps, false, true); err != nil {
 		t.Fatalf("runUpgrade --force: %v", err)
@@ -182,7 +193,7 @@ func TestUpgrade_CheckOnlyReportsWithoutInstalling(t *testing.T) {
 
 func TestUpgrade_CheckOnlyWhenCurrent(t *testing.T) {
 	f := newUpgradeFixture(t, "v0.7.0", "portal v0.7.0", true)
-	f.deps.Current = "v0.7.0"
+	f.setInstalled(t, "v0.7.0")
 
 	if err := runUpgrade(context.Background(), f.out, f.deps, true, false); err != nil {
 		t.Fatalf("runUpgrade --check: %v", err)
@@ -315,5 +326,80 @@ func TestVerifyUpgradeBinary(t *testing.T) {
 	}
 	if _, err := verifyUpgradeBinary(context.Background(), notExec); err == nil {
 		t.Fatal("a non-executable file must be an error")
+	}
+}
+
+// REGRESSION: upgrade must compare the INSTALLED binary — the one the daemon
+// executes — not the process invoking the command. A freshly built ./portal
+// from a checkout run against a stale install previously reported "up to date"
+// and left the daemon on old code.
+func TestUpgrade_ComparesInstalledBinaryNotTheInvoker(t *testing.T) {
+	f := newUpgradeFixture(t, "v0.8.0", "portal v0.8.0 (commit new)", true)
+	f.setInstalled(t, "v0.4.1")
+	// The invoking process is already newer than the release; only the stale
+	// installed binary should drive the decision.
+	f.deps.Current = "v0.8.0"
+
+	if err := runUpgrade(context.Background(), f.out, f.deps, false, false); err != nil {
+		t.Fatalf("runUpgrade: %v", err)
+	}
+	if got := f.installedContents(t); got != "portal v0.8.0 (commit new)" {
+		t.Fatalf("installed binary = %q, want the stale install replaced", got)
+	}
+	if f.restarted != 1 {
+		t.Fatalf("restarts = %d, want 1", f.restarted)
+	}
+}
+
+// --check must likewise report the installed version, not the invoker's.
+func TestUpgrade_CheckReportsInstalledVersion(t *testing.T) {
+	f := newUpgradeFixture(t, "v0.8.0", "portal v0.8.0", true)
+	f.setInstalled(t, "v0.4.1")
+	f.deps.Current = "v0.8.0"
+
+	if err := runUpgrade(context.Background(), f.out, f.deps, true, false); err != nil {
+		t.Fatalf("runUpgrade --check: %v", err)
+	}
+	out := f.out.String()
+	if !strings.Contains(out, "update available") || !strings.Contains(out, "v0.4.1") {
+		t.Fatalf("output = %q, want an update-available line naming the installed v0.4.1", out)
+	}
+}
+
+// An installed binary that refuses to run must not abort the upgrade that
+// would repair it: fall back to the running process's version and proceed.
+func TestUpgrade_UnreadableInstalledBinaryFallsBackAndStillUpgrades(t *testing.T) {
+	f := newUpgradeFixture(t, "v0.8.0", "portal v0.8.0 (commit new)", true)
+	f.deps.Current = "v0.4.1"
+	realVerify := f.deps.Verify
+	f.deps.Verify = func(ctx context.Context, path string) (string, error) {
+		if path == f.binPath {
+			return "", errors.New("exec format error")
+		}
+		return realVerify(ctx, path)
+	}
+
+	if err := runUpgrade(context.Background(), f.out, f.deps, false, false); err != nil {
+		t.Fatalf("runUpgrade: %v", err)
+	}
+	if got := f.installedContents(t); got != "portal v0.8.0 (commit new)" {
+		t.Fatalf("installed binary = %q, want the broken install replaced", got)
+	}
+}
+
+func TestParseVersionField(t *testing.T) {
+	tests := []struct{ line, want string }{
+		{"portal v0.8.0 (commit abc)", "v0.8.0"},
+		{"portal v0.8.0\n", "v0.8.0"},
+		{"  portal v0.8.0  ", "v0.8.0"},
+		{"portald v0.8.0", ""},
+		{"portal", ""},
+		{"", ""},
+		{"garbage output", ""},
+	}
+	for _, tt := range tests {
+		if got := parseVersionField(tt.line); got != tt.want {
+			t.Errorf("parseVersionField(%q) = %q, want %q", tt.line, got, tt.want)
+		}
 	}
 }

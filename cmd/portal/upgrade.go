@@ -29,7 +29,8 @@ type upgradeDeps struct {
 	Releases *upgrade.Client
 	// BinPath is the installed binary the swap replaces.
 	BinPath string
-	// Current is the running binary's version string.
+	// Current is the RUNNING process's version, used only when the installed
+	// binary cannot be interrogated (missing, or it fails to run).
 	Current string
 	// GOOS/GOARCH identify the host; a non-arm64-darwin host is refused.
 	GOOS   string
@@ -88,18 +89,25 @@ func runUpgrade(ctx context.Context, out io.Writer, deps upgradeDeps, checkOnly,
 		return err
 	}
 
-	cmpResult := upgrade.Compare(deps.Current, rel.Tag)
+	// Compare against the INSTALLED binary, not the process running this
+	// command. They are the same file in the common case, but not when a
+	// freshly built ./portal from a checkout is invoked against a stale
+	// install — and it is the installed binary the daemon executes, so
+	// comparing the invoker would report "up to date" while leaving the
+	// daemon running old code.
+	current := installedVersion(ctx, deps)
+	cmpResult := upgrade.Compare(current, rel.Tag)
 	switch {
 	case checkOnly && cmpResult < 0:
 		fmt.Fprintf(out, "update available: %s -> %s\nrun '%s upgrade' to install it\n",
-			deps.Current, rel.Tag, app.Tool)
+			current, rel.Tag, app.Tool)
 		return nil
 	case checkOnly:
-		fmt.Fprintf(out, "up to date: %s (latest release %s)\n", deps.Current, rel.Tag)
+		fmt.Fprintf(out, "up to date: %s (latest release %s)\n", current, rel.Tag)
 		return nil
 	case cmpResult >= 0 && !force:
 		fmt.Fprintf(out, "up to date: %s (latest release %s)\nre-install it anyway with --force\n",
-			deps.Current, rel.Tag)
+			current, rel.Tag)
 		return nil
 	}
 
@@ -164,4 +172,37 @@ func verifyUpgradeBinary(ctx context.Context, path string) (string, error) {
 		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(outBytes)))
 	}
 	return string(outBytes), nil
+}
+
+// installedVersion reports the version of the binary at BinPath — the one the
+// daemon executes and the one the swap replaces. It falls back to the running
+// process's own version when that binary is absent or refuses to run, so a
+// broken install still resolves to something orderable rather than aborting
+// before the download that would repair it.
+func installedVersion(ctx context.Context, deps upgradeDeps) string {
+	if deps.BinPath == "" || deps.Verify == nil {
+		return deps.Current
+	}
+	if _, err := os.Stat(deps.BinPath); err != nil {
+		return deps.Current
+	}
+	line, err := deps.Verify(ctx, deps.BinPath)
+	if err != nil {
+		return deps.Current
+	}
+	if v := parseVersionField(line); v != "" {
+		return v
+	}
+	return deps.Current
+}
+
+// parseVersionField extracts the version token from a `portal version` line
+// ("portal v0.8.0 (commit abc)" -> "v0.8.0"). An unrecognized shape returns
+// empty so the caller can fall back rather than compare against garbage.
+func parseVersionField(line string) string {
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) < 2 || fields[0] != app.Tool {
+		return ""
+	}
+	return fields[1]
 }
