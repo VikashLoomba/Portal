@@ -215,6 +215,8 @@ port = {
 msg-payload = open-url
             / clip-request
             / clip-response
+            / clip-write-request
+            / clip-write-response
             / cred-request
             / cred-response
             / notify
@@ -238,6 +240,22 @@ clip-response = {
   ? "has" => bool,
   ? "k" => tstr,
   ? "sha" => tstr,
+  ? "err" => tstr
+}
+
+clip-write-request = {
+  "n" => uint64,
+  "e" => uint64,
+  "kind" => tstr,
+  ? "fmt" => tstr,
+  ? "sha" => tstr,
+  ? "sz" => int64
+}
+
+clip-write-response = {
+  "n" => uint64,
+  "e" => uint64,
+  "ok" => bool,
   ? "err" => tstr
 }
 

@@ -236,6 +236,130 @@ func TestClipFieldCountInvariant(t *testing.T) {
 	}
 }
 
+func TestRoundtripClipWriteRequest(t *testing.T) {
+	tests := []struct {
+		name string
+		orig ClipWriteRequest
+	}{
+		{
+			name: "text",
+			orig: ClipWriteRequest{
+				Nonce: 11, Epoch: 0xdeadbeef, Kind: "text",
+				SHA: "0123456789abcdef0123456789abcdef", Size: 42,
+			},
+		},
+		{
+			name: "image",
+			orig: ClipWriteRequest{
+				Nonce: 12, Epoch: 0xdeadbeef, Kind: "image", Format: "png",
+				SHA: "fedcba9876543210fedcba9876543210", Size: 118000,
+			},
+		},
+		{
+			name: "clear",
+			orig: ClipWriteRequest{Nonce: 13, Epoch: 0xdeadbeef, Kind: "clear"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload, err := MarshalPayload(tt.orig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			in := &Envelope{Msg: &Msg{Service: "clipwrite", Kind: "req", Payload: payload}}
+			var buf bytes.Buffer
+			if err := NewEncoder(&buf).Write(in); err != nil {
+				t.Fatal(err)
+			}
+			out, err := NewDecoder(&buf).Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out.Msg == nil {
+				t.Fatal("Msg not present")
+			}
+			got, err := UnmarshalPayload[ClipWriteRequest](out.Msg.Payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tt.orig) {
+				t.Errorf("got %+v, want %+v", got, tt.orig)
+			}
+		})
+	}
+}
+
+func TestRoundtripClipWriteResponse(t *testing.T) {
+	tests := []struct {
+		name string
+		orig ClipWriteResponse
+	}{
+		{
+			name: "ok",
+			orig: ClipWriteResponse{Nonce: 11, Epoch: 0xdeadbeef, OK: true},
+		},
+		{
+			name: "error",
+			orig: ClipWriteResponse{Nonce: 12, Epoch: 0xdeadbeef, Err: "disabled"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload, err := MarshalPayload(tt.orig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			in := &Envelope{Msg: &Msg{Service: "clipwrite", Kind: "resp", Payload: payload}}
+			var buf bytes.Buffer
+			if err := NewEncoder(&buf).Write(in); err != nil {
+				t.Fatal(err)
+			}
+			out, err := NewDecoder(&buf).Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out.Msg == nil {
+				t.Fatal("Msg not present")
+			}
+			got, err := UnmarshalPayload[ClipWriteResponse](out.Msg.Payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tt.orig) {
+				t.Errorf("got %+v, want %+v", got, tt.orig)
+			}
+		})
+	}
+}
+
+func TestClipWriteFieldCountInvariant(t *testing.T) {
+	reqPayload, err := MarshalPayload(ClipWriteRequest{Nonce: 1, Kind: "clear"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := countEnvelopeFields(&Envelope{Msg: &Msg{Service: "clipwrite", Kind: "req", Payload: reqPayload}}); n != 1 {
+		t.Errorf("clipwrite req Msg alone: got %d fields, want 1", n)
+	}
+	respPayload, err := MarshalPayload(ClipWriteResponse{Nonce: 1, OK: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := countEnvelopeFields(&Envelope{Msg: &Msg{Service: "clipwrite", Kind: "resp", Payload: respPayload}}); n != 1 {
+		t.Errorf("clipwrite resp Msg alone: got %d fields, want 1", n)
+	}
+	in := &Envelope{
+		Msg:   &Msg{Service: "clipwrite", Kind: "req", Payload: reqPayload},
+		Hello: &Hello{ProtoVersion: ProtoVersion},
+	}
+	var buf bytes.Buffer
+	if err := NewEncoder(&buf).Write(in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewDecoder(&buf).Read(); !errors.Is(err, ErrMultipleFields) {
+		t.Errorf("got %v, want ErrMultipleFields", err)
+	}
+}
+
 // TestRoundtripMsg encodes a Msg carrying a MarshalPayload'd ClipRequest,
 // round-trips the Envelope, and proves the RawMessage passthrough is
 // byte-preserving: Service/Kind/Seq survive and UnmarshalPayload of the

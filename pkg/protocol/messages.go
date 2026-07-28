@@ -245,6 +245,35 @@ type CredResponse struct {
 	Err    string `cbor:"err,omitempty"`
 }
 
+// ClipWriteRequest — agent → client (service "clipwrite", kind "req"). A
+// remote shim asked the Mac to set its clipboard. Image and text bytes are
+// NEVER inline: they sit in ~/.cache/portal/clip/copy-<sha>.<ext> on the dev
+// box, and the Mac pulls them over the side channel. Kind ∈
+// {"text","image","clear"}; Format is "png" for images; SHA/Size are empty/0
+// for "clear".
+//
+// As of v4 this travels inside Msg.Payload rather than as an Envelope field.
+type ClipWriteRequest struct {
+	Nonce  uint64 `cbor:"n"`
+	Epoch  uint64 `cbor:"e"`
+	Kind   string `cbor:"kind"`
+	Format string `cbor:"fmt,omitempty"`
+	SHA    string `cbor:"sha,omitempty"`
+	Size   int64  `cbor:"sz,omitempty"`
+}
+
+// ClipWriteResponse — client → agent (service "clipwrite", kind "resp").
+// OK=true only after the Mac has pulled the bytes, verified their SHA, and set
+// the pasteboard.
+//
+// As of v4 this travels inside Msg.Payload rather than as an Envelope field.
+type ClipWriteResponse struct {
+	Nonce uint64 `cbor:"n"`
+	Epoch uint64 `cbor:"e"`
+	OK    bool   `cbor:"ok"`
+	Err   string `cbor:"err,omitempty"`
+}
+
 // Notify — agent → client (v3). A remote event (a Claude Code hook firing
 // `portald notify --hook`, or a generic `portald notify --title … --body …`)
 // is relayed up the pipe and raised as a native macOS notification on the Mac.
