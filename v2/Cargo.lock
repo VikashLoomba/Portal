@@ -1172,6 +1172,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "minisign-verify"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1650,10 +1656,11 @@ dependencies = [
 
 [[package]]
 name = "portal-cli"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "anyhow",
  "clap",
+ "minisign-verify",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -1674,7 +1681,7 @@ dependencies = [
 
 [[package]]
 name = "portal-clip"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "objc2",
  "objc2-app-kit",
@@ -1685,7 +1692,7 @@ dependencies = [
 
 [[package]]
 name = "portal-core"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -1707,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "portal-cred"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "block2",
  "objc2",
@@ -1726,7 +1733,7 @@ dependencies = [
 
 [[package]]
 name = "portal-proto"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "ciborium",
  "hex",
@@ -1738,7 +1745,7 @@ dependencies = [
 
 [[package]]
 name = "portal-transport"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "async-trait",
  "rand",
@@ -1751,7 +1758,7 @@ dependencies = [
 
 [[package]]
 name = "portald"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "anyhow",
  "ciborium",

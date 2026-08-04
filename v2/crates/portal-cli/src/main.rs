@@ -588,7 +588,16 @@ fn upgrade(paths: &Paths, check: bool, force: bool) -> i32 {
             Ok(msg) => {
                 println!("portal: {msg}");
                 if !check && !msg.contains("up to date") {
-                    println!("portal: reload the agent to run the new binary (portal restart)");
+                    // v1 parity: the upgrade owns the reload. The swapped
+                    // binary is inert until the daemon re-execs it.
+                    let code = launchctl_verb(paths, Verb::Restart);
+                    if code != 0 {
+                        eprintln!(
+                            "portal: binary upgraded, but reloading the agent failed — run `portal restart`"
+                        );
+                        return code;
+                    }
+                    println!("portal: daemon reloaded — now running the new binary");
                 }
                 0
             }
