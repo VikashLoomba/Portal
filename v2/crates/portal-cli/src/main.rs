@@ -580,33 +580,42 @@ fn logs(paths: &Paths, follow: bool, lines: usize) -> i32 {
 }
 
 fn upgrade(paths: &Paths, check: bool, force: bool) -> i32 {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(async {
+    // The reload (launchctl_verb) builds its OWN runtime, so it must run
+    // after this one is dropped — block_on inside block_on panics.
+    let result = {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let runner = OsRunner;
         let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-        match upgrade::upgrade(&runner, &paths.bin_path, &current, check, force).await {
-            Ok(msg) => {
-                println!("portal: {msg}");
-                if !check && !msg.contains("up to date") {
-                    // v1 parity: the upgrade owns the reload. The swapped
-                    // binary is inert until the daemon re-execs it.
-                    let code = launchctl_verb(paths, Verb::Restart);
-                    if code != 0 {
-                        eprintln!(
-                            "portal: binary upgraded, but reloading the agent failed — run `portal restart`"
-                        );
-                        return code;
-                    }
-                    println!("portal: daemon reloaded — now running the new binary");
+        rt.block_on(upgrade::upgrade(
+            &runner,
+            &paths.bin_path,
+            &current,
+            check,
+            force,
+        ))
+    };
+    match result {
+        Ok(msg) => {
+            println!("portal: {msg}");
+            if !check && !msg.contains("up to date") {
+                // v1 parity: the upgrade owns the reload. The swapped
+                // binary is inert until the daemon re-execs it.
+                let code = launchctl_verb(paths, Verb::Restart);
+                if code != 0 {
+                    eprintln!(
+                        "portal: binary upgraded, but reloading the agent failed — run `portal restart`"
+                    );
+                    return code;
                 }
-                0
+                println!("portal: daemon reloaded — now running the new binary");
             }
-            Err(e) => {
-                eprintln!("portal upgrade: {e}");
-                1
-            }
+            0
         }
-    })
+        Err(e) => {
+            eprintln!("portal upgrade: {e}");
+            1
+        }
+    }
 }
 
 fn doctor(paths: &Paths) -> i32 {
