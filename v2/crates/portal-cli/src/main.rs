@@ -137,8 +137,14 @@ fn main() {
         )
         .init();
     // `--version` needs the build SHA (the box-side agent-heal compares it),
-    // so intercept before clap's plain version printer.
-    if std::env::args().nth(1).as_deref() == Some("--version") {
+    // so intercept before clap's plain version printer. The bare `version`
+    // subcommand is v1 parity — v1's `portal upgrade` self-tests a downloaded
+    // binary by running `<binary> version` and checking the release tag
+    // appears in the output; without it a v1→v2 upgrade refuses the swap.
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("--version") | Some("version")
+    ) {
         println!("portal v{} (sha {})", env!("CARGO_PKG_VERSION"), BUILD_SHA);
         std::process::exit(0);
     }

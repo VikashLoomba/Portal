@@ -114,18 +114,25 @@ echo "$NOTARY_OUT" | grep -q "status: Accepted" || {
 }
 # Single-file binaries can't be stapled; the ticket is in Apple's cloud.
 
-# --- 5. Minisign ------------------------------------------------------------
+# --- 5. Stage artifacts + minisign ------------------------------------------
+# Two asset names, same signed+notarized bytes: v2's upgrader fetches
+# $ARTIFACT; v1's `portal upgrade` hardcodes portal-darwin-arm64 — without
+# that alias every v1 install errors on upgrade ("release publishes no
+# portal-darwin-arm64 asset") instead of moving to v2.
+ART="$OUT/$ARTIFACT"
+V1ART="$OUT/portal-darwin-arm64"
+cp "$BIN" "$ART"
+cp "$BIN" "$V1ART"
 MINISIGN_KEY="${MINISIGN_KEY:-$HOME/.portal-minisign.key}"
 if command -v minisign >/dev/null && [ -f "$MINISIGN_KEY" ]; then
   echo "==> minisign"
-  minisign -S -s "$MINISIGN_KEY" -x "$OUT/$ARTIFACT.minisig" -m "$BIN"
+  minisign -S -s "$MINISIGN_KEY" -x "$ART.minisig" -m "$ART"
+  minisign -S -s "$MINISIGN_KEY" -x "$V1ART.minisig" -m "$V1ART"
 else
   echo "portal: minisign unavailable ($MINISIGN_KEY missing?) — release will be unsigned" >&2
 fi
 
 # --- 6. Publish or install --------------------------------------------------
-ART="$OUT/$ARTIFACT"
-cp "$BIN" "$ART"
 if [ "${INSTALL:-0}" = "1" ]; then
   : "${INSTALL_HOST:?set INSTALL_HOST=<ssh-host> to install locally}"
   echo "==> installing locally (no publish) on $INSTALL_HOST"
@@ -133,8 +140,9 @@ if [ "${INSTALL:-0}" = "1" ]; then
   exit 0
 fi
 echo "==> publishing $TAG"
-ASSETS=("$ART")
+ASSETS=("$ART" "$V1ART")
 [ -f "$ART.minisig" ] && ASSETS+=("$ART.minisig")
+[ -f "$V1ART.minisig" ] && ASSETS+=("$V1ART.minisig")
 if gh release view "$TAG" >/dev/null 2>&1; then
   gh release upload "$TAG" --clobber "${ASSETS[@]}"
 else

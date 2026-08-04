@@ -60,9 +60,13 @@ pub fn load_or_migrate_config(paths: &Paths) -> Result<Config, String> {
             .map_err(|e| e.to_string())?
             .split_whitespace()
             .collect::<String>();
+        // v1 allow files may carry `#` comments ("8000 # api"): strip per
+        // line before tokenizing so a port glued to a comment isn't dropped.
         let allow: Vec<u16> = std::fs::read_to_string(&paths.v1_allow_file)
             .unwrap_or_default()
-            .split_whitespace()
+            .lines()
+            .map(|l| l.split('#').next().unwrap_or(""))
+            .flat_map(str::split_whitespace)
             .filter_map(|t| t.parse().ok())
             .collect();
         let cfg = Config::migrate_from_v1(&host, &allow);
