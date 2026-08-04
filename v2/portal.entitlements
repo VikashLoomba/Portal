@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Hardened-runtime exceptions portal actually needs. None today:
+         pure Rust, no JIT, no unsigned memory, no library validation
+         exceptions. The keychain-access-groups entitlement was REMOVED: it
+         only does anything inside an app bundle with a real bundle id (a
+         bare CLI gets $(AppIdentifierPrefix) unexpanded, which makes macOS
+         kill the signed binary on exec). The LAContext Touch ID gate and
+         the security-framework Keychain calls work WITHOUT any entitlement
+         on a LaunchAgent CLI. The SecAccessControl item-binding stays a
+         release-gated upgrade for a future .app bundle (TASKS.md). -->
+</dict>
+</plist>

@@ -1,0 +1,24 @@
+[package]
+name = "portal-cred"
+version.workspace = true
+edition.workspace = true
+description = "Credential sharing (portal keychain / askpass / sudo): policy core, consent + biometry + keychain seams"
+
+[dependencies]
+portal-proto = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zeroize = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+objc2-local-authentication = { version = "0.3", features = ["LAContext", "LAError"] }
+
+[dev-dependencies]
+tempfile = "3"

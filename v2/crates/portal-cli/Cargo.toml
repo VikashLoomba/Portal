@@ -1,0 +1,33 @@
+[package]
+name = "portal-cli"
+version.workspace = true
+edition.workspace = true
+description = "portal v2 CLI + Mac daemon entry point"
+
+[[bin]]
+name = "portal"
+path = "src/main.rs"
+
+[dependencies]
+portal-core = { workspace = true }
+portal-clip = { workspace = true }
+portal-cred = { workspace = true }
+portal-proto = { workspace = true }
+portal-transport = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry"] }
+objc2-app-kit = { version = "0.3", features = ["NSAlert", "NSApplication", "NSResponder", "NSRunningApplication", "NSControl", "NSTextField", "NSSecureTextField", "NSView", "NSWindow", "NSGraphics"] }
+
+[dev-dependencies]
+tempfile = "3"

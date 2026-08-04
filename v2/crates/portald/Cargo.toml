@@ -1,0 +1,32 @@
+[package]
+name = "portald"
+version.workspace = true
+edition.workspace = true
+description = "portal v2 box-side agent: clip store + shims, /proc/net loopback watcher, stdio RPC, cmd socket"
+
+[lib]
+name = "portald"
+path = "src/lib.rs"
+
+[[bin]]
+name = "portald"
+path = "src/main.rs"
+
+[dependencies]
+portal-proto = { workspace = true, features = ["async"] }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
+serde_bytes = { workspace = true }
+ciborium = { workspace = true }

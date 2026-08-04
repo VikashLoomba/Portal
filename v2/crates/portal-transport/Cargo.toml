@@ -1,0 +1,16 @@
+[package]
+name = "portal-transport"
+version.workspace = true
+edition.workspace = true
+description = "Transport seam: system-ssh (ControlMaster), native-ssh, and localexec implementations behind one async contract"
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+russh = { workspace = true }
+
+[dev-dependencies]
+rand = "0.10"
+tempfile = "3"

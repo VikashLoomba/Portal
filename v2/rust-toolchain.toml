@@ -1,0 +1,6 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# Cross-compile targets for the box-side agent (portald). Install with:
+#   rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+# (release builds use cargo-zigbuild for static musl linking)

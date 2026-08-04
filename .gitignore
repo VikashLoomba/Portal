@@ -9,3 +9,7 @@ internal/bootstrap/agent/sha.txt
 .claude/settings.local.json
 .deno_desktop_entry-*
 examples/shell-desktop/*.app/
+# release signing credentials (never check in)
+AuthKey_*.p8
+v2/.env
+.env
