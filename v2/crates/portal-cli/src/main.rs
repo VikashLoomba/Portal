@@ -28,6 +28,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// v1 compat — DO NOT REMOVE: v1's LaunchAgent plist runs `portal run`,
+    /// and a v1→v2 `portal upgrade` keeps that plist. Without this alias the
+    /// upgraded daemon crash-loops on clap's unknown-subcommand error
+    /// (launchd: "spawn scheduled", ThrottleInterval pacing).
+    #[command(hide = true)]
+    Run,
     /// Configure a dev box and install the login agent (auto-start + self-heal)
     Install {
         /// ssh alias or user@host
@@ -166,7 +172,7 @@ unsafe fn libc_getuid() -> u32 {
 
 fn run(cmd: Command, paths: Paths) -> i32 {
     match cmd {
-        Command::Daemon => block_on_daemon(paths),
+        Command::Daemon | Command::Run => block_on_daemon(paths),
         Command::Install { host, name, index } => install(&paths, &host, name, index),
         Command::Uninstall => uninstall(&paths),
         Command::Start => launchctl_verb(&paths, Verb::Start),
