@@ -262,12 +262,20 @@ enum Verb {
 }
 
 fn launchctl_verb(paths: &Paths, verb: Verb) -> i32 {
+    launchctl_verb_for(paths.uid, &paths.label, &paths.plist, verb)
+}
+
+/// One implementation of start/stop/restart for BOTH login agents. Restart
+/// deliberately uses kickstart for a loaded agent — no bootout/bootstrap
+/// teardown race — which means a CHANGED plist takes effect at next login,
+/// the same guarantee the daemon agent has always had.
+fn launchctl_verb_for(uid: u32, label: &str, plist: &std::path::Path, verb: Verb) -> i32 {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         let runner = OsRunner;
-        let l = launchd::Launchd::new(&runner, paths.uid, paths.label.clone());
+        let l = launchd::Launchd::new(&runner, uid, label.to_string());
         let result = match verb {
-            Verb::Start => l.load(&paths.plist).await.map(|_| "started"),
+            Verb::Start => l.load(plist).await.map(|_| "started"),
             Verb::Stop => match l.unload().await {
                 Ok(true) => Ok("stopped"),
                 Ok(false) => Ok("was not running"),
@@ -277,7 +285,7 @@ fn launchctl_verb(paths: &Paths, verb: Verb) -> i32 {
                 if l.is_loaded().await.unwrap_or(false) {
                     l.kickstart().await.map(|_| "restarted")
                 } else {
-                    l.load(&paths.plist).await.map(|_| "started")
+                    l.load(plist).await.map(|_| "started")
                 }
             }
         };
@@ -375,6 +383,12 @@ fn install(paths: &Paths, host: &str, name: Option<String>, index: Option<u8>) -
 /// upgrade, so a Mac upgrading from a tray-less version grows the status
 /// item automatically. Bootstrap failures are the caller's to report
 /// non-fatally: a headless session (no Aqua) rejects the load by design.
+/// Converge the tray LaunchAgent — the daemon agent's exact semantics,
+/// shared verb implementation: write the plist when its content drifted,
+/// then kickstart-if-loaded (re-execs a just-swapped binary) else bootstrap.
+/// No bootout: launchd's teardown is asynchronous and racing it is how you
+/// end up with sleeps; a changed plist applies at next login, same as the
+/// daemon's plist always has.
 fn ensure_tray_agent(paths: &Paths) -> Result<(), String> {
     let plist = launchd::render_tray_plist(
         &paths.tray_label,
@@ -382,26 +396,21 @@ fn ensure_tray_agent(paths: &Paths) -> Result<(), String> {
         &paths.home,
         &paths.tray_log,
     );
-    let current = std::fs::read_to_string(&paths.tray_plist).unwrap_or_default();
-    if current != plist {
+    if std::fs::read_to_string(&paths.tray_plist).unwrap_or_default() != plist {
         if let Some(dir) = paths.tray_plist.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         std::fs::write(&paths.tray_plist, &plist).map_err(|e| format!("write plist: {e}"))?;
     }
-    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    rt.block_on(async {
-        let runner = OsRunner;
-        let l = launchd::Launchd::new(&runner, paths.uid, paths.tray_label.clone());
-        // Always (re)load: after an upgrade the running tray is the OLD
-        // binary; bootout+bootstrap re-execs the new one (Launchd::load
-        // semantics). SuccessfulExit=false keeps a user's deliberate Quit
-        // quit — but install/upgrade is an explicit action, so restoring
-        // the item here is what the user asked for.
-        l.load(&paths.tray_plist)
-            .await
-            .map_err(|e| format!("launchctl: {e}"))
-    })
+    match launchctl_verb_for(
+        paths.uid,
+        &paths.tray_label,
+        &paths.tray_plist,
+        Verb::Restart,
+    ) {
+        0 => Ok(()),
+        code => Err(format!("launchctl exit {code}")),
+    }
 }
 
 fn install_binary(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {
