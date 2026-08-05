@@ -523,9 +523,8 @@ async fn callback_url_is_forwarded_rewritten_and_allowlisted() {
     let supervisor =
         Supervisor::start::<NoSource, NoGates>(&config, &deps, None, CancellationToken::new());
 
-    // The browser must be pointed at the LOCAL end (index-1 scheme is out of
-    // domain for 53219, so the deterministic fallback allocator names the
-    // port — assert against the forward that actually got established).
+    // The browser must be pointed at the LOCAL end — with the identity-first
+    // policy that is the SAME port number the box listener uses.
     let opened = wait_until(Duration::from_secs(5), async || {
         !urls.lock().unwrap().is_empty()
     })
@@ -541,6 +540,11 @@ async fn callback_url_is_forwarded_rewritten_and_allowlisted() {
             .expect("on-demand forward for the callback port")
     };
     assert_eq!(
+        spec.local, 53219,
+        "callback pins take the IDENTITY mapping (v1 parity) so absolute \
+         redirects to the original port keep working"
+    );
+    assert_eq!(
         urls.lock().unwrap()[0],
         format!(
             "http://127.0.0.1:{}/callback?code=abc&state=xyz",
@@ -550,6 +554,151 @@ async fn callback_url_is_forwarded_rewritten_and_allowlisted() {
     );
 
     // And the agent saw the allowlisted re-Subscribe (the task asserts it).
+    agent_task.await.unwrap();
+    supervisor.cancel_all();
+}
+
+/// The aws-sso shape through the real stack: a PUBLIC authorize URL whose
+/// redirect_uri names a loopback port. The URL must open byte-identical, the
+/// redirect port must get a SAME-PORT forward (the provider redirects to the
+/// literal port — rewriting cannot help), and the pin must be allowlisted.
+#[tokio::test]
+async fn oauth_authorize_url_gets_same_port_forward_for_redirect_target() {
+    let transport = FakeTransport::new("devbox1");
+    let forwarder = Arc::new(FakeForwarder::default());
+    let agent_bytes = b"fake-agent";
+    let digest = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(agent_bytes))
+    };
+    transport.push_exec_ok("Linux x86_64\n");
+    transport.push_exec_ok(&format!("{} {}", agent_bytes.len(), digest));
+    transport.push_exec_ok("OK\n");
+
+    let (session, mut agent) = duplex_session(256 * 1024);
+    transport.push_session(session);
+
+    const AUTHORIZE: &str = "https://oidc.us-east-1.amazonaws.com/authorize?\
+        response_type=code&client_id=abc&\
+        redirect_uri=http%3A%2F%2F127.0.0.1%3A53777%2Foauth%2Fcallback&\
+        state=xyz&code_challenge=cc&code_challenge_method=S256";
+
+    let agent_task = tokio::spawn(async move {
+        let _hello = read_frame(&mut agent.stdin).await.unwrap().hello.unwrap();
+        write_frame(&mut agent.stdout, &Envelope::of_hello_ack(ack("cafe")))
+            .await
+            .unwrap();
+        let sub = read_frame(&mut agent.stdin)
+            .await
+            .unwrap()
+            .subscribe
+            .unwrap();
+        write_frame(
+            &mut agent.stdout,
+            &Envelope::of_subscribe_ack(SubscribeAck {
+                resubscribe_id: sub.resubscribe_id,
+            }),
+        )
+        .await
+        .unwrap();
+        write_frame(
+            &mut agent.stdout,
+            &Envelope::of_snapshot(Snapshot {
+                seq: 10,
+                generated_at: 1,
+                ports: vec![],
+            }),
+        )
+        .await
+        .unwrap();
+
+        // aws sso login → xdg-open → portald open → this frame.
+        write_frame(
+            &mut agent.stdout,
+            &Envelope::of_msg(Msg {
+                service: "openurl".into(),
+                kind: "event".into(),
+                seq: Some(1),
+                payload: Some(
+                    marshal_payload(&portal_proto::messages::OpenUrl {
+                        url: AUTHORIZE.into(),
+                        seq: 1,
+                    })
+                    .unwrap(),
+                ),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The redirect target must be allowlisted like any pin.
+        loop {
+            let env =
+                match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut agent.stdin))
+                    .await
+                {
+                    Ok(Ok(env)) => env,
+                    _ => panic!("no re-Subscribe with the redirect port arrived"),
+                };
+            if let Some(sub) = env.subscribe
+                && sub.allow.contains(&53777)
+            {
+                return;
+            }
+        }
+    });
+
+    let urls: Arc<Mutex<Vec<String>>> = Arc::default();
+    let deps = Deps {
+        agent: EmbeddedAgent {
+            git_sha: "cafe".into(),
+            linux_amd64: Some(Arc::from(&agent_bytes[..])),
+            linux_arm64: None,
+        },
+        gates: Arc::new(|_| true),
+        notify: Arc::new(|_| {}),
+        open_url: {
+            let sink = urls.clone();
+            Arc::new(move |u| sink.lock().unwrap().push(u))
+        },
+        transport: {
+            let transport = transport.clone();
+            let forwarder = forwarder.clone();
+            Arc::new(move |_cfg| {
+                (
+                    transport.clone() as Arc<dyn portal_transport::Transport>,
+                    forwarder.clone() as Arc<dyn PortForwarder>,
+                )
+            })
+        },
+        cred: None,
+        clipboard_writer: None,
+    };
+
+    let config = Config::parse(CONFIG).unwrap();
+    let supervisor =
+        Supervisor::start::<NoSource, NoGates>(&config, &deps, None, CancellationToken::new());
+
+    let opened = wait_until(Duration::from_secs(5), async || {
+        !urls.lock().unwrap().is_empty()
+    })
+    .await;
+    assert!(opened, "authorize URL was never opened");
+    assert_eq!(
+        urls.lock().unwrap()[0],
+        AUTHORIZE,
+        "public authorize URL must open byte-identical — the provider page is \
+         already correct and its query carries single-use OAuth state"
+    );
+    assert!(
+        forwarder.forwards.lock().unwrap().contains(&ForwardSpec {
+            local: 53777,
+            remote: 53777
+        }),
+        "redirect target must be forwarded SAME-PORT: the provider redirects \
+         to the literal redirect_uri port after login"
+    );
+
     agent_task.await.unwrap();
     supervisor.cancel_all();
 }

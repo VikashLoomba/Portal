@@ -308,19 +308,47 @@ impl Default for LoopConfig {
 
 /// Turn a box-side URL into one that works from the Mac.
 ///
-/// A loopback URL names a port on the BOX; opened verbatim on the Mac it hits
-/// nothing (or the wrong service). So we establish a forward for that remote
-/// port and rewrite the URL to the local end.
+/// Two independent jobs, matching the two ways a callback port travels:
 ///
-/// Non-loopback URLs are already correct and pass straight through.
-///
-/// A loopback URL we could not forward yields `Err`: opening it verbatim would
-/// point the browser at a Mac-local port that is either dead or, worse, a
-/// DIFFERENT service than the one the user is authenticating against. Handing
-/// an OAuth `code` to the wrong listener is not a cosmetic failure. The caller
-/// surfaces the error instead.
+/// 1. EMBEDDED redirect targets (`redirect_uri=http://127.0.0.1:p/...` in a
+///    public authorize URL — the aws-sso/gcloud/gh shape): forward `p`
+///    SAME-PORT before the browser opens. The provider redirects to that
+///    literal port after login; a translated port cannot help, so failure to
+///    get the identity mapping is logged at ERROR while the (public, valid)
+///    URL still opens — matching v1, where a same-port conflict logged and
+///    the flow broke visibly at the redirect.
+/// 2. The URL ITSELF loopback: establish a forward and rewrite to its local
+///    end. Here failure is fail-closed (`Err`): opening the un-forwarded URL
+///    verbatim would point the browser at a dead or WRONG local service.
 async fn resolve_open_url(raw: &str, r: &mut dyn Reconciler) -> Result<String, OpenUrlError> {
-    match crate::callback::classify(raw) {
+    let classified = crate::callback::classify(raw);
+
+    let top_level_port = match &classified.target {
+        crate::callback::Target::Loopback { remote_port, .. } => Some(*remote_port),
+        crate::callback::Target::AsIs(_) => None,
+    };
+    for &port in &classified.embedded_callback_ports {
+        if Some(port) == top_level_port {
+            continue; // the target arm below owns it
+        }
+        match tokio::time::timeout(ENSURE_FORWARD_TIMEOUT, r.ensure_forward(port))
+            .await
+            .unwrap_or(None)
+        {
+            Some(local) if local == port => {
+                tracing::info!(target: "portal::engine", port,
+                    "same-port forward ready for oauth redirect target");
+            }
+            Some(local) => tracing::error!(target: "portal::engine", port, local,
+                "oauth redirect target could not get its identity port — the provider will \
+                 redirect to port {port} and the login will not complete (something on the Mac \
+                 is already bound there)"),
+            None => tracing::error!(target: "portal::engine", port,
+                "no forward for oauth redirect target — the post-login redirect will fail"),
+        }
+    }
+
+    match classified.target {
         crate::callback::Target::AsIs(u) => Ok(u),
         crate::callback::Target::Loopback { url, remote_port } => {
             // Bounded: this runs on the reconcile loop task, so an unbounded
@@ -669,6 +697,9 @@ mod tests {
         passes: Arc<AtomicUsize>,
         asked: Arc<Mutex<Vec<u16>>>,
         forward_ok: bool,
+        /// true = identity mapping (local == remote, the OAuth case);
+        /// false = translated (remote + 10000, exercises the rewrite path).
+        exact: bool,
         pin_deadline: Option<tokio::time::Instant>,
     }
 
@@ -678,6 +709,7 @@ mod tests {
                 passes,
                 asked: Arc::new(Mutex::new(Vec::new())),
                 forward_ok: true,
+                exact: false,
                 pin_deadline: None,
             }
         }
@@ -693,7 +725,8 @@ mod tests {
         }
         async fn ensure_forward(&mut self, remote: u16) -> Option<u16> {
             self.asked.lock().unwrap().push(remote);
-            self.forward_ok.then(|| remote + 10000)
+            self.forward_ok
+                .then(|| if self.exact { remote } else { remote + 10000 })
         }
     }
 
@@ -950,6 +983,99 @@ mod tests {
             "https://github.com/login/device",
             "remote URLs are already correct and always open"
         );
+
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    /// The aws-sso shape: PUBLIC authorize URL carrying a loopback
+    /// redirect_uri. The URL must open UNCHANGED (the provider page is
+    /// correct as-is) while the embedded port gets a same-port forward — the
+    /// provider will redirect the browser to that literal port after login.
+    #[tokio::test(start_paused = true)]
+    async fn loop_forwards_embedded_redirect_target_same_port() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let (etx, mut erx) = mpsc::channel::<Event>(4);
+        let (_ktx, mut krx) = mpsc::channel::<()>(1);
+        let (utx, mut urx) = mpsc::channel::<String>(4);
+        let cancel = CancellationToken::new();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+
+        let task = tokio::spawn({
+            let n = n.clone();
+            let cancel = cancel.clone();
+            let asked = asked.clone();
+            async move {
+                let mut r = Counting::new(n);
+                r.asked = asked;
+                r.exact = true; // identity mapping succeeds
+                run_reconcile_loop(
+                    &mut erx,
+                    &mut krx,
+                    Some(utx),
+                    LoopConfig::default(),
+                    cancel,
+                    &mut r,
+                )
+                .await;
+            }
+        });
+        settle().await;
+
+        let raw = "https://oidc.us-east-1.amazonaws.com/authorize?client_id=abc&\
+                   redirect_uri=http%3A%2F%2F127.0.0.1%3A55555%2Foauth%2Fcallback&state=xyz";
+        etx.send(Event::OpenUrl { url: raw.into() }).await.unwrap();
+        settle().await;
+
+        assert_eq!(
+            urx.try_recv().unwrap(),
+            raw,
+            "public authorize URL must open byte-identical"
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![55555],
+            "embedded redirect target must get a forward"
+        );
+
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    /// Same shape, but the identity port is unavailable: the public URL must
+    /// STILL open (it is valid; only the eventual redirect is doomed, which
+    /// is logged) — unlike the top-level-loopback case, which fails closed.
+    #[tokio::test(start_paused = true)]
+    async fn loop_opens_public_url_even_when_redirect_target_unforwardable() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let (etx, mut erx) = mpsc::channel::<Event>(4);
+        let (_ktx, mut krx) = mpsc::channel::<()>(1);
+        let (utx, mut urx) = mpsc::channel::<String>(4);
+        let cancel = CancellationToken::new();
+
+        let task = tokio::spawn({
+            let n = n.clone();
+            let cancel = cancel.clone();
+            async move {
+                let mut r = Counting::new(n);
+                r.forward_ok = false;
+                run_reconcile_loop(
+                    &mut erx,
+                    &mut krx,
+                    Some(utx),
+                    LoopConfig::default(),
+                    cancel,
+                    &mut r,
+                )
+                .await;
+            }
+        });
+        settle().await;
+
+        let raw = "https://p.example/auth?redirect_uri=http%3A%2F%2F127.0.0.1%3A55555%2Fcb";
+        etx.send(Event::OpenUrl { url: raw.into() }).await.unwrap();
+        settle().await;
+        assert_eq!(urx.try_recv().unwrap(), raw);
 
         cancel.cancel();
         task.await.unwrap();

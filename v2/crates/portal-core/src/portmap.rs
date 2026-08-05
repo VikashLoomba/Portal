@@ -111,6 +111,32 @@ impl PortMap {
         Some(local)
     }
 
+    /// Try to assign `remote` its IDENTITY mapping (local == remote).
+    ///
+    /// OAuth callback pins need this and nothing else works: the provider
+    /// redirects the browser to the literal `redirect_uri` port — server-side
+    /// state we cannot rewrite — so a translated local port sends the
+    /// post-login redirect into a wall. (v1 got this for free by forwarding
+    /// every port same-port.) An EXISTING assignment wins: a steady-state
+    /// indexed forward already has working URLs, and stacking a second
+    /// mapping for the same remote would leave two listeners racing.
+    /// Returns None when the identity slot is taken; callers fall back to
+    /// [`PortMap::local_for`] (rewrite-only flows still work).
+    pub fn assign_exact(
+        &mut self,
+        remote: u16,
+        mut is_taken: impl FnMut(u16) -> bool,
+    ) -> Option<u16> {
+        if let Some(&local) = self.assigned.get(&remote) {
+            return Some(local);
+        }
+        if is_taken(remote) {
+            return None;
+        }
+        self.assigned.insert(remote, remote);
+        Some(remote)
+    }
+
     /// Forget an assignment (remote listener went away and its forward was
     /// cancelled). The daemon also frees the port in its global taken-set.
     pub fn release(&mut self, remote: u16) -> Option<u16> {
@@ -196,5 +222,22 @@ mod tests {
         let local = pm.local_for(8000, |p| p == 18000).unwrap();
         assert_ne!(local, 18000);
         assert!(FALLBACK_RANGE.contains(&local));
+    }
+
+    #[test]
+    fn assign_exact_gives_identity_or_defers() {
+        let mut pm = PortMap::new("devbox1", 1);
+        // Free identity slot — OAuth redirect can land.
+        assert_eq!(pm.assign_exact(55555, |_| false), Some(55555));
+        // Recorded: subsequent general lookups agree (reconcile keeps it).
+        assert_eq!(pm.local_for(55555, |_| false), Some(55555));
+        // Identity slot taken — caller must fall back / report.
+        let mut pm2 = PortMap::new("devbox1", 1);
+        assert_eq!(pm2.assign_exact(55556, |p| p == 55556), None);
+        // An existing (indexed) assignment wins over identity: its URLs
+        // already work and a duplicate listener would race it.
+        let mut pm3 = PortMap::new("devbox1", 1);
+        assert_eq!(pm3.local_for(8000, |_| false), Some(18000));
+        assert_eq!(pm3.assign_exact(8000, |_| false), Some(18000));
     }
 }

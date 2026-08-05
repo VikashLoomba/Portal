@@ -37,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 use portal_clip::watcher::{Gates, POLL_INTERVAL, SnapshotSource, WatchEvent, Watcher};
 use portal_transport::lsof::LsofPorts;
 use portal_transport::runner::OsRunner;
-use portal_transport::{ForwardSpec, PortForwarder, Transport};
+use portal_transport::{ForwardSpec, PortForwarder, Transport, TransportError};
 
 use crate::agentclient::session::{Bootstrapper, Client, ClientConfig, Filter, Outbound};
 use crate::agentclient::{Event, EventChannels, ServiceRequest, SnapshotCache};
@@ -663,6 +663,21 @@ impl StackReconciler {
     fn publish_pins(&self) {
         self.filter.set_pins(self.state.pins.ports().collect());
     }
+
+    /// Post-bind bookkeeping shared by the exact and allocator paths.
+    fn finish_forward(&mut self, spec: ForwardSpec) {
+        self.taken.lock().unwrap().insert(spec.local);
+        let forwards: Vec<(u16, u16)> = self
+            .state
+            .portmap
+            .assignments()
+            .map(|(r, l)| (l, r))
+            .collect();
+        self.status_tx.send_modify(|s| s.forwards = forwards);
+        tracing::info!(target: "portal::supervisor", box_name = %self.state.box_name,
+            local = spec.local, remote = spec.remote,
+            "on-demand forward established for callback url");
+    }
 }
 
 #[async_trait::async_trait]
@@ -722,6 +737,13 @@ impl Reconciler for StackReconciler {
     /// cancel the forward we are about to create. Without that, a callback
     /// port absent from the snapshot (ephemeral range, or bound since the last
     /// poll) would be torn down within ~50ms, before the browser connects.
+    ///
+    /// Mapping policy: IDENTITY first (local == remote). OAuth providers
+    /// redirect to the literal `redirect_uri` port, so only the identity
+    /// mapping makes the post-login redirect land — v1 parity, where every
+    /// forward was same-port. The indexed/fallback allocator is the fallback
+    /// when the identity slot is taken (still correct for directly-opened
+    /// loopback URLs, which we rewrite).
     async fn ensure_forward(&mut self, remote: u16) -> Option<u16> {
         self.state
             .pins
@@ -731,14 +753,11 @@ impl Reconciler for StackReconciler {
         // its disappearance retires the pin — see PinSet::observe.
         self.publish_pins();
 
-        // Reuse the existing assignment when there is one; otherwise allocate
-        // through the same indexed/fallback policy a normal pass uses, honoring
-        // the cross-box taken-set so we cannot claim another box's local port.
         let local = {
             let taken = self.taken.lock().unwrap().clone();
-            self.state
-                .portmap
-                .local_for(remote, |p| taken.contains(&p))?
+            let pm = &mut self.state.portmap;
+            pm.assign_exact(remote, |p| taken.contains(&p))
+                .or_else(|| pm.local_for(remote, |p| taken.contains(&p)))?
         };
 
         // Already live (the common case on a second callback) — nothing to do.
@@ -751,17 +770,35 @@ impl Reconciler for StackReconciler {
 
         match self.forwarder.forward(spec).await {
             Ok(()) => {
-                self.taken.lock().unwrap().insert(local);
-                let forwards: Vec<(u16, u16)> = self
-                    .state
-                    .portmap
-                    .assignments()
-                    .map(|(r, l)| (l, r))
-                    .collect();
-                self.status_tx.send_modify(|s| s.forwards = forwards);
-                tracing::info!(target: "portal::supervisor", box_name = %self.state.box_name,
-                    local, remote, "on-demand forward established for callback url");
+                self.finish_forward(spec);
                 Some(local)
+            }
+            // The taken-set cannot see arbitrary Mac listeners; the BIND is
+            // the ground truth. If the IDENTITY slot is OS-occupied, retry
+            // once through the allocator so direct-open flows still work
+            // (the caller detects local != remote and warns that redirect
+            // flows cannot).
+            Err(TransportError::PortInUse { .. }) if local == remote => {
+                self.state.portmap.release(remote);
+                let alt = {
+                    let taken = self.taken.lock().unwrap().clone();
+                    self.state
+                        .portmap
+                        .local_for(remote, |p| taken.contains(&p) || p == remote)?
+                };
+                let spec = ForwardSpec { local: alt, remote };
+                match self.forwarder.forward(spec).await {
+                    Ok(()) => {
+                        self.finish_forward(spec);
+                        Some(alt)
+                    }
+                    Err(err) => {
+                        self.state.portmap.release(remote);
+                        tracing::warn!(target: "portal::supervisor", box_name = %self.state.box_name,
+                            local = alt, remote, %err, "on-demand forward failed");
+                        None
+                    }
+                }
             }
             Err(err) => {
                 // Release the mapping so the next pass can retry cleanly (or

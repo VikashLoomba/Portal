@@ -43,32 +43,69 @@ pub enum Target {
     Loopback { url: Url, remote_port: u16 },
 }
 
+/// Everything the relay must know about one URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Classified {
+    pub target: Target,
+    /// Loopback ports found INSIDE query parameters (`redirect_uri` and
+    /// friends). This is the standard OAuth shape — `aws sso login`,
+    /// `gcloud auth login`, `gh auth login -w` all open a PUBLIC authorize
+    /// URL that carries `redirect_uri=http://127.0.0.1:<port>/...`; after
+    /// login the PROVIDER redirects the browser to that literal URL. The
+    /// port is server-side state we cannot rewrite, so these must be
+    /// forwarded SAME-PORT before the browser opens, or the post-login
+    /// redirect dies with "site cannot be reached".
+    pub embedded_callback_ports: Vec<u16>,
+}
+
 /// Classify a relayed URL. Unparseable input is passed through as-is rather
 /// than dropped: the box shim already vetted the scheme, and a URL we cannot
 /// parse is still better handed to the OS opener than silently discarded.
-pub fn classify(raw: &str) -> Target {
+pub fn classify(raw: &str) -> Classified {
     let Ok(url) = Url::parse(raw) else {
-        return Target::AsIs(raw.to_string());
+        return Classified {
+            target: Target::AsIs(raw.to_string()),
+            embedded_callback_ports: Vec::new(),
+        };
     };
+    // Any query value that itself parses as a loopback URL is a callback
+    // target the provider will redirect to verbatim. False positives cost an
+    // idle same-port forward (TTL/observation reclaims it); false negatives
+    // break logins — so extraction is deliberately permissive on the KEY
+    // (redirect_uri/redirect_url/callback/… all exist in the wild) and
+    // strict on the VALUE (must parse as a URL with a loopback host).
+    let mut embedded_callback_ports: Vec<u16> = url
+        .query_pairs()
+        .filter_map(|(_, v)| {
+            let u = Url::parse(&v).ok()?;
+            let port = u.port_or_known_default()?;
+            is_loopback_url(&u).then_some(port)
+        })
+        .collect();
+    embedded_callback_ports.sort_unstable();
+    embedded_callback_ports.dedup();
+
     // port_or_known_default covers http/https/ws/wss; a scheme with no known
     // default and no explicit port has no listener to forward to.
-    let Some(port) = url.port_or_known_default() else {
-        return Target::AsIs(raw.to_string());
-    };
-    match url.host() {
-        Some(Host::Domain(h)) if is_loopback_domain(h) => Target::Loopback {
-            url,
-            remote_port: port,
-        },
-        Some(Host::Ipv4(ip)) if ip.is_loopback() => Target::Loopback {
-            url,
-            remote_port: port,
-        },
-        Some(Host::Ipv6(ip)) if ip.is_loopback() => Target::Loopback {
+    let target = match url.port_or_known_default() {
+        Some(port) if is_loopback_url(&url) => Target::Loopback {
             url,
             remote_port: port,
         },
         _ => Target::AsIs(raw.to_string()),
+    };
+    Classified {
+        target,
+        embedded_callback_ports,
+    }
+}
+
+fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(h)) => is_loopback_domain(h),
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
     }
 }
 
@@ -105,10 +142,14 @@ mod tests {
     use super::*;
 
     fn loopback_port(raw: &str) -> Option<u16> {
-        match classify(raw) {
+        match classify(raw).target {
             Target::Loopback { remote_port, .. } => Some(remote_port),
             Target::AsIs(_) => None,
         }
+    }
+
+    fn embedded(raw: &str) -> Vec<u16> {
+        classify(raw).embedded_callback_ports
     }
 
     #[test]
@@ -136,7 +177,71 @@ mod tests {
     #[test]
     fn public_urls_are_untouched() {
         let raw = "https://github.com/login/device?user_code=ABCD-1234";
-        assert_eq!(classify(raw), Target::AsIs(raw.into()));
+        assert_eq!(classify(raw).target, Target::AsIs(raw.into()));
+        assert!(embedded(raw).is_empty());
+    }
+
+    /// The aws-sso shape (and gcloud/gh -w): PUBLIC authorize URL carrying a
+    /// percent-encoded loopback redirect_uri. The provider redirects to that
+    /// literal port after login — it must be extracted for same-port
+    /// forwarding while the URL itself opens untouched.
+    #[test]
+    fn oauth_redirect_uri_ports_are_extracted_from_public_urls() {
+        let raw = "https://oidc.us-east-1.amazonaws.com/authorize?\
+                   response_type=code&client_id=abc&\
+                   redirect_uri=http%3A%2F%2F127.0.0.1%3A55555%2Foauth%2Fcallback&\
+                   state=xyz&code_challenge=cc&code_challenge_method=S256";
+        let c = classify(raw);
+        assert_eq!(c.target, Target::AsIs(raw.into()), "public URL opens as-is");
+        assert_eq!(c.embedded_callback_ports, vec![55555]);
+
+        // localhost form + scheme-default port.
+        assert_eq!(
+            embedded("https://p.example/auth?redirect_uri=http%3A%2F%2Flocalhost%3A8400%2Fcb"),
+            vec![8400]
+        );
+        assert_eq!(
+            embedded("https://p.example/auth?redirect_uri=http%3A%2F%2Flocalhost%2Fcb"),
+            vec![80]
+        );
+        // Multiple loopback params dedupe.
+        assert_eq!(
+            embedded(
+                "https://p.example/a?redirect_uri=http%3A%2F%2F127.0.0.1%3A9001%2Fx&\
+                 callback=http%3A%2F%2F127.0.0.1%3A9001%2Fy"
+            ),
+            vec![9001]
+        );
+    }
+
+    /// A public redirect_uri is the provider's business, not ours: never
+    /// forward or touch it. Only loopback values are callback targets.
+    #[test]
+    fn non_loopback_redirect_uris_are_ignored() {
+        for raw in [
+            "https://p.example/auth?redirect_uri=https%3A%2F%2Fmyapp.example%2Fcallback",
+            "https://p.example/auth?redirect_uri=https%3A%2F%2Flocalhost.evil.com%2Fcb",
+            "https://p.example/auth?state=notaurl&scope=openid",
+        ] {
+            assert!(embedded(raw).is_empty(), "must not extract from {raw}");
+        }
+    }
+
+    /// A loopback page can itself carry a loopback redirect_uri (local IdP
+    /// dev setups): both the page port and the embedded port surface.
+    #[test]
+    fn loopback_page_with_embedded_callback_reports_both() {
+        let c = classify(
+            "http://localhost:8400/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A9200%2Fcb",
+        );
+        assert!(matches!(
+            c.target,
+            Target::Loopback {
+                remote_port: 8400,
+                ..
+            }
+        ));
+        assert_eq!(c.embedded_callback_ports, vec![9200]);
     }
 
     /// The security boundary: a host that merely CONTAINS "localhost" must not
@@ -155,10 +260,13 @@ mod tests {
 
     #[test]
     fn unparseable_and_schemeless_pass_through() {
-        assert_eq!(classify("not a url"), Target::AsIs("not a url".into()));
+        assert_eq!(
+            classify("not a url").target,
+            Target::AsIs("not a url".into())
+        );
         // No host, no default port ⇒ nothing to forward.
         assert_eq!(
-            classify("mailto:someone@example.com"),
+            classify("mailto:someone@example.com").target,
             Target::AsIs("mailto:someone@example.com".into())
         );
     }
@@ -166,7 +274,7 @@ mod tests {
     #[test]
     fn rewrite_preserves_path_query_fragment() {
         let Target::Loopback { url, remote_port } =
-            classify("http://localhost:53219/cb?code=a%2Fb&state=xy#frag")
+            classify("http://localhost:53219/cb?code=a%2Fb&state=xy#frag").target
         else {
             panic!("expected loopback");
         };
@@ -181,14 +289,14 @@ mod tests {
     /// 127.0.0.1, so the rewritten URL must pin the IPv4 literal.
     #[test]
     fn rewrite_pins_ipv4_literal() {
-        let Target::Loopback { url, .. } = classify("http://localhost/cb") else {
+        let Target::Loopback { url, .. } = classify("http://localhost/cb").target else {
             panic!("expected loopback");
         };
         // Port 80 == http default, so `url` elides it; same target either way.
         assert_eq!(rewrite(&url, 80), "http://127.0.0.1/cb");
         assert_eq!(rewrite(&url, 18080), "http://127.0.0.1:18080/cb");
         // An IPv6 loopback source is rewritten to the IPv4 literal too.
-        let Target::Loopback { url, .. } = classify("http://[::1]:3000/cb") else {
+        let Target::Loopback { url, .. } = classify("http://[::1]:3000/cb").target else {
             panic!("expected loopback");
         };
         assert_eq!(rewrite(&url, 13000), "http://127.0.0.1:13000/cb");
