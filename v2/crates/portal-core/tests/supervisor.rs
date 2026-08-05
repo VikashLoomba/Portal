@@ -394,6 +394,166 @@ async fn full_stack_forwards_notifies_and_syncs_clipboard() {
     }
 }
 
+/// The callback-URL flow end-to-end through the real stack: scripted agent
+/// relays an OpenUrl for an EPHEMERAL box port (never in any snapshot — the
+/// exact shape that broke in the field), and the daemon must (1) establish an
+/// on-demand forward, (2) open the REWRITTEN local URL, (3) re-Subscribe with
+/// the pinned port allowlisted so the agent starts reporting the listener.
+#[tokio::test]
+async fn callback_url_is_forwarded_rewritten_and_allowlisted() {
+    let transport = FakeTransport::new("devbox1");
+    let forwarder = Arc::new(FakeForwarder::default());
+    let agent_bytes = b"fake-agent";
+    let digest = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(agent_bytes))
+    };
+    transport.push_exec_ok("Linux x86_64\n");
+    transport.push_exec_ok(&format!("{} {}", agent_bytes.len(), digest));
+    transport.push_exec_ok("OK\n");
+
+    let (session, mut agent) = duplex_session(256 * 1024);
+    transport.push_session(session);
+
+    let agent_task = tokio::spawn(async move {
+        // Handshake + initial Subscribe + empty snapshot (the callback
+        // listener is ephemeral: the agent does NOT report it).
+        let _hello = read_frame(&mut agent.stdin).await.unwrap().hello.unwrap();
+        write_frame(&mut agent.stdout, &Envelope::of_hello_ack(ack("cafe")))
+            .await
+            .unwrap();
+        let sub = read_frame(&mut agent.stdin)
+            .await
+            .unwrap()
+            .subscribe
+            .unwrap();
+        assert!(
+            !sub.allow.contains(&53219),
+            "pin must not be allowlisted before the callback"
+        );
+        write_frame(
+            &mut agent.stdout,
+            &Envelope::of_subscribe_ack(SubscribeAck {
+                resubscribe_id: sub.resubscribe_id,
+            }),
+        )
+        .await
+        .unwrap();
+        write_frame(
+            &mut agent.stdout,
+            &Envelope::of_snapshot(Snapshot {
+                seq: 10,
+                generated_at: 1,
+                ports: vec![],
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The box relays a callback URL (as `portald open` would).
+        write_frame(
+            &mut agent.stdout,
+            &Envelope::of_msg(Msg {
+                service: "openurl".into(),
+                kind: "event".into(),
+                seq: Some(1),
+                payload: Some(
+                    marshal_payload(&portal_proto::messages::OpenUrl {
+                        url: "http://localhost:53219/callback?code=abc&state=xyz".into(),
+                        seq: 1,
+                    })
+                    .unwrap(),
+                ),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The pin must trigger a re-Subscribe whose allowlist carries 53219
+        // (allow wins over the agent's ephemeral cut — this is what makes
+        // the listener observable and lets the pin retire on its death).
+        loop {
+            let env =
+                match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut agent.stdin))
+                    .await
+                {
+                    Ok(Ok(env)) => env,
+                    _ => panic!("no re-Subscribe with the pinned port arrived"),
+                };
+            if let Some(sub) = env.subscribe
+                && sub.allow.contains(&53219)
+            {
+                return Vec::<Msg>::new();
+            }
+        }
+    });
+
+    let notifications: Arc<Mutex<Vec<NotifyEvent>>> = Arc::default();
+    let urls: Arc<Mutex<Vec<String>>> = Arc::default();
+    let deps = Deps {
+        agent: EmbeddedAgent {
+            git_sha: "cafe".into(),
+            linux_amd64: Some(Arc::from(&agent_bytes[..])),
+            linux_arm64: None,
+        },
+        gates: Arc::new(|_| true),
+        notify: {
+            let sink = notifications.clone();
+            Arc::new(move |ev| sink.lock().unwrap().push(ev))
+        },
+        open_url: {
+            let sink = urls.clone();
+            Arc::new(move |u| sink.lock().unwrap().push(u))
+        },
+        transport: {
+            let transport = transport.clone();
+            let forwarder = forwarder.clone();
+            Arc::new(move |_cfg| {
+                (
+                    transport.clone() as Arc<dyn portal_transport::Transport>,
+                    forwarder.clone() as Arc<dyn PortForwarder>,
+                )
+            })
+        },
+        cred: None,
+        clipboard_writer: None,
+    };
+
+    let config = Config::parse(CONFIG).unwrap();
+    let supervisor =
+        Supervisor::start::<NoSource, NoGates>(&config, &deps, None, CancellationToken::new());
+
+    // The browser must be pointed at the LOCAL end (index-1 scheme is out of
+    // domain for 53219, so the deterministic fallback allocator names the
+    // port — assert against the forward that actually got established).
+    let opened = wait_until(Duration::from_secs(5), async || {
+        !urls.lock().unwrap().is_empty()
+    })
+    .await;
+    assert!(opened, "callback URL was never opened");
+
+    let spec = {
+        let forwards = forwarder.forwards.lock().unwrap();
+        forwards
+            .iter()
+            .find(|f| f.remote == 53219)
+            .copied()
+            .expect("on-demand forward for the callback port")
+    };
+    assert_eq!(
+        urls.lock().unwrap()[0],
+        format!(
+            "http://127.0.0.1:{}/callback?code=abc&state=xyz",
+            spec.local
+        ),
+        "must open the local end of the forward, query preserved"
+    );
+
+    // And the agent saw the allowlisted re-Subscribe (the task asserts it).
+    agent_task.await.unwrap();
+    supervisor.cancel_all();
+}
+
 #[tokio::test]
 async fn config_hot_reload_adds_updates_and_removes_stacks() {
     use portal_core::agentclient::session::Filter;

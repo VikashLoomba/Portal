@@ -279,7 +279,7 @@ impl ClipStore {
                 blobs.push((entry.path(), mtime));
             }
         }
-        blobs.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
+        blobs.sort_by_key(|b| std::cmp::Reverse(b.1)); // newest first
         for (path, _) in blobs.into_iter().skip(GC_KEEP_RECENT) {
             if fs::remove_file(path).is_ok() {
                 removed += 1;

@@ -47,6 +47,19 @@ trap 'rm -f "$NOTARY_ZIP"' EXIT
 SHA="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo dev)"
 echo "==> portal v2 release: $TAG (sha $SHA)"
 
+# --- 0. Tag must match the crate version (fails-closed) --------------------
+# `portal upgrade` compares CARGO_PKG_VERSION against the latest GitHub tag
+# (upgrade::is_newer). A binary shipping a version BELOW its own tag sees
+# itself as perpetually out of date and re-installs the same release on every
+# check. The SHA smoke test below CANNOT catch this: a stale version with a
+# correct SHA passes it. So gate on the version too.
+CRATE_VER="$(sed -n 's/^version = "\(.*\)"/\1/p' "$V2/Cargo.toml" | head -1)"
+if [ "$TAG" != "local" ] && [ "$TAG" != "v$CRATE_VER" ]; then
+  echo "portal: tag $TAG != crate version v$CRATE_VER (v2/Cargo.toml) — aborting release" >&2
+  echo "portal: bump [workspace.package] version to ${TAG#v}, commit, then re-run" >&2
+  exit 1
+fi
+
 # --- 1+2. Build (agents + Mac binary, embed-verified) -----------------------
 # ONE build path: the Makefile owns cross-compile + embed + verification, so
 # a portal binary without embedded agents cannot come out of any flow.

@@ -182,14 +182,23 @@ pub async fn reconcile_once(
     let observed = desired.ok_or(ReconcileError::AgentNotReady)?;
     for port in st.pins.expire(Instant::now()) {
         tracing::debug!(target: "portal::engine", box_name = %st.box_name, remote = port,
-            "callback pin expired");
+            "callback pin expired (never confirmed by the agent)");
+    }
+    // Observation-driven retirement: pinned ports ride the Subscribe
+    // allowlist, so a live callback listener IS in `observed`. Once seen,
+    // its later absence means the listener exited — drop the pin (and with
+    // it the forward) now instead of idling out the TTL.
+    let listening: BTreeSet<u16> = observed.iter().copied().collect();
+    for port in st.pins.observe(&listening) {
+        tracing::info!(target: "portal::engine", box_name = %st.box_name, remote = port,
+            "callback listener gone; retiring its forward");
     }
     // Union, deduped: a pinned port that IS in the snapshot must appear once,
     // or plan() would emit a duplicate add.
     let desired: Vec<u16> = if st.pins.is_empty() {
         observed.to_vec()
     } else {
-        observed
+        listening
             .iter()
             .copied()
             .chain(st.pins.ports())
@@ -272,6 +281,12 @@ pub trait Reconciler: Send {
     /// mapping when one is live, and returns `None` only if no local port
     /// could be established.
     async fn ensure_forward(&mut self, remote: u16) -> Option<u16>;
+
+    /// Earliest moment a pin lapses, so the loop can wake exactly then and
+    /// collect it. `None` means nothing is pinned and no timer is needed.
+    fn next_pin_deadline(&self) -> Option<tokio::time::Instant> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -297,32 +312,58 @@ impl Default for LoopConfig {
 /// nothing (or the wrong service). So we establish a forward for that remote
 /// port and rewrite the URL to the local end.
 ///
-/// If the forward cannot be established we return the URL unchanged rather
-/// than dropping it: the user is mid-login and waiting on a browser. A
-/// connection-refused page is a visible, explicable failure with a WARN in the
-/// log beside it; a silently skipped open looks like the product simply
-/// ignored them. Non-loopback URLs are already correct and pass straight
-/// through.
-async fn resolve_open_url(raw: &str, r: &mut dyn Reconciler) -> String {
+/// Non-loopback URLs are already correct and pass straight through.
+///
+/// A loopback URL we could not forward yields `Err`: opening it verbatim would
+/// point the browser at a Mac-local port that is either dead or, worse, a
+/// DIFFERENT service than the one the user is authenticating against. Handing
+/// an OAuth `code` to the wrong listener is not a cosmetic failure. The caller
+/// surfaces the error instead.
+async fn resolve_open_url(raw: &str, r: &mut dyn Reconciler) -> Result<String, OpenUrlError> {
     match crate::callback::classify(raw) {
-        crate::callback::Target::AsIs(u) => u,
+        crate::callback::Target::AsIs(u) => Ok(u),
         crate::callback::Target::Loopback { url, remote_port } => {
-            match r.ensure_forward(remote_port).await {
+            // Bounded: this runs on the reconcile loop task, so an unbounded
+            // await would stall every pass behind a wedged SSH channel.
+            let forwarded =
+                tokio::time::timeout(ENSURE_FORWARD_TIMEOUT, r.ensure_forward(remote_port))
+                    .await
+                    .unwrap_or(None);
+            match forwarded {
                 Some(local) => {
                     let out = crate::callback::rewrite(&url, local);
                     tracing::info!(target: "portal::engine", remote = remote_port, local,
                         "callback url mapped to local forward");
-                    out
+                    Ok(out)
                 }
-                None => {
-                    tracing::warn!(target: "portal::engine", remote = remote_port,
-                        "no forward available for callback url; opening as-is");
-                    url.to_string()
-                }
+                None => Err(OpenUrlError { remote_port }),
             }
         }
     }
 }
+
+/// Upper bound on establishing a callback forward. Generous relative to a
+/// healthy round-trip (tens of ms) but far below a human's patience, and it
+/// guarantees the reconcile loop cannot be parked indefinitely.
+const ENSURE_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A box-side loopback URL that could not be given a working local port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenUrlError {
+    pub remote_port: u16,
+}
+
+impl std::fmt::Display for OpenUrlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not forward box port {} for a callback URL",
+            self.remote_port
+        )
+    }
+}
+
+impl std::error::Error for OpenUrlError {}
 
 /// Event-driven reconcile loop (port of Engine.runEventDriven):
 /// - one pass immediately (forwards restore before the first agent event);
@@ -353,6 +394,18 @@ pub async fn run_reconcile_loop(
                 None => std::future::pending().await,
             }
         };
+        // Wake on the earliest pin lapse so a TTL is a real deadline and not
+        // just "whenever something else happens to fire". Read before the
+        // select so no borrow of `r` is held across arms that need it mutably;
+        // recomputed each iteration because ensure_forward can add or extend
+        // pins at any time.
+        let pin_at = r.next_pin_deadline();
+        let pin_sleep = async {
+            match pin_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             _ = cancel.cancelled() => return,
             ev = events.recv() => {
@@ -369,11 +422,16 @@ pub async fn run_reconcile_loop(
                     Some(Event::OpenUrl { url }) => {
                         if let Some(sink) = &open_url {
                             // Await here: establishing the forward BEFORE the
-                            // browser opens is the entire point. A callback URL
-                            // arrives once per login, so briefly deferring
-                            // reconcile passes costs nothing.
-                            let target = resolve_open_url(&url, r).await;
-                            let _ = sink.try_send(target);
+                            // browser opens is the entire point. Bounded by
+                            // ENSURE_FORWARD_TIMEOUT so a wedged channel cannot
+                            // park the loop.
+                            match resolve_open_url(&url, r).await {
+                                Ok(target) => { let _ = sink.try_send(target); }
+                                Err(e) => tracing::error!(target: "portal::engine",
+                                    remote = e.remote_port, url = %url,
+                                    "{e}; not opening a browser at a port that would answer \
+                                     with the wrong service or nothing at all"),
+                            }
                         }
                     }
                 }
@@ -386,6 +444,11 @@ pub async fn run_reconcile_loop(
                 r.reconcile().await;
             }
             _ = safety.tick() => {
+                r.reconcile().await;
+            }
+            _ = pin_sleep => {
+                // A pin lapsed: reconcile drops it from the desired set and
+                // the plan retires the forward.
                 r.reconcile().await;
             }
         }
@@ -606,6 +669,7 @@ mod tests {
         passes: Arc<AtomicUsize>,
         asked: Arc<Mutex<Vec<u16>>>,
         forward_ok: bool,
+        pin_deadline: Option<tokio::time::Instant>,
     }
 
     impl Counting {
@@ -614,12 +678,16 @@ mod tests {
                 passes,
                 asked: Arc::new(Mutex::new(Vec::new())),
                 forward_ok: true,
+                pin_deadline: None,
             }
         }
     }
 
     #[async_trait::async_trait]
     impl Reconciler for Counting {
+        fn next_pin_deadline(&self) -> Option<tokio::time::Instant> {
+            self.pin_deadline
+        }
         async fn reconcile(&mut self) {
             self.passes.fetch_add(1, Ordering::SeqCst);
         }
@@ -796,11 +864,12 @@ mod tests {
         task.await.unwrap();
     }
 
-    /// If the forward genuinely cannot be established we still open something
-    /// (visible failure + WARN) rather than silently swallowing the user's
-    /// login.
+    /// A loopback URL we could not forward must NOT reach the browser. The
+    /// local port is either dead (connection refused) or bound by an unrelated
+    /// service, and handing an OAuth `code` to the wrong listener is a real
+    /// failure, not a cosmetic one. Fail closed and log.
     #[tokio::test(start_paused = true)]
-    async fn loop_opens_original_when_forward_unavailable() {
+    async fn loop_refuses_to_open_unmappable_loopback_url() {
         let n = Arc::new(AtomicUsize::new(0));
         let (etx, mut erx) = mpsc::channel::<Event>(4);
         let (_ktx, mut krx) = mpsc::channel::<()>(1);
@@ -832,10 +901,105 @@ mod tests {
         .await
         .unwrap();
         settle().await;
+        assert!(
+            urx.try_recv().is_err(),
+            "must not open a loopback URL whose port was never forwarded"
+        );
+
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    /// Non-loopback URLs need no forward, so a refusing reconciler must not
+    /// suppress them — only loopback translation can fail closed.
+    #[tokio::test(start_paused = true)]
+    async fn loop_still_opens_remote_urls_when_forwarding_is_unavailable() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let (etx, mut erx) = mpsc::channel::<Event>(4);
+        let (_ktx, mut krx) = mpsc::channel::<()>(1);
+        let (utx, mut urx) = mpsc::channel::<String>(4);
+        let cancel = CancellationToken::new();
+
+        let task = tokio::spawn({
+            let n = n.clone();
+            let cancel = cancel.clone();
+            async move {
+                let mut r = Counting::new(n);
+                r.forward_ok = false;
+                run_reconcile_loop(
+                    &mut erx,
+                    &mut krx,
+                    Some(utx),
+                    LoopConfig::default(),
+                    cancel,
+                    &mut r,
+                )
+                .await;
+            }
+        });
+        settle().await;
+
+        etx.send(Event::OpenUrl {
+            url: "https://github.com/login/device".into(),
+        })
+        .await
+        .unwrap();
+        settle().await;
         assert_eq!(
             urx.try_recv().unwrap(),
-            "http://localhost:53219/callback",
-            "unmapped callback opens as-is"
+            "https://github.com/login/device",
+            "remote URLs are already correct and always open"
+        );
+
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    /// A lapsed pin must be collected when it actually expires, not whenever
+    /// the next unrelated event happens to arrive. The loop sleeps on
+    /// `next_pin_deadline`, so with no deltas, no kicks, and the 60s safety
+    /// tick still far off, a 30s deadline alone must drive a pass.
+    #[tokio::test(start_paused = true)]
+    async fn loop_wakes_on_pin_deadline() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let (_etx, mut erx) = mpsc::channel::<Event>(4);
+        let (_ktx, mut krx) = mpsc::channel::<()>(1);
+        let cancel = CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+        let task = tokio::spawn({
+            let n = n.clone();
+            let cancel = cancel.clone();
+            async move {
+                let mut r = Counting::new(n);
+                r.pin_deadline = Some(deadline);
+                run_reconcile_loop(
+                    &mut erx,
+                    &mut krx,
+                    None,
+                    LoopConfig::default(),
+                    cancel,
+                    &mut r,
+                )
+                .await;
+            }
+        });
+        settle().await;
+        assert_eq!(n.load(Ordering::SeqCst), 1, "initial pass only");
+
+        tokio::time::advance(Duration::from_secs(20)).await;
+        settle().await;
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            1,
+            "no wakeup before the deadline (safety tick is 60s out)"
+        );
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        settle().await;
+        assert!(
+            n.load(Ordering::SeqCst) >= 2,
+            "pin deadline must drive a reconcile pass on its own"
         );
 
         cancel.cancel();

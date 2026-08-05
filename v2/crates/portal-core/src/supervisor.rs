@@ -65,6 +65,53 @@ pub struct BoxStatus {
     pub clipsync_change_id: u64,
 }
 
+/// Composes the Subscribe filter from its two independent sources — the
+/// config-derived BASE (deny/allow/ephemeral policy) and the live PIN set
+/// (callback ports that must be visible past the ephemeral cut) — and owns
+/// the publish. One writer per source: config reload sets base, the
+/// reconciler sets pins; every change re-publishes base ∪ pins, so neither
+/// path can clobber the other's contribution (a raw `filter_tx.send` from
+/// the config path would silently strip pin allowlist entries).
+pub struct FilterHub {
+    base: Mutex<Filter>,
+    pinned: Mutex<BTreeSet<u16>>,
+    tx: watch::Sender<Filter>,
+}
+
+impl FilterHub {
+    fn new(base: Filter, tx: watch::Sender<Filter>) -> Self {
+        Self {
+            base: Mutex::new(base),
+            pinned: Mutex::new(BTreeSet::new()),
+            tx,
+        }
+    }
+
+    fn publish(&self) {
+        let mut f = self.base.lock().unwrap().clone();
+        {
+            let pinned = self.pinned.lock().unwrap();
+            for &p in pinned.iter() {
+                if !f.allow.contains(&p) {
+                    f.allow.push(p);
+                }
+            }
+        }
+        f.allow.sort_unstable();
+        let _ = self.tx.send(f);
+    }
+
+    pub fn set_base(&self, base: Filter) {
+        *self.base.lock().unwrap() = base;
+        self.publish();
+    }
+
+    pub fn set_pins(&self, pins: BTreeSet<u16>) {
+        *self.pinned.lock().unwrap() = pins;
+        self.publish();
+    }
+}
+
 /// Handle to one running per-box stack.
 pub struct BoxStack {
     pub cfg: BoxConfig,
@@ -72,8 +119,8 @@ pub struct BoxStack {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     status: watch::Receiver<BoxStatus>,
     /// Held for the stack's lifetime: dropping it would kill live filter
-    /// updates; publish a new Filter here to re-Subscribe (allow/unallow).
-    filter_tx: watch::Sender<Filter>,
+    /// updates (the hub owns the watch Sender).
+    filter: Arc<FilterHub>,
 }
 
 impl BoxStack {
@@ -81,9 +128,10 @@ impl BoxStack {
         self.status.borrow().clone()
     }
 
-    /// Update the port filter live (re-sends Subscribe on the live session).
+    /// Update the BASE port filter live (re-sends Subscribe on the live
+    /// session, preserving pin allowlist entries).
     pub fn set_filter(&self, filter: Filter) {
-        let _ = self.filter_tx.send(filter);
+        self.filter.set_base(filter);
     }
 
     /// Re-derive the filter from a (possibly updated) box config.
@@ -342,8 +390,10 @@ fn spawn_box_stack(
     let bootstrap = Arc::new(Manager::new(transport.clone(), deps.agent.clone()));
 
     // Filter: deny = defaults + per-box extras; allow = per-box allowlist.
+    // The hub composes this base with live callback pins (base ∪ pins).
     let filter = filter_for(&cfg);
-    let (filter_tx, filter_rx) = watch::channel(filter);
+    let (filter_tx, filter_rx) = watch::channel(filter.clone());
+    let filter_hub = Arc::new(FilterHub::new(filter, filter_tx));
 
     let (outbound_tx, outbound_rx) = mpsc::channel::<Outbound>(32);
     let channels = EventChannels::new();
@@ -440,6 +490,7 @@ fn spawn_box_stack(
 
     // ---- reconcile loop task ----
     let (url_tx, mut url_rx) = mpsc::channel::<String>(4);
+    let filter_hub_reconciler = filter_hub.clone();
     tasks.push(tokio::spawn({
         let cancel = cancel.clone();
         let status_tx = status_tx.clone();
@@ -465,6 +516,7 @@ fn spawn_box_stack(
                 },
                 taken,
                 status_tx,
+                filter: filter_hub_reconciler,
             };
             run_reconcile_loop(
                 &mut engine_ev_rx,
@@ -587,7 +639,7 @@ fn spawn_box_stack(
         cancel,
         tasks,
         status: status_rx,
-        filter_tx,
+        filter: filter_hub,
     }
 }
 
@@ -600,12 +652,28 @@ struct StackReconciler {
     state: BoxState,
     taken: Arc<Mutex<BTreeSet<u16>>>,
     status_tx: Arc<watch::Sender<BoxStatus>>,
+    /// Publishing pin changes here re-Subscribes the live session; the
+    /// allowlist force-forwards pinned ports past the agent's ephemeral cut,
+    /// which is what makes pinned listeners VISIBLE in snapshots (the pin
+    /// observation lifecycle depends on it).
+    filter: Arc<FilterHub>,
+}
+
+impl StackReconciler {
+    fn publish_pins(&self) {
+        self.filter.set_pins(self.state.pins.ports().collect());
+    }
 }
 
 #[async_trait::async_trait]
 impl Reconciler for StackReconciler {
+    fn next_pin_deadline(&self) -> Option<tokio::time::Instant> {
+        self.state.pins.next_deadline().map(Into::into)
+    }
+
     async fn reconcile(&mut self) {
         let desired = self.snapshot.desired_ports();
+        let pins_before: BTreeSet<u16> = self.state.pins.ports().collect();
         // The cross-box taken-set is cloned for the pass and written back
         // afterwards: reconcile_once mutates it synchronously, and holding
         // the std mutex across awaits is forbidden. Two boxes reconciling
@@ -624,6 +692,12 @@ impl Reconciler for StackReconciler {
         )
         .await;
         *self.taken.lock().unwrap() = taken;
+        // The pass expires TTL'd pins and drops observed-then-gone ones; the
+        // Subscribe allowlist must follow so the agent stops force-reporting
+        // ports nobody pins anymore.
+        if self.state.pins.ports().collect::<BTreeSet<u16>>() != pins_before {
+            self.publish_pins();
+        }
         match result {
             Ok(_summary) => {
                 let forwards: Vec<(u16, u16)> = self
@@ -652,6 +726,10 @@ impl Reconciler for StackReconciler {
         self.state
             .pins
             .pin(remote, Instant::now(), pins::DEFAULT_PIN_TTL);
+        // Allowlist the pinned port on the live session so the agent starts
+        // REPORTING it (allow wins over the ephemeral cut). Once reported,
+        // its disappearance retires the pin — see PinSet::observe.
+        self.publish_pins();
 
         // Reuse the existing assignment when there is one; otherwise allocate
         // through the same indexed/fallback policy a normal pass uses, honoring

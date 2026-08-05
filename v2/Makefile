@@ -17,8 +17,10 @@
 #   make release-install HOST=<ssh>   signed local install, no publish
 #   make clean
 
-# rustup's shims MUST win over a Homebrew rust: Homebrew's cargo has no musl
-# std and ignores rust-toolchain.toml (E0463 "can't find crate for core").
+# Defense in depth: rustup's shims must win even if a Homebrew rust ever
+# reappears (its cargo has no musl std, ignores rust-toolchain.toml, and
+# poisons target/ with mixed-compiler artifacts — E0514). Homebrew rust was
+# uninstalled 2026-08-05; see AGENTS.md at the repo root.
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 
 SHA        ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
