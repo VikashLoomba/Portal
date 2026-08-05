@@ -286,7 +286,7 @@ fn path_prepend_snippet() -> String {
     format!(
         "{PATH_MARKER_START}\n\
          # Ensures portal's shims (~/.local/bin/xclip, wl-paste, pbpaste, wl-copy,\n\
-         # pbcopy, sudo, portal-askpass) win on PATH.\n\
+         # pbcopy, sudo, portal-askpass, xdg-open) win on PATH.\n\
          {DEDUP_PREPEND}\n\
          {PATH_MARKER_END}"
     )

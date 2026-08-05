@@ -73,7 +73,7 @@ pub async fn check_box(transport: &dyn Transport) -> Vec<Verdict> {
     let mut out = Vec::new();
 
     // Shims: which(1) must resolve to ~/.local/bin AND carry our marker.
-    for shim in ["xclip", "wl-paste", "sudo"] {
+    for shim in ["xclip", "wl-paste", "sudo", "xdg-open"] {
         let script = format!(
             "p=$(command -v {shim} 2>/dev/null) || {{ echo MISSING; exit 0; }}; \
              case \"$p\" in \"$HOME/.local/bin/\"*) ;; *) echo SHADOWED:$p; exit 0;; esac; \

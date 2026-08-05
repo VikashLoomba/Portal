@@ -17,7 +17,7 @@
 //! content marker that makes redeploys a cheap grep, exactly like v1.
 
 /// Bump when any shim text changes (drives daemon-driven re-deploys).
-pub const VERSION: &str = "11";
+pub const VERSION: &str = "12";
 
 /// Marker every shim carries; version-independent prefix owns backup/restore
 /// decisions (v1 doctrine: a portal shim of ANY version is never mistaken
@@ -296,6 +296,40 @@ exit 111
     )
 }
 
+/// xdg-open: THE box→Mac URL relay entry point. OAuth CLIs (gh, gcloud,
+/// rclone, claude) and Python's webbrowser all shell out to xdg-open on
+/// Linux; on a headless box the real one has nothing to open. Relaying to
+/// `portald open` sends the URL up the pipe, where the Mac establishes a
+/// forward for loopback callback ports and opens the browser (see
+/// portal-core::callback). Falls through to the real xdg-open when no
+/// portal session is live (desktop boxes keep working).
+pub fn xdg_open() -> String {
+    format!(
+        r#"#!/bin/sh
+# {marker}. Relays URL opens to the Mac client when a portal session is
+# active; otherwise falls through to the real xdg-open.
+_portald="${{HOME}}/.cache/portal/portald"
+_log="${{HOME}}/.cache/portal/shim.log"
+if [ -x "$_portald" ] && "$_portald" open "$@" 2>>"$_log"; then
+    exit 0
+fi
+_wrapper_dir=$(cd "$(dirname "$0")" && pwd -P)
+_oifs=$IFS; IFS=:
+for _d in $PATH; do
+    [ -n "$_d" ] || continue
+    _cand=$(cd "$_d" 2>/dev/null && pwd -P)
+    [ -n "$_cand" ] || continue
+    [ "$_cand" = "$_wrapper_dir" ] && continue
+    if [ -x "$_cand/xdg-open" ]; then IFS=$_oifs; exec "$_cand/xdg-open" "$@"; fi
+done
+IFS=$_oifs
+# No real xdg-open (headless box) and no client: nothing can open it.
+exit 0
+"#,
+        marker = marker()
+    )
+}
+
 /// (name, script) table the Mac-side deploy iterates.
 pub fn all() -> Vec<(&'static str, String)> {
     vec![
@@ -306,6 +340,7 @@ pub fn all() -> Vec<(&'static str, String)> {
         ("pbcopy", pbcopy()),
         ("sudo", sudo()),
         ("portal-askpass", portal_askpass()),
+        ("xdg-open", xdg_open()),
     ]
 }
 
@@ -338,6 +373,24 @@ mod tests {
         let w = wl_paste();
         assert!(w.contains("clip targets wl-paste"));
         assert!(w.contains("clip paste --type image/png"));
+    }
+
+    /// The URL relay: portald first (the Mac forwards + opens), real
+    /// xdg-open as fallthrough, self-exclusion in PATH resolution, and a
+    /// clean exit when neither exists (headless box, no session).
+    #[test]
+    fn xdg_open_relays_then_falls_through() {
+        let s = xdg_open();
+        assert!(s.contains(r#""$_portald" open "$@""#), "{s}");
+        assert!(
+            s.contains("shim.log"),
+            "relay failures must be diagnosable: {s}"
+        );
+        assert!(
+            s.contains(r#"[ "$_cand" = "$_wrapper_dir" ] && continue"#),
+            "must never exec itself: {s}"
+        );
+        assert!(s.contains(r#"exec "$_cand/xdg-open""#), "{s}");
     }
 
     #[test]
