@@ -71,6 +71,68 @@ pub fn render_plist(
     )
 }
 
+/// Render the tray (menu bar status item) LaunchAgent plist. Differs from
+/// the daemon's on exactly the axes a UI agent needs:
+/// - `LimitLoadToSessionType=Aqua`: a status item only exists in a GUI login
+///   session — launchd must not spawn it for ssh-only sessions;
+/// - `KeepAlive={SuccessfulExit:false}`: a crash relaunches it, but the
+///   user's deliberate Quit (exit 0) STAYS quit until next login/upgrade —
+///   KeepAlive=true would make Quit a lie;
+/// - `ProcessType=Interactive`: it services a click, not a batch queue.
+pub fn render_tray_plist(label: &str, bin_path: &Path, home: &Path, log: &Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+        <string>tray</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Crash ⇒ relaunch; deliberate Quit (exit 0) stays quit. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Status items exist only in GUI login sessions. -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{home}</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+</dict>
+</plist>
+"#,
+        bin = bin_path.display(),
+        home = home.display(),
+        log = log.display(),
+    )
+}
+
 pub struct Launchd<'a> {
     pub runner: &'a dyn Runner,
     /// gui/<uid>
@@ -199,6 +261,35 @@ mod tests {
         ] {
             assert!(p.contains(needle), "missing {needle}");
         }
+    }
+
+    /// The tray plist's load-bearing differences from the daemon's: Aqua-only
+    /// (status items need a GUI session), quit-stays-quit KeepAlive, and the
+    /// `tray` verb.
+    #[test]
+    fn tray_plist_is_aqua_only_with_quit_stays_quit() {
+        let p = render_tray_plist(
+            "local.portal.tray",
+            &PathBuf::from("/Users/u/.local/bin/portal"),
+            &PathBuf::from("/Users/u"),
+            &PathBuf::from("/Users/u/Library/Logs/portal-tray.log"),
+        );
+        for needle in [
+            "<string>local.portal.tray</string>",
+            "<string>tray</string>",
+            "<key>LimitLoadToSessionType</key>",
+            "<string>Aqua</string>",
+            "<key>SuccessfulExit</key>",
+            "<false/>",
+            "<string>Interactive</string>",
+            "/Users/u/Library/Logs/portal-tray.log",
+        ] {
+            assert!(p.contains(needle), "missing {needle}");
+        }
+        assert!(
+            !p.contains("<key>KeepAlive</key>\n    <true/>"),
+            "KeepAlive=true would relaunch a deliberately quit tray"
+        );
     }
 
     #[tokio::test]

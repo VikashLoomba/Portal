@@ -26,6 +26,10 @@ pub struct Paths {
     pub bin_dir: PathBuf,
     pub bin_path: PathBuf,
     pub plist: PathBuf,
+    /// Menu bar status-item agent (second LaunchAgent; Aqua sessions only).
+    pub tray_label: String,
+    pub tray_plist: PathBuf,
+    pub tray_log: PathBuf,
     pub log: PathBuf,
     pub api_sock: PathBuf,
     /// launchd domain, `gui/<uid>`.
@@ -44,6 +48,7 @@ impl Paths {
             .unwrap_or_else(|| config_dir.join("api.sock"));
         let bin_dir = home.join(".local").join("bin");
         let label = format!("local.{TOOL}.autoforward");
+        let tray_label = format!("local.{TOOL}.tray");
         Paths {
             home: home.to_path_buf(),
             uid,
@@ -56,6 +61,14 @@ impl Paths {
                 .join("Library")
                 .join("LaunchAgents")
                 .join(format!("{label}.plist")),
+            tray_plist: home
+                .join("Library")
+                .join("LaunchAgents")
+                .join(format!("{tray_label}.plist")),
+            tray_log: home
+                .join("Library")
+                .join("Logs")
+                .join(format!("{TOOL}-tray.log")),
             log: home
                 .join("Library")
                 .join("Logs")
@@ -63,6 +76,7 @@ impl Paths {
             api_sock,
             domain: format!("gui/{uid}"),
             label,
+            tray_label,
             config_dir,
         }
     }

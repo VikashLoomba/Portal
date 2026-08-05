@@ -5,6 +5,7 @@
 mod daemon;
 mod launchd;
 mod prompt_helper;
+mod tray;
 mod upgrade;
 
 use std::io::Write as _;
@@ -34,6 +35,9 @@ enum Command {
     /// (launchd: "spawn scheduled", ThrottleInterval pacing).
     #[command(hide = true)]
     Run,
+    /// Menu bar status item (normally started by launchd; `portal install`
+    /// and `portal upgrade` manage its LaunchAgent)
+    Tray,
     /// Configure a dev box and install the login agent (auto-start + self-heal)
     Install {
         /// ssh alias or user@host
@@ -163,7 +167,7 @@ fn main() {
 }
 
 // getuid without a libc dependency line for one call.
-unsafe fn libc_getuid() -> u32 {
+pub(crate) unsafe fn libc_getuid() -> u32 {
     unsafe extern "C" {
         fn getuid() -> u32;
     }
@@ -173,6 +177,7 @@ unsafe fn libc_getuid() -> u32 {
 fn run(cmd: Command, paths: Paths) -> i32 {
     match cmd {
         Command::Daemon | Command::Run => block_on_daemon(paths),
+        Command::Tray => tray::run(),
         Command::Install { host, name, index } => install(&paths, &host, name, index),
         Command::Uninstall => uninstall(&paths),
         Command::Start => launchctl_verb(&paths, Verb::Start),
@@ -342,6 +347,13 @@ fn install(paths: &Paths, host: &str, name: Option<String>, index: Option<u8>) -
     if code != 0 {
         return code;
     }
+    // 4. Menu bar agent (idempotent; also converged by `portal upgrade` so
+    //    upgrades from tray-less versions grow the status item without a
+    //    reinstall).
+    if let Err(e) = ensure_tray_agent(paths) {
+        // Non-fatal: forwarding must not be held hostage to UI plumbing.
+        eprintln!("portal install: menu bar agent: {e}");
+    }
     println!(
         "portal: installed. `portal status` shows per-box state; logs: {}",
         paths.log.display()
@@ -356,6 +368,40 @@ fn install(paths: &Paths, host: &str, name: Option<String>, index: Option<u8>) -
         );
     }
     0
+}
+
+/// Converge the tray LaunchAgent: write the plist when its content drifted
+/// (or never existed) and (re)load it. Idempotent — called from install AND
+/// upgrade, so a Mac upgrading from a tray-less version grows the status
+/// item automatically. Bootstrap failures are the caller's to report
+/// non-fatally: a headless session (no Aqua) rejects the load by design.
+fn ensure_tray_agent(paths: &Paths) -> Result<(), String> {
+    let plist = launchd::render_tray_plist(
+        &paths.tray_label,
+        &paths.bin_path,
+        &paths.home,
+        &paths.tray_log,
+    );
+    let current = std::fs::read_to_string(&paths.tray_plist).unwrap_or_default();
+    if current != plist {
+        if let Some(dir) = paths.tray_plist.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&paths.tray_plist, &plist).map_err(|e| format!("write plist: {e}"))?;
+    }
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let runner = OsRunner;
+        let l = launchd::Launchd::new(&runner, paths.uid, paths.tray_label.clone());
+        // Always (re)load: after an upgrade the running tray is the OLD
+        // binary; bootout+bootstrap re-execs the new one (Launchd::load
+        // semantics). SuccessfulExit=false keeps a user's deliberate Quit
+        // quit — but install/upgrade is an explicit action, so restoring
+        // the item here is what the user asked for.
+        l.load(&paths.tray_plist)
+            .await
+            .map_err(|e| format!("launchctl: {e}"))
+    })
 }
 
 fn install_binary(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {
@@ -375,6 +421,16 @@ fn install_binary(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {
 
 fn uninstall(paths: &Paths) -> i32 {
     let code = launchctl_verb(paths, Verb::Stop);
+    // Tray agent goes with the install (best-effort: absent on pre-tray
+    // installs and headless sessions).
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let runner = OsRunner;
+        let _ = launchd::Launchd::new(&runner, paths.uid, paths.tray_label.clone())
+            .unload()
+            .await;
+    });
+    let _ = std::fs::remove_file(&paths.tray_plist);
     let _ = std::fs::remove_file(&paths.plist);
     let _ = std::fs::remove_file(&paths.api_sock);
     println!(
@@ -628,6 +684,11 @@ fn upgrade(paths: &Paths, check: bool, force: bool) -> i32 {
                     return code;
                 }
                 println!("portal: daemon reloaded — now running the new binary");
+                // Tray convergence: upgrades from tray-less versions grow
+                // the status item; existing trays re-exec the new binary.
+                if let Err(e) = ensure_tray_agent(paths) {
+                    eprintln!("portal: menu bar agent: {e} (forwarding unaffected)");
+                }
             }
             0
         }
