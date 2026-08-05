@@ -228,7 +228,8 @@ async fn heartbeats_arrive_without_pings() {
     let mut heartbeats = 0;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(900);
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(300), read_frame(&mut rig.client_out)).await
+        match tokio::time::timeout(Duration::from_millis(300), read_frame(&mut rig.client_out))
+            .await
         {
             Ok(Ok(env)) if env.heartbeat.is_some() => heartbeats += 1,
             Ok(Ok(_)) => {}
@@ -236,7 +237,10 @@ async fn heartbeats_arrive_without_pings() {
             Err(_) => break, // silence
         }
     }
-    assert!(heartbeats >= 2, "expected periodic heartbeats, got {heartbeats}");
+    assert!(
+        heartbeats >= 2,
+        "expected periodic heartbeats, got {heartbeats}"
+    );
     rig.agent_task.abort();
 }
 
@@ -261,7 +265,10 @@ async fn dribbled_frames_survive_tick_races() {
     }))
     .unwrap();
     for byte in &buf {
-        rig.client_in.write_all(std::slice::from_ref(byte)).await.unwrap();
+        rig.client_in
+            .write_all(std::slice::from_ref(byte))
+            .await
+            .unwrap();
         rig.client_in.flush().await.unwrap();
         tokio::time::sleep(Duration::from_millis(15)).await;
     }

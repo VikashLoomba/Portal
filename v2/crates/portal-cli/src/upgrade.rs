@@ -162,8 +162,8 @@ async fn verify_signature(
         .await
         .map_err(|e| e.to_string())?;
     let pubkey = std::env::var("PORTAL_MINISIGN_PUB").unwrap_or_else(|_| MINISIGN_PUB.to_string());
-    let sig_text = std::fs::read_to_string(&sig)
-        .map_err(|e| format!("signature download unreadable: {e}"))?;
+    let sig_text =
+        std::fs::read_to_string(&sig).map_err(|e| format!("signature download unreadable: {e}"))?;
     let data = std::fs::read(bin).map_err(|e| e.to_string())?;
     verify_minisign(&data, &sig_text, &pubkey)
 }

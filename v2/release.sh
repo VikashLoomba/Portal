@@ -41,35 +41,16 @@ fi
 OUT="$V2/target/aarch64-apple-darwin/release"
 BIN="$OUT/portal"
 ARTIFACT="portal-v2-darwin-arm64"
-AGENTS="$V2/target/agents"
 NOTARY_ZIP="$(mktemp -t portal-notarize).zip"
-mkdir -p "$AGENTS"
 trap 'rm -f "$NOTARY_ZIP"' EXIT
 
 SHA="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo dev)"
 echo "==> portal v2 release: $TAG (sha $SHA)"
 
-# --- 1. Cross-compile portald (musl, both arches) --------------------------
-command -v cargo-zigbuild >/dev/null || { echo "install: cargo install cargo-zigbuild" >&2; exit 1; }
-for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-  echo "==> building portald ($t)"
-  PORTAL_GIT_SHA="$SHA" cargo zigbuild --release -p portald --target "$t" --quiet
-  cp "target/$t/release/portald" "$AGENTS/portald-$t"
-done
-
-# --- 2. Build the Mac binary (agents embedded, SHA stamped) ----------------
-echo "==> building portal (darwin-arm64, agents embedded)"
-PORTAL_GIT_SHA="$SHA" \
-PORTAL_AGENT_AMD64_FILE="$AGENTS/portald-x86_64-unknown-linux-musl" \
-PORTAL_AGENT_ARM64_FILE="$AGENTS/portald-aarch64-unknown-linux-musl" \
-  cargo build --release -p portal-cli --target aarch64-apple-darwin --quiet
-
-# Verify the agent bytes actually embedded (fail fast, not at first user run).
-python3 - "$BIN" "$AGENTS/portald-x86_64-unknown-linux-musl" <<'PY'
-import sys
-d=open(sys.argv[1],'rb').read(); a=open(sys.argv[2],'rb').read()
-sys.exit(0 if a[:4096] in d else "portal: embedded agent bytes NOT found in binary")
-PY
+# --- 1+2. Build (agents + Mac binary, embed-verified) -----------------------
+# ONE build path: the Makefile owns cross-compile + embed + verification, so
+# a portal binary without embedded agents cannot come out of any flow.
+make --no-print-directory build SHA="$SHA"
 
 # --- 3. Sign (Developer ID, hardened runtime) ------------------------------
 DEVELOPER_ID="${DEVELOPER_ID:-$(security find-identity -v -p codesigning | grep -o 'Developer ID Application: [^"]*' | head -1)}"

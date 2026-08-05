@@ -290,6 +290,20 @@ fn launchctl_verb(paths: &Paths, verb: Verb) -> i32 {
 }
 
 fn install(paths: &Paths, host: &str, name: Option<String>, index: Option<u8>) -> i32 {
+    // 0. Refuse to install a binary that cannot provision boxes: a plain
+    //    `cargo build` has no embedded portald (only `make build` /
+    //    release.sh embed it), and installing one puts the daemon into a
+    //    silent reconnect loop ("no embedded agent for ..."). The runtime
+    //    PORTAL_AGENT_AMD64/ARM64 override (dev seam) satisfies this too.
+    let agent = daemon::embedded_agent();
+    if agent.linux_amd64.is_none() || agent.linux_arm64.is_none() {
+        eprintln!(
+            "portal install: this binary has no embedded box agent (portald).\n\
+             Build with `make build` or release.sh — or, for a dev daemon,\n\
+             set PORTAL_AGENT_AMD64/PORTAL_AGENT_ARM64 to local portald builds."
+        );
+        return 1;
+    }
     // 1. Config: add the box (or create the config).
     if let Err(e) = add_box_to_config(paths, host, name, index) {
         eprintln!("portal install: {e}");

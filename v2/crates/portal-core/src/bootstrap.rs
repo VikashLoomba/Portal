@@ -206,6 +206,9 @@ pub async fn ensure_shims(transport: &dyn Transport) -> Result<bool, String> {
         .await
         .map_err(|e| format!("shim probe: {e}"))?;
     if out.stdout_lossy().trim() == "OK" {
+        // Fast path still converges the rc PATH blocks (v1 semantics): a
+        // user who deleted one gets it back without a shim rewrite.
+        ensure_path_blocks(transport).await?;
         return Ok(false);
     }
 
@@ -224,7 +227,95 @@ pub async fn ensure_shims(transport: &dyn Transport) -> Result<bool, String> {
             .map_err(|e| format!("shim {name}: {e}"))?;
     }
     tracing::info!(target: "portal::bootstrap", shims = shims.len(), "deployed clip shims");
+    ensure_path_blocks(transport).await?;
     Ok(true)
+}
+
+/// Marker strings are SHIPPED STATE (v1 clipshim wrote them to user rc files);
+/// they MUST stay byte-identical so v1-converged boxes are recognized instead
+/// of accumulating duplicate blocks.
+const PATH_MARKER_START: &str = "# >>> portal PATH (clip shims) >>>";
+const PATH_MARKER_END: &str = "# <<< portal PATH (clip shims) <<<";
+const EARLY_PATH_MARKER_START: &str = "# >>> portal PATH early (non-interactive) >>>";
+const EARLY_PATH_MARKER_END: &str = "# <<< portal PATH early (non-interactive) <<<";
+
+/// The dedup-prepend line (v1 DESIGN §9.2): remove any existing ~/.local/bin
+/// from PATH and re-add it at the FRONT, so the shims win even on a box that
+/// already has /usr/bin/xclip with ~/.local/bin later (or absent) on PATH.
+const DEDUP_PREPEND: &str = r#"PATH="$HOME/.local/bin:$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$HOME/.local/bin" | paste -sd: -)"
+export PATH"#;
+
+fn path_prepend_snippet() -> String {
+    format!(
+        "{PATH_MARKER_START}\n\
+         # Ensures portal's shims (~/.local/bin/xclip, wl-paste, pbpaste, wl-copy,\n\
+         # pbcopy, sudo, portal-askpass) win on PATH.\n\
+         {DEDUP_PREPEND}\n\
+         {PATH_MARKER_END}"
+    )
+}
+
+fn early_path_prepend_snippet() -> String {
+    format!(
+        "{EARLY_PATH_MARKER_START}\n\
+         # Placed above the distro interactive guard so sshd-sourced non-interactive\n\
+         # bash gets the shims; the bottom portal PATH block re-wins interactively.\n\
+         {DEDUP_PREPEND}\n\
+         {EARLY_PATH_MARKER_END}"
+    )
+}
+
+/// Converge the rc-file PATH marker blocks (port of v1 clipshim's
+/// ensureEarlyPathPrepend + ensurePathPrepend). PATH ordering is the single
+/// make-or-break for shim interception (DESIGN §9.2):
+/// - EARLY block at the TOP of ~/.bashrc — above Debian/Ubuntu's interactive
+///   guard, so sshd-sourced non-interactive bash gets the shims;
+/// - BOTTOM block appended to ~/.bashrc, ~/.zshrc, ~/.zshenv and ~/.profile
+///   (created when missing) — multiple files because PATH managers
+///   (nvm/asdf/mise/conda) re-export PATH later;
+/// - ~/.bash_profile and ~/.bash_login receive the bottom block only when
+///   they already EXIST — creating either would make bash skip ~/.profile.
+///
+/// Runs on every reconnect (cheap, idempotent by marker grep) so a user who
+/// deleted a block gets it back without forcing a shim rewrite.
+pub async fn ensure_path_blocks(transport: &dyn Transport) -> Result<(), String> {
+    let early = format!(
+        "block=$(cat)\nrc=~/.bashrc\n\
+         if [ -f \"$rc\" ] && grep -qF '{EARLY_PATH_MARKER_START}' \"$rc\"; then exit 0; fi\n\
+         touch \"$rc\" || exit 1\n\
+         tmp=$(mktemp) || exit 1\n\
+         if printf '%s\\n\\n' \"$block\" > \"$tmp\" && cat \"$rc\" >> \"$tmp\" && \
+            cat \"$tmp\" > \"$rc\" && rm -f \"$tmp\"; then exit 0; fi\n\
+         rm -f \"$tmp\"; exit 1",
+    );
+    transport
+        .exec(
+            early_path_prepend_snippet().as_bytes(),
+            &["bash".into(), "-c".into(), shell_quote(&early)],
+        )
+        .await
+        .map_err(|e| format!("early PATH block: {e}"))?;
+
+    let bottom = format!(
+        "block=$(cat)\n\
+         for rc in ~/.bashrc ~/.zshrc ~/.zshenv ~/.profile; do\n\
+           if [ -f \"$rc\" ] && grep -qF '{PATH_MARKER_START}' \"$rc\"; then continue; fi\n\
+           printf '\\n%s\\n' \"$block\" >> \"$rc\"\n\
+         done\n\
+         for rc in ~/.bash_profile ~/.bash_login; do\n\
+           [ -f \"$rc\" ] || continue\n\
+           if grep -qF '{PATH_MARKER_START}' \"$rc\"; then continue; fi\n\
+           printf '\\n%s\\n' \"$block\" >> \"$rc\"\n\
+         done",
+    );
+    transport
+        .exec(
+            path_prepend_snippet().as_bytes(),
+            &["bash".into(), "-c".into(), shell_quote(&bottom)],
+        )
+        .await
+        .map_err(|e| format!("PATH block: {e}"))?;
+    Ok(())
 }
 
 fn shell_quote(s: &str) -> String {
@@ -351,9 +442,11 @@ mod tests {
     async fn shims_probe_ok_is_one_grep() {
         let t = FakeTransport::new("devbox1");
         t.push_exec_ok("OK\n");
+        t.push_exec_ok(""); // early PATH block
+        t.push_exec_ok(""); // bottom PATH block
         assert!(!ensure_shims(&*t).await.unwrap());
         let calls = t.exec_calls();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 3, "probe + 2 rc-block convergences");
         let script = &calls[0].0[2];
         assert!(script.contains("grep -qF"), "{script}");
         assert!(
@@ -373,9 +466,11 @@ mod tests {
         for _ in &shims {
             t.push_exec_ok("");
         }
+        t.push_exec_ok(""); // early PATH block
+        t.push_exec_ok(""); // bottom PATH block
         assert!(ensure_shims(&*t).await.unwrap());
         let calls = t.exec_calls();
-        assert_eq!(calls.len(), 1 + shims.len());
+        assert_eq!(calls.len(), 1 + shims.len() + 2);
         for (i, (name, script)) in shims.iter().enumerate() {
             let (argv, stdin) = &calls[1 + i];
             assert_eq!(stdin, script.as_bytes(), "{name}: script rides stdin");
@@ -396,5 +491,50 @@ mod tests {
         t.push_exec_err("read-only filesystem");
         let err = ensure_shims(&*t).await.unwrap_err();
         assert!(err.contains("read-only filesystem"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn path_blocks_carry_v1_markers_and_dedup_prepend() {
+        let t = FakeTransport::new("devbox1");
+        t.push_exec_ok(""); // early
+        t.push_exec_ok(""); // bottom
+        ensure_path_blocks(&*t).await.unwrap();
+        let calls = t.exec_calls();
+        assert_eq!(calls.len(), 2);
+
+        // Early block: inserted at the TOP of ~/.bashrc only, snippet on stdin.
+        let (argv, stdin) = &calls[0];
+        let early_stdin = String::from_utf8_lossy(stdin);
+        assert!(argv[2].contains(EARLY_PATH_MARKER_START), "{}", argv[2]);
+        assert!(
+            argv[2].contains("cat \"$rc\" >> \"$tmp\""),
+            "prepend, not append"
+        );
+        assert!(early_stdin.starts_with(EARLY_PATH_MARKER_START));
+        assert!(early_stdin.trim_end().ends_with(EARLY_PATH_MARKER_END));
+        assert!(
+            early_stdin.contains("grep -vxF \"$HOME/.local/bin\""),
+            "dedup"
+        );
+
+        // Bottom block: unconditional rc set + conditional bash_profile/login.
+        let (argv, stdin) = &calls[1];
+        let bottom_stdin = String::from_utf8_lossy(stdin);
+        for rc in ["~/.bashrc", "~/.zshrc", "~/.zshenv", "~/.profile"] {
+            assert!(argv[2].contains(rc), "missing {rc}");
+        }
+        assert!(
+            argv[2].contains("[ -f \"$rc\" ] || continue"),
+            "bash_profile/login must be conditional: {}",
+            argv[2]
+        );
+        assert!(bottom_stdin.starts_with(PATH_MARKER_START));
+        assert!(bottom_stdin.trim_end().ends_with(PATH_MARKER_END));
+        // Shipped-state markers (v1 wrote these to user rc files) — never drift.
+        assert_eq!(PATH_MARKER_START, "# >>> portal PATH (clip shims) >>>");
+        assert_eq!(
+            EARLY_PATH_MARKER_START,
+            "# >>> portal PATH early (non-interactive) >>>"
+        );
     }
 }
