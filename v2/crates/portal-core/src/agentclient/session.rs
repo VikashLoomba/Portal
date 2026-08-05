@@ -35,6 +35,19 @@ pub trait Bootstrapper: Send + Sync {
     async fn ensure_uploaded(&self) -> Result<String, String>;
     fn embedded_sha(&self) -> String;
     fn set_boot_id(&self, id: &str);
+
+    /// Idempotent convergence of EVERYTHING this product installs box-side:
+    /// the agent binary, the stable `portald` symlink, and the PATH shims.
+    ///
+    /// Grouped behind one call because they form a single dependency chain,
+    /// and the v1→v2 upgrade failure ran straight down it: a probe hit
+    /// returned early without converging the `portald` symlink, so the box had
+    /// the binary but no stable path — `portald missing on the box`. Shim
+    /// convergence runs only after a successful HelloAck, so a box that could
+    /// not answer left the shims at their old version too, which is why
+    /// `doctor` reported BOTH `outdated shim` and a missing portald from what
+    /// is really one defect.
+    async fn ensure_box_converged(&self) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone)]
@@ -318,12 +331,15 @@ impl Client {
         self.bootstrap.set_boot_id(&ack.boot_id);
         let agent_services = ack.services.clone().unwrap_or_default();
         *self.hello_ack.lock().unwrap() = Some(ack);
-        // Deploy/refresh the box shims now that the SHA matched (daemon-driven
-        // re-convergence, v1 DESIGN §9.1). Non-fatal but loud: forwarding must
-        // not be held hostage to a shim write, but paste depends on it.
-        if let Err(err) = crate::bootstrap::ensure_shims(&*self.transport).await {
+        // Converge the box install now that the SHA matched (daemon-driven
+        // re-convergence, v1 DESIGN §9.1): stable portald symlink + PATH
+        // shims. Non-fatal but loud — forwarding must not be held hostage to
+        // a shim write, but paste, askpass and callback-URL opening all
+        // depend on it.
+        if let Err(err) = self.bootstrap.ensure_box_converged().await {
             tracing::error!(target: "portal::agent",
-                "clip shim deploy failed — clipboard paste will not work until this succeeds: {err}");
+                "box convergence failed — clipboard paste, sudo askpass and callback URLs will \
+                 not work until this succeeds: {err}");
         }
 
         // Initial Subscribe with the latest filter, THEN announce Connected

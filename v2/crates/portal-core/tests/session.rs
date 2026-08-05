@@ -29,6 +29,9 @@ impl Bootstrapper for FakeBootstrap {
         "cafe".into()
     }
     fn set_boot_id(&self, _id: &str) {}
+    async fn ensure_box_converged(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 fn ack(sha: &str) -> HelloAck {

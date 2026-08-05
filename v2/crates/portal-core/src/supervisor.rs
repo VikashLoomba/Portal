@@ -29,6 +29,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -36,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 use portal_clip::watcher::{Gates, POLL_INTERVAL, SnapshotSource, WatchEvent, Watcher};
 use portal_transport::lsof::LsofPorts;
 use portal_transport::runner::OsRunner;
-use portal_transport::{PortForwarder, Transport};
+use portal_transport::{ForwardSpec, PortForwarder, Transport};
 
 use crate::agentclient::session::{Bootstrapper, Client, ClientConfig, Filter, Outbound};
 use crate::agentclient::{Event, EventChannels, ServiceRequest, SnapshotCache};
@@ -47,6 +48,7 @@ use crate::cred::CredHandler;
 use crate::engine::{
     BoxState, ConflictSet, LoopConfig, Reconciler, reconcile_once, run_reconcile_loop,
 };
+use crate::pins::{self, PinSet};
 use crate::portmap::PortMap;
 
 /// A point-in-time status snapshot for one box (feeds `portal status`).
@@ -459,6 +461,7 @@ fn spawn_box_stack(
                     portmap: PortMap::new(box_name, box_index),
                     conflicts: ConflictSet::default(),
                     skip_local: Vec::new(),
+                    pins: PinSet::new(),
                 },
                 taken,
                 status_tx,
@@ -634,6 +637,61 @@ impl Reconciler for StackReconciler {
             Err(err) => {
                 tracing::debug!(target: "portal::supervisor",
                     box_name = %self.state.box_name, %err, "reconcile pass failed");
+            }
+        }
+    }
+
+    /// Establish (or confirm) a forward for one remote port, on demand.
+    ///
+    /// Ordering matters here. The pin is taken FIRST so that a concurrent
+    /// reconcile pass — which computes desired as snapshot ∪ pins — cannot
+    /// cancel the forward we are about to create. Without that, a callback
+    /// port absent from the snapshot (ephemeral range, or bound since the last
+    /// poll) would be torn down within ~50ms, before the browser connects.
+    async fn ensure_forward(&mut self, remote: u16) -> Option<u16> {
+        self.state
+            .pins
+            .pin(remote, Instant::now(), pins::DEFAULT_PIN_TTL);
+
+        // Reuse the existing assignment when there is one; otherwise allocate
+        // through the same indexed/fallback policy a normal pass uses, honoring
+        // the cross-box taken-set so we cannot claim another box's local port.
+        let local = {
+            let taken = self.taken.lock().unwrap().clone();
+            self.state
+                .portmap
+                .local_for(remote, |p| taken.contains(&p))?
+        };
+
+        // Already live (the common case on a second callback) — nothing to do.
+        let live = self.forwarder.list_forwards().await.unwrap_or_default();
+        let spec = ForwardSpec { local, remote };
+        if live.contains(&spec) {
+            self.taken.lock().unwrap().insert(local);
+            return Some(local);
+        }
+
+        match self.forwarder.forward(spec).await {
+            Ok(()) => {
+                self.taken.lock().unwrap().insert(local);
+                let forwards: Vec<(u16, u16)> = self
+                    .state
+                    .portmap
+                    .assignments()
+                    .map(|(r, l)| (l, r))
+                    .collect();
+                self.status_tx.send_modify(|s| s.forwards = forwards);
+                tracing::info!(target: "portal::supervisor", box_name = %self.state.box_name,
+                    local, remote, "on-demand forward established for callback url");
+                Some(local)
+            }
+            Err(err) => {
+                // Release the mapping so the next pass can retry cleanly (or
+                // pick a different local port if this one is contended).
+                self.state.portmap.release(remote);
+                tracing::warn!(target: "portal::supervisor", box_name = %self.state.box_name,
+                    local, remote, %err, "on-demand forward failed");
+                None
             }
         }
     }

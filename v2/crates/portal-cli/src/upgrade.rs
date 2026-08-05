@@ -175,8 +175,7 @@ fn verify_minisign(data: &[u8], sig_text: &str, pubkey_text: &str) -> Result<(),
     let key_b64 = pubkey_text
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with("untrusted comment:"))
-        .next_back()
+        .rfind(|l| !l.is_empty() && !l.starts_with("untrusted comment:"))
         .ok_or("minisign public key is empty")?;
     let pk = minisign_verify::PublicKey::from_base64(key_b64)
         .map_err(|e| format!("bad minisign public key: {e}"))?;

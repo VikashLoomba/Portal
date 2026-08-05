@@ -140,10 +140,17 @@ impl Bootstrapper for Manager {
         let remote_path = format!("{REMOTE_DIR}/agent-{sha}");
         let digest = hex::encode(Sha256::digest(bytes.as_ref()));
 
-        // 1. Probe by size + content hash.
+        // 1. Probe by size + content hash. A hit still has to converge the
+        //    stable `portald` symlink: the binary being present says NOTHING
+        //    about the link, and everything box-side (shims, xdg-open,
+        //    doctor, keychain askpass) resolves `~/.cache/portal/portald`,
+        //    not `agent-<sha>`. A v1→v2 upgrade is exactly this case — the
+        //    hash matches on the second connect while the link still points
+        //    at a pruned v1 path or does not exist at all.
         if let Ok(out) = self.bash(probe_script(&remote_path), b"").await
             && out.trim() == format!("{} {}", bytes.len(), digest)
         {
+            self.ensure_portald_link(&remote_path).await;
             return Ok(remote_path);
         }
 
@@ -154,11 +161,9 @@ impl Bootstrapper for Manager {
             .await
             .map_err(|e| format!("bootstrap: upload failed: {e}"))?;
 
-        // 3. Stable portald symlink (xdg-open wrapper resolves it) — and
+        // 3. Stable portald symlink (shims/xdg-open/doctor resolve it) — and
         // 4. best-effort prune of stale agents / tmp fragments.
-        let _ = self
-            .bash(format!("ln -sf {remote_path} {REMOTE_DIR}/portald"), b"")
-            .await;
+        self.ensure_portald_link(&remote_path).await;
         let _ = self
             .bash(
                 format!(
@@ -176,8 +181,40 @@ impl Bootstrapper for Manager {
         self.agent.git_sha.clone()
     }
 
+    async fn ensure_box_converged(&self) -> Result<(), String> {
+        let remote_path = self.ensure_uploaded().await?;
+        self.ensure_portald_link(&remote_path).await;
+        ensure_shims(&*self.transport).await.map(|_| ())
+    }
+
     fn set_boot_id(&self, id: &str) {
         self.state.lock().unwrap().boot = id.to_string();
+    }
+}
+
+impl Manager {
+    /// Converge `~/.cache/portal/portald` → `agent-<sha>`.
+    ///
+    /// Best-effort by design: forwarding must never be held hostage to a
+    /// symlink write. But it runs on EVERY session (probe hit included),
+    /// because every box-side entry point — the clip shims, xdg-open,
+    /// portal-askpass, and `portal doctor`'s portald check — resolves the
+    /// stable path. `ln -sfn` with a preceding rm handles the case where the
+    /// path exists as a directory or a stale regular file, which plain
+    /// `ln -sf` silently turns into `portald/agent-<sha>`.
+    async fn ensure_portald_link(&self, remote_path: &str) {
+        let link = format!("{REMOTE_DIR}/portald");
+        let script = format!(
+            "set -e; install -d -m 0700 {dir}; \
+             if [ \"$(readlink {link} 2>/dev/null)\" = {remote_path} ] && [ -x {link} ]; then exit 0; fi; \
+             rm -rf {link}; ln -sfn {remote_path} {link}",
+            dir = REMOTE_DIR,
+        );
+        if let Err(e) = self.bash(script, b"").await {
+            tracing::warn!(target: "portal::bootstrap", link = %link,
+                "portald symlink convergence failed — box-side shims, xdg-open and askpass \
+                 will not resolve portald: {e}");
+        }
     }
 }
 
@@ -335,14 +372,19 @@ mod tests {
         }
     }
 
+    /// A probe hit skips the UPLOAD but must still converge the `portald`
+    /// symlink — that link is what every box-side shim resolves, and a v1→v2
+    /// upgrade hits exactly this path with a stale/absent link.
     #[tokio::test]
-    async fn probe_hit_skips_upload_and_caches_uname() {
+    async fn probe_hit_skips_upload_but_still_converges_link() {
         let t = FakeTransport::new("devbox1");
         let bytes = b"agent-binary";
         let digest = hex::encode(Sha256::digest(bytes));
         t.push_exec_ok("Linux x86_64\n"); // uname
         t.push_exec_ok(&format!("{} {}", bytes.len(), digest)); // probe
+        t.push_exec_ok(""); // symlink convergence
         t.push_exec_ok(&format!("{} {}", bytes.len(), digest)); // probe (2nd call)
+        t.push_exec_ok(""); // symlink convergence (2nd call)
 
         let m = Manager::new(t.clone(), agent("cafe", bytes));
         assert_eq!(
@@ -355,13 +397,24 @@ mod tests {
         );
 
         let calls = t.exec_calls();
-        // uname probed ONCE (cached), then one probe per ensure call, no upload.
-        assert_eq!(calls.len(), 3);
+        // uname probed ONCE (cached), then probe+link per ensure call, no upload.
+        assert_eq!(calls.len(), 5);
         assert_eq!(calls[0].0, vec!["uname", "-sm"]);
         assert!(
             calls[1].0[2].contains("sha256sum"),
             "probe script: {}",
             calls[1].0[2]
+        );
+        assert!(
+            calls[2].0[2].contains("ln -sfn"),
+            "probe hit must converge the symlink: {}",
+            calls[2].0[2]
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|(a, _)| a.iter().any(|s| s.contains("mktemp"))),
+            "probe hit must not re-upload"
         );
     }
 
@@ -410,9 +463,12 @@ mod tests {
         let hit = format!("{} {}", bytes.len(), digest);
         t.push_exec_ok("Linux x86_64\n"); // uname #1
         t.push_exec_ok(&hit); // probe #1
+        t.push_exec_ok(""); // link #1
         t.push_exec_ok(&hit); // probe #2 (same boot: no uname)
+        t.push_exec_ok(""); // link #2
         t.push_exec_ok("Linux x86_64\n"); // uname #2 (boot changed)
         t.push_exec_ok(&hit); // probe #3
+        t.push_exec_ok(""); // link #3
 
         let m = Manager::new(t.clone(), agent("cafe", bytes));
         m.set_boot_id("boot-1");

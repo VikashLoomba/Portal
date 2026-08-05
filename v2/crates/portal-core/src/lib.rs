@@ -19,6 +19,7 @@
 
 pub mod agentclient;
 pub mod bootstrap;
+pub mod callback;
 pub mod clipsync;
 pub mod clipwrite;
 pub mod config;
@@ -27,5 +28,6 @@ pub mod doctor;
 pub mod engine;
 pub mod localapi;
 pub mod paths;
+pub mod pins;
 pub mod portmap;
 pub mod supervisor;

@@ -14,7 +14,7 @@
 //! (see `portmap`), not same-port.
 
 use std::collections::{BTreeSet, HashMap};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use portal_transport::lsof::LsofPorts;
 use portal_transport::{ForwardSpec, PortForwarder, Transport, TransportError};
@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agentclient::Event;
+use crate::pins::PinSet;
 use crate::portmap::PortMap;
 
 /// One reconcile pass's work order.
@@ -142,15 +143,25 @@ pub struct BoxState {
     pub portmap: PortMap,
     pub conflicts: ConflictSet,
     pub skip_local: Vec<u16>,
+    /// Explicitly requested remote ports (callback URLs), unioned into the
+    /// desired set so a pass cannot cancel a forward the user is about to
+    /// use. See [`crate::pins`].
+    pub pins: PinSet,
 }
 
 /// ONE stateless pass (port of Engine.Reconcile):
 /// 1. ensure + health — rebuild the master if down, then re-derive from
 ///    ground truth;
-/// 2. desired: the agent snapshot (None ⇒ AgentNotReady ⇒ keep forwards);
+/// 2. desired: the agent snapshot UNION live pins ([`crate::pins`]) — a
+///    pinned port is wanted even if no snapshot lists it;
 /// 3. current: `list_forwards` — the transport's live view, never a cache;
 /// 4. plan + apply: add desired−current (skipping local conflicts), cancel
 ///    current−desired. Forward failures log and continue — next pass retries.
+///
+/// A `None` snapshot still means AgentNotReady (keep forwards, change
+/// nothing): with no observed listeners there is no way to tell a vanished
+/// listener from an unobserved one, and tearing down on that ambiguity is the
+/// failure mode the whole design avoids.
 pub async fn reconcile_once(
     transport: &dyn Transport,
     forwarder: &dyn PortForwarder,
@@ -168,12 +179,29 @@ pub async fn reconcile_once(
         return Err(ReconcileError::MasterDown);
     }
 
-    let desired = desired.ok_or(ReconcileError::AgentNotReady)?;
+    let observed = desired.ok_or(ReconcileError::AgentNotReady)?;
+    for port in st.pins.expire(Instant::now()) {
+        tracing::debug!(target: "portal::engine", box_name = %st.box_name, remote = port,
+            "callback pin expired");
+    }
+    // Union, deduped: a pinned port that IS in the snapshot must appear once,
+    // or plan() would emit a duplicate add.
+    let desired: Vec<u16> = if st.pins.is_empty() {
+        observed.to_vec()
+    } else {
+        observed
+            .iter()
+            .copied()
+            .chain(st.pins.ports())
+            .collect::<BTreeSet<u16>>()
+            .into_iter()
+            .collect()
+    };
     let current = forwarder.list_forwards().await.unwrap_or_default();
 
     let plan = {
         let portmap = &mut st.portmap;
-        plan(desired, &current, |remote| {
+        plan(&desired, &current, |remote| {
             portmap.local_for(remote, |p| taken.contains(&p))
         })
     };
@@ -234,6 +262,16 @@ pub async fn reconcile_once(
 #[async_trait::async_trait]
 pub trait Reconciler: Send {
     async fn reconcile(&mut self);
+
+    /// Guarantee a live forward for `remote` and return its local port.
+    ///
+    /// Used by the callback-URL relay, which must not open a URL until the
+    /// port behind it actually answers on the Mac. Unlike [`reconcile`] this
+    /// is a targeted, idempotent request: it pins `remote` (see
+    /// [`crate::pins`]) so the next pass cannot cancel it, reuses the existing
+    /// mapping when one is live, and returns `None` only if no local port
+    /// could be established.
+    async fn ensure_forward(&mut self, remote: u16) -> Option<u16>;
 }
 
 #[derive(Debug, Clone)]
@@ -253,11 +291,45 @@ impl Default for LoopConfig {
     }
 }
 
+/// Turn a box-side URL into one that works from the Mac.
+///
+/// A loopback URL names a port on the BOX; opened verbatim on the Mac it hits
+/// nothing (or the wrong service). So we establish a forward for that remote
+/// port and rewrite the URL to the local end.
+///
+/// If the forward cannot be established we return the URL unchanged rather
+/// than dropping it: the user is mid-login and waiting on a browser. A
+/// connection-refused page is a visible, explicable failure with a WARN in the
+/// log beside it; a silently skipped open looks like the product simply
+/// ignored them. Non-loopback URLs are already correct and pass straight
+/// through.
+async fn resolve_open_url(raw: &str, r: &mut dyn Reconciler) -> String {
+    match crate::callback::classify(raw) {
+        crate::callback::Target::AsIs(u) => u,
+        crate::callback::Target::Loopback { url, remote_port } => {
+            match r.ensure_forward(remote_port).await {
+                Some(local) => {
+                    let out = crate::callback::rewrite(&url, local);
+                    tracing::info!(target: "portal::engine", remote = remote_port, local,
+                        "callback url mapped to local forward");
+                    out
+                }
+                None => {
+                    tracing::warn!(target: "portal::engine", remote = remote_port,
+                        "no forward available for callback url; opening as-is");
+                    url.to_string()
+                }
+            }
+        }
+    }
+}
+
 /// Event-driven reconcile loop (port of Engine.runEventDriven):
 /// - one pass immediately (forwards restore before the first agent event);
 /// - Connected / SnapshotReplaced / Delta ⇒ debounced pass;
 /// - Disconnected ⇒ log and KEEP forwards (reconnect reconverges);
-/// - OpenUrl ⇒ forwarded to `open_url` (not a reconcile trigger);
+/// - OpenUrl ⇒ port-translated, then forwarded to `open_url` (not a reconcile
+///   trigger; see [`resolve_open_url`]);
 /// - `kick` ⇒ same debounce path (POST /reconcile);
 /// - safety ticker ⇒ unconditional pass.
 pub async fn run_reconcile_loop(
@@ -296,7 +368,12 @@ pub async fn run_reconcile_loop(
                     }
                     Some(Event::OpenUrl { url }) => {
                         if let Some(sink) = &open_url {
-                            let _ = sink.try_send(url);
+                            // Await here: establishing the forward BEFORE the
+                            // browser opens is the entire point. A callback URL
+                            // arrives once per login, so briefly deferring
+                            // reconcile passes costs nothing.
+                            let target = resolve_open_url(&url, r).await;
+                            let _ = sink.try_send(target);
                         }
                     }
                 }
@@ -318,6 +395,7 @@ pub async fn run_reconcile_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn fs(local: u16, remote: u16) -> ForwardSpec {
         ForwardSpec { local, remote }
@@ -394,6 +472,7 @@ mod tests {
             portmap: PortMap::new("devbox1", 1),
             conflicts: ConflictSet::default(),
             skip_local: Vec::new(),
+            pins: PinSet::new(),
         }
     }
 
@@ -521,12 +600,32 @@ mod tests {
 
     // ---- run_reconcile_loop ----
 
-    struct Counting(Arc<AtomicUsize>);
+    /// Counts passes; `ensure_forward` maps remote → remote+10000 (or refuses
+    /// when `forward_ok` is false) and records what it was asked for.
+    struct Counting {
+        passes: Arc<AtomicUsize>,
+        asked: Arc<Mutex<Vec<u16>>>,
+        forward_ok: bool,
+    }
+
+    impl Counting {
+        fn new(passes: Arc<AtomicUsize>) -> Self {
+            Self {
+                passes,
+                asked: Arc::new(Mutex::new(Vec::new())),
+                forward_ok: true,
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl Reconciler for Counting {
         async fn reconcile(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
+            self.passes.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn ensure_forward(&mut self, remote: u16) -> Option<u16> {
+            self.asked.lock().unwrap().push(remote);
+            self.forward_ok.then(|| remote + 10000)
         }
     }
 
@@ -548,7 +647,7 @@ mod tests {
             let n = n.clone();
             let cancel = cancel.clone();
             async move {
-                let mut r = Counting(n);
+                let mut r = Counting::new(n);
                 run_reconcile_loop(&mut erx, &mut krx, None, cfg, cancel, &mut r).await;
             }
         });
@@ -602,12 +701,15 @@ mod tests {
         let (_ktx, mut krx) = mpsc::channel::<()>(1);
         let (utx, mut urx) = mpsc::channel::<String>(4);
         let cancel = CancellationToken::new();
+        let asked = Arc::new(Mutex::new(Vec::new()));
 
         let task = tokio::spawn({
             let n = n.clone();
             let cancel = cancel.clone();
+            let asked = asked.clone();
             async move {
-                let mut r = Counting(n);
+                let mut r = Counting::new(n);
+                r.asked = asked;
                 run_reconcile_loop(
                     &mut erx,
                     &mut krx,
@@ -626,7 +728,9 @@ mod tests {
         .await
         .unwrap();
         settle().await;
+        // Public URL: opened untouched, and no forward requested.
         assert_eq!(urx.try_recv().unwrap(), "https://example.com");
+        assert!(asked.lock().unwrap().is_empty());
         tokio::time::advance(std::time::Duration::from_millis(100)).await;
         settle().await;
         assert_eq!(
@@ -634,6 +738,106 @@ mod tests {
             1,
             "OpenUrl must not trigger a pass"
         );
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    /// The bug this whole path exists for: a box-side loopback callback URL
+    /// must be forwarded and REWRITTEN to the local port, never opened with
+    /// the box's port number.
+    #[tokio::test(start_paused = true)]
+    async fn loop_translates_loopback_callback_url() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let (etx, mut erx) = mpsc::channel::<Event>(4);
+        let (_ktx, mut krx) = mpsc::channel::<()>(1);
+        let (utx, mut urx) = mpsc::channel::<String>(4);
+        let cancel = CancellationToken::new();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+
+        let task = tokio::spawn({
+            let n = n.clone();
+            let cancel = cancel.clone();
+            let asked = asked.clone();
+            async move {
+                let mut r = Counting::new(n);
+                r.asked = asked;
+                run_reconcile_loop(
+                    &mut erx,
+                    &mut krx,
+                    Some(utx),
+                    LoopConfig::default(),
+                    cancel,
+                    &mut r,
+                )
+                .await;
+            }
+        });
+        settle().await;
+
+        etx.send(Event::OpenUrl {
+            url: "http://localhost:53219/callback?code=xyz".into(),
+        })
+        .await
+        .unwrap();
+        settle().await;
+
+        assert_eq!(
+            urx.try_recv().unwrap(),
+            "http://127.0.0.1:63219/callback?code=xyz",
+            "must open the LOCAL port, preserving the query"
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![53219],
+            "must have requested a forward for the box's port"
+        );
+
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    /// If the forward genuinely cannot be established we still open something
+    /// (visible failure + WARN) rather than silently swallowing the user's
+    /// login.
+    #[tokio::test(start_paused = true)]
+    async fn loop_opens_original_when_forward_unavailable() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let (etx, mut erx) = mpsc::channel::<Event>(4);
+        let (_ktx, mut krx) = mpsc::channel::<()>(1);
+        let (utx, mut urx) = mpsc::channel::<String>(4);
+        let cancel = CancellationToken::new();
+
+        let task = tokio::spawn({
+            let n = n.clone();
+            let cancel = cancel.clone();
+            async move {
+                let mut r = Counting::new(n);
+                r.forward_ok = false;
+                run_reconcile_loop(
+                    &mut erx,
+                    &mut krx,
+                    Some(utx),
+                    LoopConfig::default(),
+                    cancel,
+                    &mut r,
+                )
+                .await;
+            }
+        });
+        settle().await;
+
+        etx.send(Event::OpenUrl {
+            url: "http://localhost:53219/callback".into(),
+        })
+        .await
+        .unwrap();
+        settle().await;
+        assert_eq!(
+            urx.try_recv().unwrap(),
+            "http://localhost:53219/callback",
+            "unmapped callback opens as-is"
+        );
+
         cancel.cancel();
         task.await.unwrap();
     }
