@@ -77,12 +77,17 @@ impl PreparedUpgrade {
     pub fn candidate(&self) -> &std::path::Path {
         &self.candidate
     }
+
+    pub fn staging_dir(&self) -> &std::path::Path {
+        self._staging.path()
+    }
 }
 
 /// Resolve and fully verify an upgrade candidate without touching the active
 /// installation. Lifecycle downtime begins only after this returns Candidate.
 pub async fn prepare(
     runner: &dyn portal_transport::runner::Runner,
+    install_dir: &std::path::Path,
     current_version: &str,
     check_only: bool,
     force: bool,
@@ -101,9 +106,14 @@ pub async fn prepare(
         )));
     }
 
+    std::fs::create_dir_all(install_dir)
+        .map_err(|e| format!("create install directory {}: {e}", install_dir.display()))?;
+    // Stage beside the installed binary. The verified Mach-O inode can then
+    // be renamed into place unchanged (same filesystem), preserving both its
+    // Gatekeeper assessment and provenance metadata.
     let staging = tempfile::Builder::new()
         .prefix("portal-upgrade-")
-        .tempdir()
+        .tempdir_in(install_dir)
         .map_err(|e| format!("create upgrade staging directory: {e}"))?;
     let tmp = staging.path().join("portal.new");
 
@@ -285,7 +295,10 @@ mod tests {
             "",
             0,
         );
-        let out = prepare(&fake, "v2.0.0", true, false).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = prepare(&fake, dir.path(), "v2.0.0", true, false)
+            .await
+            .unwrap();
         let UpgradePlan::NoChange(message) = out else {
             panic!("expected no-op plan");
         };

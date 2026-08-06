@@ -25,6 +25,7 @@ use tokio::io::AsyncReadExt as _;
 use crate::launchd::{self, Launchd};
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
+const HEALTH_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Default)]
 pub struct StartReport {
@@ -159,9 +160,9 @@ impl<'a> LoginAgents<'a> {
                     self.paths.api_sock.display()
                 ));
             }
-            // This state query both detects an early process exit and paces
-            // the readiness loop. Completion remains condition-driven; there
-            // is no fixed post-launch sleep.
+            // Detect an early process exit, then rate-limit the next probe.
+            // Completion remains condition-driven; this is not a fixed
+            // post-launch readiness delay.
             if !daemon
                 .is_loaded()
                 .await
@@ -169,7 +170,7 @@ impl<'a> LoginAgents<'a> {
             {
                 return Err("daemon became unregistered during startup".to_string());
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(HEALTH_PROBE_INTERVAL).await;
         }
     }
 }

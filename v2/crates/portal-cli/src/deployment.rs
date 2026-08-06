@@ -54,7 +54,7 @@ impl Deployment {
     /// atomically rename it over the destination. The prior executable is
     /// copied to a private same-directory rollback file first, so the public
     /// path is never absent—even if the process crashes during deployment.
-    pub fn swap(&self, candidate: &Path) -> Result<BinarySwap<'_>, String> {
+    pub fn swap_copy(&self, candidate: &Path) -> Result<BinarySwap<'_>, String> {
         let mut staged = Builder::new()
             .prefix(".portal.candidate.")
             .tempfile_in(&self.parent)
@@ -85,6 +85,53 @@ impl Deployment {
                 "atomically install {}: {}",
                 self.destination.display(),
                 e.error
+            ));
+        }
+        sync_directory(&self.parent).map_err(|e| format!("sync {}: {e}", self.parent.display()))?;
+
+        Ok(BinarySwap {
+            deployment: self,
+            backup,
+            finished: false,
+        })
+    }
+
+    /// Atomically move a same-filesystem, already-verified candidate into
+    /// place without rewriting it. This preserves the exact inode that passed
+    /// the execution/Gatekeeper check; self-update must use this path.
+    pub fn swap_staged(&self, candidate: &Path) -> Result<BinarySwap<'_>, String> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let candidate_meta = fs::metadata(candidate)
+            .map_err(|e| format!("stat staged candidate {}: {e}", candidate.display()))?;
+        let parent_meta = fs::metadata(&self.parent)
+            .map_err(|e| format!("stat install directory {}: {e}", self.parent.display()))?;
+        if candidate_meta.dev() != parent_meta.dev() {
+            return Err("staged upgrade is not on the install filesystem".to_string());
+        }
+
+        let backup = if self.destination.exists() {
+            let mut file = Builder::new()
+                .prefix(".portal.rollback.")
+                .tempfile_in(&self.parent)
+                .map_err(|e| format!("create rollback file: {e}"))?;
+            copy_executable(&self.destination, file.as_file_mut())
+                .map_err(|e| format!("back up {}: {e}", self.destination.display()))?;
+            let (_, path) = file
+                .keep()
+                .map_err(|e| format!("keep rollback file: {e}"))?;
+            Some(path)
+        } else {
+            None
+        };
+
+        if let Err(e) = fs::rename(candidate, &self.destination) {
+            if let Some(path) = &backup {
+                let _ = fs::remove_file(path);
+            }
+            return Err(format!(
+                "atomically install {}: {e}",
+                self.destination.display()
             ));
         }
         sync_directory(&self.parent).map_err(|e| format!("sync {}: {e}", self.parent.display()))?;
@@ -182,7 +229,7 @@ mod tests {
         let (_dir, candidate, destination) = fixture();
         fs::write(&destination, b"old").unwrap();
         let deployment = Deployment::acquire(&destination).unwrap();
-        let swap = deployment.swap(&candidate).unwrap();
+        let swap = deployment.swap_copy(&candidate).unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"new");
         swap.commit().unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"new");
@@ -193,7 +240,11 @@ mod tests {
         let (_dir, candidate, destination) = fixture();
         fs::write(&destination, b"old").unwrap();
         let deployment = Deployment::acquire(&destination).unwrap();
-        deployment.swap(&candidate).unwrap().rollback().unwrap();
+        deployment
+            .swap_copy(&candidate)
+            .unwrap()
+            .rollback()
+            .unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"old");
     }
 
@@ -201,8 +252,26 @@ mod tests {
     fn rollback_of_first_install_removes_destination() {
         let (_dir, candidate, destination) = fixture();
         let deployment = Deployment::acquire(&destination).unwrap();
-        deployment.swap(&candidate).unwrap().rollback().unwrap();
+        deployment
+            .swap_copy(&candidate)
+            .unwrap()
+            .rollback()
+            .unwrap();
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn staged_swap_preserves_verified_inode() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (_dir, candidate, destination) = fixture();
+        fs::write(&destination, b"old").unwrap();
+        let verified_inode = fs::metadata(&candidate).unwrap().ino();
+        let deployment = Deployment::acquire(&destination).unwrap();
+        let swap = deployment.swap_staged(&candidate).unwrap();
+        assert_eq!(fs::metadata(&destination).unwrap().ino(), verified_inode);
+        assert!(!candidate.exists());
+        swap.commit().unwrap();
     }
 
     #[test]

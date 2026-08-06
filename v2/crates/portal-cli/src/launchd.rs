@@ -12,6 +12,10 @@ use portal_transport::runner::{RunOutput, Runner};
 /// The deadline only bounds a broken launchd interaction; each condition
 /// probe is a launchctl subprocess, which naturally yields to launchd.
 const TRANSITION_TIMEOUT: Duration = Duration::from_secs(8);
+/// Rate-limit launchctl condition probes. This is not a readiness delay: every
+/// transition still completes on observed state, while a stuck transition no
+/// longer forks thousands of launchctl processes per second.
+const PROBE_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Render the LaunchAgent plist (v1 template, verbatim semantics):
 /// RunAtLoad + KeepAlive (any exit relaunches), ThrottleInterval 30 to damp
@@ -199,7 +203,7 @@ impl<'a> Launchd<'a> {
                     format!("launchd did not unregister {}", self.domain_label()),
                 ));
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(PROBE_INTERVAL).await;
         }
     }
 
@@ -268,7 +272,7 @@ impl<'a> Launchd<'a> {
                     ),
                 ));
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(PROBE_INTERVAL).await;
         }
     }
 

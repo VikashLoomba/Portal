@@ -98,6 +98,10 @@ enum Command {
     },
     /// Self-test each box: connection, shims, clipsync, forwards
     Doctor,
+    /// Stable-path second phase of self-upgrade. The public `upgrade` command
+    /// execs a hard-linked copy before replacing ~/.local/bin/portal.
+    #[command(name = "_apply-upgrade", hide = true)]
+    ApplyUpgrade { candidate: PathBuf, tag: String },
     /// Run the daemon in the foreground (launchd entry point)
     #[command(hide = true)]
     Daemon,
@@ -192,6 +196,9 @@ fn run(cmd: Command, paths: Paths) -> i32 {
         Command::Logs { follow, lines } => logs(&paths, follow, lines),
         Command::Doctor => doctor(&paths),
         Command::Upgrade { check, force } => upgrade(&paths, check, force),
+        Command::ApplyUpgrade { candidate, tag } => {
+            apply_prepared_upgrade(&paths, &candidate, &tag)
+        }
         Command::Features { name, state } => features(&paths, name, state),
         Command::Keychain(cmd) => keychain(cmd),
     }
@@ -309,12 +316,19 @@ fn launchctl_verb(paths: &Paths, verb: Verb) -> i32 {
     }
 }
 
+enum DeployCandidate<'a> {
+    /// Source/dev install: preserve the source and copy into a staged inode.
+    Copy(&'a std::path::Path),
+    /// Self-upgrade: move the exact inode that already passed verification.
+    Staged(&'a std::path::Path),
+}
+
 /// Replace the shared executable only while BOTH LaunchAgents are fully
 /// unregistered, then fresh-bootstrap and health-check before committing.
 /// Any failed health gate restores the previous binary and starts it again.
 fn deploy_binary(
     paths: &Paths,
-    candidate: Option<&std::path::Path>,
+    candidate: Option<DeployCandidate<'_>>,
 ) -> Result<services::StartReport, String> {
     let deployment = deployment::Deployment::acquire(&paths.bin_path)?;
     let runner = OsRunner;
@@ -334,22 +348,26 @@ fn deploy_binary(
             });
         }
 
-        let swap = match candidate {
-            Some(candidate) => match deployment.swap(candidate) {
-                Ok(swap) => Some(swap),
-                Err(swap_error) => {
-                    let recovery = agents.start_fresh().await;
-                    return Err(match recovery {
-                        Ok(_) => format!(
-                            "binary replacement failed ({swap_error}); previous daemon restored"
-                        ),
-                        Err(recovery_error) => format!(
-                            "binary replacement failed ({swap_error}); restoring daemon also failed: {recovery_error}"
-                        ),
-                    });
-                }
-            },
-            None => None,
+        let swap_result = match candidate {
+            Some(DeployCandidate::Copy(candidate)) => deployment.swap_copy(candidate).map(Some),
+            Some(DeployCandidate::Staged(candidate)) => {
+                deployment.swap_staged(candidate).map(Some)
+            }
+            None => Ok(None),
+        };
+        let swap = match swap_result {
+            Ok(swap) => swap,
+            Err(swap_error) => {
+                let recovery = agents.start_fresh().await;
+                return Err(match recovery {
+                    Ok(_) => format!(
+                        "binary replacement failed ({swap_error}); previous daemon restored"
+                    ),
+                    Err(recovery_error) => format!(
+                        "binary replacement failed ({swap_error}); restoring daemon also failed: {recovery_error}"
+                    ),
+                });
+            }
         };
 
         match agents.start_fresh().await {
@@ -413,7 +431,8 @@ fn install(paths: &Paths, host: &str, name: Option<String>, index: Option<u8>) -
             return 1;
         }
     };
-    let candidate = (self_path != paths.bin_path).then_some(self_path.as_path());
+    let candidate =
+        (self_path != paths.bin_path).then_some(DeployCandidate::Copy(self_path.as_path()));
     let report = match deploy_binary(paths, candidate) {
         Ok(report) => report,
         Err(e) => {
@@ -686,33 +705,97 @@ fn logs(paths: &Paths, follow: bool, lines: usize) -> i32 {
 fn upgrade(paths: &Paths, check: bool, force: bool) -> i32 {
     // Network and cryptographic verification happen while the current daemon
     // remains untouched. Only a fully executable candidate enters deployment.
+    let install_dir = paths
+        .bin_path
+        .parent()
+        .expect("installed binary has a parent directory");
     let plan = {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let runner = OsRunner;
         let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-        rt.block_on(upgrade::prepare(&runner, &current, check, force))
+        rt.block_on(upgrade::prepare(
+            &runner,
+            install_dir,
+            &current,
+            check,
+            force,
+        ))
     };
     match plan {
         Ok(upgrade::UpgradePlan::NoChange(message)) => {
             println!("portal: {message}");
             0
         }
-        Ok(upgrade::UpgradePlan::Candidate(prepared)) => {
-            let tag = prepared.tag.clone();
-            match deploy_binary(paths, Some(prepared.candidate())) {
-                Ok(report) => {
-                    println!("portal: upgraded to {tag}");
-                    println!("portal: daemon health gate passed on the new binary");
-                    if let Some(warning) = report.tray_warning {
-                        eprintln!("portal: {warning} (forwarding is healthy)");
-                    }
-                    0
-                }
-                Err(e) => {
-                    eprintln!("portal upgrade: {e}");
-                    1
-                }
+        Ok(upgrade::UpgradePlan::Candidate(prepared)) => exec_upgrade_helper(prepared),
+        Err(e) => {
+            eprintln!("portal upgrade: {e}");
+            1
+        }
+    }
+}
+
+/// Move execution to a stable hard link BEFORE replacing the installed path.
+/// macOS denies child processes from a running executable whose own path was
+/// replaced; launchctl must therefore run from this unchanged helper inode.
+fn exec_upgrade_helper(prepared: upgrade::PreparedUpgrade) -> i32 {
+    use std::os::unix::process::CommandExt as _;
+
+    let current = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("portal upgrade: cannot locate updater executable: {e}");
+            return 1;
+        }
+    };
+    let helper = prepared.staging_dir().join("portal-upgrade-helper");
+    if let Err(link_error) = std::fs::hard_link(&current, &helper) {
+        // Same-filesystem staging makes hard-link the normal path. Copy is a
+        // safe fallback for filesystems that disable links; it still gives the
+        // helper a stable pathname distinct from the installation target.
+        if let Err(copy_error) = std::fs::copy(&current, &helper) {
+            eprintln!(
+                "portal upgrade: stage updater helper: hard link failed ({link_error}); copy failed ({copy_error})"
+            );
+            return 1;
+        }
+    }
+
+    let error = std::process::Command::new(&helper)
+        .arg("_apply-upgrade")
+        .arg(prepared.candidate())
+        .arg(&prepared.tag)
+        .exec();
+    eprintln!("portal upgrade: exec stable updater helper: {error}");
+    1
+}
+
+fn apply_prepared_upgrade(paths: &Paths, candidate: &std::path::Path, tag: &str) -> i32 {
+    let Some(staging) = candidate.parent() else {
+        eprintln!("portal upgrade: staged candidate has no parent directory");
+        return 1;
+    };
+    let valid_staging = candidate.file_name().and_then(|s| s.to_str()) == Some("portal.new")
+        && staging
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|name| name.starts_with("portal-upgrade-"));
+    if !valid_staging {
+        eprintln!("portal upgrade: invalid staged candidate path");
+        return 1;
+    }
+
+    let result = deploy_binary(paths, Some(DeployCandidate::Staged(candidate)));
+    // `exec` bypassed TempDir::drop. All launchctl work is complete now, so
+    // unlinking this running helper is safe; its mapped inode lives to exit.
+    let _ = std::fs::remove_dir_all(staging);
+    match result {
+        Ok(report) => {
+            println!("portal: upgraded to {tag}");
+            println!("portal: daemon health gate passed on the new binary");
+            if let Some(warning) = report.tray_warning {
+                eprintln!("portal: {warning} (forwarding is healthy)");
             }
+            0
         }
         Err(e) => {
             eprintln!("portal upgrade: {e}");
