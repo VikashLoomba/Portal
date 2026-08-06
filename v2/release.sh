@@ -152,8 +152,21 @@ if [ "${INSTALL:-0}" = "1" ]; then
       exit 1
     }
   done
-  echo "==> signed LaunchAgents healthy; running doctor"
-  "$INSTALLED" doctor
+  echo "==> signed LaunchAgents healthy; waiting for remote convergence"
+  # The local API is ready before SSH/agent/forward convergence by design.
+  # Retry the real doctor condition until it passes or a bounded deadline is
+  # reached. Each doctor attempt performs its own SSH probe, which naturally
+  # paces this loop; there is no arbitrary post-install sleep.
+  DOCTOR_DEADLINE=$((SECONDS + 45))
+  DOCTOR_OUT=""
+  until DOCTOR_OUT="$("$INSTALLED" doctor 2>&1)"; do
+    if (( SECONDS >= DOCTOR_DEADLINE )); then
+      echo "portal: doctor did not pass within the convergence deadline" >&2
+      printf '%s\n' "$DOCTOR_OUT" >&2
+      exit 1
+    fi
+  done
+  printf '%s\n' "$DOCTOR_OUT"
   echo "==> local signed install verified"
   exit 0
 fi
