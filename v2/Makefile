@@ -12,6 +12,7 @@
 #   make build                 agents + darwin binary (embedded, verified)
 #   make test                  workspace tests
 #   make lint                  clippy -D warnings + rustfmt check
+#   make check                 test + lint (release prerequisite)
 #   make install HOST=<ssh>    dev install (ad-hoc signed) + agent reload
 #   make release TAG=v2.x.y    sign + exec-gate + notarize + publish
 #   make release-install HOST=<ssh>   signed local install, no publish
@@ -30,7 +31,7 @@ MUSL_ARM64 := aarch64-unknown-linux-musl
 AGENTS     := target/agents
 BIN        := target/$(DARWIN)/release/portal
 
-.PHONY: build agents verify-embed test lint install release release-install clean
+.PHONY: build agents verify-embed test lint check install release release-install clean
 
 build: agents
 	@echo "==> building portal (darwin-arm64, agents embedded, sha $(SHA))"
@@ -63,15 +64,19 @@ lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo fmt --all --check
 
+# Every distributable path runs the same correctness gates first. release.sh
+# still owns the one-SHA cross-build/sign/notarize/publish transaction.
+check: test lint
+
 install: build
 	@test -n "$(HOST)" || { echo "usage: make install HOST=<ssh-host>" >&2; exit 1; }
 	"$(BIN)" install "$(HOST)"
 
-release:
+release: check
 	@test -n "$(TAG)" || { echo "usage: make release TAG=v2.x.y" >&2; exit 1; }
 	./release.sh "$(TAG)"
 
-release-install:
+release-install: check
 	@test -n "$(HOST)" || { echo "usage: make release-install HOST=<ssh-host>" >&2; exit 1; }
 	INSTALL=1 INSTALL_HOST="$(HOST)" ./release.sh local
 

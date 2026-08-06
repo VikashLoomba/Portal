@@ -131,6 +131,30 @@ if [ "${INSTALL:-0}" = "1" ]; then
   : "${INSTALL_HOST:?set INSTALL_HOST=<ssh-host> to install locally}"
   echo "==> installing locally (no publish) on $INSTALL_HOST"
   "$BIN" install "$INSTALL_HOST"
+
+  # A command-line smoke test cannot catch launchd's cached code-requirement
+  # failures. The install transaction waits on real launchd/API conditions;
+  # now assert that the exact signed bytes survived the swap and that BOTH
+  # freshly registered jobs are running. No fixed sleeps or timing guesses.
+  INSTALLED="$HOME/.local/bin/portal"
+  cmp "$BIN" "$INSTALLED" || {
+    echo "portal: installed binary differs from signed artifact" >&2
+    exit 1
+  }
+  codesign --verify --deep --strict --verbose=2 "$INSTALLED"
+  "$INSTALLED" status >/dev/null
+  UID_NOW="$(id -u)"
+  for LABEL in local.portal.autoforward local.portal.tray; do
+    STATE="$(launchctl print "gui/$UID_NOW/$LABEL" | awk '$1 == "state" && $2 == "=" { print $3; exit }')"
+    [ "$STATE" = "running" ] || {
+      echo "portal: $LABEL is not running after signed install (state=${STATE:-missing})" >&2
+      launchctl print "gui/$UID_NOW/$LABEL" >&2 || true
+      exit 1
+    }
+  done
+  echo "==> signed LaunchAgents healthy; running doctor"
+  "$INSTALLED" doctor
+  echo "==> local signed install verified"
   exit 0
 fi
 echo "==> publishing $TAG"

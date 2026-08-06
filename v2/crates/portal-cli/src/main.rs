@@ -3,8 +3,10 @@
 //! status socket; `daemon` is what launchd runs.
 
 mod daemon;
+mod deployment;
 mod launchd;
 mod prompt_helper;
+mod services;
 mod tray;
 mod upgrade;
 
@@ -262,52 +264,135 @@ enum Verb {
 }
 
 fn launchctl_verb(paths: &Paths, verb: Verb) -> i32 {
-    launchctl_verb_for(paths.uid, &paths.label, &paths.plist, verb)
-}
-
-/// One implementation of start/stop/restart for BOTH login agents. Restart
-/// deliberately uses kickstart for a loaded agent — no bootout/bootstrap
-/// teardown race — which means a CHANGED plist takes effect at next login,
-/// the same guarantee the daemon agent has always had.
-fn launchctl_verb_for(uid: u32, label: &str, plist: &std::path::Path, verb: Verb) -> i32 {
+    // Serialize explicit lifecycle commands against install/upgrade. Restart
+    // performs a fresh registration (not kickstart), so it also repairs a
+    // stale launchd Lightweight Code Requirement after an external swap.
+    let _deployment = match deployment::Deployment::acquire(&paths.bin_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("portal: {e}");
+            return 1;
+        }
+    };
+    let runner = OsRunner;
+    let agents = services::LoginAgents::new(&runner, paths);
+    if !matches!(verb, Verb::Stop)
+        && let Err(e) = agents.write_manifests()
+    {
+        eprintln!("portal: {e}");
+        return 1;
+    }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(async {
-        let runner = OsRunner;
-        let l = launchd::Launchd::new(&runner, uid, label.to_string());
-        let result = match verb {
-            Verb::Start => l.load(plist).await.map(|_| "started"),
-            Verb::Stop => match l.unload().await {
-                Ok(true) => Ok("stopped"),
-                Ok(false) => Ok("was not running"),
-                Err(e) => Err(e),
-            },
-            Verb::Restart => {
-                if l.is_loaded().await.unwrap_or(false) {
-                    l.kickstart().await.map(|_| "restarted")
-                } else {
-                    l.load(plist).await.map(|_| "started")
+    let result: Result<&str, String> = rt.block_on(async {
+        match verb {
+            Verb::Start => agents.start_daemon_fresh().await.map(|()| "started"),
+            Verb::Restart => agents.start_daemon_fresh().await.map(|()| "restarted"),
+            Verb::Stop => {
+                let daemon = launchd::Launchd::new(&runner, paths.uid, paths.label.clone());
+                match daemon.unload().await {
+                    Ok(true) => Ok("stopped"),
+                    Ok(false) => Ok("was not running"),
+                    Err(e) => Err(e.to_string()),
                 }
             }
+        }
+    });
+    match result {
+        Ok(message) => {
+            println!("portal: {message}");
+            0
+        }
+        Err(e) => {
+            eprintln!("portal: {e}");
+            1
+        }
+    }
+}
+
+/// Replace the shared executable only while BOTH LaunchAgents are fully
+/// unregistered, then fresh-bootstrap and health-check before committing.
+/// Any failed health gate restores the previous binary and starts it again.
+fn deploy_binary(
+    paths: &Paths,
+    candidate: Option<&std::path::Path>,
+) -> Result<services::StartReport, String> {
+    let deployment = deployment::Deployment::acquire(&paths.bin_path)?;
+    let runner = OsRunner;
+    let agents = services::LoginAgents::new(&runner, paths);
+    agents.write_manifests()?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        if let Err(quiesce_error) = agents.quiesce().await {
+            let recovery = agents.start_fresh().await;
+            return Err(match recovery {
+                Ok(_) => format!(
+                    "could not quiesce login agents for deployment ({quiesce_error}); current binary restarted"
+                ),
+                Err(recovery_error) => format!(
+                    "could not quiesce login agents for deployment ({quiesce_error}); restoring their prior state failed: {recovery_error}"
+                ),
+            });
+        }
+
+        let swap = match candidate {
+            Some(candidate) => match deployment.swap(candidate) {
+                Ok(swap) => Some(swap),
+                Err(swap_error) => {
+                    let recovery = agents.start_fresh().await;
+                    return Err(match recovery {
+                        Ok(_) => format!(
+                            "binary replacement failed ({swap_error}); previous daemon restored"
+                        ),
+                        Err(recovery_error) => format!(
+                            "binary replacement failed ({swap_error}); restoring daemon also failed: {recovery_error}"
+                        ),
+                    });
+                }
+            },
+            None => None,
         };
-        match result {
-            Ok(msg) => {
-                println!("portal: {msg}");
-                0
+
+        match agents.start_fresh().await {
+            Ok(report) => {
+                if let Some(swap) = swap {
+                    swap.commit().map_err(|e| {
+                        format!("new binary is healthy, but finalizing its install failed: {e}")
+                    })?;
+                }
+                Ok(report)
             }
-            Err(e) => {
-                eprintln!("portal: {e}");
-                1
+            Err(start_error) => {
+                // A rollback is safe only after launchd confirms both jobs are
+                // unregistered. Never mutate the executable under a live job.
+                if let Err(stop_error) = agents.quiesce().await {
+                    return Err(format!(
+                        "new binary failed its daemon health gate ({start_error}); could not quiesce it for rollback ({stop_error})"
+                    ));
+                }
+                if let Some(swap) = swap
+                    && let Err(rollback_error) = swap.rollback()
+                {
+                    return Err(format!(
+                        "new binary failed its daemon health gate ({start_error}); binary rollback failed: {rollback_error}"
+                    ));
+                }
+                let recovery = agents.start_fresh().await;
+                Err(match recovery {
+                    Ok(_) => format!(
+                        "new binary failed its daemon health gate ({start_error}); previous binary restored and restarted"
+                    ),
+                    Err(recovery_error) => format!(
+                        "new binary failed its daemon health gate ({start_error}); previous binary restored but did not restart: {recovery_error}"
+                    ),
+                })
             }
         }
     })
 }
 
 fn install(paths: &Paths, host: &str, name: Option<String>, index: Option<u8>) -> i32 {
-    // 0. Refuse to install a binary that cannot provision boxes: a plain
-    //    `cargo build` has no embedded portald (only `make build` /
-    //    release.sh embed it), and installing one puts the daemon into a
-    //    silent reconnect loop ("no embedded agent for ..."). The runtime
-    //    PORTAL_AGENT_AMD64/ARM64 override (dev seam) satisfies this too.
+    // Refuse binaries that cannot provision boxes. `make build` and every
+    // release path embed both Linux portald architectures.
     let agent = daemon::embedded_agent();
     if agent.linux_amd64.is_none() || agent.linux_arm64.is_none() {
         eprintln!(
@@ -317,50 +402,27 @@ fn install(paths: &Paths, host: &str, name: Option<String>, index: Option<u8>) -
         );
         return 1;
     }
-    // 1. Config: add the box (or create the config).
     if let Err(e) = add_box_to_config(paths, host, name, index) {
         eprintln!("portal install: {e}");
         return 1;
     }
-    // 2. Copy this binary to ~/.local/bin/portal (atomic).
     let self_path = match std::env::current_exe() {
-        Ok(p) => p,
+        Ok(path) => path,
         Err(e) => {
             eprintln!("portal install: cannot locate own binary: {e}");
             return 1;
         }
     };
-    if self_path != paths.bin_path
-        && let Err(e) = install_binary(&self_path, &paths.bin_path)
-    {
-        eprintln!("portal install: {e}");
-        return 1;
-    }
-    // 3. Render + load the launch agent.
-    let plist = launchd::render_plist(
-        &paths.label,
-        &paths.bin_path,
-        &["daemon"],
-        &paths.home,
-        &paths.log,
-    );
-    if let Some(dir) = paths.plist.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Err(e) = std::fs::write(&paths.plist, plist) {
-        eprintln!("portal install: write plist: {e}");
-        return 1;
-    }
-    let code = launchctl_verb(paths, Verb::Restart);
-    if code != 0 {
-        return code;
-    }
-    // 4. Menu bar agent (idempotent; also converged by `portal upgrade` so
-    //    upgrades from tray-less versions grow the status item without a
-    //    reinstall).
-    if let Err(e) = ensure_tray_agent(paths) {
-        // Non-fatal: forwarding must not be held hostage to UI plumbing.
-        eprintln!("portal install: menu bar agent: {e}");
+    let candidate = (self_path != paths.bin_path).then_some(self_path.as_path());
+    let report = match deploy_binary(paths, candidate) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("portal install: {e}");
+            return 1;
+        }
+    };
+    if let Some(warning) = report.tray_warning {
+        eprintln!("portal install: {warning} (forwarding is healthy)");
     }
     println!(
         "portal: installed. `portal status` shows per-box state; logs: {}",
@@ -378,75 +440,32 @@ fn install(paths: &Paths, host: &str, name: Option<String>, index: Option<u8>) -
     0
 }
 
-/// Converge the tray LaunchAgent: write the plist when its content drifted
-/// (or never existed) and (re)load it. Idempotent — called from install AND
-/// upgrade, so a Mac upgrading from a tray-less version grows the status
-/// item automatically. Bootstrap failures are the caller's to report
-/// non-fatally: a headless session (no Aqua) rejects the load by design.
-/// Converge the tray LaunchAgent — the daemon agent's exact semantics,
-/// shared verb implementation: write the plist when its content drifted,
-/// then kickstart-if-loaded (re-execs a just-swapped binary) else bootstrap.
-/// No bootout: launchd's teardown is asynchronous and racing it is how you
-/// end up with sleeps; a changed plist applies at next login, same as the
-/// daemon's plist always has.
-fn ensure_tray_agent(paths: &Paths) -> Result<(), String> {
-    let plist = launchd::render_tray_plist(
-        &paths.tray_label,
-        &paths.bin_path,
-        &paths.home,
-        &paths.tray_log,
-    );
-    if std::fs::read_to_string(&paths.tray_plist).unwrap_or_default() != plist {
-        if let Some(dir) = paths.tray_plist.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&paths.tray_plist, &plist).map_err(|e| format!("write plist: {e}"))?;
-    }
-    match launchctl_verb_for(
-        paths.uid,
-        &paths.tray_label,
-        &paths.tray_plist,
-        Verb::Restart,
-    ) {
-        0 => Ok(()),
-        code => Err(format!("launchctl exit {code}")),
-    }
-}
-
-fn install_binary(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {
-    if let Some(dir) = dst.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    let tmp = dst.with_extension("tmp");
-    std::fs::copy(src, &tmp).map_err(|e| format!("copy: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| e.to_string())?;
-    }
-    std::fs::rename(&tmp, dst).map_err(|e| format!("rename: {e}"))
-}
-
 fn uninstall(paths: &Paths) -> i32 {
-    let code = launchctl_verb(paths, Verb::Stop);
-    // Tray agent goes with the install (best-effort: absent on pre-tray
-    // installs and headless sessions).
+    let _deployment = match deployment::Deployment::acquire(&paths.bin_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("portal uninstall: {e}");
+            return 1;
+        }
+    };
+    let runner = OsRunner;
+    let agents = services::LoginAgents::new(&runner, paths);
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(async {
-        let runner = OsRunner;
-        let _ = launchd::Launchd::new(&runner, paths.uid, paths.tray_label.clone())
-            .unload()
-            .await;
-    });
+    if let Err(e) = rt.block_on(agents.quiesce()) {
+        let recovery = rt.block_on(agents.start_fresh());
+        eprintln!("portal uninstall: {e}");
+        if let Err(recovery_error) = recovery {
+            eprintln!("portal uninstall: restoring login agents failed: {recovery_error}");
+        }
+        return 1;
+    }
     let _ = std::fs::remove_file(&paths.tray_plist);
     let _ = std::fs::remove_file(&paths.plist);
-    let _ = std::fs::remove_file(&paths.api_sock);
     println!(
-        "portal: login agent removed (config kept at {})",
+        "portal: login agents removed (config kept at {})",
         paths.config_dir.display()
     );
-    code
+    0
 }
 
 fn load_config(paths: &Paths) -> Result<Config, String> {
@@ -665,41 +684,35 @@ fn logs(paths: &Paths, follow: bool, lines: usize) -> i32 {
 }
 
 fn upgrade(paths: &Paths, check: bool, force: bool) -> i32 {
-    // The reload (launchctl_verb) builds its OWN runtime, so it must run
-    // after this one is dropped — block_on inside block_on panics.
-    let result = {
+    // Network and cryptographic verification happen while the current daemon
+    // remains untouched. Only a fully executable candidate enters deployment.
+    let plan = {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let runner = OsRunner;
         let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-        rt.block_on(upgrade::upgrade(
-            &runner,
-            &paths.bin_path,
-            &current,
-            check,
-            force,
-        ))
+        rt.block_on(upgrade::prepare(&runner, &current, check, force))
     };
-    match result {
-        Ok(msg) => {
-            println!("portal: {msg}");
-            if !check && !msg.contains("up to date") {
-                // v1 parity: the upgrade owns the reload. The swapped
-                // binary is inert until the daemon re-execs it.
-                let code = launchctl_verb(paths, Verb::Restart);
-                if code != 0 {
-                    eprintln!(
-                        "portal: binary upgraded, but reloading the agent failed — run `portal restart`"
-                    );
-                    return code;
+    match plan {
+        Ok(upgrade::UpgradePlan::NoChange(message)) => {
+            println!("portal: {message}");
+            0
+        }
+        Ok(upgrade::UpgradePlan::Candidate(prepared)) => {
+            let tag = prepared.tag.clone();
+            match deploy_binary(paths, Some(prepared.candidate())) {
+                Ok(report) => {
+                    println!("portal: upgraded to {tag}");
+                    println!("portal: daemon health gate passed on the new binary");
+                    if let Some(warning) = report.tray_warning {
+                        eprintln!("portal: {warning} (forwarding is healthy)");
+                    }
+                    0
                 }
-                println!("portal: daemon reloaded — now running the new binary");
-                // Tray convergence: upgrades from tray-less versions grow
-                // the status item; existing trays re-exec the new binary.
-                if let Err(e) = ensure_tray_agent(paths) {
-                    eprintln!("portal: menu bar agent: {e} (forwarding unaffected)");
+                Err(e) => {
+                    eprintln!("portal upgrade: {e}");
+                    1
                 }
             }
-            0
         }
         Err(e) => {
             eprintln!("portal upgrade: {e}");

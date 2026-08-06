@@ -1,9 +1,11 @@
-//! `portal upgrade` — v1's safety semantics: download the release binary,
-//! RUN it to verify (`--version` must match the expected tag), then
-//! atomically rename into ~/.local/bin/portal and reload the agent. A
-//! truncated, wrong-arch, or mis-versioned download leaves the running
-//! binary untouched. Release-integrity (sha256 + minisign signature)
-//! verification is wired here against the CI lane's artifacts when present.
+//! Supply-chain half of `portal upgrade`: resolve, download, minisign-verify,
+//! and RUN the candidate (`--version` must match the expected tag).
+//!
+//! This module deliberately does not mutate the installed binary or launchd.
+//! It returns a [`PreparedUpgrade`] whose temporary directory lives until the
+//! deployment layer has unregistered both LaunchAgents and transactionally
+//! swapped the executable. A truncated, wrong-arch, or mis-versioned download
+//! therefore never enters the lifecycle transaction.
 
 const REPO: &str = "VikashLoomba/Portal";
 const ARTIFACT: &str = "portal-v2-darwin-arm64";
@@ -58,31 +60,52 @@ pub async fn latest(runner: &dyn portal_transport::runner::Runner) -> Result<Rel
     })
 }
 
-/// Full upgrade dance. Returns a human summary line.
-pub async fn upgrade(
+pub enum UpgradePlan {
+    NoChange(String),
+    Candidate(PreparedUpgrade),
+}
+
+pub struct PreparedUpgrade {
+    pub tag: String,
+    candidate: std::path::PathBuf,
+    /// Owns cleanup. Kept last so the candidate remains valid for the full
+    /// deployment transaction.
+    _staging: tempfile::TempDir,
+}
+
+impl PreparedUpgrade {
+    pub fn candidate(&self) -> &std::path::Path {
+        &self.candidate
+    }
+}
+
+/// Resolve and fully verify an upgrade candidate without touching the active
+/// installation. Lifecycle downtime begins only after this returns Candidate.
+pub async fn prepare(
     runner: &dyn portal_transport::runner::Runner,
-    bin_path: &std::path::Path,
     current_version: &str,
     check_only: bool,
     force: bool,
-) -> Result<String, String> {
+) -> Result<UpgradePlan, String> {
     let rel = latest(runner).await?;
     if !force && !is_newer(&rel.tag, current_version) {
-        return Ok(format!(
+        return Ok(UpgradePlan::NoChange(format!(
             "current ({current_version}) is up to date (latest {})",
             rel.tag
-        ));
+        )));
     }
     if check_only {
-        return Ok(format!(
+        return Ok(UpgradePlan::NoChange(format!(
             "new release available: {} (current {current_version})",
             rel.tag
-        ));
+        )));
     }
 
-    let dir = std::env::temp_dir().join(format!("portal-upgrade-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let tmp = dir.join("portal.new");
+    let staging = tempfile::Builder::new()
+        .prefix("portal-upgrade-")
+        .tempdir()
+        .map_err(|e| format!("create upgrade staging directory: {e}"))?;
+    let tmp = staging.path().join("portal.new");
 
     // 1. Download (+ signature when the release provides one).
     let code = runner
@@ -103,7 +126,7 @@ pub async fn upgrade(
         return Err("download failed".into());
     }
     if let Some(sig) = &rel.sig_url {
-        verify_signature(runner, &tmp, sig, &dir).await?;
+        verify_signature(runner, &tmp, sig, staging.path()).await?;
     }
 
     // 2. Run-once verification (v1): the candidate must execute and report
@@ -125,16 +148,11 @@ pub async fn upgrade(
         ));
     }
 
-    // 3. Atomic swap + reload.
-    let backup = bin_path.with_extension("bak");
-    let _ = std::fs::rename(bin_path, &backup);
-    if let Err(e) = std::fs::rename(&tmp, bin_path) {
-        let _ = std::fs::rename(&backup, bin_path); // roll back
-        return Err(format!("swap failed: {e}"));
-    }
-    let _ = std::fs::remove_file(&backup);
-    let _ = std::fs::remove_dir_all(&dir);
-    Ok(format!("upgraded to {}", rel.tag))
+    Ok(UpgradePlan::Candidate(PreparedUpgrade {
+        tag: rel.tag,
+        candidate: tmp,
+        _staging: staging,
+    }))
 }
 
 /// minisign verification: the release publishes a .minisig; the public key
@@ -267,9 +285,10 @@ mod tests {
             "",
             0,
         );
-        let out = upgrade(&fake, std::path::Path::new("/tmp/x"), "v2.0.0", true, false)
-            .await
-            .unwrap();
-        assert!(out.contains("up to date"));
+        let out = prepare(&fake, "v2.0.0", true, false).await.unwrap();
+        let UpgradePlan::NoChange(message) = out else {
+            panic!("expected no-op plan");
+        };
+        assert!(message.contains("up to date"));
     }
 }

@@ -1,10 +1,17 @@
-//! launchd login-agent management (port of internal/service): plist render +
-//! bootstrap/bootout/kickstart/print through the Runner seam so every
-//! launchctl interaction is unit-testable.
+//! launchd login-agent management: plist rendering plus synchronized
+//! bootstrap/bootout/print through the Runner seam, so every launchctl
+//! interaction is unit-testable.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
-use portal_transport::runner::Runner;
+use portal_transport::runner::{RunOutput, Runner};
+
+/// launchd transitions are asynchronous. Correctness is driven by querying
+/// the registry state, never by assuming an arbitrary sleep was long enough.
+/// The deadline only bounds a broken launchd interaction; each condition
+/// probe is a launchctl subprocess, which naturally yields to launchd.
+const TRANSITION_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Render the LaunchAgent plist (v1 template, verbatim semantics):
 /// RunAtLoad + KeepAlive (any exit relaunches), ThrottleInterval 30 to damp
@@ -153,62 +160,116 @@ impl<'a> Launchd<'a> {
         format!("{}/{}", self.domain, self.label)
     }
 
-    async fn launchctl(&self, args: &[String]) -> std::io::Result<i32> {
-        Ok(self.runner.run("launchctl", args, b"").await?.code)
+    async fn launchctl_output(&self, args: &[String]) -> std::io::Result<RunOutput> {
+        self.runner.run("launchctl", args, b"").await
     }
 
-    /// Is the agent loaded? (`launchctl print` exit 0)
+    fn command_error(verb: &str, out: &RunOutput) -> std::io::Error {
+        let detail = out.stderr_lossy().trim().to_string();
+        let detail = if detail.is_empty() {
+            format!("exit {}", out.code)
+        } else {
+            format!("exit {}: {detail}", out.code)
+        };
+        std::io::Error::other(format!("launchctl {verb} failed ({detail})"))
+    }
+
+    async fn print(&self) -> std::io::Result<RunOutput> {
+        self.launchctl_output(&["print".into(), self.domain_label()])
+            .await
+    }
+
+    /// Is the agent registered? (`launchctl print` exit 0)
     pub async fn is_loaded(&self) -> std::io::Result<bool> {
-        Ok(self
-            .launchctl(&["print".into(), self.domain_label()])
-            .await?
-            == 0)
+        Ok(self.print().await?.code == 0)
     }
 
-    /// Load the plist (idempotent: an already-loaded agent is bootout'd
-    /// first so plist changes apply — v1 `reload` semantics).
-    pub async fn load(&self, plist: &Path) -> std::io::Result<()> {
-        if self.is_loaded().await? {
-            let _ = self
-                .launchctl(&["bootout".into(), self.domain_label()])
-                .await;
+    /// Wait for launchd's registry—not elapsed wall-clock guesswork—to say
+    /// bootout is complete. This closes the documented bootout/bootstrap race
+    /// that otherwise surfaces as bootstrap exit 5 (EIO).
+    async fn wait_until_unloaded(&self) -> std::io::Result<()> {
+        let deadline = Instant::now() + TRANSITION_TIMEOUT;
+        loop {
+            if !self.is_loaded().await? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("launchd did not unregister {}", self.domain_label()),
+                ));
+            }
+            tokio::task::yield_now().await;
         }
-        let code = self
-            .launchctl(&[
+    }
+
+    /// Register an unloaded job from its plist.
+    pub async fn bootstrap(&self, plist: &Path) -> std::io::Result<()> {
+        let out = self
+            .launchctl_output(&[
                 "bootstrap".into(),
                 self.domain.clone(),
                 plist.display().to_string(),
             ])
             .await?;
-        if code != 0 {
-            return Err(std::io::Error::other(format!(
-                "launchctl bootstrap failed (exit {code})"
-            )));
+        if out.code != 0 {
+            return Err(Self::command_error("bootstrap", &out));
         }
         Ok(())
     }
 
+    /// Freshly register the plist. Unlike kickstart, this refreshes launchd's
+    /// Lightweight Code Requirement after an executable replacement.
+    pub async fn load(&self, plist: &Path) -> std::io::Result<()> {
+        self.unload().await?;
+        self.bootstrap(plist).await
+    }
+
+    /// Unregister the job and do not return until launchd confirms the label
+    /// is gone. `Ok(false)` means it was already absent.
     pub async fn unload(&self) -> std::io::Result<bool> {
         if !self.is_loaded().await? {
             return Ok(false);
         }
-        let code = self
-            .launchctl(&["bootout".into(), self.domain_label()])
+        let out = self
+            .launchctl_output(&["bootout".into(), self.domain_label()])
             .await?;
-        Ok(code == 0)
+        if out.code != 0 {
+            return Err(Self::command_error("bootout", &out));
+        }
+        self.wait_until_unloaded().await?;
+        Ok(true)
     }
 
-    /// Restart the (loaded) agent now.
-    pub async fn kickstart(&self) -> std::io::Result<()> {
-        let code = self
-            .launchctl(&["kickstart".into(), "-k".into(), self.domain_label()])
-            .await?;
-        if code != 0 {
-            return Err(std::io::Error::other(format!(
-                "launchctl kickstart failed (exit {code})"
-            )));
+    /// Wait until the job's top-level launchd state reaches `running`.
+    pub async fn wait_until_running(&self) -> std::io::Result<()> {
+        let deadline = Instant::now() + TRANSITION_TIMEOUT;
+        loop {
+            let out = self.print().await?;
+            let state = if out.code == 0 {
+                out.stdout_lossy()
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| line.starts_with("state ="))
+                    .unwrap_or("state unavailable")
+                    .to_string()
+            } else {
+                "not registered".to_string()
+            };
+            if state == "state = running" {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "{} did not reach running state ({state})",
+                        self.domain_label()
+                    ),
+                ));
+            }
+            tokio::task::yield_now().await;
         }
-        Ok(())
     }
 
     /// The state/pid/last-exit lines from `launchctl print` (status display).
@@ -230,6 +291,9 @@ impl<'a> Launchd<'a> {
                     || l.starts_with("runs =")
                     || l.starts_with("last exit code =")
             })
+            // Nested resource/jetsam coalitions have their own `state` lines;
+            // only the four top-level job fields belong in user-facing status.
+            .take(4)
             .map(|l| format!("  {l}"))
             .collect())
     }
@@ -293,17 +357,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_boots_out_first_when_loaded() {
+    async fn load_waits_for_registry_removal_before_bootstrap() {
         let fake = FakeRunner::new();
-        fake.push_str("state = running", "", 0); // print → loaded
-        fake.push_str("", "", 0); // bootout
+        fake.push_str("state = running", "", 0); // initial print → loaded
+        fake.push_str("", "", 0); // bootout accepted
+        fake.push_str("state = exited", "", 0); // teardown still registered
+        fake.push_str("", "not found", 113); // registry removal complete
         fake.push_str("", "", 0); // bootstrap
         let l = Launchd::new(&fake, 501, "local.portal.autoforward");
         l.load(&PathBuf::from("/tmp/x.plist")).await.unwrap();
         let calls = fake.calls();
         assert_eq!(calls[0].1[0], "print");
         assert_eq!(calls[1].1[0], "bootout");
-        assert_eq!(calls[2].1, vec!["bootstrap", "gui/501", "/tmp/x.plist"]);
+        assert_eq!(calls[2].1[0], "print");
+        assert_eq!(calls[3].1[0], "print");
+        assert_eq!(calls[4].1, vec!["bootstrap", "gui/501", "/tmp/x.plist"]);
     }
 
     #[tokio::test]
@@ -314,6 +382,26 @@ mod tests {
         let l = Launchd::new(&fake, 501, "local.portal.autoforward");
         l.load(&PathBuf::from("/tmp/x.plist")).await.unwrap();
         assert_eq!(fake.calls()[1].1[0], "bootstrap");
+    }
+
+    #[tokio::test]
+    async fn unload_propagates_bootout_failure() {
+        let fake = FakeRunner::new();
+        fake.push_str("state = running", "", 0);
+        fake.push_str("", "permission denied", 1);
+        let l = Launchd::new(&fake, 501, "local.portal.autoforward");
+        let err = l.unload().await.unwrap_err().to_string();
+        assert!(err.contains("permission denied"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn wait_until_running_observes_launchd_state() {
+        let fake = FakeRunner::new();
+        fake.push_str("state = xpcproxy", "", 0);
+        fake.push_str("state = running", "", 0);
+        let l = Launchd::new(&fake, 501, "local.portal.autoforward");
+        l.wait_until_running().await.unwrap();
+        assert_eq!(fake.calls().len(), 2);
     }
 
     #[tokio::test]
