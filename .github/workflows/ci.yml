@@ -1,5 +1,11 @@
-# portal CI — runs on every push and pull request: build the agent +
-# go test ./..., plus the TypeScript reference client's typecheck and tests.
+# portal CI — runs on every push and pull request: the Rust workspace's
+# tests and lints, plus the TypeScript reference client's typecheck and tests.
+#
+# The Rust job runs on macOS because portal is a macOS CLI: the tray, launchd
+# services, and Keychain-backed credential store are all cfg(target_os =
+# "macos"). The box-side agent (portald) is a workspace member, so its code is
+# compiled and tested here too; its musl cross-build lives in `make agents`
+# and needs zig, which the release flow provides.
 name: CI
 
 on:
@@ -7,40 +13,29 @@ on:
     branches: ['**']
   pull_request:
 
-env:
-  CGO_ENABLED: "0"
-  GOFLAGS: "-trimpath"
-
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends dash busybox-static
-      - run: make test
-        env:
-          PORTAL_SHIM_SHELLS_STRICT: "1"
-
-  test-darwin-clipboard:
+  rust:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - run: go test ./internal/clip
+      # rustup reads rust-toolchain.toml (stable + rustfmt + clippy).
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - run: make test
+      - run: make lint
 
   test-ts:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/ts
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.9.x
-      - run: make test-ts
+          cache: npm
+          cache-dependency-path: clients/ts/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

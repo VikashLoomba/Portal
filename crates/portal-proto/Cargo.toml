@@ -1,0 +1,19 @@
+[package]
+name = "portal-proto"
+version.workspace = true
+edition.workspace = true
+description = "portal wire protocol: framed CBOR envelopes, ProtoVersion 4"
+
+[dependencies]
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+ciborium = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+async = ["dep:tokio"]
+
+[dev-dependencies]
+hex = { workspace = true }

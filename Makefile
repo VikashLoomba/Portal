@@ -1,75 +1,84 @@
-# Portal build orchestration. Three binaries:
-#   portald (linux-amd64/linux-arm64) — embedded into portal via go:embed
-#   portal  (host-native) — the user-facing CLI
+# portal build orchestration. Three binaries:
+#   portald (linux musl amd64/arm64) — embedded into portal at build time
+#   portal  (darwin-arm64)           — the user-facing CLI + daemon
 #
-# Both binaries are stamped with the SAME git SHA at build time:
-#   - portald via -X main.gitSHA=$(GIT_SHA) (reported in HelloAck)
-#   - portal  via -X .../bootstrap.gitSHA=$(GIT_SHA) (used to name the
-#     remote cache file ~/.cache/portal/agent-<sha>)
-# Mismatch is impossible because Make sets GIT_SHA once per invocation.
+# Both are stamped with the SAME git SHA per invocation: the HelloAck SHA
+# match and the ~/.cache/portal/agent-<sha> remote path both depend on it,
+# and a mismatched pair reconnect-loops.
+# `make build` is THE build path: release.sh delegates here, so a portal
+# binary without embedded agents cannot come out of any supported flow.
+#
+# Targets:
+#   make build                 agents + darwin binary (embedded, verified)
+#   make test                  workspace tests
+#   make lint                  clippy -D warnings + rustfmt check
+#   make check                 test + lint (release prerequisite)
+#   make install HOST=<ssh>    dev install (ad-hoc signed) + agent reload
+#   make release TAG=v2.x.y    sign + exec-gate + notarize + publish
+#   make release-install HOST=<ssh>   signed local install, no publish
+#   make clean
 
-GIT_SHA       := $(shell git rev-parse HEAD 2>/dev/null || echo dev-$(shell date +%s))
-# VERSION is the human-facing release string shown by `portal version` and
-# `portal --version`: the nearest git tag (e.g. v0.1.1), with -dirty/commit
-# suffixes for untagged or modified trees. Falls back to "dev" with no git.
-VERSION       := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-AGENT_DIR     := internal/bootstrap/agent
-AGENT_AMD64   := $(AGENT_DIR)/portald-linux-amd64
-AGENT_ARM64   := $(AGENT_DIR)/portald-linux-arm64
-SHA_PATH      := $(AGENT_DIR)/sha.txt
+# Defense in depth: rustup's shims must win even if a Homebrew rust ever
+# reappears (its cargo has no musl std, ignores rust-toolchain.toml, and
+# poisons target/ with mixed-compiler artifacts — E0514). Homebrew rust was
+# uninstalled 2026-08-05; see AGENTS.md.
+export PATH := $(HOME)/.cargo/bin:$(PATH)
 
-MODULE         := github.com/VikashLoomba/Portal
-LDFLAGS_AGENT  := -s -w -X main.gitSHA=$(GIT_SHA)
-# Stamp the portal CLI: main.version (release string) + bootstrap.gitSHA (the
-# linker-injected build SHA the drift check in bootstrap/embed.go validates).
-LDFLAGS_PORTAL := -X main.version=$(VERSION) -X $(MODULE)/internal/bootstrap.gitSHA=$(GIT_SHA)
+SHA        ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
+DARWIN     := aarch64-apple-darwin
+MUSL_AMD64 := x86_64-unknown-linux-musl
+MUSL_ARM64 := aarch64-unknown-linux-musl
+AGENTS     := target/agents
+BIN        := target/$(DARWIN)/release/portal
 
-# Cross-compilation target for the Mac client binary.
-# The agent is built for supported Linux dev-box architectures.
-# The Mac client ships as darwin-arm64 (Apple Silicon only).
-PORTAL_DARWIN_ARM64  := portal-darwin-arm64
+.PHONY: build agents verify-embed test lint check install release release-install clean
 
-.PHONY: build agent portal portal-all test clean print-sha
+build: agents
+	@echo "==> building portal (darwin-arm64, agents embedded, sha $(SHA))"
+	PORTAL_GIT_SHA="$(SHA)" \
+	PORTAL_AGENT_AMD64_FILE="$(CURDIR)/$(AGENTS)/portald-$(MUSL_AMD64)" \
+	PORTAL_AGENT_ARM64_FILE="$(CURDIR)/$(AGENTS)/portald-$(MUSL_ARM64)" \
+	cargo build --release -p portal-cli --target $(DARWIN) --quiet
+	@$(MAKE) --no-print-directory verify-embed
 
-build: portal
+agents:
+	@command -v cargo-zigbuild >/dev/null || { echo "install: cargo install cargo-zigbuild (and brew install zig)" >&2; exit 1; }
+	@mkdir -p $(AGENTS)
+	@for t in $(MUSL_AMD64) $(MUSL_ARM64); do \
+		echo "==> building portald ($$t, sha $(SHA))"; \
+		PORTAL_GIT_SHA="$(SHA)" cargo zigbuild --release -p portald --target $$t --quiet || exit 1; \
+		cp "target/$$t/release/portald" "$(AGENTS)/portald-$$t" || exit 1; \
+	done
 
-agent:
-	@mkdir -p $(AGENT_DIR)
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-		go build -trimpath -ldflags "$(LDFLAGS_AGENT)" \
-		-o $(AGENT_AMD64) ./cmd/portald
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
-		go build -trimpath -ldflags "$(LDFLAGS_AGENT)" \
-		-o $(AGENT_ARM64) ./cmd/portald
-	@printf "%s" "$(GIT_SHA)" > $(SHA_PATH)
-	@echo "built agent $(AGENT_AMD64) (sha=$(GIT_SHA), $$(stat -f%z $(AGENT_AMD64) 2>/dev/null || stat -c%s $(AGENT_AMD64)) bytes)"
-	@echo "built agent $(AGENT_ARM64) (sha=$(GIT_SHA), $$(stat -f%z $(AGENT_ARM64) 2>/dev/null || stat -c%s $(AGENT_ARM64)) bytes)"
+# The daemon cannot provision boxes without the embedded portald bytes —
+# assert they actually landed in the Mac binary (fail here, not at the
+# first user's reconnect loop).
+verify-embed:
+	@python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); a=open(sys.argv[2],"rb").read(); sys.exit(0 if a[:4096] in d else "portal: embedded agent bytes NOT found in binary")' "$(BIN)" "$(AGENTS)/portald-$(MUSL_AMD64)"
+	@echo "==> $(BIN) (embedded agents verified)"
 
-portal: agent
-	go build -trimpath -ldflags "$(LDFLAGS_PORTAL)" -o portal ./cmd/portal
-	@echo "built portal (sha=$(GIT_SHA))"
+test:
+	cargo test --workspace
 
-# portal-all builds the Apple Silicon Mac binary — used by CI to produce the
-# release artifact.
-portal-all: agent
-	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 \
-		go build -trimpath -ldflags "$(LDFLAGS_PORTAL)" \
-		-o $(PORTAL_DARWIN_ARM64) ./cmd/portal
-	@echo "built $(PORTAL_DARWIN_ARM64) (sha=$(GIT_SHA))"
+lint:
+	cargo clippy --workspace --all-targets -- -D warnings
+	cargo fmt --all --check
 
-test: agent
-	go test ./...
+# Every distributable path runs the same correctness gates first. release.sh
+# still owns the one-SHA cross-build/sign/notarize/publish transaction.
+check: test lint
+
+install: build
+	@test -n "$(HOST)" || { echo "usage: make install HOST=<ssh-host>" >&2; exit 1; }
+	"$(BIN)" install "$(HOST)"
+
+release: check
+	@test -n "$(TAG)" || { echo "usage: make release TAG=v2.x.y" >&2; exit 1; }
+	./release.sh "$(TAG)"
+
+release-install: check
+	@test -n "$(HOST)" || { echo "usage: make release-install HOST=<ssh-host>" >&2; exit 1; }
+	INSTALL=1 INSTALL_HOST="$(HOST)" ./release.sh local
 
 clean:
-	rm -f portal $(AGENT_AMD64) $(AGENT_ARM64) $(SHA_PATH)
-
-print-sha:
-	@echo $(GIT_SHA)
-
-.PHONY: test-ts
-test-ts:
-	@node -e 'const found = process.version; const major = Number(process.versions.node.split(".")[0]); if (major < 24) { console.error("node >= v24 required; found " + found); process.exit(1); }'
-	npm_config_cache=$$PWD/clients/ts/.npm-cache npm ci --prefix clients/ts
-	npm_config_cache=$$PWD/clients/ts/.npm-cache npx --prefix clients/ts tsc --noEmit -p clients/ts
-	cd clients/ts && node --test test/*.test.ts
-	cd examples/shell-desktop && deno task check
+	cargo clean

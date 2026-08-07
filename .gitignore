@@ -1,15 +1,26 @@
+/target/
 /portal
 /portal-darwin-arm64
-# CI sets GOPATH=$CI_PROJECT_DIR/.go-cache (inside the repo). Ignoring it keeps
-# the build tree clean so Go's buildvcs stamp isn't marked dirty (+dirty).
-/.go-cache/
-internal/bootstrap/agent/portald-linux-amd64
-internal/bootstrap/agent/portald-linux-arm64
-internal/bootstrap/agent/sha.txt
+/portal-v2-darwin-arm64
 .claude/settings.local.json
 .deno_desktop_entry-*
 examples/shell-desktop/*.app/
 # release signing credentials (never check in)
-AuthKey_*.p8
-v2/.env
+# Broader than the filenames currently in use: any .p8 notary key, any minisign
+# secret. minisign.pub is deliberately NOT ignored -- release verification
+# needs the public key in-tree.
+*.p8
+*.key
+minisign.sec
+!minisign.pub
 .env
+.env.*
+
+# local scratch, not part of the repo
+/scratchpad/
+
+# per-machine agent/editor tooling, installed not authored
+/.agents/
+/.codex/
+/.claude/skills/
+/skills-lock.json

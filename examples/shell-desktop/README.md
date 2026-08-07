@@ -1,5 +1,13 @@
 # Portal Shell Desktop Reference
 
+> **Status: unmaintained, does not currently run.** This example was written
+> against v1's streamed local control API (`/v1/events`, `/v1/setup`,
+> `/v1/exec`), which v2 does not serve — v2's socket returns a single read-only
+> JSON status snapshot. It is not built or tested by CI, and the `make portal`
+> step below refers to a target that no longer exists (see the root `Makefile`).
+> Kept as a design reference for the embedding UX; see
+> [`docs/embedding.md`](../../docs/embedding.md) for what v2 actually exposes.
+
 This example embeds portal in a TanStack Start app hosted by the experimental
 `deno desktop` runtime. It requires Deno 2.9 or newer; the dependency and
 workflow pins currently target Deno 2.9.x because the desktop APIs are still

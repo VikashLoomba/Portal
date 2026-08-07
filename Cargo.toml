@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/portal-proto",
+    "crates/portal-transport",
+    "crates/portal-core",
+    "crates/portal-clip",
+    "crates/portal-cred",
+    "crates/portal-cli",
+    "crates/portald",
+]
+
+[workspace.package]
+version = "2.0.15"
+edition = "2024"
+repository = "https://github.com/VikashLoomba/Portal"
+authors = ["Vikash Loomba"]
+
+[workspace.dependencies]
+# intra-workspace
+portal-proto = { path = "crates/portal-proto" }
+portal-transport = { path = "crates/portal-transport" }
+portal-core = { path = "crates/portal-core" }
+portal-clip = { path = "crates/portal-clip" }
+portal-cred = { path = "crates/portal-cred" }
+portald = { path = "crates/portald" }
+
+# wire format
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1"
+ciborium = "0.2"
+
+# runtime / plumbing
+tokio = { version = "1", features = ["full"] }
+russh = "0.62"
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "2"
+
+# config / cli / logging
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# URL parsing/rewriting for the callback-URL relay. Hand-rolling this is how
+# you ship an open-redirect: userinfo, IPv6 literals, default ports and
+# percent-encoding all have to be handled exactly right.
+url = "2"
+
+# hashing
+sha2 = "0.10"
+hex = "0.4"
+
+[profile.release]
+# Single static-ish binary, small enough to embed portald in portal.
+strip = true
+lto = "thin"
+codegen-units = 1
