@@ -526,7 +526,10 @@ fn add_box_to_config(
             .find(|i| !cfg.boxes.iter().any(|b| b.index == *i))
             .ok_or("no free index")?,
     };
-    println!("portal: adding box {name:?} (index {index}: remote port p → local {index}0000+p)");
+    println!(
+        "portal: adding box {name:?} (remote port p → localhost:p; \
+         falls back to {index}0000+p if p is already in use locally)"
+    );
     cfg.boxes.push(BoxConfig {
         name,
         host: host.to_string(),

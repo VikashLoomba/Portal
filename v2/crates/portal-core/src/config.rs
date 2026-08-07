@@ -29,9 +29,9 @@ pub const DEFAULT_DENY_PORTS: [u16; 6] = [22, 25, 53, 139, 445, 631];
 pub struct BoxConfig {
     pub name: String,
     pub host: String,
-    /// Port-mapping index. 1..=5 use the indexed scheme (`1xxxx`..`5xxxx`);
-    /// higher indexes are legal but all their forwards use the fallback
-    /// allocator (see `portmap`).
+    /// Port-mapping index, used only when the identity mapping is unavailable:
+    /// 1..=5 get a reserved `1xxxx`..`5xxxx` slot, higher indexes fall straight
+    /// through to the allocator (see `portmap`).
     pub index: u8,
     #[serde(default)]
     pub allow: Vec<u16>,
@@ -110,8 +110,9 @@ impl Config {
     }
 
     /// Migrate a v1 single-host install (`~/.config/portal/host` + `allow`)
-    /// into a one-box config. The box gets index 1 — its forwards move from
-    /// `p` to `10000+p`, which `portal install` must call out loudly.
+    /// into a one-box config. The box gets index 1, but v1's same-port
+    /// behaviour is preserved: identity is the preferred mapping, and index 1
+    /// only supplies the fallback slot when a local port is already held.
     pub fn migrate_from_v1(host: &str, allow: &[u16]) -> Config {
         Config {
             boxes: vec![BoxConfig {

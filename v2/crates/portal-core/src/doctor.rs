@@ -51,6 +51,21 @@ pub fn check_status(st: &BoxStatus) -> Vec<Verdict> {
                 .join(", ")
         ))
     });
+    // Same-number forwards keep Host/Origin headers truthful; a translated one
+    // is the usual cause of "works on the box, 403s through the tunnel".
+    let translated: Vec<String> = st
+        .forwards
+        .iter()
+        .filter(|(l, r)| l != r)
+        .map(|(l, r)| format!("{r}→localhost:{l}"))
+        .collect();
+    if !translated.is_empty() {
+        out.push(Verdict::Warn(format!(
+            "port translated ({}) — origin-checking services may reject requests; \
+             free the local port to get the same number",
+            translated.join(", ")
+        )));
+    }
     out.push(if st.clipsync_synced {
         Verdict::Ok(format!(
             "clipsync in sync (change {})",
@@ -154,13 +169,30 @@ mod tests {
 
     #[test]
     fn status_checks_cover_the_three_axes() {
-        let good = check_status(&st(true, vec![(18000, 8000)], true, 5));
+        let good = check_status(&st(true, vec![(8000, 8000)], true, 5));
         assert!(good.iter().all(|v| !v.is_fail()), "{good:?}");
-        assert!(good[1].line().contains("8000→localhost:18000"));
+        assert!(good[1].line().contains("8000→localhost:8000"));
+        // Identity mapping is the happy path: nothing to warn about.
+        assert!(
+            !good.iter().any(|v| v.line().contains("port translated")),
+            "{good:?}"
+        );
 
         let bad = check_status(&st(false, vec![], false, 3));
         assert!(bad[0].is_fail());
         assert!(matches!(bad[2], Verdict::Warn(_)));
+    }
+
+    #[test]
+    fn a_translated_port_is_called_out_as_an_origin_hazard() {
+        let out = check_status(&st(true, vec![(18000, 8000)], true, 5));
+        let warn = out
+            .iter()
+            .find(|v| v.line().contains("port translated"))
+            .expect("translation warning");
+        assert!(matches!(warn, Verdict::Warn(_)));
+        assert!(warn.line().contains("8000→localhost:18000"));
+        assert!(out.iter().all(|v| !v.is_fail()), "{out:?}");
     }
 
     #[tokio::test]

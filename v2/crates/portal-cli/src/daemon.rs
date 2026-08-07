@@ -48,7 +48,8 @@ fn agent_bytes(embedded: &'static [u8], runtime_var: &str) -> Option<Arc<[u8]>> 
 }
 
 /// Load config.toml; if absent but v1 files exist, auto-migrate (writing the
-/// new file and LOUDLY announcing the port shift `p` → `10000+p`).
+/// new file). v1's same-port forwarding carries over unchanged: the migrated
+/// box keeps the identity mapping whenever the local port is free.
 pub fn load_or_migrate_config(paths: &Paths) -> Result<Config, String> {
     if paths.config_file.exists() {
         let raw = std::fs::read_to_string(&paths.config_file)
@@ -73,9 +74,10 @@ pub fn load_or_migrate_config(paths: &Paths) -> Result<Config, String> {
         let doc = toml::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&paths.config_dir).map_err(|e| e.to_string())?;
         std::fs::write(&paths.config_file, &doc).map_err(|e| e.to_string())?;
-        tracing::warn!(
-            "migrated v1 config: box {:?} now has index 1 — forwarded ports moved from <p> to 1<p> \
-             (e.g. 8000 → 18000)",
+        tracing::info!(
+            "migrated v1 config: box {:?} has index 1 — forwarded ports keep their \
+             remote numbers (localhost:8000 → 8000), so Host/Origin-checking \
+             services keep working",
             cfg.boxes[0].name
         );
         return Ok(cfg);

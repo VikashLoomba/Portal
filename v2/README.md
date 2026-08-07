@@ -30,11 +30,32 @@ cargo-zigbuild, embed via `include_bytes!` in `portal-cli`.
 
 ## Port mapping (multi-box)
 
-Box index `n` maps remote port `p` to local `n*10000 + p` (box 1 `:8000` →
-`localhost:18000`). Domain limits (see `portal-core/src/portmap.rs`):
-remote ports ≥ 10000 would collide across boxes and indexes ≥ 6 overflow u16,
-so those fall back to a deterministic FNV-seeded allocator in 60000–64999.
-`portal status`/`ports` always render the actual mapping table.
+Remote port `p` is forwarded to **`localhost:p`** whenever that local port is
+free. Same-number mapping is not cosmetic: forwarded services see a truthful
+`Host`/`Origin` header, so MCP servers, Vite, `create-react-app`, and Django
+(all of which reject mismatched origins) work through the tunnel without
+per-app allowlists.
+
+Fallbacks apply only under contention, in order (see
+`portal-core/src/portmap.rs`):
+
+1. **identity** — `p` → `localhost:p`; skipped for privileged remotes (< 1024,
+   unbindable by a user LaunchAgent).
+2. **indexed slot** — box index `n` in 1..=5 reserves `n*10000 + p`, giving
+   each box a collision-free lane when two boxes both listen on `:8000`.
+3. **allocator** — a deterministic FNV-seeded port in 60000–64999, for remote
+   ports ≥ 10000, indexes ≥ 6, or when both tiers above are held.
+
+Contention is discovered by the bind itself (`AddrInUse`/`PermissionDenied`),
+and retried down the list inside the same reconcile pass, so a busy port never
+costs a full safety interval of downtime. Two WARNs cover the fallout: one
+names the local holder (pid + process name, deduped per port), and one flags
+the translated forward itself, since that is exactly when an origin-checking
+service may start rejecting requests. When the local port later frees, the
+next pass reclaims the same-number mapping unprompted — otherwise a one-time
+collision would keep `Host`/`Origin` wrong until the daemon restarted.
+`portal status`/`ports` always render the actual mapping table, and
+`portal doctor` repeats the translation as a warn.
 
 ## Phase plan
 
@@ -67,6 +88,7 @@ so those fall back to a deterministic FNV-seeded allocator in 60000–64999.
   local reads against portald's clip store (DESIGN-clipsync §2.2).
 - A Go portald that doesn't advertise `clipsync` gets forwards/notify/cred
   but no clipboard — `portal install` deploys the v2 portald anyway.
-- v1 single-host installs migrate via `Config::migrate_from_v1`; the index-1
-  port shift (`p` → `10000+p`) must be called out loudly by `portal install`.
+- v1 single-host installs migrate via `Config::migrate_from_v1`; v1's
+  same-port forwarding is preserved, because identity is now the preferred
+  mapping and index 1 only supplies a fallback slot under contention.
 - Env seams keep their names: `PORTAL_CONFIG_DIR`, `PORTAL_API_SOCK`.

@@ -306,14 +306,15 @@ async fn sup_first_cfg(rig: &Rig) -> portal_core::config::BoxConfig {
 async fn full_stack_forwards_notifies_and_syncs_clipboard() {
     let rig = rig().await;
 
-    // 1. Forwards converge from the snapshot: 8000→18000, 3000→13000.
+    // 1. Forwards converge from the snapshot SAME-PORT (8000→8000, 3000→3000)
+    //    so forwarded services see a truthful Host/Origin.
     let converged = wait_until(Duration::from_secs(5), async || {
         let f = rig.forwarder.forwards.lock().unwrap();
         f.contains(&ForwardSpec {
-            local: 18000,
+            local: 8000,
             remote: 8000,
         }) && f.contains(&ForwardSpec {
-            local: 13000,
+            local: 3000,
             remote: 3000,
         })
     })

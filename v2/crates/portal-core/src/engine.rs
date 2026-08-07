@@ -11,7 +11,9 @@
 //! pure diff so it can be exhaustively unit-tested.
 //!
 //! v2 change: forwards are (local, remote) pairs via a mapping function
-//! (see `portmap`), not same-port.
+//! (see `portmap`), which PREFERS the identity mapping (local == remote) so
+//! `Host`/`Origin` reach the service unchanged, and falls back to translated
+//! ports only when the identity port cannot be bound.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
@@ -23,7 +25,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agentclient::Event;
 use crate::pins::PinSet;
-use crate::portmap::PortMap;
+use crate::portmap::{PortMap, identity_eligible};
+
+/// How many local ports one remote listener may be offered in a single pass:
+/// the three tiers of [`crate::portmap`] (identity, indexed slot, allocator).
+const MAX_BIND_ATTEMPTS: usize = 3;
 
 /// One reconcile pass's work order.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -194,9 +200,11 @@ pub async fn reconcile_once(
             "callback listener gone; retiring its forward");
     }
     // Union, deduped: a pinned port that IS in the snapshot must appear once,
-    // or plan() would emit a duplicate add.
+    // or plan() would emit a duplicate add. Sorted for allocation determinism:
+    // identity claims are first-come within a pass, so a stable order means a
+    // stable mapping table across restarts.
     let desired: Vec<u16> = if st.pins.is_empty() {
-        observed.to_vec()
+        listening.iter().copied().collect()
     } else {
         listening
             .iter()
@@ -207,6 +215,26 @@ pub async fn reconcile_once(
             .collect()
     };
     let current = forwarder.list_forwards().await.unwrap_or_default();
+
+    // UPGRADE PASS: a forward stuck on a translated port is a broken forward
+    // for anything that validates Host/Origin, and the conflict that caused it
+    // is usually gone long before the daemon is. Re-probe each degraded port;
+    // when identity is free again, drop the assignment so plan() below cancels
+    // the translated forward and re-adds it at identity, unattended.
+    for (remote, was_local) in st.portmap.degraded() {
+        if !desired.contains(&remote) || taken.contains(&remote) {
+            continue;
+        }
+        if local.holder(remote).await.is_some() {
+            continue;
+        }
+        st.portmap.release(remote);
+        taken.remove(&was_local);
+        st.conflicts.clear(was_local);
+        tracing::info!(target: "portal::engine", box_name = %st.box_name,
+            remote, was_local,
+            "localhost:{} came free; reclaiming the same-port mapping", remote);
+    }
 
     let plan = {
         let portmap = &mut st.portmap;
@@ -224,38 +252,79 @@ pub async fn reconcile_once(
         if st.skip_local.contains(&spec.local) {
             continue;
         }
-        match forwarder.forward(spec).await {
-            Ok(()) => {
-                taken.insert(spec.local);
-                st.conflicts.clear(spec.local);
-                tracing::info!(target: "portal::engine", box_name = %st.box_name,
-                    "forwarded localhost:{} -> {}:{}", spec.local,
-                    transport.describe().host, spec.remote);
-                summary.added.push(spec);
-            }
-            Err(TransportError::PortInUse { .. }) => {
-                // The bind itself is the conflict signal; lsof/ps only
-                // name the holder for the (deduped) diagnostic.
-                let holder = local.holder(spec.local).await.unwrap_or(0);
-                if st.conflicts.note(spec.local, holder) {
-                    let name = local.process_name(holder).await;
-                    tracing::warn!(target: "portal::engine", box_name = %st.box_name,
-                        local = spec.local, remote = spec.remote, holder, process = %name,
-                        "local port in use; skipping forward");
-                    summary.conflicts.push((spec.local, holder));
+        // A bind is the only way to discover a Mac-side holder: `taken` knows
+        // only about ports portal itself claimed. On refusal, walk down the
+        // preference order (identity → indexed → allocator) IN THIS PASS —
+        // waiting for the next event would leave the service unreachable for
+        // up to a safety interval.
+        let mut spec = spec;
+        for attempt in 0..MAX_BIND_ATTEMPTS {
+            match forwarder.forward(spec).await {
+                Ok(()) => {
+                    taken.insert(spec.local);
+                    st.conflicts.clear(spec.local);
+                    tracing::info!(target: "portal::engine", box_name = %st.box_name,
+                        "forwarded localhost:{} -> {}:{}", spec.local,
+                        transport.describe().host, spec.remote);
+                    if spec.local != spec.remote && identity_eligible(spec.remote) {
+                        tracing::warn!(target: "portal::engine", box_name = %st.box_name,
+                            local = spec.local, remote = spec.remote,
+                            "forwarded on a TRANSLATED port: localhost:{} is held on the Mac. \
+                             Services that validate Host/Origin (MCP servers, Vite, Django) may \
+                             reject requests through localhost:{} — free the port to get the \
+                             same-port mapping back", spec.remote, spec.local);
+                    }
+                    summary.added.push(spec);
+                    break;
                 }
-            }
-            Err(err) => {
-                tracing::warn!(target: "portal::engine", box_name = %st.box_name,
-                    local = spec.local, remote = spec.remote, %err, "forward failed");
+                Err(TransportError::PortInUse { .. }) => {
+                    // The bind itself is the conflict signal; lsof/ps only
+                    // name the holder for the (deduped) diagnostic.
+                    let holder = local.holder(spec.local).await.unwrap_or(0);
+                    if st.conflicts.note(spec.local, holder) {
+                        let name = local.process_name(holder).await;
+                        tracing::warn!(target: "portal::engine", box_name = %st.box_name,
+                            local = spec.local, remote = spec.remote, holder, process = %name,
+                            "local port in use; remapping");
+                        summary.conflicts.push((spec.local, holder));
+                    }
+                    st.portmap.reject_local(spec.remote, spec.local);
+                    let next = (attempt + 1 < MAX_BIND_ATTEMPTS)
+                        .then(|| st.portmap.local_for(spec.remote, |p| taken.contains(&p)))
+                        .flatten();
+                    match next {
+                        Some(local) => spec = ForwardSpec { local, ..spec },
+                        None => {
+                            tracing::warn!(target: "portal::engine", box_name = %st.box_name,
+                                remote = spec.remote,
+                                "no bindable local port for remote listener");
+                            summary.unmappable.push(spec.remote);
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(target: "portal::engine", box_name = %st.box_name,
+                        local = spec.local, remote = spec.remote, %err, "forward failed");
+                    break;
+                }
             }
         }
     }
 
     for spec in plan.remove {
+        // A pass that MOVES a remote to a better local port emits both an add
+        // and a remove for the same remote (identity reclaim, bind-refusal
+        // fallback). Neither the live listener nor the fresh assignment may be
+        // collateral damage of retiring the old spec.
+        if summary.added.contains(&spec) {
+            continue;
+        }
         let _ = forwarder.cancel(spec).await;
-        st.portmap.release(spec.remote);
-        taken.remove(&spec.local);
+        st.portmap.release_exact(spec.remote, spec.local);
+        if !st.portmap.assignments().any(|(_, l)| l == spec.local) {
+            taken.remove(&spec.local);
+        }
         tracing::info!(target: "portal::engine", box_name = %st.box_name,
             "removed forward {} (no longer wanted)", spec.local);
         summary.removed.push(spec);
@@ -578,15 +647,15 @@ mod tests {
         let s = reconcile_once(&*t, &fwd, &local, &mut st, &mut taken, Some(&[3000, 8000]))
             .await
             .unwrap();
-        assert_eq!(s.added, vec![fs(13000, 3000), fs(18000, 8000)]);
-        assert!(taken.contains(&13000) && taken.contains(&18000));
+        assert_eq!(s.added, vec![fs(3000, 3000), fs(8000, 8000)]);
+        assert!(taken.contains(&3000) && taken.contains(&8000));
 
         let s = reconcile_once(&*t, &fwd, &local, &mut st, &mut taken, Some(&[8000]))
             .await
             .unwrap();
         assert!(s.added.is_empty());
-        assert_eq!(s.removed, vec![fs(13000, 3000)]);
-        assert!(!taken.contains(&13000));
+        assert_eq!(s.removed, vec![fs(3000, 3000)]);
+        assert!(!taken.contains(&3000));
         assert_eq!(
             fwd.forwards
                 .lock()
@@ -594,7 +663,7 @@ mod tests {
                 .iter()
                 .copied()
                 .collect::<Vec<_>>(),
-            vec![fs(18000, 8000)]
+            vec![fs(8000, 8000)]
         );
     }
 
@@ -602,7 +671,7 @@ mod tests {
     async fn agent_not_ready_keeps_forwards() {
         let t = FakeTransport::new("devbox1");
         let fwd = FakeForwarder::default();
-        fwd.forwards.lock().unwrap().insert(fs(18000, 8000));
+        fwd.forwards.lock().unwrap().insert(fs(8000, 8000));
         let local = FakeLocal::default();
         let mut st = state();
         let mut taken = BTreeSet::new();
@@ -635,43 +704,127 @@ mod tests {
         assert!(matches!(err, ReconcileError::MasterDown));
     }
 
+    /// The header-correctness path: when the identity port is held on the Mac,
+    /// the pass must land the forward somewhere else IMMEDIATELY rather than
+    /// leaving the service unreachable until the next event.
     #[tokio::test]
-    async fn bind_conflicts_skip_and_dedupe() {
+    async fn identity_conflict_remaps_within_the_pass() {
         let t = FakeTransport::new("devbox1");
         let fwd = FakeForwarder::default();
-        fwd.busy_locals.lock().unwrap().insert(18000); // bind would fail
+        fwd.busy_locals.lock().unwrap().insert(6274); // a Mac-side holder
         let local = FakeLocal {
-            holders: HashMap::from([(18000, 999)]),
+            holders: HashMap::from([(6274, 999)]),
         };
         let mut st = state();
+        let mut taken = BTreeSet::new();
+
+        let s = reconcile_once(&*t, &fwd, &local, &mut st, &mut taken, Some(&[6274]))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.added,
+            vec![fs(16274, 6274)],
+            "must fall back, not give up"
+        );
+        assert_eq!(s.conflicts, vec![(6274, 999)]);
+        assert!(taken.contains(&16274) && !taken.contains(&6274));
+
+        // Stable next pass: no churn back onto the busy identity port.
+        let s = reconcile_once(&*t, &fwd, &local, &mut st, &mut taken, Some(&[6274]))
+            .await
+            .unwrap();
+        assert_eq!(s, PassSummary::default());
+    }
+
+    /// The conflict that forced a translated port almost always outlives its
+    /// cause: kill the squatter and the forward must climb BACK to identity on
+    /// its own, or every Host/Origin-checking service stays broken for the life
+    /// of the daemon.
+    #[tokio::test]
+    async fn a_freed_identity_port_is_reclaimed_next_pass() {
+        let t = FakeTransport::new("devbox1");
+        let fwd = FakeForwarder::default();
+        fwd.busy_locals.lock().unwrap().insert(6277);
+        let local = FakeLocal {
+            holders: HashMap::from([(6277, 999)]),
+        };
+        let mut st = state();
+        let mut taken = BTreeSet::new();
+
+        let s = reconcile_once(&*t, &fwd, &local, &mut st, &mut taken, Some(&[6277]))
+            .await
+            .unwrap();
+        assert_eq!(s.added, vec![fs(16277, 6277)]);
+
+        // The squatter exits: the bind would now succeed and lsof sees nobody.
+        fwd.busy_locals.lock().unwrap().remove(&6277);
+        let local = FakeLocal::default();
+
+        let s = reconcile_once(&*t, &fwd, &local, &mut st, &mut taken, Some(&[6277]))
+            .await
+            .unwrap();
+        assert_eq!(s.added, vec![fs(6277, 6277)], "must climb back to identity");
+        assert_eq!(s.removed, vec![fs(16277, 6277)], "and retire the detour");
+        assert_eq!(
+            fwd.list_forwards().await.unwrap(),
+            vec![fs(6277, 6277)],
+            "exactly one listener survives the swap"
+        );
+        assert!(taken.contains(&6277) && !taken.contains(&16277));
+
+        // Converged: identity is not re-probed, so no churn.
+        let s = reconcile_once(&*t, &fwd, &local, &mut st, &mut taken, Some(&[6277]))
+            .await
+            .unwrap();
+        assert_eq!(s, PassSummary::default());
+    }
+
+    #[tokio::test]
+    async fn bind_conflicts_walk_the_preference_order_then_report() {
+        let t = FakeTransport::new("devbox1");
+        let fwd = FakeForwarder::default();
+        // Identity, indexed slot AND the deterministic port are all held: the
+        // pass exhausts its attempts and reports instead of looping forever.
+        let mut st = state();
+        let mut probe = PortMap::new("devbox1", 1);
+        probe.reject_local(8000, 8000);
+        probe.reject_local(8000, 18000);
+        let fallback = probe.local_for(8000, |_| false).unwrap();
+        for p in [8000, 18000, fallback] {
+            fwd.busy_locals.lock().unwrap().insert(p);
+        }
+        let local = FakeLocal {
+            holders: HashMap::from([(8000, 111), (18000, 222), (fallback, 333)]),
+        };
         let mut taken = BTreeSet::new();
 
         let s = reconcile_once(&*t, &fwd, &local, &mut st, &mut taken, Some(&[8000]))
             .await
             .unwrap();
-        assert_eq!(s.conflicts, vec![(18000, 999)]);
+        assert_eq!(
+            s.conflicts,
+            vec![(8000, 111), (18000, 222), (fallback, 333)]
+        );
+        assert!(s.added.is_empty());
+        assert_eq!(s.unmappable, vec![8000], "exhaustion must be reported");
         assert!(fwd.forwards.lock().unwrap().is_empty());
 
-        // Same conflict next pass: still skipped, but NOT re-reported.
+        // Next pass keeps probing the allocator range rather than re-reporting
+        // the same three holders: refusals are remembered, so it makes progress.
         let s = reconcile_once(&*t, &fwd, &local, &mut st, &mut taken, Some(&[8000]))
             .await
             .unwrap();
-        assert!(s.conflicts.is_empty());
-        assert!(fwd.forwards.lock().unwrap().is_empty());
-
-        // Holder frees the port: the forward lands and the note clears.
-        fwd.busy_locals.lock().unwrap().clear();
-        let s = reconcile_once(&*t, &fwd, &local, &mut st, &mut taken, Some(&[8000]))
-            .await
-            .unwrap();
-        assert_eq!(s.added, vec![fs(18000, 8000)]);
+        assert!(s.conflicts.is_empty(), "conflict notes must dedupe");
+        let landed = s.added.first().copied().expect("a later probe must land");
+        assert_eq!(landed.remote, 8000);
+        assert!(crate::portmap::FALLBACK_RANGE.contains(&landed.local));
     }
 
     #[tokio::test]
     async fn generic_forward_failure_logs_and_continues() {
         let t = FakeTransport::new("devbox1");
         let fwd = FakeForwarder::default();
-        fwd.fail_locals.lock().unwrap().insert(18000);
+        fwd.fail_locals.lock().unwrap().insert(8000);
         let mut st = state();
         let mut taken = BTreeSet::new();
         let s = reconcile_once(
@@ -684,9 +837,21 @@ mod tests {
         )
         .await
         .unwrap();
-        // 8000's forward failed (not a conflict), 3000's landed.
-        assert_eq!(s.added, vec![fs(13000, 3000)]);
+        // 8000's forward failed (not a conflict, so no remap), 3000's landed.
+        assert_eq!(s.added, vec![fs(3000, 3000)]);
         assert!(s.conflicts.is_empty());
+    }
+
+    #[test]
+    fn conflict_notes_dedupe_until_the_holder_changes() {
+        let mut c = ConflictSet::default();
+        assert!(c.note(8000, 111));
+        assert!(!c.note(8000, 111));
+        assert!(c.note(8000, 222), "a new holder is news again");
+        c.clear(8000);
+        assert!(c.note(8000, 222));
+        c.prune(&[18000]);
+        assert!(c.note(8000, 222), "pruned note is forgotten");
     }
 
     // ---- run_reconcile_loop ----

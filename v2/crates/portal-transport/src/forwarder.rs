@@ -59,7 +59,16 @@ impl ListenerForwarder {
         // binding both loopbacks when available.
         let v4 = match TcpListener::bind(("127.0.0.1", local)).await {
             Ok(l) => l,
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // Both mean "this local port is not available to us": AddrInUse is
+            // another holder, PermissionDenied is a privileged port we cannot
+            // bind as a user agent. Callers treat them the same way — pick a
+            // different local port — so don't make them special-case Io.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
                 return Err(TransportError::PortInUse { local });
             }
             Err(e) => return Err(TransportError::Io(e)),
