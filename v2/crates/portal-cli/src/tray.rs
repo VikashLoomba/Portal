@@ -2,7 +2,10 @@
 //!
 //! Architecture:
 //! - The daemon owns ALL state; this process is a dumb renderer over the
-//!   read-only status socket (`api.sock`), exactly like `portal status`.
+//!   read-only status socket (`api.sock`), exactly like `portal status`. The
+//!   one action a row can take (open a forward in the browser) goes through
+//!   the same `open` handoff the daemon's URL relay uses — it needs no daemon
+//!   round trip and mutates nothing, so the socket stays read-only.
 //! - ZERO idle activity: no timers, no persistent connections. The ONLY
 //!   data fetch happens in `menuWillOpen:` — a sub-millisecond local Unix
 //!   socket round trip performed synchronously while AppKit prepares the
@@ -24,12 +27,20 @@ use std::time::Duration;
 /// and everything above it is unit-testable off-Mac.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
-    /// U+25CF colored by `color`; the row reads "● name — n forwards".
+    /// Host rows read "name" (plus a suffix when there is nothing to list);
+    /// forward rows read "remote → localhost:local" beneath their host.
     pub label: String,
-    pub color: Dot,
-    /// Disabled rows render gray and don't highlight (all of ours: the menu
-    /// is a status display, not a command surface — for now).
-    pub enabled: bool,
+    /// `Some` prepends U+25CF in that color. Forward rows are `None`: they
+    /// inherit their host's state, so a dot per port would only add noise.
+    pub dot: Option<Dot>,
+    /// NSMenuItem indentation level; 1 nests a forward under its host.
+    pub indent: u8,
+    /// `Some(local)` makes the row clickable and opens `http://127.0.0.1:local`
+    /// in the default browser. `None` rows (hosts, hints, the elided tail)
+    /// render gray and don't highlight: there is nothing to open. Enablement is
+    /// derived from this rather than tracked separately so an enabled row
+    /// without an action cannot be expressed.
+    pub open_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,11 +50,20 @@ pub enum Dot {
     Red,
 }
 
+/// Forward rows shown per host before the list is elided. A dev box can
+/// expose dozens of listeners; past a dozen the menu stops being readable and
+/// the tail row carries the rest as a count.
+pub const MAX_FORWARD_ROWS: usize = 12;
+
 /// Snapshot → rows. The states map to what the daemon can actually attest:
 /// - GREEN:  session up (HelloAck'd agent, SHA known);
 /// - YELLOW: box configured, daemon reconnecting (connected=false);
 /// - RED:    the daemon itself is unreachable (socket connect/read failed) —
 ///   one row for the whole menu, since per-box state is unknowable.
+///
+/// A connected box contributes its name plus one indented, clickable row per
+/// live forward, so the menu answers "what is reachable right now, and at
+/// which local port" instead of just how many there are.
 pub fn rows_from_status(json: &str) -> Vec<Row> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return vec![daemon_down_row()];
@@ -52,44 +72,83 @@ pub fn rows_from_status(json: &str) -> Vec<Row> {
         return vec![daemon_down_row()];
     };
     if boxes.is_empty() {
-        return vec![Row {
-            label: "no boxes configured — portal install <host>".into(),
-            color: Dot::Yellow,
-            enabled: false,
-        }];
+        return vec![host_row(
+            "no boxes configured — portal install <host>".into(),
+            Dot::Yellow,
+        )];
     }
-    boxes
-        .iter()
-        .map(|b| {
-            let name = b["name"].as_str().unwrap_or("?");
-            let connected = b["connected"].as_bool().unwrap_or(false);
-            let forwards = b["forwards"].as_array().map_or(0, |f| f.len());
-            if connected {
-                Row {
-                    label: format!(
-                        "{name} — {forwards} forward{}",
-                        if forwards == 1 { "" } else { "s" }
-                    ),
-                    color: Dot::Green,
-                    enabled: false,
-                }
-            } else {
-                Row {
-                    label: format!("{name} — reconnecting"),
-                    color: Dot::Yellow,
-                    enabled: false,
-                }
-            }
+    let mut rows = Vec::new();
+    for b in boxes {
+        let name = b["name"].as_str().unwrap_or("?");
+        if !b["connected"].as_bool().unwrap_or(false) {
+            rows.push(host_row(format!("{name} — reconnecting"), Dot::Yellow));
+            continue;
+        }
+        let forwards = forwards_of(b);
+        if forwards.is_empty() {
+            // Nothing to list, so the reason goes inline rather than into a
+            // child row that says only "none".
+            rows.push(host_row(format!("{name} — no forwards"), Dot::Green));
+            continue;
+        }
+        rows.push(host_row(name.to_string(), Dot::Green));
+        for (local, remote) in forwards.iter().take(MAX_FORWARD_ROWS) {
+            rows.push(forward_row(
+                format!("{remote} → localhost:{local}"),
+                Some(*local),
+            ));
+        }
+        if let Some(rest) = forwards
+            .len()
+            .checked_sub(MAX_FORWARD_ROWS)
+            .filter(|n| *n > 0)
+        {
+            rows.push(forward_row(format!("… and {rest} more"), None));
+        }
+    }
+    rows
+}
+
+/// `forwards` is `[[local, remote], …]` (daemon shape). Ordered by remote
+/// port — the number the user asked for — so the list reads in the order they
+/// think in and cannot reshuffle between opens.
+fn forwards_of(b: &serde_json::Value) -> Vec<(u16, u16)> {
+    let mut out: Vec<(u16, u16)> = b["forwards"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| Some((p[0].as_u64()? as u16, p[1].as_u64()? as u16)))
+                .collect()
         })
-        .collect()
+        .unwrap_or_default();
+    out.sort_by_key(|&(local, remote)| (remote, local));
+    out
+}
+
+/// A box's own row: dotted, flush left, never clickable — a host has no one
+/// URL to open.
+fn host_row(label: String, dot: Dot) -> Row {
+    Row {
+        label,
+        dot: Some(dot),
+        indent: 0,
+        open_port: None,
+    }
+}
+
+/// A row nested under a host: one forward (clickable), or the elided tail
+/// (not — it stands for ports whose numbers it doesn't carry).
+fn forward_row(label: String, open_port: Option<u16>) -> Row {
+    Row {
+        label,
+        dot: None,
+        indent: 1,
+        open_port,
+    }
 }
 
 pub fn daemon_down_row() -> Row {
-    Row {
-        label: "portal daemon not running".into(),
-        color: Dot::Red,
-        enabled: false,
-    }
+    host_row("portal daemon not running".into(), Dot::Red)
 }
 
 /// One status-socket round trip, bounded so a wedged daemon cannot hang the
@@ -165,8 +224,33 @@ mod macos {
         }
 
         impl Tray {
-            /// Quit is the only command: exit 0 = launchd SuccessfulExit rule
-            /// keeps us quit until next login/upgrade.
+            /// Click a forward row → open it in the default browser. The local
+            /// port rides on the item's `tag`, so the action reads it back off
+            /// `sender` and no per-row Rust state has to outlive the rebuild
+            /// that created the item.
+            ///
+            /// 127.0.0.1, never `localhost`: the forward always binds v4 (v6 is
+            /// best-effort) and `localhost` can resolve to ::1 first on a Mac,
+            /// which would miss the listener — same rule the callback relay
+            /// follows (see portal-core::callback). http, because that is what
+            /// a forwarded dev listener almost always speaks and the scheme is
+            /// all we cannot observe; a non-HTTP port fails visibly in the
+            /// browser rather than silently here.
+            #[unsafe(method(openForward:))]
+            fn open_forward(&self, sender: Option<&NSMenuItem>) {
+                // tag 0 = untagged item; a real forward is never port 0.
+                let Some(port) = sender
+                    .map(|s| s.tag())
+                    .and_then(|t| u16::try_from(t).ok())
+                    .filter(|p| *p != 0)
+                else {
+                    return;
+                };
+                crate::daemon::open_url(format!("http://127.0.0.1:{port}"));
+            }
+
+            /// Quit: exit 0 = launchd SuccessfulExit rule keeps us quit until
+            /// next login/upgrade.
             #[unsafe(method(quit:))]
             fn quit(&self, _sender: Option<&NSObject>) {
                 std::process::exit(0);
@@ -185,8 +269,22 @@ mod macos {
             menu.removeAllItems();
             for row in rows {
                 let item = NSMenuItem::new(mtm);
-                item.setAttributedTitle(Some(&dotted_title(row)));
-                item.setEnabled(row.enabled);
+                item.setAttributedTitle(Some(&row_title(row)));
+                item.setIndentationLevel(isize::from(row.indent));
+                item.setEnabled(row.open_port.is_some());
+                if let Some(port) = row.open_port {
+                    item.setTag(port as isize);
+                    // The label says "localhost" (the display convention shared
+                    // with `portal doctor`); the tooltip shows what actually
+                    // opens, so the click has no surprise in it.
+                    item.setToolTip(Some(&NSString::from_str(&format!(
+                        "Open http://127.0.0.1:{port}"
+                    ))));
+                    unsafe {
+                        item.setAction(Some(sel!(openForward:)));
+                        item.setTarget(Some(self));
+                    }
+                }
                 menu.addItem(&item);
             }
             menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -198,6 +296,7 @@ mod macos {
                     ns_string!(""),
                 )
             };
+            quit.setEnabled(true);
             unsafe { quit.setTarget(Some(self)) };
             menu.addItem(&quit);
         }
@@ -205,31 +304,34 @@ mod macos {
 
     /// "● label" with the bullet in the status color and the label in the
     /// standard menu font — native look in both light and dark mode because
-    /// only the dot carries color.
-    fn dotted_title(row: &Row) -> Retained<NSAttributedString> {
-        let color = match row.color {
-            Dot::Green => NSColor::systemGreenColor(),
-            Dot::Yellow => NSColor::systemYellowColor(),
-            Dot::Red => NSColor::systemRedColor(),
-        };
+    /// only the dot carries color. Dotless rows (the per-forward ones) are the
+    /// label alone, offset by AppKit's own indentation rather than padding.
+    fn row_title(row: &Row) -> Retained<NSAttributedString> {
         let font = NSFont::menuFontOfSize(0.0);
         unsafe {
-            let dot_attrs = NSDictionary::from_slices(
-                &[
-                    objc2_app_kit::NSForegroundColorAttributeName,
-                    objc2_app_kit::NSFontAttributeName,
-                ],
-                &[color.as_ref() as &objc2::runtime::AnyObject, &font],
-            );
             let text_attrs = NSDictionary::from_slices(
                 &[objc2_app_kit::NSFontAttributeName],
                 &[&font as &objc2::runtime::AnyObject],
             );
             let out = objc2_foundation::NSMutableAttributedString::new();
-            out.appendAttributedString(&NSAttributedString::new_with_attributes(
-                ns_string!("\u{25CF} "),
-                &dot_attrs,
-            ));
+            if let Some(dot) = row.dot {
+                let color = match dot {
+                    Dot::Green => NSColor::systemGreenColor(),
+                    Dot::Yellow => NSColor::systemYellowColor(),
+                    Dot::Red => NSColor::systemRedColor(),
+                };
+                let dot_attrs = NSDictionary::from_slices(
+                    &[
+                        objc2_app_kit::NSForegroundColorAttributeName,
+                        objc2_app_kit::NSFontAttributeName,
+                    ],
+                    &[color.as_ref() as &objc2::runtime::AnyObject, &font],
+                );
+                out.appendAttributedString(&NSAttributedString::new_with_attributes(
+                    ns_string!("\u{25CF} "),
+                    &dot_attrs,
+                ));
+            }
             out.appendAttributedString(&NSAttributedString::new_with_attributes(
                 &NSString::from_str(&row.label),
                 &text_attrs,
@@ -275,6 +377,10 @@ mod macos {
         }
 
         let menu = NSMenu::new(mtm);
+        // Enablement is ours, not AppKit's: rebuild sets it per row, so a
+        // status row can never light up just because the delegate happens to
+        // implement its action.
+        menu.setAutoenablesItems(false);
         menu.setDelegate(Some(ProtocolObject::from_ref(&*tray)));
         item.setMenu(Some(&menu));
 
@@ -287,24 +393,133 @@ mod macos {
 mod tests {
     use super::*;
 
+    fn labels(rows: &[Row]) -> Vec<&str> {
+        rows.iter().map(|r| r.label.as_str()).collect()
+    }
+
     #[test]
-    fn connected_box_is_green_with_forward_count() {
+    fn connected_box_lists_every_forward_under_its_name() {
         let rows = rows_from_status(
             r#"[{"name":"devbox1","host":"h","index":1,"connected":true,
                 "agent_sha":"cafe","forwards":[[18000,8000],[13000,3000]],
                 "clipsync_synced":true,"clipsync_change_id":1}]"#,
         );
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].color, Dot::Green);
-        assert_eq!(rows[0].label, "devbox1 — 2 forwards");
-        assert!(!rows[0].enabled);
+        assert_eq!(
+            labels(&rows),
+            [
+                "devbox1",
+                "3000 → localhost:13000",
+                "8000 → localhost:18000"
+            ]
+        );
+        assert_eq!(rows[0].dot, Some(Dot::Green));
+        assert_eq!(rows[0].indent, 0);
+        // Forwards inherit the host's state: no dot, nested one level.
+        assert!(rows[1..].iter().all(|r| r.dot.is_none() && r.indent == 1));
     }
 
     #[test]
-    fn disconnected_box_is_yellow() {
-        let rows = rows_from_status(r#"[{"name":"devbox1","connected":false,"forwards":[]}]"#);
-        assert_eq!(rows[0].color, Dot::Yellow);
-        assert_eq!(rows[0].label, "devbox1 — reconnecting");
+    fn forward_rows_open_their_local_port() {
+        let rows = rows_from_status(
+            r#"[{"name":"b","connected":true,"forwards":[[18000,8000],[13000,3000]]}]"#,
+        );
+        // Click target is the LOCAL port (what listens on the Mac), even though
+        // the label leads with the remote number.
+        assert_eq!(
+            rows.iter().map(|r| r.open_port).collect::<Vec<_>>(),
+            [None, Some(13000), Some(18000)]
+        );
+    }
+
+    #[test]
+    fn status_rows_are_never_clickable() {
+        let cases = [
+            r#"[{"name":"b","connected":true,"forwards":[]}]"#,
+            r#"[{"name":"b","connected":false,"forwards":[[18000,8000]]}]"#,
+            "[]",
+            "not json",
+        ];
+        for json in cases {
+            let rows = rows_from_status(json);
+            assert!(
+                rows.iter().all(|r| r.open_port.is_none()),
+                "input: {json:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn forwards_are_ordered_by_remote_port() {
+        let rows = rows_from_status(
+            r#"[{"name":"b","connected":true,
+                "forwards":[[18080,8080],[13000,3000],[15173,5173]]}]"#,
+        );
+        assert_eq!(
+            labels(&rows)[1..],
+            [
+                "3000 → localhost:13000",
+                "5173 → localhost:15173",
+                "8080 → localhost:18080"
+            ]
+        );
+    }
+
+    #[test]
+    fn single_forward_still_gets_its_own_row() {
+        let rows = rows_from_status(r#"[{"name":"b","connected":true,"forwards":[[18000,8000]]}]"#);
+        assert_eq!(labels(&rows), ["b", "8000 → localhost:18000"]);
+        assert_eq!(rows[1].open_port, Some(18000));
+    }
+
+    #[test]
+    fn long_list_is_elided_with_a_counted_tail() {
+        let forwards: Vec<String> = (0..MAX_FORWARD_ROWS + 3)
+            .map(|i| format!("[{},{}]", 18000 + i, 8000 + i))
+            .collect();
+        let rows = rows_from_status(&format!(
+            r#"[{{"name":"b","connected":true,"forwards":[{}]}}]"#,
+            forwards.join(",")
+        ));
+        assert_eq!(rows.len(), 1 + MAX_FORWARD_ROWS + 1);
+        let tail = rows.last().unwrap();
+        assert_eq!(tail.label, "… and 3 more");
+        assert_eq!(tail.indent, 1);
+        // It stands for ports whose numbers it doesn't carry — nothing to open.
+        assert_eq!(tail.open_port, None);
+    }
+
+    #[test]
+    fn connected_box_without_forwards_says_so_inline() {
+        let rows = rows_from_status(r#"[{"name":"devbox1","connected":true,"forwards":[]}]"#);
+        assert_eq!(labels(&rows), ["devbox1 — no forwards"]);
+        assert_eq!(rows[0].dot, Some(Dot::Green));
+    }
+
+    #[test]
+    fn disconnected_box_is_yellow_and_lists_nothing() {
+        let rows =
+            rows_from_status(r#"[{"name":"devbox1","connected":false,"forwards":[[18000,8000]]}]"#);
+        assert_eq!(labels(&rows), ["devbox1 — reconnecting"]);
+        assert_eq!(rows[0].dot, Some(Dot::Yellow));
+    }
+
+    #[test]
+    fn each_box_owns_its_own_forward_rows() {
+        let rows = rows_from_status(
+            r#"[{"name":"a","connected":true,"forwards":[[18000,8000]]},
+                {"name":"b","connected":true,"forwards":[[23000,3000]]},
+                {"name":"c","connected":false,"forwards":[]}]"#,
+        );
+        assert_eq!(
+            labels(&rows),
+            [
+                "a",
+                "8000 → localhost:18000",
+                "b",
+                "3000 → localhost:23000",
+                "c — reconnecting"
+            ]
+        );
     }
 
     #[test]
@@ -312,20 +527,23 @@ mod tests {
         for bad in ["", "not json", "{}"] {
             let rows = rows_from_status(bad);
             assert_eq!(rows, vec![daemon_down_row()], "input: {bad:?}");
-            assert_eq!(rows[0].color, Dot::Red);
+            assert_eq!(rows[0].dot, Some(Dot::Red));
         }
     }
 
     #[test]
     fn empty_config_hints_at_install() {
         let rows = rows_from_status("[]");
-        assert_eq!(rows[0].color, Dot::Yellow);
+        assert_eq!(rows[0].dot, Some(Dot::Yellow));
         assert!(rows[0].label.contains("portal install"));
     }
 
     #[test]
-    fn singular_forward_grammar() {
-        let rows = rows_from_status(r#"[{"name":"b","connected":true,"forwards":[[18000,8000]]}]"#);
-        assert_eq!(rows[0].label, "b — 1 forward");
+    fn malformed_forward_entries_are_skipped_not_fatal() {
+        let rows = rows_from_status(
+            r#"[{"name":"b","connected":true,
+                "forwards":[[18000,8000],["x",1],[2],null]}]"#,
+        );
+        assert_eq!(labels(&rows), ["b", "8000 → localhost:18000"]);
     }
 }
