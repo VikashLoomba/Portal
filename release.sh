@@ -40,6 +40,9 @@ fi
 OUT="$ROOT/target/aarch64-apple-darwin/release"
 BIN="$OUT/portal"
 ARTIFACT="portal-v2-darwin-arm64"
+APP="$OUT/Portal.app"
+APP_ARTIFACT="$OUT/Portal-v2-darwin-arm64.app.zip"
+DMG_ARTIFACT="$OUT/Portal-v2-darwin-arm64.dmg"
 NOTARY_ZIP="$(mktemp -t portal-notarize).zip"
 trap 'rm -f "$NOTARY_ZIP"' EXIT
 
@@ -92,7 +95,9 @@ fi
 # --- 1+2. Build (agents + Mac binary, embed-verified) -----------------------
 # ONE build path: the Makefile owns cross-compile + embed + verification, so
 # a portal binary without embedded agents cannot come out of any flow.
-make --no-print-directory build SHA="$SHA"
+AUTO_APP_MIGRATION=1
+[ "$TAG" = "local" ] && AUTO_APP_MIGRATION=0
+make --no-print-directory build SHA="$SHA" PORTAL_AUTO_APP_MIGRATION="$AUTO_APP_MIGRATION"
 
 # --- 3. Sign (Developer ID, hardened runtime) ------------------------------
 DEVELOPER_ID="${DEVELOPER_ID:-$(security find-identity -v -p codesigning | grep -o 'Developer ID Application: [^"]*' | head -1)}"
@@ -101,6 +106,16 @@ echo "==> signing with: $DEVELOPER_ID"
 codesign --sign "$DEVELOPER_ID" --options runtime --timestamp --force \
   --entitlements "$ROOT/portal.entitlements" "$BIN"
 codesign --verify --deep --strict --verbose=2 "$BIN"
+
+# Assemble the app only after the standalone compatibility binary is signed,
+# then sign the complete bundle. The CLI symlink installed by first launch
+# points at the app's executable, so its GUI + CLI + daemon carry one SHA.
+"$ROOT/scripts/package-app.sh" "$BIN" "$APP"
+codesign --sign "$DEVELOPER_ID" --options runtime --timestamp --force \
+  --entitlements "$ROOT/portal.entitlements" "$APP/Contents/MacOS/portal"
+codesign --sign "$DEVELOPER_ID" --options runtime --timestamp --force \
+  --entitlements "$ROOT/portal.entitlements" "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
 
 # --- 3b. Prove the signed binary actually EXECUTES (fails-closed) ----------
 # Static verification is NOT enough: restricted entitlements (e.g. the old
@@ -118,41 +133,89 @@ case "$SMOKE" in
   *"sha $SHA"*) echo "==> signed artifact runs: $SMOKE" ;;
   *) echo "portal: signed binary reports '$SMOKE' (want sha $SHA) — stale build?" >&2; exit 1 ;;
 esac
+MIGRATION_MODE="$("$BIN" _app-migration-mode)"
+EXPECTED_MODE=enabled
+[ "$TAG" = "local" ] && EXPECTED_MODE=disabled
+[ "$MIGRATION_MODE" = "$EXPECTED_MODE" ] || {
+  echo "portal: app migration bridge is $MIGRATION_MODE (want $EXPECTED_MODE)" >&2
+  exit 1
+}
 
-# --- 4. Notarize (notarytool; zip required) --------------------------------
+# --- 4. Notarize the application bundle ------------------------------------
 NOTARY_KEY_ID="${NOTARY_KEY_ID:?set NOTARY_KEY_ID in .env (App Store Connect key id)}"
 NOTARY_ISSUER="${NOTARY_ISSUER:?set NOTARY_ISSUER in .env (issuer UUID)}"
 NOTARY_KEY="${NOTARY_KEY:-$HOME/Downloads/AuthKey_${NOTARY_KEY_ID}.p8}"
 [ -f "$NOTARY_KEY" ] || { echo "notary key not found: $NOTARY_KEY" >&2; exit 1; }
-echo "==> notarizing (key $NOTARY_KEY_ID)"
-ditto -c -k --keepParent "$BIN" "$NOTARY_ZIP"
+echo "==> notarizing Portal.app (key $NOTARY_KEY_ID)"
+ditto -c -k --keepParent "$APP" "$NOTARY_ZIP"
 NOTARY_OUT="$(xcrun notarytool submit "$NOTARY_ZIP" \
   --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
   --wait --timeout 20m)"
 echo "$NOTARY_OUT" | tail -4
 echo "$NOTARY_OUT" | grep -q "status: Accepted" || {
-  echo "portal: notarization NOT accepted" >&2
+  echo "portal: app notarization NOT accepted" >&2
   echo "$NOTARY_OUT" | grep -iE "status|issue|error" >&2 || true
   exit 1
 }
-# Single-file binaries can't be stapled; the ticket is in Apple's cloud.
+xcrun stapler staple "$APP"
+xcrun stapler validate "$APP"
+
+# Pre-app upgraders still fetch the standalone bridge artifact. It is signed
+# separately from the app executable, so submit it explicitly.
+rm -f "$NOTARY_ZIP"
+ditto -c -k --keepParent "$BIN" "$NOTARY_ZIP"
+BIN_NOTARY_OUT="$(xcrun notarytool submit "$NOTARY_ZIP" \
+  --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
+  --wait --timeout 20m)"
+echo "$BIN_NOTARY_OUT" | tail -4
+echo "$BIN_NOTARY_OUT" | grep -q "status: Accepted" || {
+  echo "portal: standalone binary notarization NOT accepted" >&2
+  echo "$BIN_NOTARY_OUT" | grep -iE "status|issue|error" >&2 || true
+  exit 1
+}
+
+# The downloadable archive preserves the signed+stapled bundle. The DMG is
+# the normal drag-to-Applications experience and receives its own ticket.
+rm -f "$APP_ARTIFACT" "$DMG_ARTIFACT"
+ditto -c -k --keepParent "$APP" "$APP_ARTIFACT"
+DMG_STAGE="$(mktemp -d -t portal-dmg)"
+cp -R "$APP" "$DMG_STAGE/Portal.app"
+ln -s /Applications "$DMG_STAGE/Applications"
+hdiutil create -quiet -volname Portal -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_ARTIFACT"
+rm -rf "$DMG_STAGE"
+echo "==> notarizing Portal DMG"
+DMG_NOTARY_OUT="$(xcrun notarytool submit "$DMG_ARTIFACT" \
+  --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
+  --wait --timeout 20m)"
+echo "$DMG_NOTARY_OUT" | tail -4
+echo "$DMG_NOTARY_OUT" | grep -q "status: Accepted" || {
+  echo "portal: DMG notarization NOT accepted" >&2
+  echo "$DMG_NOTARY_OUT" | grep -iE "status|issue|error" >&2 || true
+  exit 1
+}
+xcrun stapler staple "$DMG_ARTIFACT"
+xcrun stapler validate "$DMG_ARTIFACT"
+# The legacy single-file binary cannot be stapled; its ticket lives in cloud.
 
 # --- 5. Stage artifacts + minisign ------------------------------------------
-# Two asset names, same signed+notarized bytes: the current upgrader fetches
-# $ARTIFACT; v1's `portal upgrade` hardcodes portal-darwin-arm64 — without
-# that alias every v1 install errors on upgrade ("release publishes no
-# portal-darwin-arm64 asset") instead of moving to v2.
+# Compatibility assets remain mandatory for pre-app upgraders: v2 CLI builds
+# fetch $ARTIFACT, while v1 hardcodes portal-darwin-arm64. The release bridge
+# they install automatically finishes migration to the app archive.
 ART="$OUT/$ARTIFACT"
 V1ART="$OUT/portal-darwin-arm64"
 cp "$BIN" "$ART"
 cp "$BIN" "$V1ART"
 MINISIGN_KEY="${MINISIGN_KEY:-$HOME/.portal-minisign.key}"
+rm -f "$ART.minisig" "$V1ART.minisig" "$APP_ARTIFACT.minisig" "$DMG_ARTIFACT.minisig"
 if command -v minisign >/dev/null && [ -f "$MINISIGN_KEY" ]; then
   echo "==> minisign"
   minisign -S -s "$MINISIGN_KEY" -x "$ART.minisig" -m "$ART"
   minisign -S -s "$MINISIGN_KEY" -x "$V1ART.minisig" -m "$V1ART"
+  minisign -S -s "$MINISIGN_KEY" -x "$APP_ARTIFACT.minisig" -m "$APP_ARTIFACT"
+  minisign -S -s "$MINISIGN_KEY" -x "$DMG_ARTIFACT.minisig" -m "$DMG_ARTIFACT"
 else
-  echo "portal: minisign unavailable ($MINISIGN_KEY missing?) — release will be unsigned" >&2
+  echo "portal: minisign unavailable ($MINISIGN_KEY missing?) — aborting release" >&2
+  exit 1
 fi
 
 # --- 6. Publish or install --------------------------------------------------
@@ -200,13 +263,19 @@ if [ "${INSTALL:-0}" = "1" ]; then
   exit 0
 fi
 echo "==> publishing $TAG"
-ASSETS=("$ART" "$V1ART")
+ASSETS=("$DMG_ARTIFACT" "$APP_ARTIFACT" "$ART" "$V1ART")
+[ -f "$DMG_ARTIFACT.minisig" ] && ASSETS+=("$DMG_ARTIFACT.minisig")
+[ -f "$APP_ARTIFACT.minisig" ] && ASSETS+=("$APP_ARTIFACT.minisig")
 [ -f "$ART.minisig" ] && ASSETS+=("$ART.minisig")
 [ -f "$V1ART.minisig" ] && ASSETS+=("$V1ART.minisig")
 if gh release view "$TAG" >/dev/null 2>&1; then
   gh release upload "$TAG" --clobber "${ASSETS[@]}"
 else
-  gh release create "$TAG" --title "portal $TAG" --generate-notes "${ASSETS[@]}"
+  # Keep the release invisible to /releases/latest until every mutually
+  # dependent app + compatibility asset is uploaded. Otherwise an old updater
+  # could install the bridge while the app archive is not available yet.
+  gh release create "$TAG" --draft --title "portal $TAG" --generate-notes "${ASSETS[@]}"
+  gh release edit "$TAG" --draft=false
 fi
 echo "==> done: $TAG published"
 gh release view "$TAG" --json url -q .url

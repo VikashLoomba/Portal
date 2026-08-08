@@ -1,26 +1,15 @@
-# Embedding portal as an application sidecar
+# Embedding and controlling the local portal daemon
 
-An embedding application owns one `portal daemon` child for the application's
-full lifetime and reads state from that instance's status socket.
+Portal.app communicates with the local macOS daemon over its owner-only Unix
+socket. The daemon owns SSH sessions, remote `portald` agents, forwarding, and
+API configuration mutations; UI clients do not connect to remote agents
+directly. The CLI retains direct lifecycle/recovery paths while sharing the
+same validated configuration model.
 
-> **Scope note.** v2 exposes a **read-only** status socket. The streamed control
-> API this document used to describe — `/v1/events`, `/v1/setup`, `/v1/exec`, and
-> the in-process host hot-swap that let a UI drive onboarding — is **not part of
-> v2**. Onboarding a box from an embedding app means shelling out to
-> `portal install` / `portal box add` and watching the status socket, not
-> streaming setup events.
->
-> The `/v1/*` client code in [`clients/ts`](../clients/ts) and
-> [`examples/shell-desktop`](../examples/shell-desktop) targets that removed API.
-> Note that `clients/ts` is mixed: its CBOR/framing layer is current and is
-> checked against [`docs/vectors/`](vectors) in CI alongside the Rust
-> implementation, while only its HTTP control-API half is stale. See that
-> package's README for the split.
+## Resolve paths
 
-## Resolve app-scoped paths
-
-Keep the embedded instance separate from a CLI-installed portal. Point both
-portal path variables at an app-owned directory:
+The normal socket is `~/.config/portal/api.sock`. An embedding application that
+owns a private daemon can isolate it with environment overrides:
 
 ```ts
 const configDir = Deno.env.get("PORTAL_CONFIG_DIR") ??
@@ -41,53 +30,62 @@ const child = new Deno.Command(binPath, {
 }).spawn();
 ```
 
-`PORTAL_CONFIG_DIR` relocates the configuration directory and the default API
-socket; `PORTAL_API_SOCK` overrides the socket path on its own. Set both
-explicitly so an embedded instance and a system-installed one can never share a
-socket — the socket doubles as portal's single-instance lock, so two instances
-pointed at one path will fight over it.
+`PORTAL_CONFIG_DIR` relocates the configuration directory and default API
+socket; `PORTAL_API_SOCK` overrides the socket alone. The socket also acts as
+the daemon's single-instance lock, so two instances must never share it.
 
-There is deliberately **no `PORTAL_SOCK`**. v2 speaks SSH in-process (russh), so
-there is no `ControlMaster` socket to isolate; v1's warning about two portals
-sharing a multiplexed SSH connection does not apply.
+## Versioned local API
 
-`portal daemon` is the hidden foreground entry point launchd uses. `portal run`
-also starts the daemon, but exists only so a v1 LaunchAgent plist keeps working
-across a v1→v2 upgrade; new embedders should use `daemon`.
+API v1 is newline-delimited JSON. A new client writes one request immediately;
+the daemon returns one response with the same `id` and closes. Every envelope
+contains `api_version: 1`.
 
-## Read status
-
-Connect to the socket and read until EOF. The daemon writes one
-pretty-printed JSON snapshot per connection and closes — there is no request
-framing and no streaming:
-
-```ts
-const conn = await Deno.connect({ path: apiSock, transport: "unix" });
-const snapshot = JSON.parse(new TextDecoder().decode(await toArrayBuffer(conn)));
+```json
+{"api_version":1,"id":1,"method":"get_state"}
 ```
 
-The snapshot is an array with one object per configured box:
+A successful response is typed by `result`:
 
-| Field | Type | Meaning |
-|---|---|---|
-| `name` | string | box name |
-| `host` | string | ssh alias or `user@host` |
-| `index` | number | port-mapping slot |
-| `connected` | bool | SSH session is up |
-| `agent_sha` | string \| null | build SHA of the running dev-box agent |
-| `forwards` | `[remote, local][]` | live forwards |
-| `clipsync_synced` | bool | deployed shims match this build |
-| `clipsync_change_id` | number | monotonic clipboard-config generation |
+```json
+{"api_version":1,"id":1,"result":"state","state":{"version":"2.0.15","build_sha":"…","boxes":[],"statuses":[],"features":{}}}
+```
 
-An unconfigured instance returns `[]`. A missing socket file means the daemon is
-not running yet; poll rather than assuming failure, since the daemon binds the
-socket after startup.
+Errors are explicit and do not overload transport failure:
 
-Treat `connected: false` as transient — portal reconnects on its own with
-backoff, so surface it as "reconnecting" rather than an error state. An
-`agent_sha` that differs from the app's bundled portal build means the box agent
-is mid-reconvergence.
+```json
+{"api_version":1,"id":1,"result":"error","code":"operation_failed","message":"…"}
+```
 
-Auth is peer uid over an owner-only (`0600`) Unix socket. There are no bearer
-tokens, so an embedding app must not expose the socket or its contents to a less
-trusted process.
+The Rust request and response schema is defined in
+[`portal_core::localapi`](../crates/portal-core/src/localapi.rs). API v1 methods:
+
+| Method | Purpose |
+|---|---|
+| `get_state` | Build, configured boxes, live status, and feature gates |
+| `subscribe_state` | Keep the connection open and emit changed state snapshots |
+| `add_box` | Add and enable a configured SSH box |
+| `remove_box` | Remove a configured box |
+| `set_box_enabled` | Connect/disconnect without forgetting configuration |
+| `set_allow` | Add or remove forced remote ports |
+| `set_feature` | Toggle a known capability gate |
+| `get_logs` | Read a bounded tail of the local daemon log |
+
+`subscribe_state` emits a state response immediately and then only when its
+rendered state changes. Clients should reconnect after EOF or a daemon restart.
+
+Configuration-changing methods validate and atomically write `config.toml`.
+The daemon's existing hot-reload reconciles SSH stacks from the new document.
+The socket verifies the peer uid in addition to filesystem mode `0600`; there
+are no bearer tokens, so it must not be proxied to a less-trusted process.
+
+## Legacy status compatibility
+
+Portal 2.0 clients connect and wait without sending a request. For compatibility,
+a client that writes nothing during the short protocol-detection window still
+receives the old pretty-printed bare JSON status array and EOF. New code should
+always use the versioned API.
+
+The stale HTTP `/v1/*` client under [`clients/ts`](../clients/ts) and the
+unmaintained [`examples/shell-desktop`](../examples/shell-desktop) do not
+implement this API. Their wire-protocol CBOR fixtures remain useful, but their
+local HTTP control layer must not be used for Portal v2.

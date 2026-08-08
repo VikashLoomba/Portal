@@ -1,10 +1,12 @@
-//! `portal` — v2 CLI + daemon entry point. Most verbs are file/launchctl
-//! operations (no daemon API needed); `status` reads the daemon's read-only
-//! status socket; `daemon` is what launchd runs.
+//! `portal` — CLI, local daemon, and native Portal.app entry point. The GUI
+//! uses the versioned owner-only local API; existing CLI verbs retain their
+//! command shapes and lifecycle recovery paths.
 
+mod app_install;
 mod daemon;
 mod deployment;
 mod launchd;
+mod local_client;
 mod prompt_helper;
 mod services;
 mod tray;
@@ -26,7 +28,7 @@ use portal_transport::runner::OsRunner;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -37,6 +39,8 @@ enum Command {
     /// (launchd: "spawn scheduled", ThrottleInterval pacing).
     #[command(hide = true)]
     Run,
+    /// Open the native Portal desktop application
+    App,
     /// Menu bar status item (normally started by launchd; `portal install`
     /// and `portal upgrade` manage its LaunchAgent)
     Tray,
@@ -101,7 +105,19 @@ enum Command {
     /// Stable-path second phase of self-upgrade. The public `upgrade` command
     /// execs a hard-linked copy before replacing ~/.local/bin/portal.
     #[command(name = "_apply-upgrade", hide = true)]
-    ApplyUpgrade { candidate: PathBuf, tag: String },
+    ApplyUpgrade {
+        #[arg(long)]
+        app: bool,
+        candidate: PathBuf,
+        tag: String,
+        staging: PathBuf,
+    },
+    /// Finish the one-time standalone-to-Portal.app migration after an older
+    /// upgrader has installed this compatibility binary.
+    #[command(name = "_complete-app-migration", hide = true)]
+    CompleteAppMigration,
+    #[command(name = "_app-migration-mode", hide = true)]
+    AppMigrationMode,
     /// Run the daemon in the foreground (launchd entry point)
     #[command(hide = true)]
     Daemon,
@@ -175,7 +191,7 @@ fn main() {
     let home = PathBuf::from(std::env::var_os("HOME").expect("HOME not set"));
     let uid = unsafe { libc_getuid() };
     let paths = Paths::derive(&home, uid);
-    let code = run(cli.command, paths);
+    let code = run(cli.command.unwrap_or(Command::App), paths);
     std::process::exit(code);
 }
 
@@ -190,6 +206,7 @@ pub(crate) unsafe fn libc_getuid() -> u32 {
 fn run(cmd: Command, paths: Paths) -> i32 {
     match cmd {
         Command::Daemon | Command::Run => block_on_daemon(paths),
+        Command::App => tray::run_app(),
         Command::Tray => tray::run(),
         Command::Install { host, name, index } => install(&paths, &host, name, index),
         Command::Uninstall => uninstall(&paths),
@@ -203,8 +220,23 @@ fn run(cmd: Command, paths: Paths) -> i32 {
         Command::Logs { follow, lines } => logs(&paths, follow, lines),
         Command::Doctor => doctor(&paths),
         Command::Upgrade { check, force } => upgrade(&paths, check, force),
-        Command::ApplyUpgrade { candidate, tag } => {
-            apply_prepared_upgrade(&paths, &candidate, &tag)
+        Command::ApplyUpgrade {
+            app,
+            candidate,
+            tag,
+            staging,
+        } => apply_prepared_upgrade(&paths, &candidate, &tag, &staging, app),
+        Command::CompleteAppMigration => complete_app_migration(&paths),
+        Command::AppMigrationMode => {
+            println!(
+                "{}",
+                if auto_app_migration_enabled() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            0
         }
         Command::Features { name, state } => features(&paths, name, state),
         Command::Keychain(cmd) => keychain(cmd),
@@ -258,6 +290,135 @@ fn keychain(cmd: KeychainCmd) -> i32 {
 fn keychain(_cmd: KeychainCmd) -> i32 {
     eprintln!("portal keychain: macOS only");
     2
+}
+
+/// First-launch bridge for a signed Portal.app. The app bundle remains the
+/// source of truth; the familiar CLI path is an owner-writable symlink to its
+/// bundled executable. The daemon is then registered and started independently
+/// so closing or quitting the UI never tears down SSH connections.
+fn prepare_desktop_app(paths: &Paths) -> Result<(), String> {
+    // Manual UI smoke tests use an isolated daemon and must not register the
+    // real user's launchd labels.
+    if std::env::var_os("PORTAL_SKIP_APP_BOOTSTRAP").is_some() {
+        return Ok(());
+    }
+    let current = std::env::current_exe().map_err(|e| e.to_string())?;
+    let bundled = current
+        .ancestors()
+        .any(|path| path.extension().is_some_and(|extension| extension == "app"));
+    if bundled
+        && (current.starts_with("/Volumes")
+            || current.to_string_lossy().contains("/AppTranslocation/"))
+    {
+        return Err("move Portal.app to Applications before opening it".into());
+    }
+    let mut runtime_is_bundled = false;
+    let mut migrate_standalone = false;
+
+    if bundled {
+        std::fs::create_dir_all(&paths.bin_dir).map_err(|e| e.to_string())?;
+        match std::fs::symlink_metadata(&paths.bin_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(&paths.bin_path).map_err(|e| e.to_string())?;
+                if target != current {
+                    let staged = paths.bin_dir.join(".portal.app-link");
+                    let _ = std::fs::remove_file(&staged);
+                    std::os::unix::fs::symlink(&current, &staged).map_err(|e| e.to_string())?;
+                    std::fs::rename(&staged, &paths.bin_path).map_err(|e| e.to_string())?;
+                }
+                runtime_is_bundled = true;
+            }
+            Ok(_) => {
+                // Do not let an older app bundle undo a newer `portal upgrade`.
+                // Otherwise first app launch migrates the standalone install
+                // to the bundle-owned executable below.
+                let standalone = std::process::Command::new(&paths.bin_path)
+                    .arg("--version")
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .and_then(|output| String::from_utf8(output.stdout).ok())
+                    .and_then(|output| {
+                        output
+                            .split_whitespace()
+                            .find_map(|word| word.strip_prefix('v').map(str::to_string))
+                    });
+                migrate_standalone = !standalone.is_some_and(|version| {
+                    upgrade::is_newer(
+                        &format!("v{version}"),
+                        &format!("v{}", env!("CARGO_PKG_VERSION")),
+                    )
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::os::unix::fs::symlink(&current, &paths.bin_path)
+                    .map_err(|e| format!("install portal CLI link: {e}"))?;
+                runtime_is_bundled = true;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+
+    let runner = OsRunner;
+    let agents = services::LoginAgents::new(&runner, paths);
+    agents.write_manifests()?;
+
+    if migrate_standalone {
+        let _deployment = deployment::Deployment::acquire(&paths.bin_path)?;
+        let backup = paths.bin_dir.join(".portal.pre-app");
+        if backup.exists() {
+            return Err(format!(
+                "stale app-migration backup at {}",
+                backup.display()
+            ));
+        }
+        let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+        rt.block_on(agents.quiesce())?;
+        if let Err(error) = std::fs::rename(&paths.bin_path, &backup) {
+            let recovery = rt.block_on(agents.start_daemon_fresh());
+            return Err(match recovery {
+                Ok(()) => format!("stage existing portal CLI: {error}; daemon restarted"),
+                Err(recovery) => format!(
+                    "stage existing portal CLI: {error}; restarting daemon failed: {recovery}"
+                ),
+            });
+        }
+        let install_result = (|| {
+            let staged = paths.bin_dir.join(".portal.app-link");
+            let _ = std::fs::remove_file(&staged);
+            std::os::unix::fs::symlink(&current, &staged)
+                .map_err(|e| format!("stage portal app CLI link: {e}"))?;
+            std::fs::rename(&staged, &paths.bin_path)
+                .map_err(|e| format!("install portal app CLI link: {e}"))?;
+            agents.write_manifests()?;
+            rt.block_on(agents.start_daemon_fresh())
+        })();
+        if let Err(error) = install_result {
+            let _ = rt.block_on(agents.quiesce());
+            let _ = std::fs::remove_file(&paths.bin_path);
+            std::fs::rename(&backup, &paths.bin_path)
+                .map_err(|rollback| format!("{error}; restore standalone CLI: {rollback}"))?;
+            agents.write_manifests()?;
+            let recovery = rt.block_on(agents.start_daemon_fresh());
+            return Err(match recovery {
+                Ok(()) => format!("{error}; restored the standalone daemon"),
+                Err(recovery) => format!("{error}; restoring daemon failed: {recovery}"),
+            });
+        }
+        std::fs::remove_file(&backup).map_err(|e| format!("remove app-migration backup: {e}"))?;
+        runtime_is_bundled = true;
+    }
+
+    let daemon_matches = matches!(
+        local_client::request(&paths.api_sock, portal_core::localapi::Request::GetState),
+        Ok(portal_core::localapi::Response::State { state })
+            if !runtime_is_bundled || state.build_sha == BUILD_SHA
+    );
+    if daemon_matches {
+        return Ok(());
+    }
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(agents.restart_daemon_fresh())
 }
 
 fn block_on_daemon(paths: Paths) -> i32 {
@@ -713,6 +874,9 @@ fn logs(paths: &Paths, follow: bool, lines: usize) -> i32 {
 }
 
 fn upgrade(paths: &Paths, check: bool, force: bool) -> i32 {
+    if !check {
+        let _ = std::fs::remove_file(paths.config_dir.join("app-migration.failed"));
+    }
     // Network and cryptographic verification happen while the current daemon
     // remains untouched. Only a fully executable candidate enters deployment.
     let install_dir = paths
@@ -729,6 +893,7 @@ fn upgrade(paths: &Paths, check: bool, force: bool) -> i32 {
             &current,
             check,
             force,
+            app_install::app_is_needed(paths),
         ))
     };
     match plan {
@@ -770,48 +935,180 @@ fn exec_upgrade_helper(prepared: upgrade::PreparedUpgrade) -> i32 {
         }
     }
 
-    let error = std::process::Command::new(&helper)
-        .arg("_apply-upgrade")
+    let mut command = std::process::Command::new(&helper);
+    command.arg("_apply-upgrade");
+    if prepared.kind == upgrade::ArtifactKind::AppBundle {
+        command.arg("--app");
+    }
+    let error = command
         .arg(prepared.candidate())
         .arg(&prepared.tag)
+        .arg(prepared.staging_dir())
         .exec();
     eprintln!("portal upgrade: exec stable updater helper: {error}");
     1
 }
 
-fn apply_prepared_upgrade(paths: &Paths, candidate: &std::path::Path, tag: &str) -> i32 {
-    let Some(staging) = candidate.parent() else {
-        eprintln!("portal upgrade: staged candidate has no parent directory");
-        return 1;
-    };
-    let valid_staging = candidate.file_name().and_then(|s| s.to_str()) == Some("portal.new")
-        && staging
-            .file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|name| name.starts_with("portal-upgrade-"));
+fn apply_prepared_upgrade(
+    paths: &Paths,
+    candidate: &std::path::Path,
+    tag: &str,
+    staging: &std::path::Path,
+    app: bool,
+) -> i32 {
+    let valid_staging = staging
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("portal-upgrade-"))
+        && candidate.starts_with(staging)
+        && if app {
+            candidate.file_name().and_then(|name| name.to_str()) == Some("Portal.app")
+        } else {
+            candidate.file_name().and_then(|name| name.to_str()) == Some("portal.new")
+        };
     if !valid_staging {
         eprintln!("portal upgrade: invalid staged candidate path");
         return 1;
     }
 
-    let result = deploy_binary(paths, Some(DeployCandidate::Staged(candidate)));
-    // `exec` bypassed TempDir::drop. All launchctl work is complete now, so
-    // unlinking this running helper is safe; its mapped inode lives to exit.
+    let result = if app {
+        app_install::install_verified_app(candidate, paths, tag)
+    } else {
+        deploy_binary(paths, Some(DeployCandidate::Staged(candidate)))
+    };
+    // `exec` bypassed TempDir::drop. The helper's mapped inode remains valid
+    // while its staging pathname is removed.
     let _ = std::fs::remove_dir_all(staging);
     match result {
         Ok(report) => {
             println!("portal: upgraded to {tag}");
-            println!("portal: daemon health gate passed on the new binary");
+            println!(
+                "portal: {} installed and daemon health gate passed",
+                if app { "Portal.app" } else { "new binary" }
+            );
             if let Some(warning) = report.tray_warning {
                 eprintln!("portal: {warning} (forwarding is healthy)");
             }
             0
         }
-        Err(e) => {
-            eprintln!("portal upgrade: {e}");
+        Err(error) => {
+            eprintln!("portal upgrade: {error}");
             1
         }
     }
+}
+
+/// Release compatibility binaries use this once: an older `portal upgrade`
+/// can only install the standalone asset it knows about, so the newly started
+/// daemon launches this stable child to finish the signed app-bundle migration.
+fn auto_app_migration_enabled() -> bool {
+    option_env!("PORTAL_AUTO_APP_MIGRATION") == Some("1")
+}
+
+pub(crate) fn spawn_app_migration_if_needed(paths: &Paths) {
+    if !auto_app_migration_enabled()
+        || std::env::var_os("PORTAL_DISABLE_APP_MIGRATION").is_some()
+        || paths.config_dir.join("app-migration.failed").exists()
+        || !app_install::app_is_needed(paths)
+    {
+        return;
+    }
+    let Ok(current) = std::env::current_exe() else {
+        return;
+    };
+    if app_install::app_from_executable(&current).is_some() {
+        return;
+    }
+    let Ok(installed) = std::fs::canonicalize(&paths.bin_path) else {
+        return;
+    };
+    let Ok(running) = std::fs::canonicalize(&current) else {
+        return;
+    };
+    if installed != running {
+        return;
+    }
+
+    let _ = std::fs::create_dir_all(paths.log.parent().unwrap_or(&paths.home));
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.log)
+        .ok();
+    let mut command = std::process::Command::new(current);
+    command
+        .arg("_complete-app-migration")
+        .stdin(std::process::Stdio::null());
+    if let Some(log) = log {
+        if let Ok(stdout) = log.try_clone() {
+            command.stdout(std::process::Stdio::from(stdout));
+        }
+        command.stderr(std::process::Stdio::from(log));
+    }
+    match command.spawn() {
+        Ok(_) => tracing::info!("scheduled standalone-to-Portal.app migration"),
+        Err(error) => tracing::warn!(%error, "could not schedule Portal.app migration"),
+    }
+}
+
+fn complete_app_migration(paths: &Paths) -> i32 {
+    use fs2::FileExt as _;
+
+    if !app_install::app_is_needed(paths) {
+        return 0;
+    }
+    if let Err(error) = std::fs::create_dir_all(&paths.config_dir) {
+        eprintln!("portal app migration: {error}");
+        return 1;
+    }
+    let lock_path = paths.config_dir.join("app-migration.lock");
+    let lock = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!(
+                "portal app migration: open {}: {error}",
+                lock_path.display()
+            );
+            return 1;
+        }
+    };
+    if lock.try_lock_exclusive().is_err() {
+        return 0;
+    }
+
+    // The older upgrader still owns the deployment lock while it health-checks
+    // this daemon. Wait on that condition rather than racing its transaction.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match deployment::Deployment::acquire(&paths.bin_path) {
+            Ok(deployment) => {
+                drop(deployment);
+                break;
+            }
+            Err(error) if std::time::Instant::now() < deadline => {
+                tracing::debug!(%error, "waiting for compatibility upgrade to finish");
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(error) => {
+                eprintln!("portal app migration: {error}");
+                return 1;
+            }
+        }
+    }
+    let code = upgrade(paths, false, true);
+    if code != 0 && app_install::app_is_needed(paths) {
+        let _ = std::fs::write(
+            paths.config_dir.join("app-migration.failed"),
+            "automatic Portal.app migration failed; run `portal upgrade` to retry\n",
+        );
+    }
+    code
 }
 
 fn doctor(paths: &Paths) -> i32 {

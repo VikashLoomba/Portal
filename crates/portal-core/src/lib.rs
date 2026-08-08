@@ -14,8 +14,8 @@
 //!   clipsync publisher + notify/open-url routing; shared watcher fan-out;
 //!   cross-box taken-set; status snapshots; composition-tested end-to-end
 //!   against a scripted portald over real frames)
-//! - `localapi`   — DOWNGRADED: full API deferred; a minimal read-only status
-//!   socket ships with the CLI phase (doubles as the single-instance lock)
+//! - `localapi`   — DONE: versioned local control schema for Portal.app + CLI;
+//!   daemon transport also preserves the legacy bare status snapshot
 
 pub mod agentclient;
 pub mod bootstrap;

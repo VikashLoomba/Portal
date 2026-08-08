@@ -20,36 +20,31 @@ localhost ports.
 
 ## Installation
 
-### Recommended: download the latest release
+### Recommended: install Portal.app
 
-portal ships a signed, notarized **Apple Silicon** (arm64) Mac binary with every
-release. Download the latest one, make it executable, and run the installer:
+portal ships as a signed, notarized **Apple Silicon** macOS application.
+Download `Portal-v2-darwin-arm64.dmg` from the latest release, open it, and drag
+**Portal** to Applications. The first launch:
+
+1. installs the `portal` CLI at `~/.local/bin/portal`;
+2. registers and starts the independent local daemon;
+3. installs the menu-bar login agent; and
+4. opens the native box-management window.
+
+Add the first remote box with **Add Box…** in Portal, or with the unchanged CLI:
 
 ```sh
-curl -fL -o portal \
-  https://github.com/VikashLoomba/Portal/releases/latest/download/portal-v2-darwin-arm64
-chmod +x portal
-./portal install <ssh-host>
+portal box add <ssh-host>
 ```
-
-(Or, with the [`gh`](https://cli.github.com) CLI:
-`gh release download -R VikashLoomba/Portal --pattern portal-v2-darwin-arm64`.)
-
-Every release is also signed with [minisign](https://jedisct1.github.io/minisign/);
-the `.minisig` is published next to the binary and
-[`minisign.pub`](minisign.pub) is the key. `portal upgrade` verifies that
-signature for you.
-
-`portal install` copies the binary to `~/.local/bin/portal`, saves the box
-config, loads the background login agent and the menu bar item, deploys the
-clipboard shims and notification hook to the box, and runs a self-test so you
-know the path works before you rely on it. After it runs you can invoke `portal`
-from anywhere (it prints a one-line `export PATH=...` to add if `~/.local/bin`
-isn't already on your PATH).
 
 `<ssh-host>` may be an alias from `~/.ssh/config` or `user@hostname`. The
 background daemon connects headlessly, so **key-based passwordless SSH is
 required** (`ssh-copy-id <ssh-host>` if you haven't set it up).
+
+Every app archive, DMG, and compatibility CLI binary is also signed with
+[minisign](https://jedisct1.github.io/minisign/); [`minisign.pub`](minisign.pub)
+is the key. Existing command-line installations remain upgradeable during the
+app transition.
 
 Add more boxes at any time:
 
@@ -73,8 +68,10 @@ rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 ```sh
 git clone https://github.com/VikashLoomba/Portal.git
 cd Portal
-make build              # produces ./target/release/portal with agents embedded
-make install            # build, then install to ~/.local/bin and reload
+make build              # build the CLI/daemon with both embedded agents
+make app                # assemble target/aarch64-apple-darwin/release/Portal.app
+make dmg                # assemble a drag-to-Applications Portal.dmg
+make install HOST=box   # legacy CLI install + login-agent reload
 ```
 
 Use `make`, not raw `cargo`: the Makefile stamps **one** git SHA across the
@@ -85,6 +82,8 @@ what causes a reconnect loop, so the check is not cosmetic.
 | Target | What it does |
 |---|---|
 | `make build` | cross-build both agents, embed, build `portal` |
+| `make app` | assemble an unsigned `Portal.app` for development/signing |
+| `make dmg` | assemble an unsigned drag-to-Applications DMG |
 | `make test` | workspace tests |
 | `make lint` | `cargo fmt --check` + `clippy -D warnings` |
 | `make check` | `test` + `lint` |
@@ -104,13 +103,20 @@ portal upgrade          # install the newest release and reload the daemon
 portal upgrade --check  # just report whether a newer release exists
 ```
 
-`upgrade` downloads the latest published `portal-v2-darwin-arm64`, **verifies
-its minisign signature, runs it once to confirm it works and reports the
-expected version**, and only then swaps it into `~/.local/bin/portal` before
-reloading the login agents. A download that is truncated, unsigned,
-wrong-architecture, or reports an unexpected version leaves your working binary
-untouched. Nothing on the dev box changes: the agent and clipboard shims
-re-converge on their own at the next reconnect.
+`upgrade` now prefers `Portal-v2-darwin-arm64.app.zip`: it verifies the embedded
+minisign signature, checks the complete bundle with `codesign` and Gatekeeper,
+executes its bundled CLI to confirm the expected version, and stages it on the
+installation filesystem. It then stops the old agents, atomically replaces
+Portal.app, links `~/.local/bin/portal` to the bundle, and starts the independent
+daemon and menu-bar UI. Any failed health gate restores the previous app and CLI.
+
+Pre-app versions know only the compatibility binary asset. Their existing
+`portal upgrade` installs that signed bridge normally; when its daemon starts,
+it waits for the old upgrade transaction to finish and automatically completes
+the same verified Portal.app migration. This makes the transition a single
+user command. Portal installs in `/Applications` when writable and otherwise in
+`~/Applications`. Nothing on the dev box is discarded: the embedded agent and
+clipboard shims reconverge after the local daemon restarts.
 
 A build made from a git checkout (`2.0.14-3-gabc1234`) already sits *after* its
 base tag, so `upgrade` reports it as current rather than moving it backwards;
@@ -120,6 +126,9 @@ base tag, so `upgrade` reports it as current rather than moving it backwards;
 
 ```
 portal <command>
+
+  Desktop
+    app             Open the native Portal window (also the no-argument default)
 
   Setup
     install [host]  Configure a dev box and install as a login agent
@@ -138,7 +147,7 @@ portal <command>
     start / stop / restart   Control the forwarding daemon.
 
   Inspect
-    status          Per-box daemon state and the port mapping table. (default)
+    status          Per-box daemon state and the port mapping table.
     doctor          Self-test each box: connection, shims, clipsync, forwards.
     logs [-f|N]     Show recent log lines; -f to follow, N for last N lines.
     version         Print the portal version and build commit (also -v/--version).
@@ -159,27 +168,38 @@ portal <command>
 Run `portal help` for the full reference, or `portal <command> --help` for a
 command's flags.
 
-## Menu bar
+## Native desktop app and menu bar
 
-`portal install` also loads a menu bar status item. It shows each configured box
+Portal.app owns both the full native AppKit management window and the menu-bar
+status item. Closing the window leaves Portal and its status item running;
+**Quit Portal** removes the UI and status item, while the independent local
+daemon keeps every connection and forward alive.
+
+The desktop window adds/removes and enables/disables boxes, manages forced
+ports and feature gates, displays live state, and reads a bounded daemon-log
+tail through the versioned owner-only local API. The CLI remains available and
+uses the same configuration and service model.
+
+The menu-bar item shows each configured box
 with a colored dot for its connection state and, indented beneath it, the
 forwards that are actually live:
 
 ```
+Open Portal…
+─────────────────────────
 ● devbox1
       3000 → localhost:13000
       8000 → localhost:18000
 ● devbox2 — no forwards
 ● oldbox — reconnecting
 ─────────────────────────
-portal 2.0.14 (abc1234)
-Quit Portal Menu Bar
+portal 2.0.15 (abc1234)
+Quit Portal
 ```
 
-The item is a status display, not a command surface: it reads one bounded JSON
-snapshot from the daemon when you open the menu, and does nothing while idle.
-When a newer release exists, an **Update to …** entry appears above the version
-line and runs the same verified `portal upgrade` path.
+The status portion still reads one bounded legacy snapshot only when the menu
+opens and does nothing while idle. **Open Portal…** presents the full management
+window, whose actions use the versioned local API.
 
 ## Port mapping
 
@@ -365,14 +385,15 @@ The Mac↔box protocol is specified in [`docs/wire.cddl`](docs/wire.cddl) with
 golden vectors under [`docs/vectors/`](docs/vectors/), so a client in any
 language can prove itself conformant.
 
-The local socket currently serves a **read-only JSON status snapshot** (what
-`portal status` and the menu bar render) and doubles as the daemon's
-single-instance lock. The streamed exec/PTY control API is not part of v2, so
-the `/v1/*` client code in [`clients/ts`](clients/ts) and
-[`examples/shell-desktop`](examples/shell-desktop) targets an API that no longer
-exists. `clients/ts` is not wholly stale, though: its CBOR/framing layer is a
-second implementation of the current protocol, and CI checks it against the same
-`docs/vectors/` fixtures the Rust crate uses.
+The owner-only local socket serves the versioned newline-delimited JSON API used
+by Portal.app and retains the original bare status snapshot for older clients.
+It also doubles as the daemon's single-instance lock. The local API manages
+boxes, allowlists and feature gates, provides bounded logs, and publishes state
+subscriptions; it does not expose the remote exec/PTY protocol. See
+[`docs/embedding.md`](docs/embedding.md). The old HTTP `/v1/*` layer in
+[`clients/ts`](clients/ts) and [`examples/shell-desktop`](examples/shell-desktop)
+remains stale, although the TypeScript CBOR/framing implementation is still
+checked against the same `docs/vectors/` fixtures as Rust.
 
 ## Requirements
 

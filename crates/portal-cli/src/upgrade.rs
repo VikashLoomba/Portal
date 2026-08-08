@@ -1,34 +1,36 @@
-//! Supply-chain half of `portal upgrade`: resolve, download, minisign-verify,
-//! and RUN the candidate (`--version` must match the expected tag).
+//! Supply-chain half of `portal upgrade`.
 //!
-//! This module deliberately does not mutate the installed binary or launchd.
-//! It returns a [`PreparedUpgrade`] whose temporary directory lives until the
-//! deployment layer has unregistered both LaunchAgents and transactionally
-//! swapped the executable. A truncated, wrong-arch, or mis-versioned download
-//! therefore never enters the lifecycle transaction.
+//! New releases prefer the complete signed/notarized Portal.app archive. The
+//! standalone Mach-O remains a compatibility asset so pre-app upgraders can
+//! install a bridge release; that bridge then completes app migration in a
+//! separate transaction. Nothing active is mutated until this module returns a
+//! fully verified [`PreparedUpgrade`].
 
 const REPO: &str = "VikashLoomba/Portal";
-const ARTIFACT: &str = "portal-v2-darwin-arm64";
+const APP_ARTIFACT: &str = "Portal-v2-darwin-arm64.app.zip";
+const BINARY_ARTIFACT: &str = "portal-v2-darwin-arm64";
 
-/// The release-signing minisign public key, embedded at build time so a
-/// distributed binary can verify upgrades with no repo checkout, no
-/// PORTAL_MINISIGN_PUB, and no external minisign install.
+/// Embedded release-signing key; no external minisign executable is required.
 const MINISIGN_PUB: &str = include_str!("../../../minisign.pub");
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Asset {
+    pub url: String,
+    pub sig_url: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Release {
     pub tag: String,
-    pub asset_url: String,
-    pub sig_url: Option<String>,
+    pub app: Option<Asset>,
+    pub binary: Option<Asset>,
 }
 
-/// Latest release metadata via the GitHub API (gh CLI preferred — it carries
-/// the user's auth; plain curl as fallback).
+/// Latest release metadata via the GitHub API.
 pub async fn latest(runner: &dyn portal_transport::runner::Runner) -> Result<Release, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let args = vec!["-sfL".to_string(), url];
     let out = runner
-        .run("curl", &args, b"")
+        .run("curl", &["-sfL".to_string(), url], b"")
         .await
         .map_err(|e| e.to_string())?;
     if out.code != 0 {
@@ -37,27 +39,36 @@ pub async fn latest(runner: &dyn portal_transport::runner::Runner) -> Result<Rel
     let json: serde_json::Value =
         serde_json::from_str(&out.stdout_lossy()).map_err(|e| e.to_string())?;
     let tag = json["tag_name"].as_str().unwrap_or("").to_string();
-    let assets = json["assets"].as_array().cloned().unwrap_or_default();
-    let mut asset_url = None;
-    let mut sig_url = None;
-    for a in assets {
-        let name = a["name"].as_str().unwrap_or("");
-        let dl = a["browser_download_url"].as_str().unwrap_or("").to_string();
-        if name == ARTIFACT {
-            asset_url = Some(dl);
-        } else if name == format!("{ARTIFACT}.minisig") {
-            sig_url = Some(dl);
-        }
-    }
-    let asset_url = asset_url.ok_or_else(|| format!("no {ARTIFACT} asset in release {tag}"))?;
     if tag.is_empty() {
         return Err("release has no tag".into());
     }
-    Ok(Release {
-        tag,
-        asset_url,
-        sig_url,
-    })
+    let assets = json["assets"].as_array().cloned().unwrap_or_default();
+    let find = |wanted: &str| {
+        assets.iter().find_map(|asset| {
+            (asset["name"].as_str()? == wanted)
+                .then(|| {
+                    asset["browser_download_url"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .filter(|url| !url.is_empty())
+        })
+    };
+    let app = find(APP_ARTIFACT).map(|url| Asset {
+        url,
+        sig_url: find(&format!("{APP_ARTIFACT}.minisig")),
+    });
+    let binary = find(BINARY_ARTIFACT).map(|url| Asset {
+        url,
+        sig_url: find(&format!("{BINARY_ARTIFACT}.minisig")),
+    });
+    if app.is_none() && binary.is_none() {
+        return Err(format!(
+            "release {tag} has neither {APP_ARTIFACT} nor {BINARY_ARTIFACT}"
+        ));
+    }
+    Ok(Release { tag, app, binary })
 }
 
 pub enum UpgradePlan {
@@ -65,11 +76,17 @@ pub enum UpgradePlan {
     Candidate(PreparedUpgrade),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactKind {
+    AppBundle,
+    StandaloneBinary,
+}
+
 pub struct PreparedUpgrade {
     pub tag: String,
+    pub kind: ArtifactKind,
     candidate: std::path::PathBuf,
-    /// Owns cleanup. Kept last so the candidate remains valid for the full
-    /// deployment transaction.
+    /// Owns cleanup until the stable helper takes over with `exec`.
     _staging: tempfile::TempDir,
 }
 
@@ -83,151 +100,271 @@ impl PreparedUpgrade {
     }
 }
 
-/// Resolve and fully verify an upgrade candidate without touching the active
-/// installation. Lifecycle downtime begins only after this returns Candidate.
+/// Resolve, download, signature-check, Gatekeeper-check and execute-check an
+/// upgrade candidate without touching the active installation.
 pub async fn prepare(
     runner: &dyn portal_transport::runner::Runner,
     install_dir: &std::path::Path,
     current_version: &str,
     check_only: bool,
     force: bool,
+    app_needed: bool,
 ) -> Result<UpgradePlan, String> {
     let rel = latest(runner).await?;
-    if !force && !is_newer(&rel.tag, current_version) {
+    let newer = is_newer(&rel.tag, current_version);
+    if !force && !newer && !app_needed {
         return Ok(UpgradePlan::NoChange(format!(
             "current ({current_version}) is up to date (latest {})",
             rel.tag
         )));
     }
     if check_only {
-        return Ok(UpgradePlan::NoChange(format!(
-            "new release available: {} (current {current_version})",
-            rel.tag
-        )));
+        let message = if app_needed && !newer {
+            format!(
+                "Portal.app migration available for current release {}",
+                rel.tag
+            )
+        } else {
+            format!(
+                "new release available: {} (current {current_version})",
+                rel.tag
+            )
+        };
+        return Ok(UpgradePlan::NoChange(message));
     }
 
     std::fs::create_dir_all(install_dir)
         .map_err(|e| format!("create install directory {}: {e}", install_dir.display()))?;
-    // Stage beside the installed binary. The verified Mach-O inode can then
-    // be renamed into place unchanged (same filesystem), preserving both its
-    // Gatekeeper assessment and provenance metadata.
     let staging = tempfile::Builder::new()
         .prefix("portal-upgrade-")
         .tempdir_in(install_dir)
         .map_err(|e| format!("create upgrade staging directory: {e}"))?;
-    let tmp = staging.path().join("portal.new");
 
-    // 1. Download (+ signature when the release provides one).
-    let code = runner
-        .run(
-            "curl",
-            &[
-                "-sfL".into(),
-                "-o".into(),
-                tmp.display().to_string(),
-                rel.asset_url.clone(),
-            ],
-            b"",
+    if let Some(app) = rel.app.as_ref() {
+        let archive = staging.path().join("Portal.app.zip");
+        download(runner, &app.url, &archive).await?;
+        let sig = app
+            .sig_url
+            .as_deref()
+            .ok_or_else(|| format!("release {} has no {APP_ARTIFACT}.minisig", rel.tag))?;
+        verify_signature(
+            runner,
+            &archive,
+            sig,
+            staging.path(),
+            "Portal.app.zip.minisig",
         )
-        .await
-        .map_err(|e| e.to_string())?
-        .code;
-    if code != 0 {
-        return Err("download failed".into());
-    }
-    if let Some(sig) = &rel.sig_url {
-        verify_signature(runner, &tmp, sig, staging.path()).await?;
+        .await?;
+
+        let extracted = staging.path().join("extracted");
+        std::fs::create_dir(&extracted).map_err(|e| e.to_string())?;
+        let out = runner
+            .run(
+                "ditto",
+                &[
+                    "-x".into(),
+                    "-k".into(),
+                    archive.display().to_string(),
+                    extracted.display().to_string(),
+                ],
+                b"",
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if out.code != 0 {
+            return Err(format!("extract app archive: {}", out.stderr_lossy()));
+        }
+        let candidate = extracted.join("Portal.app");
+        verify_app_bundle(runner, &candidate, &rel.tag).await?;
+        return Ok(UpgradePlan::Candidate(PreparedUpgrade {
+            tag: rel.tag,
+            kind: ArtifactKind::AppBundle,
+            candidate,
+            _staging: staging,
+        }));
     }
 
-    // 2. Run-once verification (v1): the candidate must execute and report
-    //    the expected version — catches truncated/wrong-arch downloads.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
-    }
-    let out = runner
-        .run(tmp.to_string_lossy().as_ref(), &["--version".into()], b"")
-        .await
-        .map_err(|e| e.to_string())?;
-    let reported = out.stdout_lossy().trim().to_string();
-    if out.code != 0 || !reported.contains(rel.tag.trim_start_matches('v')) {
+    if app_needed {
         return Err(format!(
-            "candidate failed run-once verification (reported {reported:?}, want {})",
+            "release {} has no {APP_ARTIFACT}; cannot migrate this installation to Portal.app",
             rel.tag
         ));
     }
 
+    let binary = rel
+        .binary
+        .as_ref()
+        .ok_or_else(|| format!("release {} has no {BINARY_ARTIFACT}", rel.tag))?;
+    let candidate = staging.path().join("portal.new");
+    download(runner, &binary.url, &candidate).await?;
+    if let Some(sig) = &binary.sig_url {
+        verify_signature(
+            runner,
+            &candidate,
+            sig,
+            staging.path(),
+            "portal.new.minisig",
+        )
+        .await?;
+    }
+    verify_binary(runner, &candidate, &rel.tag).await?;
     Ok(UpgradePlan::Candidate(PreparedUpgrade {
         tag: rel.tag,
-        candidate: tmp,
+        kind: ArtifactKind::StandaloneBinary,
+        candidate,
         _staging: staging,
     }))
 }
 
-/// minisign verification: the release publishes a .minisig; the public key
-/// is embedded at build time (PORTAL_MINISIGN_PUB overrides it — test seam
-/// and key-rotation escape hatch). A signature that is present but does not
-/// verify FAILS the upgrade — never silently skip.
-async fn verify_signature(
+async fn download(
     runner: &dyn portal_transport::runner::Runner,
-    bin: &std::path::Path,
-    sig_url: &str,
-    dir: &std::path::Path,
+    url: &str,
+    destination: &std::path::Path,
 ) -> Result<(), String> {
-    let sig = dir.join("portal.new.minisig");
-    runner
+    let out = runner
         .run(
             "curl",
             &[
                 "-sfL".into(),
                 "-o".into(),
-                sig.display().to_string(),
-                sig_url.to_string(),
+                destination.display().to_string(),
+                url.to_string(),
             ],
             b"",
         )
         .await
         .map_err(|e| e.to_string())?;
+    if out.code == 0 {
+        Ok(())
+    } else {
+        Err(format!("download failed: {}", out.stderr_lossy()))
+    }
+}
+
+async fn verify_binary(
+    runner: &dyn portal_transport::runner::Runner,
+    binary: &std::path::Path,
+    tag: &str,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
+    verify_reported_version(runner, binary, tag).await
+}
+
+async fn verify_app_bundle(
+    runner: &dyn portal_transport::runner::Runner,
+    app: &std::path::Path,
+    tag: &str,
+) -> Result<(), String> {
+    let binary = app.join("Contents/MacOS/portal");
+    if !app.join("Contents/Info.plist").is_file() || !binary.is_file() {
+        return Err("app archive does not contain Portal.app/Contents/MacOS/portal".into());
+    }
+    for (program, args, label) in [
+        (
+            "codesign",
+            vec![
+                "--verify".into(),
+                "--deep".into(),
+                "--strict".into(),
+                app.display().to_string(),
+            ],
+            "code signature",
+        ),
+        (
+            "spctl",
+            vec![
+                "--assess".into(),
+                "--type".into(),
+                "execute".into(),
+                app.display().to_string(),
+            ],
+            "Gatekeeper assessment",
+        ),
+    ] {
+        let out = runner
+            .run(program, &args, b"")
+            .await
+            .map_err(|e| e.to_string())?;
+        if out.code != 0 {
+            return Err(format!("app {label} failed: {}", out.stderr_lossy()));
+        }
+    }
+    verify_reported_version(runner, &binary, tag).await
+}
+
+async fn verify_reported_version(
+    runner: &dyn portal_transport::runner::Runner,
+    binary: &std::path::Path,
+    tag: &str,
+) -> Result<(), String> {
+    let out = runner
+        .run(
+            binary.to_string_lossy().as_ref(),
+            &["--version".into()],
+            b"",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let reported = out.stdout_lossy().trim().to_string();
+    if out.code == 0 && reported.contains(tag.trim_start_matches('v')) {
+        Ok(())
+    } else {
+        Err(format!(
+            "candidate failed run-once verification (reported {reported:?}, want {tag})"
+        ))
+    }
+}
+
+async fn verify_signature(
+    runner: &dyn portal_transport::runner::Runner,
+    artifact: &std::path::Path,
+    sig_url: &str,
+    dir: &std::path::Path,
+    signature_name: &str,
+) -> Result<(), String> {
+    let sig = dir.join(signature_name);
+    download(runner, sig_url, &sig).await?;
     let pubkey = std::env::var("PORTAL_MINISIGN_PUB").unwrap_or_else(|_| MINISIGN_PUB.to_string());
     let sig_text =
         std::fs::read_to_string(&sig).map_err(|e| format!("signature download unreadable: {e}"))?;
-    let data = std::fs::read(bin).map_err(|e| e.to_string())?;
+    let data = std::fs::read(artifact).map_err(|e| e.to_string())?;
     verify_minisign(&data, &sig_text, &pubkey)
 }
 
-/// Pure verification half (testable without network or runner). Accepts the
-/// public key as either a full minisign.pub document (comment line + key
-/// line) or the bare base64 line.
 fn verify_minisign(data: &[u8], sig_text: &str, pubkey_text: &str) -> Result<(), String> {
     let key_b64 = pubkey_text
         .lines()
         .map(str::trim)
-        .rfind(|l| !l.is_empty() && !l.starts_with("untrusted comment:"))
+        .rfind(|line| !line.is_empty() && !line.starts_with("untrusted comment:"))
         .ok_or("minisign public key is empty")?;
-    let pk = minisign_verify::PublicKey::from_base64(key_b64)
+    let key = minisign_verify::PublicKey::from_base64(key_b64)
         .map_err(|e| format!("bad minisign public key: {e}"))?;
-    let sig = minisign_verify::Signature::decode(sig_text)
+    let signature = minisign_verify::Signature::decode(sig_text)
         .map_err(|e| format!("bad signature file: {e}"))?;
-    pk.verify(data, &sig, false)
+    key.verify(data, &signature, false)
         .map_err(|e| format!("signature verification FAILED: {e}"))
 }
 
-/// Compare semver-ish tags (v1 rule: a git-describe build after its base tag
-/// counts as current; --force re-installs anyway).
+/// Compare semver-ish tags. A git-describe build after its base tag counts as
+/// current; `--force` still reinstalls it.
 pub fn is_newer(latest: &str, current: &str) -> bool {
-    fn triple(v: &str) -> Option<(u64, u64, u64)> {
-        let v = v.trim().trim_start_matches('v');
-        let v = v.split('-').next()?;
-        let mut it = v.split('.');
+    fn triple(version: &str) -> Option<(u64, u64, u64)> {
+        let version = version.trim().trim_start_matches('v');
+        let version = version.split('-').next()?;
+        let mut parts = version.split('.');
         Some((
-            it.next()?.parse().ok()?,
-            it.next()?.parse().ok()?,
-            it.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
         ))
     }
     match (triple(latest), triple(current)) {
-        (Some(l), Some(c)) => l > c,
+        (Some(latest), Some(current)) => latest > current,
         _ => latest != current,
     }
 }
@@ -239,18 +376,13 @@ mod tests {
 
     #[test]
     fn pubkey_full_document_and_bare_line_both_parse() {
-        // Wrong-key verification must fail loudly, but the KEY ITSELF must
-        // parse from both accepted shapes (full file / bare base64).
         let sig = "untrusted comment: sig\nRUS9mJ21KwF7+wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\ntrusted comment: t\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n";
         for key in [
             super::MINISIGN_PUB.to_string(),
             super::MINISIGN_PUB.lines().nth(1).unwrap().to_string(),
         ] {
             let err = verify_minisign(b"data", sig, &key).unwrap_err();
-            assert!(
-                !err.contains("bad minisign public key"),
-                "key should parse, got: {err}"
-            );
+            assert!(!err.contains("bad minisign public key"), "{err}");
         }
     }
 
@@ -271,37 +403,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parses_latest_release() {
+    async fn parses_release_with_app_and_compatibility_binary() {
         let fake = FakeRunner::new();
         fake.push_str(
             r#"{"tag_name":"v2.1.0","assets":[
+                {"name":"Portal-v2-darwin-arm64.app.zip","browser_download_url":"https://dl/app"},
+                {"name":"Portal-v2-darwin-arm64.app.zip.minisig","browser_download_url":"https://dl/app-sig"},
                 {"name":"portal-v2-darwin-arm64","browser_download_url":"https://dl/bin"},
-                {"name":"portal-v2-darwin-arm64.minisig","browser_download_url":"https://dl/sig"}
+                {"name":"portal-v2-darwin-arm64.minisig","browser_download_url":"https://dl/bin-sig"}
             ]}"#,
             "",
             0,
         );
-        let rel = latest(&fake).await.unwrap();
-        assert_eq!(rel.tag, "v2.1.0");
-        assert_eq!(rel.asset_url, "https://dl/bin");
-        assert_eq!(rel.sig_url.as_deref(), Some("https://dl/sig"));
+        let release = latest(&fake).await.unwrap();
+        assert_eq!(release.tag, "v2.1.0");
+        assert_eq!(release.app.unwrap().url, "https://dl/app");
+        assert_eq!(release.binary.unwrap().url, "https://dl/bin");
     }
 
     #[tokio::test]
-    async fn up_to_date_is_a_noop() {
+    async fn up_to_date_app_install_is_a_noop() {
         let fake = FakeRunner::new();
         fake.push_str(
-            r#"{"tag_name":"v2.0.0","assets":[{"name":"portal-v2-darwin-arm64","browser_download_url":"https://dl/bin"}]}"#,
+            r#"{"tag_name":"v2.0.0","assets":[{"name":"Portal-v2-darwin-arm64.app.zip","browser_download_url":"https://dl/app"}]}"#,
             "",
             0,
         );
         let dir = tempfile::tempdir().unwrap();
-        let out = prepare(&fake, dir.path(), "v2.0.0", true, false)
+        let plan = prepare(&fake, dir.path(), "v2.0.0", true, false, false)
             .await
             .unwrap();
-        let UpgradePlan::NoChange(message) = out else {
+        let UpgradePlan::NoChange(message) = plan else {
             panic!("expected no-op plan");
         };
         assert!(message.contains("up to date"));
+    }
+
+    #[tokio::test]
+    async fn same_version_still_offers_missing_app_migration() {
+        let fake = FakeRunner::new();
+        fake.push_str(
+            r#"{"tag_name":"v2.0.0","assets":[{"name":"Portal-v2-darwin-arm64.app.zip","browser_download_url":"https://dl/app"}]}"#,
+            "",
+            0,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let plan = prepare(&fake, dir.path(), "v2.0.0", true, false, true)
+            .await
+            .unwrap();
+        let UpgradePlan::NoChange(message) = plan else {
+            panic!("expected check-only plan");
+        };
+        assert!(message.contains("migration"));
     }
 }

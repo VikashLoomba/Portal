@@ -61,9 +61,14 @@ impl<'a> LoginAgents<'a> {
             &self.paths.home,
             &self.paths.log,
         );
+        // Once the CLI path is an app-owned symlink, launch the UI through
+        // the bundle executable's real path so AppKit/LaunchServices associate
+        // it with Portal.app and its bundle identifier. The daemon continues
+        // to use the stable CLI path.
+        let tray_binary = tray_binary(self.paths);
         let tray = launchd::render_tray_plist(
             &self.paths.tray_label,
-            &self.paths.bin_path,
+            &tray_binary,
             &self.paths.home,
             &self.paths.tray_log,
         );
@@ -91,6 +96,22 @@ impl<'a> LoginAgents<'a> {
             Err(e) => return Err(format!("remove stale api socket: {e}")),
         }
         Ok(())
+    }
+
+    /// Unregister any running daemon, remove its stale API pathname, then
+    /// freshly register the bundled/current build. The desktop app uses this
+    /// after an app-bundle replacement without disturbing its own UI process.
+    pub async fn restart_daemon_fresh(&self) -> Result<(), String> {
+        self.daemon()
+            .unload()
+            .await
+            .map_err(|e| format!("stop daemon: {e}"))?;
+        match fs::remove_file(&self.paths.api_sock) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove stale api socket: {e}")),
+        }
+        self.start_daemon_fresh().await
     }
 
     /// Freshly register the daemon and prove it can answer its status API.
@@ -175,6 +196,17 @@ impl<'a> LoginAgents<'a> {
     }
 }
 
+fn tray_binary(paths: &Paths) -> std::path::PathBuf {
+    std::fs::read_link(&paths.bin_path)
+        .ok()
+        .filter(|target| {
+            target
+                .ancestors()
+                .any(|path| path.extension().is_some_and(|ext| ext == "app"))
+        })
+        .unwrap_or_else(|| paths.bin_path.clone())
+}
+
 fn write_if_changed(path: &Path, contents: &[u8]) -> Result<(), String> {
     if fs::read(path).ok().as_deref() == Some(contents) {
         return Ok(());
@@ -215,6 +247,20 @@ impl FileSync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_owned_cli_uses_bundle_path_for_tray() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::derive(dir.path(), 501);
+        std::fs::create_dir_all(&paths.bin_dir).unwrap();
+        let app_binary = dir
+            .path()
+            .join("Applications/Portal.app/Contents/MacOS/portal");
+        std::fs::create_dir_all(app_binary.parent().unwrap()).unwrap();
+        std::fs::write(&app_binary, b"app").unwrap();
+        std::os::unix::fs::symlink(&app_binary, &paths.bin_path).unwrap();
+        assert_eq!(tray_binary(&paths), app_binary);
+    }
 
     #[test]
     fn manifest_write_is_atomic_and_idempotent() {

@@ -52,7 +52,7 @@ use crate::pins::{self, PinSet};
 use crate::portmap::PortMap;
 
 /// A point-in-time status snapshot for one box (feeds `portal status`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BoxStatus {
     pub name: String,
     pub host: String,

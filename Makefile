@@ -10,6 +10,8 @@
 #
 # Targets:
 #   make build                 agents + darwin binary (embedded, verified)
+#   make app                   build + assemble unsigned Portal.app
+#   make dmg                   app + assemble unsigned drag-to-install DMG
 #   make test                  workspace tests
 #   make lint                  clippy -D warnings + rustfmt check
 #   make check                 test + lint (release prerequisite)
@@ -25,17 +27,23 @@
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 
 SHA        ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
+# Release compatibility binary only: after an old upgrader installs it, the
+# daemon completes migration to the app artifact. Source builds stay offline.
+PORTAL_AUTO_APP_MIGRATION ?= 0
 DARWIN     := aarch64-apple-darwin
 MUSL_AMD64 := x86_64-unknown-linux-musl
 MUSL_ARM64 := aarch64-unknown-linux-musl
 AGENTS     := target/agents
 BIN        := target/$(DARWIN)/release/portal
+APP        := target/$(DARWIN)/release/Portal.app
+DMG        := target/$(DARWIN)/release/Portal.dmg
 
-.PHONY: build agents verify-embed test lint check install release release-install clean
+.PHONY: build app dmg agents verify-embed test lint check install release release-install clean
 
 build: agents
 	@echo "==> building portal (darwin-arm64, agents embedded, sha $(SHA))"
 	PORTAL_GIT_SHA="$(SHA)" \
+	PORTAL_AUTO_APP_MIGRATION="$(PORTAL_AUTO_APP_MIGRATION)" \
 	PORTAL_AGENT_AMD64_FILE="$(CURDIR)/$(AGENTS)/portald-$(MUSL_AMD64)" \
 	PORTAL_AGENT_ARM64_FILE="$(CURDIR)/$(AGENTS)/portald-$(MUSL_ARM64)" \
 	cargo build --release -p portal-cli --target $(DARWIN) --quiet
@@ -56,6 +64,18 @@ agents:
 verify-embed:
 	@python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); a=open(sys.argv[2],"rb").read(); sys.exit(0 if a[:4096] in d else "portal: embedded agent bytes NOT found in binary")' "$(BIN)" "$(AGENTS)/portald-$(MUSL_AMD64)"
 	@echo "==> $(BIN) (embedded agents verified)"
+
+app: build
+	@./scripts/package-app.sh "$(BIN)" "$(APP)"
+
+dmg: app
+	@rm -f "$(DMG)"
+	@STAGE="$$(mktemp -d -t portal-dmg)"; \
+	trap 'rm -rf "$$STAGE"' EXIT; \
+	cp -R "$(APP)" "$$STAGE/Portal.app"; \
+	ln -s /Applications "$$STAGE/Applications"; \
+	hdiutil create -quiet -volname Portal -srcfolder "$$STAGE" -ov -format UDZO "$(DMG)"
+	@echo "==> $(DMG)"
 
 test:
 	cargo test --workspace

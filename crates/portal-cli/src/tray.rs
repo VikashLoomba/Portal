@@ -1,11 +1,9 @@
-//! `portal tray` — the menu bar status item (second LaunchAgent, Aqua only).
+//! Native Portal.app UI and menu-bar status item (Aqua process).
 //!
 //! Architecture:
-//! - The daemon owns ALL state; this process is a dumb renderer over the
-//!   read-only status socket (`api.sock`), exactly like `portal status`. The
-//!   one action a row can take (open a forward in the browser) goes through
-//!   the same `open` handoff the daemon's URL relay uses — it needs no daemon
-//!   round trip and mutates nothing, so the socket stays read-only.
+//! - The daemon owns ALL state. The status menu preserves its zero-idle-work
+//!   legacy snapshot path; the management window uses the versioned local API
+//!   for state, configuration mutations, and bounded logs.
 //! - ZERO idle activity: no timers, no persistent connections. The ONLY
 //!   data fetch happens in `menuWillOpen:` — a sub-millisecond local Unix
 //!   socket round trip performed synchronously while AppKit prepares the
@@ -185,12 +183,23 @@ pub fn fetch_status(sock: &std::path::Path) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 pub fn run() -> i32 {
-    macos::run()
+    macos::run(false)
+}
+
+#[cfg(target_os = "macos")]
+pub fn run_app() -> i32 {
+    macos::run(true)
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn run() -> i32 {
     eprintln!("portal tray: only supported on macOS");
+    1
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn run_app() -> i32 {
+    eprintln!("Portal.app: only supported on macOS");
     1
 }
 
@@ -201,17 +210,25 @@ mod macos {
     use objc2::runtime::ProtocolObject;
     use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSColor, NSFont, NSImage, NSMenu,
-        NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+        NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy,
+        NSApplicationDelegate, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor,
+        NSFont, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSScrollView, NSStatusBar,
+        NSStatusItem, NSTextField, NSTextView, NSVariableStatusItemLength, NSView, NSWindow,
+        NSWindowStyleMask,
     };
     use objc2_foundation::{
-        MainThreadMarker, NSAttributedString, NSDictionary, NSObject, NSObjectProtocol, NSString,
-        ns_string,
+        MainThreadMarker, NSAttributedString, NSDictionary, NSObject, NSObjectProtocol, NSPoint,
+        NSRect, NSSize, NSString, NSTimer, ns_string,
     };
+    use portal_core::localapi::{Request, Response, State};
+    use std::cell::OnceCell;
     use std::path::PathBuf;
 
     struct TrayIvars {
         api_sock: PathBuf,
+        window: OnceCell<Retained<NSWindow>>,
+        content: OnceCell<Retained<NSTextView>>,
+        refresh_timer: OnceCell<Retained<NSTimer>>,
     }
 
     define_class!(
@@ -222,6 +239,23 @@ mod macos {
         struct Tray;
 
         unsafe impl NSObjectProtocol for Tray {}
+
+        unsafe impl NSApplicationDelegate for Tray {
+            #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
+            fn should_terminate_after_last_window(&self, _sender: &NSApplication) -> bool {
+                false
+            }
+
+            #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
+            fn should_handle_reopen(
+                &self,
+                _sender: &NSApplication,
+                _has_visible_windows: bool,
+            ) -> bool {
+                self.show_window();
+                true
+            }
+        }
 
         // SAFETY: NSMenuDelegate has no safety requirements; signatures match.
         unsafe impl NSMenuDelegate for Tray {
@@ -238,6 +272,166 @@ mod macos {
         }
 
         impl Tray {
+            /// Open (or reactivate) Portal's full management window. Closing
+            /// the window leaves this process and its status item running.
+            #[unsafe(method(openPortal:))]
+            fn open_portal(&self, _sender: Option<&NSObject>) {
+                self.show_window();
+            }
+
+            #[unsafe(method(refreshPortal:))]
+            fn refresh_portal(&self, _sender: Option<&NSObject>) {
+                self.refresh_window();
+            }
+
+            #[unsafe(method(refreshPortalIfVisible:))]
+            fn refresh_portal_if_visible(&self, _sender: Option<&NSTimer>) {
+                if self
+                    .ivars()
+                    .window
+                    .get()
+                    .is_some_and(|window| window.isVisible())
+                {
+                    self.refresh_window();
+                }
+            }
+
+            #[unsafe(method(addBox:))]
+            fn add_box(&self, _sender: Option<&NSObject>) {
+                let Some((host, name)) = prompt_two_fields(
+                    self.mtm(),
+                    "Add a remote box",
+                    "Portal uses your SSH configuration and requires key-based authentication.",
+                    ("SSH host or user@host", ""),
+                    ("Box name (optional)", ""),
+                ) else {
+                    return;
+                };
+                if host.trim().is_empty() {
+                    show_error(self.mtm(), "A host is required");
+                    return;
+                }
+                let name = (!name.trim().is_empty()).then(|| name.trim().to_string());
+                self.perform(Request::AddBox {
+                    host: host.trim().to_string(),
+                    name,
+                    index: None,
+                });
+            }
+
+            #[unsafe(method(removeBox:))]
+            fn remove_box(&self, _sender: Option<&NSObject>) {
+                let Some(name) = prompt_one_field(
+                    self.mtm(),
+                    "Remove a remote box",
+                    "The daemon will close this box's forwards. Remote files are left intact.",
+                    "Box name",
+                    "Remove",
+                ) else {
+                    return;
+                };
+                if !name.trim().is_empty() {
+                    self.perform(Request::RemoveBox {
+                        name: name.trim().to_string(),
+                    });
+                }
+            }
+
+            #[unsafe(method(configureBox:))]
+            fn configure_box(&self, _sender: Option<&NSObject>) {
+                let Some((name, state)) = prompt_two_fields(
+                    self.mtm(),
+                    "Enable or disable a box",
+                    "Enter on to connect the box, or off to keep it configured but disconnected.",
+                    ("Box name", ""),
+                    ("State: on or off", "on"),
+                ) else {
+                    return;
+                };
+                let enabled = match state.trim().to_ascii_lowercase().as_str() {
+                    "on" | "enabled" | "true" => true,
+                    "off" | "disabled" | "false" => false,
+                    _ => {
+                        show_error(self.mtm(), "State must be on or off");
+                        return;
+                    }
+                };
+                self.perform(Request::SetBoxEnabled {
+                    name: name.trim().to_string(),
+                    enabled,
+                });
+            }
+
+            #[unsafe(method(configurePorts:))]
+            fn configure_ports(&self, _sender: Option<&NSObject>) {
+                let Some((name, ports)) = prompt_two_fields(
+                    self.mtm(),
+                    "Manage force-forwarded ports",
+                    "Enter comma- or space-separated remote ports. Prefix the list with remove to unallow them.",
+                    ("Box name", ""),
+                    ("Ports, or: remove 3000, 8000", "3000, 8000"),
+                ) else {
+                    return;
+                };
+                let trimmed = ports.trim();
+                let (allowed, values) = match trimmed.strip_prefix("remove") {
+                    Some(values) => (false, values),
+                    None => (true, trimmed),
+                };
+                let ports = values
+                    .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                    .filter(|part| !part.is_empty())
+                    .map(str::parse::<u16>)
+                    .collect::<Result<Vec<_>, _>>();
+                match ports {
+                    Ok(ports) if !ports.is_empty() => self.perform(Request::SetAllow {
+                        name: name.trim().to_string(),
+                        ports,
+                        allowed,
+                    }),
+                    _ => show_error(self.mtm(), "Enter at least one valid port"),
+                }
+            }
+
+            #[unsafe(method(configureFeature:))]
+            fn configure_feature(&self, _sender: Option<&NSObject>) {
+                let Some((name, state)) = prompt_two_fields(
+                    self.mtm(),
+                    "Configure a Portal feature",
+                    "Features: clip-text, clip-image, clip-write, notify, cred, cred-touchid.",
+                    ("Feature name", ""),
+                    ("State: on or off", "on"),
+                ) else {
+                    return;
+                };
+                let enabled = match state.trim().to_ascii_lowercase().as_str() {
+                    "on" | "enabled" | "true" => true,
+                    "off" | "disabled" | "false" => false,
+                    _ => {
+                        show_error(self.mtm(), "State must be on or off");
+                        return;
+                    }
+                };
+                self.perform(Request::SetFeature {
+                    name: name.trim().to_string(),
+                    enabled,
+                });
+            }
+
+            #[unsafe(method(showLogs:))]
+            fn show_logs(&self, _sender: Option<&NSObject>) {
+                self.show_window();
+                match crate::local_client::request(&self.ivars().api_sock, Request::GetLogs { lines: 500 }) {
+                    Ok(Response::Logs { lines }) => self.set_content(&format!(
+                        "Portal daemon log — last {} lines\n\n{}",
+                        lines.len(),
+                        lines.join("\n")
+                    )),
+                    Ok(_) => show_error(self.mtm(), "The daemon returned an unexpected log response"),
+                    Err(error) => show_error(self.mtm(), &error),
+                }
+            }
+
             /// Click a forward row → open it in the default browser. The local
             /// port rides on the item's `tag`, so the action reads it back off
             /// `sender` and no per-row Rust state has to outlive the rebuild
@@ -274,13 +468,145 @@ mod macos {
 
     impl Tray {
         fn new(mtm: MainThreadMarker, api_sock: PathBuf) -> Retained<Self> {
-            let this = Self::alloc(mtm).set_ivars(TrayIvars { api_sock });
+            let this = Self::alloc(mtm).set_ivars(TrayIvars {
+                api_sock,
+                window: OnceCell::new(),
+                content: OnceCell::new(),
+                refresh_timer: OnceCell::new(),
+            });
             unsafe { msg_send![super(this), init] }
+        }
+
+        fn perform(&self, request: Request) {
+            match crate::local_client::request(&self.ivars().api_sock, request) {
+                Ok(Response::Ok { .. }) => self.refresh_window(),
+                Ok(_) => show_error(self.mtm(), "The daemon returned an unexpected response"),
+                Err(error) => show_error(self.mtm(), &error),
+            }
+        }
+
+        fn set_content(&self, text: &str) {
+            if let Some(content) = self.ivars().content.get() {
+                content.setString(&NSString::from_str(text));
+            }
+        }
+
+        fn refresh_window(&self) {
+            match crate::local_client::request(&self.ivars().api_sock, Request::GetState) {
+                Ok(Response::State { state }) => self.set_content(&render_state(&state)),
+                Ok(_) => self.set_content("The daemon returned an unexpected response."),
+                Err(error) => self.set_content(&format!(
+                    "Portal daemon is not reachable.\n\n{error}\n\nUse the portal CLI to start or diagnose the local service."
+                )),
+            }
+        }
+
+        fn show_window(&self) {
+            let mtm = self.mtm();
+            let window = self.ivars().window.get_or_init(|| {
+                let window = unsafe {
+                    NSWindow::initWithContentRect_styleMask_backing_defer(
+                        NSWindow::alloc(mtm),
+                        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(820.0, 600.0)),
+                        NSWindowStyleMask::Titled
+                            | NSWindowStyleMask::Closable
+                            | NSWindowStyleMask::Miniaturizable
+                            | NSWindowStyleMask::Resizable,
+                        NSBackingStoreType::Buffered,
+                        false,
+                    )
+                };
+                unsafe { window.setReleasedWhenClosed(false) };
+                window.setTitle(ns_string!("Portal"));
+                window.setContentMinSize(NSSize::new(680.0, 460.0));
+                window.center();
+
+                let root = window.contentView().expect("window has a content view");
+                let heading = NSTextField::labelWithString(ns_string!("Portal"), mtm);
+                heading.setFrame(NSRect::new(
+                    NSPoint::new(24.0, 550.0),
+                    NSSize::new(760.0, 30.0),
+                ));
+                heading.setFont(Some(&NSFont::boldSystemFontOfSize(22.0)));
+                heading.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+                root.addSubview(&heading);
+
+                let scroll = NSScrollView::initWithFrame(
+                    NSScrollView::alloc(mtm),
+                    NSRect::new(NSPoint::new(24.0, 88.0), NSSize::new(772.0, 450.0)),
+                );
+                scroll.setHasVerticalScroller(true);
+                scroll.setAutoresizingMask(
+                    NSAutoresizingMaskOptions::ViewWidthSizable
+                        | NSAutoresizingMaskOptions::ViewHeightSizable,
+                );
+                let content = NSTextView::initWithFrame(
+                    NSTextView::alloc(mtm),
+                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(772.0, 450.0)),
+                );
+                content.setEditable(false);
+                content.setSelectable(true);
+                content.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(13.0, 0.0)));
+                scroll.setDocumentView(Some(&content));
+                root.addSubview(&scroll);
+                let _ = self.ivars().content.set(content);
+
+                let buttons = [
+                    ("Refresh", sel!(refreshPortal:), 24.0, 82.0),
+                    ("Add Box…", sel!(addBox:), 114.0, 94.0),
+                    ("Remove…", sel!(removeBox:), 216.0, 94.0),
+                    ("Enable/Disable…", sel!(configureBox:), 318.0, 128.0),
+                    ("Allow Ports…", sel!(configurePorts:), 454.0, 112.0),
+                    ("Features…", sel!(configureFeature:), 574.0, 98.0),
+                    ("Logs", sel!(showLogs:), 680.0, 82.0),
+                ];
+                for (title, action, x, width) in buttons {
+                    let button = unsafe {
+                        NSButton::buttonWithTitle_target_action(
+                            &NSString::from_str(title),
+                            Some(self),
+                            Some(action),
+                            mtm,
+                        )
+                    };
+                    button.setFrame(NSRect::new(NSPoint::new(x, 38.0), NSSize::new(width, 32.0)));
+                    button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
+                    root.addSubview(&button);
+                }
+                let timer = unsafe {
+                    NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                        2.0,
+                        self,
+                        sel!(refreshPortalIfVisible:),
+                        None,
+                        true,
+                    )
+                };
+                let _ = self.ivars().refresh_timer.set(timer);
+                window
+            });
+
+            NSApplication::sharedApplication(mtm)
+                .setActivationPolicy(NSApplicationActivationPolicy::Regular);
+            self.refresh_window();
+            window.makeKeyAndOrderFront(None);
+            NSApplication::sharedApplication(mtm).activate();
         }
 
         fn rebuild(&self, menu: &NSMenu, rows: &[Row]) {
             let mtm = self.mtm();
             menu.removeAllItems();
+            let open = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    ns_string!("Open Portal…"),
+                    Some(sel!(openPortal:)),
+                    ns_string!(""),
+                )
+            };
+            unsafe { open.setTarget(Some(self)) };
+            menu.addItem(&open);
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
             for row in rows {
                 let item = NSMenuItem::new(mtm);
                 item.setAttributedTitle(Some(&row_title(row)));
@@ -312,7 +638,7 @@ mod macos {
             let quit = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
                     NSMenuItem::alloc(mtm),
-                    ns_string!("Quit Portal Menu Bar"),
+                    ns_string!("Quit Portal"),
                     Some(sel!(quit:)),
                     ns_string!(""),
                 )
@@ -361,7 +687,160 @@ mod macos {
         }
     }
 
-    pub fn run() -> i32 {
+    fn render_state(state: &State) -> String {
+        let mut out = format!(
+            "Portal {} ({})\nLocal daemon connected\n\n",
+            state.version, state.build_sha
+        );
+        if state.boxes.is_empty() {
+            out.push_str("No remote boxes configured.\n\nChoose Add Box… to get started.\n");
+        }
+        for box_config in &state.boxes {
+            let status = state
+                .statuses
+                .iter()
+                .find(|status| status.name == box_config.name);
+            let connection = if !box_config.enabled {
+                "disabled"
+            } else if status.is_some_and(|status| status.connected) {
+                "connected"
+            } else {
+                "reconnecting"
+            };
+            out.push_str(&format!(
+                "● {}  [{}]\n  host: {}\n  index: {}\n",
+                box_config.name, connection, box_config.host, box_config.index
+            ));
+            if !box_config.allow.is_empty() {
+                out.push_str(&format!("  forced ports: {:?}\n", box_config.allow));
+            }
+            match status {
+                Some(status) if !status.forwards.is_empty() => {
+                    out.push_str("  live forwards:\n");
+                    let mut forwards = status.forwards.clone();
+                    forwards.sort_by_key(|&(local, remote)| (remote, local));
+                    for (local, remote) in forwards {
+                        out.push_str(&format!("    remote :{remote} → localhost:{local}\n"));
+                    }
+                }
+                Some(_) if box_config.enabled => out.push_str("  no live forwards\n"),
+                _ => {}
+            }
+            out.push('\n');
+        }
+        out.push_str("Features\n");
+        for (name, enabled) in &state.features {
+            out.push_str(&format!(
+                "  {name}: {}\n",
+                if *enabled { "on" } else { "off" }
+            ));
+        }
+        out
+    }
+
+    fn prompt_one_field(
+        mtm: MainThreadMarker,
+        title: &str,
+        information: &str,
+        placeholder: &str,
+        confirm: &str,
+    ) -> Option<String> {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(title));
+        alert.setInformativeText(&NSString::from_str(information));
+        alert.addButtonWithTitle(&NSString::from_str(confirm));
+        alert.addButtonWithTitle(ns_string!("Cancel"));
+        let field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 24.0)),
+        );
+        field.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+        alert.setAccessoryView(Some(&field));
+        NSApplication::sharedApplication(mtm).activate();
+        (alert.runModal() == NSAlertFirstButtonReturn).then(|| field.stringValue().to_string())
+    }
+
+    fn prompt_two_fields(
+        mtm: MainThreadMarker,
+        title: &str,
+        information: &str,
+        first: (&str, &str),
+        second: (&str, &str),
+    ) -> Option<(String, String)> {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(title));
+        alert.setInformativeText(&NSString::from_str(information));
+        alert.addButtonWithTitle(ns_string!("Save"));
+        alert.addButtonWithTitle(ns_string!("Cancel"));
+
+        let accessory = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(360.0, 64.0)),
+        );
+        let first_field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 36.0), NSSize::new(360.0, 24.0)),
+        );
+        first_field.setPlaceholderString(Some(&NSString::from_str(first.0)));
+        first_field.setStringValue(&NSString::from_str(first.1));
+        accessory.addSubview(&first_field);
+        let second_field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 4.0), NSSize::new(360.0, 24.0)),
+        );
+        second_field.setPlaceholderString(Some(&NSString::from_str(second.0)));
+        second_field.setStringValue(&NSString::from_str(second.1));
+        accessory.addSubview(&second_field);
+        alert.setAccessoryView(Some(&accessory));
+        NSApplication::sharedApplication(mtm).activate();
+        (alert.runModal() == NSAlertFirstButtonReturn).then(|| {
+            (
+                first_field.stringValue().to_string(),
+                second_field.stringValue().to_string(),
+            )
+        })
+    }
+
+    fn show_error(mtm: MainThreadMarker, message: &str) {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(ns_string!("Portal could not complete that action"));
+        alert.setInformativeText(&NSString::from_str(message));
+        alert.addButtonWithTitle(ns_string!("OK"));
+        NSApplication::sharedApplication(mtm).activate();
+        alert.runModal();
+    }
+
+    fn install_main_menu(app: &NSApplication, tray: &Tray, mtm: MainThreadMarker) {
+        let menu = NSMenu::new(mtm);
+        let app_item = NSMenuItem::new(mtm);
+        let app_menu = NSMenu::new(mtm);
+        let open = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                ns_string!("Open Portal…"),
+                Some(sel!(openPortal:)),
+                ns_string!("o"),
+            )
+        };
+        unsafe { open.setTarget(Some(tray)) };
+        app_menu.addItem(&open);
+        app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let quit = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                ns_string!("Quit Portal"),
+                Some(sel!(quit:)),
+                ns_string!("q"),
+            )
+        };
+        unsafe { quit.setTarget(Some(tray)) };
+        app_menu.addItem(&quit);
+        app_item.setSubmenu(Some(&app_menu));
+        menu.addItem(&app_item);
+        app.setMainMenu(Some(&menu));
+    }
+
+    pub fn run(open_on_launch: bool) -> i32 {
         let Some(mtm) = MainThreadMarker::new() else {
             eprintln!("portal tray: must run on the main thread");
             return 1;
@@ -375,12 +854,19 @@ mod macos {
         };
         let uid = unsafe { crate::libc_getuid() };
         let paths = portal_core::paths::Paths::derive(&home, uid);
+        let startup_error = if open_on_launch {
+            crate::prepare_desktop_app(&paths).err()
+        } else {
+            None
+        };
 
         let app = NSApplication::sharedApplication(mtm);
         // Accessory: status item + menus, no Dock icon, no app switcher entry.
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
         let tray = Tray::new(mtm, paths.api_sock.clone());
+        app.setDelegate(Some(ProtocolObject::from_ref(&*tray)));
+        install_main_menu(&app, &tray, mtm);
 
         let status_bar = NSStatusBar::systemStatusBar();
         let item: Retained<NSStatusItem> =
@@ -405,6 +891,15 @@ mod macos {
         menu.setDelegate(Some(ProtocolObject::from_ref(&*tray)));
         item.setMenu(Some(&menu));
 
+        if open_on_launch {
+            tray.show_window();
+            if let Some(error) = startup_error {
+                show_error(
+                    mtm,
+                    &format!("Could not start the local Portal daemon: {error}"),
+                );
+            }
+        }
         app.run();
         0
     }

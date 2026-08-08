@@ -358,10 +358,10 @@ exec-stream = "stdin"
 ; enable unknown-field errors; additive fields such as rs/cs depend on unknown
 ; key tolerance.
 ;
-; The local socket currently serves one read-only JSON status snapshot per
-; connection (see docs/embedding.md); the HTTP+JSON control API this section
-; describes is not served by any shipping binary. Local API auth is peer uid
-; over the Unix socket; there are no bearer tokens.
+; The local socket serves the versioned newline-delimited JSON API documented
+; in docs/embedding.md and preserves a bare status snapshot for old clients.
+; It deliberately does not expose these remote ExecFrame messages. Local API
+; auth is peer uid over the Unix socket; there are no bearer tokens.
 
 uint8 = 0..255
 uint16 = 0..65535

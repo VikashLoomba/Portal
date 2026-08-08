@@ -1,18 +1,24 @@
 //! The daemon: what launchd runs (`portal daemon`). Loads config (with v1
 //! auto-migration), acquires the single-instance lock, composes the
 //! Supervisor with production deps (native transport, NSPasteboard watcher,
-//! feature-gate files, osascript notifications, `open`), serves the minimal
-//! read-only status socket, and exits cleanly on SIGTERM.
+//! feature-gate files, osascript notifications, `open`), serves the versioned
+//! local control API plus legacy status snapshots, and exits cleanly on SIGTERM.
 
+use std::collections::BTreeMap;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 
 use portal_core::bootstrap::EmbeddedAgent;
-use portal_core::config::Config;
+use portal_core::config::{BoxConfig, Config, sanitize_name};
+use portal_core::localapi::{
+    API_VERSION, KNOWN_FEATURES, Request, RequestEnvelope, Response, ResponseEnvelope, State,
+};
 use portal_core::paths::Paths;
 use portal_core::supervisor::{BoxStatus, Deps, NotifyEvent, Supervisor, native_transport};
 
@@ -226,7 +232,16 @@ fn cred_deps(bin_path: PathBuf) -> Option<Arc<portal_core::cred::CredDeps>> {
 
 /// The daemon entry point.
 pub async fn run(paths: Paths) -> Result<(), String> {
-    let config = load_or_migrate_config(&paths)?;
+    // A packaged Portal.app must be able to start before first-run onboarding
+    // has added a box. Existing or migratable configuration still fails loud
+    // when malformed; only a genuinely fresh installation starts empty.
+    let config = if paths.config_file.exists() || paths.v1_host_file.exists() {
+        load_or_migrate_config(&paths)?
+    } else {
+        let config = Config::default();
+        crate::save_config(&paths, &config)?;
+        config
+    };
     let listener = bind_status_socket(&paths.api_sock).await?;
 
     let cancel = CancellationToken::new();
@@ -256,22 +271,32 @@ pub async fn run(paths: Paths) -> Result<(), String> {
         watcher,
         cancel.clone(),
     )));
+    let live_config = Arc::new(tokio::sync::Mutex::new(config.clone()));
     tracing::info!(boxes = config.enabled_boxes().count(), "portal daemon up");
 
-    // Status socket reads through the lock.
+    // The local API is the single integration surface for Portal.app. Legacy
+    // clients that write nothing still receive the old bare status array.
     let status_sup = supervisor.clone();
+    let status_config = live_config.clone();
+    let status_paths = paths.clone();
     let status_task = tokio::spawn({
         let cancel = cancel.clone();
         async move {
-            serve_status_locked(listener, status_sup, cancel).await;
+            serve_local_api(listener, status_sup, status_config, status_paths, cancel).await;
         }
     });
+
+    // Only release compatibility binaries carry the build flag that enables
+    // this one-time, out-of-process app migration. Source builds never
+    // auto-download anything.
+    crate::spawn_app_migration_if_needed(&paths);
 
     // Config hot-reload: poll mtime (2s), reconcile on change. allow/unallow
     // + box add/remove apply WITHOUT a daemon restart (v1's live-file-read
     // semantics, generalized to the TOML config).
     let config_task = tokio::spawn({
         let supervisor = supervisor.clone();
+        let live_config = live_config.clone();
         let cancel = cancel.clone();
         let path = paths.config_file.clone();
         async move {
@@ -296,6 +321,7 @@ pub async fn run(paths: Paths) -> Result<(), String> {
                             Ok(cfg) => {
                                 tracing::info!(boxes = cfg.enabled_boxes().count(),
                                     "config changed; hot-reloading");
+                                *live_config.lock().await = cfg.clone();
                                 supervisor.lock().await.reconcile(&cfg).await;
                             }
                             Err(e) => {
@@ -322,26 +348,321 @@ pub async fn run(paths: Paths) -> Result<(), String> {
     Ok(())
 }
 
-/// Status serving against the Mutex-wrapped supervisor (hot-reload needs
-/// &mut access, so the Arc holds the lock).
-async fn serve_status_locked(
+/// Serve the versioned control API while preserving the v2.0 bare-snapshot
+/// response for clients that connect and write nothing.
+async fn serve_local_api(
     listener: UnixListener,
     supervisor: Arc<tokio::sync::Mutex<Supervisor>>,
+    config: Arc<tokio::sync::Mutex<Config>>,
+    paths: Paths,
     cancel: CancellationToken,
 ) {
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return,
             conn = listener.accept() => {
-                let Ok((mut stream, _)) = conn else { continue };
-                let snapshot = status_json(&supervisor.lock().await.status());
+                let Ok((stream, _)) = conn else { continue };
+                match stream.peer_cred() {
+                    Ok(credentials) if credentials.uid() == paths.uid => {}
+                    Ok(credentials) => {
+                        tracing::warn!(peer_uid = credentials.uid(), "rejected local API client with a different uid");
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not authenticate local API peer");
+                        continue;
+                    }
+                }
+                let supervisor = supervisor.clone();
+                let config = config.clone();
+                let paths = paths.clone();
+                let cancel = cancel.clone();
                 tokio::spawn(async move {
-                    let _ = stream.write_all(snapshot.as_bytes()).await;
-                    let _ = stream.shutdown().await;
+                    handle_local_api_connection(stream, supervisor, config, paths, cancel).await;
                 });
             }
         }
     }
+}
+
+async fn handle_local_api_connection(
+    stream: UnixStream,
+    supervisor: Arc<tokio::sync::Mutex<Supervisor>>,
+    config: Arc<tokio::sync::Mutex<Config>>,
+    paths: Paths,
+    cancel: CancellationToken,
+) {
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut line = String::new();
+    let read = tokio::time::timeout(Duration::from_millis(25), reader.read_line(&mut line)).await;
+    let mut stream = reader.into_inner();
+
+    // v2.0 clients wait for the server to speak first. A short bounded grace
+    // period distinguishes them from API clients, which write immediately.
+    match read {
+        Err(_) | Ok(Ok(0)) if line.is_empty() => {
+            let snapshot = status_json(&supervisor.lock().await.status());
+            let _ = stream.write_all(snapshot.as_bytes()).await;
+            let _ = stream.shutdown().await;
+            return;
+        }
+        Err(_) => {
+            let _ = write_api_response(
+                &mut stream,
+                &ResponseEnvelope::error(0, "request_timeout", "request line was not completed"),
+            )
+            .await;
+            return;
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "failed reading local API request");
+            return;
+        }
+        Ok(Ok(_)) => {}
+    }
+
+    if line.len() > 64 * 1024 {
+        let _ = write_api_response(
+            &mut stream,
+            &ResponseEnvelope::error(0, "request_too_large", "local API request exceeds 64 KiB"),
+        )
+        .await;
+        return;
+    }
+    let request: RequestEnvelope = match serde_json::from_str(&line) {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = write_api_response(
+                &mut stream,
+                &ResponseEnvelope::error(0, "invalid_json", error.to_string()),
+            )
+            .await;
+            return;
+        }
+    };
+    if request.api_version != API_VERSION {
+        let _ = write_api_response(
+            &mut stream,
+            &ResponseEnvelope::error(
+                request.id,
+                "unsupported_api_version",
+                format!(
+                    "client requested API {}; daemon supports API {}",
+                    request.api_version, API_VERSION
+                ),
+            ),
+        )
+        .await;
+        return;
+    }
+
+    if request.request == Request::SubscribeState {
+        let mut previous = None;
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tick.tick() => {
+                    let state = local_api_state(&supervisor, &config, &paths).await;
+                    if previous.as_ref() == Some(&state) {
+                        continue;
+                    }
+                    previous = Some(state.clone());
+                    let response = ResponseEnvelope::new(request.id, Response::State { state });
+                    if write_api_response(&mut stream, &response).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    let response = handle_local_api_request(request, &supervisor, &config, &paths).await;
+    let _ = write_api_response(&mut stream, &response).await;
+    let _ = stream.shutdown().await;
+}
+
+async fn write_api_response(
+    stream: &mut UnixStream,
+    response: &ResponseEnvelope,
+) -> std::io::Result<()> {
+    let mut bytes = serde_json::to_vec(response).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes).await
+}
+
+async fn local_api_state(
+    supervisor: &Arc<tokio::sync::Mutex<Supervisor>>,
+    config: &Arc<tokio::sync::Mutex<Config>>,
+    paths: &Paths,
+) -> State {
+    let boxes = config.lock().await.boxes.clone();
+    let statuses = supervisor.lock().await.status();
+    let gates = feature_gates(paths.config_dir.clone());
+    let features = KNOWN_FEATURES
+        .into_iter()
+        .map(|name| (name.to_string(), gates(name)))
+        .collect::<BTreeMap<_, _>>();
+    State {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build_sha: crate::BUILD_SHA.to_string(),
+        boxes,
+        statuses,
+        features,
+    }
+}
+
+async fn handle_local_api_request(
+    request: RequestEnvelope,
+    supervisor: &Arc<tokio::sync::Mutex<Supervisor>>,
+    config: &Arc<tokio::sync::Mutex<Config>>,
+    paths: &Paths,
+) -> ResponseEnvelope {
+    let id = request.id;
+    let result: Result<Response, String> = match request.request {
+        Request::GetState => Ok(Response::State {
+            state: local_api_state(supervisor, config, paths).await,
+        }),
+        Request::GetLogs { lines } => {
+            read_log_tail(&paths.log, lines).map(|lines| Response::Logs { lines })
+        }
+        Request::SetFeature { name, enabled } => {
+            if !KNOWN_FEATURES.contains(&name.as_str()) {
+                Err(format!("unknown feature {name:?}"))
+            } else {
+                std::fs::create_dir_all(&paths.config_dir)
+                    .and_then(|()| {
+                        std::fs::write(
+                            paths.feature_file(&name),
+                            if enabled { "on\n" } else { "off\n" },
+                        )
+                    })
+                    .map_err(|e| e.to_string())
+                    .map(|()| Response::Ok {
+                        message: format!("{name} is now {}", if enabled { "on" } else { "off" }),
+                    })
+            }
+        }
+        Request::AddBox { host, name, index } => {
+            mutate_api_config(config, paths, move |next| {
+                let name = name.unwrap_or_else(|| sanitize_name(&host));
+                if next.boxes.iter().any(|b| b.name == name) {
+                    return Err(format!("box {name:?} already exists"));
+                }
+                let index = index.unwrap_or_else(|| {
+                    (1..=u8::MAX)
+                        .find(|candidate| !next.boxes.iter().any(|b| b.index == *candidate))
+                        .unwrap_or(0)
+                });
+                if index == 0 {
+                    return Err("no free box index".into());
+                }
+                next.boxes.push(BoxConfig {
+                    name: name.clone(),
+                    host,
+                    index,
+                    allow: Vec::new(),
+                    deny: Vec::new(),
+                    enabled: true,
+                });
+                Ok(format!("added box {name:?}"))
+            })
+            .await
+        }
+        Request::RemoveBox { name } => {
+            mutate_api_config(config, paths, move |next| {
+                let before = next.boxes.len();
+                next.boxes.retain(|b| b.name != name);
+                if before == next.boxes.len() {
+                    return Err(format!("no box named {name:?}"));
+                }
+                Ok(format!("removed box {name:?}"))
+            })
+            .await
+        }
+        Request::SetBoxEnabled { name, enabled } => {
+            mutate_api_config(config, paths, move |next| {
+                let Some(box_config) = next.boxes.iter_mut().find(|b| b.name == name) else {
+                    return Err(format!("no box named {name:?}"));
+                };
+                box_config.enabled = enabled;
+                Ok(format!(
+                    "box {name:?} {}",
+                    if enabled { "enabled" } else { "disabled" }
+                ))
+            })
+            .await
+        }
+        Request::SetAllow {
+            name,
+            ports,
+            allowed,
+        } => {
+            mutate_api_config(config, paths, move |next| {
+                let Some(box_config) = next.boxes.iter_mut().find(|b| b.name == name) else {
+                    return Err(format!("no box named {name:?}"));
+                };
+                if allowed {
+                    for port in ports {
+                        if !box_config.allow.contains(&port) {
+                            box_config.allow.push(port);
+                        }
+                    }
+                    box_config.allow.sort_unstable();
+                } else {
+                    box_config.allow.retain(|port| !ports.contains(port));
+                }
+                Ok(format!("updated allowlist for {name:?}"))
+            })
+            .await
+        }
+        Request::SubscribeState => unreachable!("handled above"),
+    };
+
+    match result {
+        Ok(response) => ResponseEnvelope::new(id, response),
+        Err(message) => ResponseEnvelope::error(id, "operation_failed", message),
+    }
+}
+
+async fn mutate_api_config(
+    config: &Arc<tokio::sync::Mutex<Config>>,
+    paths: &Paths,
+    mutate: impl FnOnce(&mut Config) -> Result<String, String>,
+) -> Result<Response, String> {
+    let mut current = config.lock().await;
+    let mut next = current.clone();
+    let message = mutate(&mut next)?;
+    crate::save_config(paths, &next)?;
+    *current = next;
+    Ok(Response::Ok { message })
+}
+
+/// Read a bounded tail without loading an arbitrarily large daemon log into
+/// the UI process. The first partial line in the one-MiB window is discarded.
+fn read_log_tail(path: &std::path::Path, lines: usize) -> Result<Vec<String>, String> {
+    const MAX_BYTES: u64 = 1024 * 1024;
+    const MAX_LINES: usize = 2000;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    let start = len.saturating_sub(MAX_BYTES);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| e.to_string())?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(|e| e.to_string())?;
+    if start > 0
+        && let Some(newline) = text.find('\n')
+    {
+        text.drain(..=newline);
+    }
+    let all = text.lines().collect::<Vec<_>>();
+    let count = lines.clamp(1, MAX_LINES);
+    Ok(all[all.len().saturating_sub(count)..]
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect())
 }
 
 /// File-backed gates adapter for the pasteboard watcher.
@@ -416,6 +737,43 @@ mod tests {
         assert!(!gates("clip-text"));
         std::fs::write(dir.path().join("feature.clip-text"), "on\n").unwrap();
         assert!(gates("clip-text"));
+    }
+
+    #[test]
+    fn bounded_log_tail_returns_requested_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("portal.log");
+        std::fs::write(&log, "one\ntwo\nthree\nfour\n").unwrap();
+        assert_eq!(read_log_tail(&log, 2).unwrap(), ["three", "four"]);
+        assert_eq!(read_log_tail(&log, 0).unwrap(), ["four"]);
+    }
+
+    #[tokio::test]
+    async fn api_config_mutation_is_validated_and_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let config = Arc::new(tokio::sync::Mutex::new(Config::default()));
+        let response = mutate_api_config(&config, &paths, |next| {
+            next.boxes.push(BoxConfig {
+                name: "dev".into(),
+                host: "dev.example".into(),
+                index: 1,
+                allow: vec![],
+                deny: vec![],
+                enabled: true,
+            });
+            Ok("added".into())
+        })
+        .await
+        .unwrap();
+        assert!(matches!(response, Response::Ok { .. }));
+        assert_eq!(
+            Config::parse(&std::fs::read_to_string(paths.config_file).unwrap())
+                .unwrap()
+                .boxes
+                .len(),
+            1
+        );
     }
 
     #[test]
