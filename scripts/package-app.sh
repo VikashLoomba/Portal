@@ -7,11 +7,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${1:-$ROOT/target/aarch64-apple-darwin/release/portal}"
 APP="${2:-$ROOT/target/aarch64-apple-darwin/release/Portal.app}"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
+ICON="$ROOT/assets/Portal.icns"
 
 [ -x "$BIN" ] || { echo "portal app: executable not found: $BIN" >&2; exit 1; }
+[ -f "$ICON" ] || { echo "portal app: icon not found: $ICON" >&2; exit 1; }
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/portal"
+cp "$ICON" "$APP/Contents/Resources/Portal.icns"
 chmod 0755 "$APP/Contents/MacOS/portal"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -22,6 +25,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleDevelopmentRegion</key><string>en</string>
     <key>CFBundleExecutable</key><string>portal</string>
     <key>CFBundleIdentifier</key><string>com.vikashloomba.portal</string>
+    <key>CFBundleIconFile</key><string>Portal.icns</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleName</key><string>Portal</string>
     <key>CFBundleDisplayName</key><string>Portal</string>
