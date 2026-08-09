@@ -712,6 +712,12 @@ async fn config_hot_reload_adds_updates_and_removes_stacks() {
 
     let rig = rig().await; // one box "devbox1" @ "devbox1"
     assert_eq!(sup_stacks_len(&rig).await, 1);
+    let claimed = wait_until(Duration::from_secs(5), async || {
+        let ports = rig.supervisor.lock().await.taken_ports();
+        ports.contains(&3000) && ports.contains(&8000)
+    })
+    .await;
+    assert!(claimed, "initial stack never claimed its identity ports");
 
     // 1. In-place update: allowlist change applies WITHOUT respawning and
     // publishes one event-driven local API invalidation (no status poller).
@@ -763,6 +769,10 @@ index = 2
     .unwrap();
     rig.supervisor_apply(&cfg3).await;
     assert_eq!(sup_stacks_len(&rig).await, 2);
+    assert!(
+        rig.supervisor.lock().await.taken_ports().is_empty(),
+        "replacing a stack releases its local-port claims so re-enable can reuse identity ports"
+    );
     let hosts = sup_stack_hosts(&rig).await;
     assert!(hosts.iter().any(|h| h == "devbox1-NEW"));
 
@@ -793,4 +803,76 @@ impl Rig {
     async fn supervisor_apply(&self, cfg: &Config) {
         self.supervisor.lock().await.reconcile(cfg).await;
     }
+}
+
+/// reconcile's return contract: it reports (and broadcasts) exactly when a
+/// running stack changed. Disabled-only configs — added, edited, or removed
+/// — change the rendered state without touching a stack, so reconcile has
+/// nothing to say; the daemon's mutation and hot-reload paths rely on that
+/// `false` to emit the one invalidation themselves.
+#[tokio::test]
+async fn reconcile_reports_invalidation_only_when_stacks_change() {
+    // No boxes at all: the transport factory must never fire.
+    let deps = Deps {
+        agent: EmbeddedAgent {
+            git_sha: "quiet".into(),
+            linux_amd64: None,
+            linux_arm64: None,
+        },
+        gates: Arc::new(|_| true),
+        notify: Arc::new(|_| {}),
+        open_url: Arc::new(|_| {}),
+        transport: Arc::new(|_| panic!("no enabled boxes: no stack may spawn")),
+        cred: None,
+        clipboard_writer: None,
+    };
+    let mut supervisor = Supervisor::start::<NoSource, NoGates>(
+        &Config::default(),
+        &deps,
+        None,
+        CancellationToken::new(),
+    );
+    let mut changes = supervisor.subscribe_state_changes();
+
+    let paused = Config::parse(
+        r#"
+[[boxes]]
+name = "paused"
+host = "paused.internal"
+index = 1
+enabled = false
+allow = [3000]
+"#,
+    )
+    .unwrap();
+    assert!(
+        !supervisor.reconcile(&paused).await,
+        "adding a disabled box touches no stack"
+    );
+
+    let paused_edited = Config::parse(
+        r#"
+[[boxes]]
+name = "paused"
+host = "paused.internal"
+index = 1
+enabled = false
+allow = [3000, 8080]
+"#,
+    )
+    .unwrap();
+    assert!(
+        !supervisor.reconcile(&paused_edited).await,
+        "editing a disabled box's allowlist touches no stack"
+    );
+
+    assert!(
+        !supervisor.reconcile(&Config::default()).await,
+        "removing a disabled box touches no stack"
+    );
+    assert!(
+        changes.try_recv().is_err(),
+        "disabled-only changes broadcast nothing from reconcile"
+    );
+    supervisor.cancel_all();
 }

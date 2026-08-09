@@ -31,7 +31,15 @@ fs2 = "0.4"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
+[dev-dependencies]
+# The local-API subscription tests script the bootstrap's agent probe.
+sha2 = { workspace = true }
+hex = { workspace = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry", "NSAttributedString", "NSDictionary", "NSEnumerator", "NSNotification"] }
-objc2-app-kit = { version = "0.3", features = ["NSAlert", "NSApplication", "NSResponder", "NSRunningApplication", "NSControl", "NSTextField", "NSSecureTextField", "NSView", "NSWindow", "NSGraphics", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSImage", "NSButton", "NSCell", "NSFont", "NSColor", "NSAttributedString", "NSSegmentedControl", "NSGlassEffectView", "NSVisualEffectView", "NSSwitch"] }
+# block2 powers the two appearance-dynamic pieces of the native UI: the
+# PortalAccent NSColor provider and the dark-aware alert icon drawing handler.
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry", "NSAttributedString", "NSDictionary", "NSEnumerator", "NSNotification", "NSDateFormatter"] }
+objc2-app-kit = { version = "0.3", features = ["NSAlert", "NSApplication", "NSResponder", "NSRunningApplication", "NSControl", "NSTextField", "NSSecureTextField", "NSView", "NSWindow", "NSGraphics", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSImage", "NSButton", "NSCell", "NSFont", "NSColor", "NSAttributedString", "NSSegmentedControl", "NSGlassEffectView", "NSVisualEffectView", "NSSwitch", "block2"] }

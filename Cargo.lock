@@ -1801,11 +1801,13 @@ dependencies = [
 
 [[package]]
 name = "portal-cli"
-version = "2.0.22"
+version = "2.0.23"
 dependencies = [
  "anyhow",
+ "block2",
  "clap",
  "fs2",
+ "hex",
  "minisign-verify",
  "objc2",
  "objc2-app-kit",
@@ -1817,6 +1819,7 @@ dependencies = [
  "portal-transport",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -1827,7 +1830,7 @@ dependencies = [
 
 [[package]]
 name = "portal-clip"
-version = "2.0.22"
+version = "2.0.23"
 dependencies = [
  "objc2",
  "objc2-app-kit",
@@ -1838,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "portal-core"
-version = "2.0.22"
+version = "2.0.23"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -1862,7 +1865,7 @@ dependencies = [
 
 [[package]]
 name = "portal-cred"
-version = "2.0.22"
+version = "2.0.23"
 dependencies = [
  "block2",
  "objc2",
@@ -1881,7 +1884,7 @@ dependencies = [
 
 [[package]]
 name = "portal-proto"
-version = "2.0.22"
+version = "2.0.23"
 dependencies = [
  "ciborium",
  "hex",
@@ -1893,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "portal-transport"
-version = "2.0.22"
+version = "2.0.23"
 dependencies = [
  "async-trait",
  "rand",
@@ -1906,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "portald"
-version = "2.0.22"
+version = "2.0.23"
 dependencies = [
  "anyhow",
  "ciborium",

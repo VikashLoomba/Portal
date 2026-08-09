@@ -69,6 +69,13 @@ pub enum Request {
         ports: Vec<u16>,
         allowed: bool,
     },
+    /// Replace a box's entire pinned-ports allowlist in one mutation. The
+    /// structured editor submits the full desired set; splitting a mixed
+    /// edit into independent add/remove requests could commit half of it.
+    SetAllowExact {
+        name: String,
+        ports: Vec<u16>,
+    },
     SetFeature {
         name: String,
         enabled: bool,
@@ -146,6 +153,24 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""api_version":1"#));
         assert!(json.contains(r#""method":"add_box""#));
+        assert_eq!(
+            serde_json::from_str::<RequestEnvelope>(&json).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn set_allow_exact_is_one_atomic_request() {
+        let request = RequestEnvelope::new(
+            3,
+            Request::SetAllowExact {
+                name: "dev".into(),
+                ports: vec![3000, 5173],
+            },
+        );
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains(r#""method":"set_allow_exact""#));
+        assert!(json.contains(r#""ports":[3000,5173]"#));
         assert_eq!(
             serde_json::from_str::<RequestEnvelope>(&json).unwrap(),
             request

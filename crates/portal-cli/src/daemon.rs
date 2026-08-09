@@ -179,7 +179,7 @@ pub async fn bind_status_socket(path: &PathBuf) -> Result<UnixListener, String> 
     Ok(listener)
 }
 
-pub fn status_json(statuses: &[BoxStatus]) -> String {
+pub fn status_json(statuses: &[BoxStatus], configured: &[BoxConfig]) -> String {
     // Hand-rolled (stable, tiny) rather than pulling serde_json into the CLI
     // for one shape... except serde_json is already a workspace dep — use it.
     #[derive(serde::Serialize)]
@@ -188,24 +188,54 @@ pub fn status_json(statuses: &[BoxStatus]) -> String {
         host: &'a str,
         index: u8,
         connected: bool,
+        /// Old readers ignore unknown keys, so disabled boxes degrade to
+        /// "not connected" there instead of vanishing outright.
+        enabled: bool,
+        /// Pinned always-forward ports — how many forwards a disabled box
+        /// has paused. Old readers ignore unknown keys.
+        pinned: usize,
         agent_sha: Option<&'a str>,
         forwards: &'a [(u16, u16)],
         clipsync_synced: bool,
         clipsync_change_id: u64,
     }
-    let view: Vec<S> = statuses
+    let mut view: Vec<S> = statuses
         .iter()
         .map(|b| S {
             name: &b.name,
             host: &b.host,
             index: b.index,
             connected: b.connected,
+            enabled: true,
+            pinned: configured
+                .iter()
+                .find(|c| c.name == b.name)
+                .map_or(0, |c| c.allow.len()),
             agent_sha: b.agent_sha.as_deref(),
             forwards: &b.forwards,
             clipsync_synced: b.clipsync_synced,
             clipsync_change_id: b.clipsync_change_id,
         })
         .collect();
+    // A disabled box owns no stack, so the supervisor has no status for it;
+    // without these entries it would vanish from the status menu instead of
+    // reporting "disabled".
+    for b in configured.iter().filter(|b| !b.enabled) {
+        if !view.iter().any(|s| s.name == b.name) {
+            view.push(S {
+                name: &b.name,
+                host: &b.host,
+                index: b.index,
+                connected: false,
+                enabled: false,
+                pinned: b.allow.len(),
+                agent_sha: None,
+                forwards: &[],
+                clipsync_synced: false,
+                clipsync_change_id: 0,
+            });
+        }
+    }
     serde_json::to_string_pretty(&view).unwrap_or_else(|_| "[]".into())
 }
 
@@ -319,10 +349,28 @@ pub async fn run(paths: Paths) -> Result<(), String> {
                             .and_then(|raw| Config::parse(&raw).map_err(|e| e.to_string()))
                         {
                             Ok(cfg) => {
-                                tracing::info!(boxes = cfg.enabled_boxes().count(),
-                                    "config changed; hot-reloading");
-                                *live_config.lock().await = cfg.clone();
-                                supervisor.lock().await.reconcile(&cfg).await;
+                                {
+                                    let mut live = live_config.lock().await;
+                                    if *live == cfg {
+                                        // mtime moved but the rendered
+                                        // config did not (our own API saves
+                                        // land here): that path already
+                                        // invalidated, so a second event
+                                        // would be a duplicate.
+                                        continue;
+                                    }
+                                    tracing::info!(boxes = cfg.enabled_boxes().count(),
+                                        "config changed; hot-reloading");
+                                    *live = cfg.clone();
+                                }
+                                let mut supervisor = supervisor.lock().await;
+                                if !supervisor.reconcile(&cfg).await {
+                                    // A disabled-box-only edit changes the
+                                    // rendered state without touching any
+                                    // running stack, so reconcile had
+                                    // nothing to broadcast — invalidate here.
+                                    supervisor.notify_state_changed();
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!("config reload skipped (invalid): {e}");
@@ -401,7 +449,9 @@ async fn handle_local_api_connection(
     // period distinguishes them from API clients, which write immediately.
     match read {
         Err(_) | Ok(Ok(0)) if line.is_empty() => {
-            let snapshot = status_json(&supervisor.lock().await.status());
+            let statuses = supervisor.lock().await.status();
+            let configured = config.lock().await.boxes.clone();
+            let snapshot = status_json(&statuses, &configured);
             let _ = stream.write_all(snapshot.as_bytes()).await;
             let _ = stream.shutdown().await;
             return;
@@ -533,6 +583,7 @@ async fn handle_local_api_request(
             | Request::RemoveBox { .. }
             | Request::SetBoxEnabled { .. }
             | Request::SetAllow { .. }
+            | Request::SetAllowExact { .. }
     );
     let mutates_feature = matches!(&request.request, Request::SetFeature { .. });
     let result: Result<Response, String> = match request.request {
@@ -609,6 +660,12 @@ async fn handle_local_api_request(
             })
             .await
         }
+        Request::SetAllowExact { name, ports } => {
+            mutate_api_config(config, paths, move |next| {
+                replace_allow_exact(next, &name, &ports)
+            })
+            .await
+        }
         Request::SetAllow {
             name,
             ports,
@@ -639,7 +696,15 @@ async fn handle_local_api_request(
         Ok(response) => {
             if mutates_config {
                 let next = config.lock().await.clone();
-                supervisor.lock().await.reconcile(&next).await;
+                let mut supervisor = supervisor.lock().await;
+                if !supervisor.reconcile(&next).await {
+                    // The mutation committed but no running stack changed —
+                    // a disabled box was edited or removed. reconcile only
+                    // broadcasts stack changes, so emit the one invalidation
+                    // here; when reconcile did emit, a second event would be
+                    // a duplicate.
+                    supervisor.notify_state_changed();
+                }
             } else if mutates_feature {
                 supervisor.lock().await.notify_state_changed();
             }
@@ -647,6 +712,21 @@ async fn handle_local_api_request(
         }
         Err(message) => ResponseEnvelope::error(id, "operation_failed", message),
     }
+}
+
+/// One exact replacement of a box's pinned allowlist: the full desired set
+/// lands together, or — when the box is unknown — not at all. Persistence
+/// failure is handled by the caller (`mutate_api_config` saves before
+/// committing the in-memory config), so a failed write changes nothing.
+fn replace_allow_exact(config: &mut Config, name: &str, ports: &[u16]) -> Result<String, String> {
+    let Some(box_config) = config.boxes.iter_mut().find(|b| b.name == name) else {
+        return Err(format!("no box named {name:?}"));
+    };
+    let mut ports = ports.to_vec();
+    ports.sort_unstable();
+    ports.dedup();
+    box_config.allow = ports;
+    Ok(format!("updated allowlist for {name:?}"))
 }
 
 async fn mutate_api_config(
@@ -838,21 +918,386 @@ mod tests {
         );
     }
 
+    /// Deps for local-API tests: gates on, every sink a no-op, and the
+    /// caller's transport factory (disabled-box rigs pass one that must
+    /// never fire).
+    fn api_test_deps(transport: Arc<portal_core::supervisor::TransportFactory>) -> Deps {
+        Deps {
+            agent: EmbeddedAgent {
+                git_sha: "test".into(),
+                linux_amd64: None,
+                linux_arm64: None,
+            },
+            gates: Arc::new(|_| true),
+            notify: Arc::new(|_| {}),
+            open_url: Arc::new(|_| {}),
+            transport,
+            cred: None,
+            clipboard_writer: None,
+        }
+    }
+
+    /// The `None` watcher still needs concrete type parameters; NoSource is
+    /// cfg-gated to non-Mac builds, so the tests bring their own.
+    struct NoWatchSource;
+    impl portal_clip::watcher::SnapshotSource for NoWatchSource {
+        fn change_count(&self) -> i64 {
+            0
+        }
+        fn observe(&self) -> Result<portal_clip::watcher::Observation, portal_clip::ClipError> {
+            Ok(portal_clip::watcher::Observation::Empty)
+        }
+    }
+
+    fn api_test_supervisor(config: &Config, deps: &Deps) -> Arc<tokio::sync::Mutex<Supervisor>> {
+        Arc::new(tokio::sync::Mutex::new(Supervisor::start::<
+            NoWatchSource,
+            FileGates,
+        >(
+            config,
+            deps,
+            None,
+            CancellationToken::new(),
+        )))
+    }
+
+    fn disabled_box_config() -> Config {
+        let mut config = Config::default();
+        config.boxes.push(BoxConfig {
+            name: "paused".into(),
+            host: "paused.example".into(),
+            index: 1,
+            allow: vec![3000],
+            deny: vec![],
+            enabled: false,
+        });
+        config
+    }
+
+    #[tokio::test]
+    async fn disabled_box_allowlist_change_notifies_subscribers_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let config = Arc::new(tokio::sync::Mutex::new(disabled_box_config()));
+        let deps = api_test_deps(Arc::new(|_| {
+            unreachable!("a disabled box never spawns a stack")
+        }));
+        let supervisor = api_test_supervisor(&config.lock().await.clone(), &deps);
+        let mut changes = supervisor.lock().await.subscribe_state_changes();
+
+        let response = handle_local_api_request(
+            RequestEnvelope::new(
+                1,
+                Request::SetAllowExact {
+                    name: "paused".into(),
+                    ports: vec![3000, 8080],
+                },
+            ),
+            &supervisor,
+            &config,
+            &paths,
+        )
+        .await;
+        assert!(
+            matches!(response.response, Response::Ok { .. }),
+            "mutation failed: {:?}",
+            response.response
+        );
+        // The regression this pins: editing a disabled box's pinned ports
+        // changes the rendered paused count, but reconcile has no stack to
+        // change — before the fix, subscribers heard nothing, indefinitely.
+        tokio::time::timeout(Duration::from_secs(1), changes.recv())
+            .await
+            .expect("disabled-box allowlist change never reached subscribers")
+            .expect("state channel closed");
+        assert!(
+            changes.try_recv().is_err(),
+            "one invalidation per mutation — never a duplicate"
+        );
+        assert_eq!(config.lock().await.boxes[0].allow, vec![3000, 8080]);
+        supervisor.lock().await.cancel_all();
+    }
+
+    #[tokio::test]
+    async fn disabled_box_removal_notifies_subscribers_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let config = Arc::new(tokio::sync::Mutex::new(disabled_box_config()));
+        let deps = api_test_deps(Arc::new(|_| {
+            unreachable!("a disabled box never spawns a stack")
+        }));
+        let supervisor = api_test_supervisor(&config.lock().await.clone(), &deps);
+        let mut changes = supervisor.lock().await.subscribe_state_changes();
+
+        let response = handle_local_api_request(
+            RequestEnvelope::new(
+                1,
+                Request::RemoveBox {
+                    name: "paused".into(),
+                },
+            ),
+            &supervisor,
+            &config,
+            &paths,
+        )
+        .await;
+        assert!(
+            matches!(response.response, Response::Ok { .. }),
+            "removal failed: {:?}",
+            response.response
+        );
+        // Same regression, removal shape: the removed card would have stayed
+        // on the subscription-only UI forever.
+        tokio::time::timeout(Duration::from_secs(1), changes.recv())
+            .await
+            .expect("disabled-box removal never reached subscribers")
+            .expect("state channel closed");
+        assert!(
+            changes.try_recv().is_err(),
+            "one invalidation per mutation — never a duplicate"
+        );
+        assert!(config.lock().await.boxes.is_empty());
+        supervisor.lock().await.cancel_all();
+    }
+
+    #[tokio::test]
+    async fn failed_mutation_notifies_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let config = Arc::new(tokio::sync::Mutex::new(disabled_box_config()));
+        let deps = api_test_deps(Arc::new(|_| {
+            unreachable!("a disabled box never spawns a stack")
+        }));
+        let supervisor = api_test_supervisor(&config.lock().await.clone(), &deps);
+        let mut changes = supervisor.lock().await.subscribe_state_changes();
+
+        let response = handle_local_api_request(
+            RequestEnvelope::new(
+                1,
+                Request::RemoveBox {
+                    name: "ghost".into(),
+                },
+            ),
+            &supervisor,
+            &config,
+            &paths,
+        )
+        .await;
+        assert!(matches!(response.response, Response::Error { .. }));
+        assert!(
+            changes.try_recv().is_err(),
+            "a rejected mutation changed nothing and must not invalidate"
+        );
+        supervisor.lock().await.cancel_all();
+    }
+
+    #[tokio::test]
+    async fn enabled_box_mutation_notifies_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let mut cfg = Config::default();
+        cfg.boxes.push(BoxConfig {
+            name: "live".into(),
+            host: "live.example".into(),
+            index: 1,
+            allow: vec![3000],
+            deny: vec![],
+            enabled: true,
+        });
+        // A scripted fake agent answers the bootstrap probes and then holds
+        // the handshake open forever: the stack starts but publishes no
+        // status changes, so the mutation's invalidation is the ONLY event
+        // a subscriber can receive — a duplicate cannot hide.
+        let agent_bytes = b"fake-agent";
+        let digest = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(agent_bytes))
+        };
+        let transport = portal_transport::testing::FakeTransport::new("live.example");
+        transport.push_exec_ok("Linux x86_64\n");
+        transport.push_exec_ok(&format!("{} {}", agent_bytes.len(), digest));
+        transport.push_exec_ok("OK\n");
+        let (session, _agent_side) = portal_transport::testing::duplex_session(256 * 1024);
+        transport.push_session(session);
+        let forwarder = Arc::new(portal_transport::testing::FakeForwarder::default());
+        let mut deps = api_test_deps({
+            let transport = transport.clone();
+            let forwarder = forwarder.clone();
+            Arc::new(move |_| {
+                (
+                    transport.clone() as Arc<dyn portal_transport::Transport>,
+                    forwarder.clone() as Arc<dyn portal_transport::PortForwarder>,
+                )
+            })
+        });
+        deps.agent.linux_amd64 = Some(Arc::from(&agent_bytes[..]));
+
+        let config = Arc::new(tokio::sync::Mutex::new(cfg));
+        let supervisor = api_test_supervisor(&config.lock().await.clone(), &deps);
+        let mut changes = supervisor.lock().await.subscribe_state_changes();
+
+        let response = handle_local_api_request(
+            RequestEnvelope::new(
+                1,
+                Request::SetAllowExact {
+                    name: "live".into(),
+                    ports: vec![3000, 8080],
+                },
+            ),
+            &supervisor,
+            &config,
+            &paths,
+        )
+        .await;
+        assert!(
+            matches!(response.response, Response::Ok { .. }),
+            "mutation failed: {:?}",
+            response.response
+        );
+        // reconcile itself broadcasts this stack's config change; the
+        // disabled-box fallback must NOT pile a second invalidation on top.
+        tokio::time::timeout(Duration::from_secs(1), changes.recv())
+            .await
+            .expect("enabled-box allowlist change never reached subscribers")
+            .expect("state channel closed");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            changes.try_recv().is_err(),
+            "reconcile's own broadcast must not be followed by a duplicate"
+        );
+        assert_eq!(config.lock().await.boxes[0].allow, vec![3000, 8080]);
+        supervisor.lock().await.cancel_all();
+    }
+
+    #[test]
+    fn replace_allow_exact_applies_mixed_changes_atomically() {
+        let mut config = Config::default();
+        config.boxes.push(BoxConfig {
+            name: "dev".into(),
+            host: "h".into(),
+            index: 1,
+            allow: vec![3000, 8000],
+            deny: vec![],
+            enabled: true,
+        });
+        // A mixed edit — remove 8000, add 5173, keep 3000 — lands as one
+        // exact set, not as two independent requests.
+        replace_allow_exact(&mut config, "dev", &[3000, 5173]).unwrap();
+        assert_eq!(config.boxes[0].allow, vec![3000, 5173]);
+        // The full set is normalized: sorted, duplicates collapsed.
+        replace_allow_exact(&mut config, "dev", &[9000, 3000, 9000]).unwrap();
+        assert_eq!(config.boxes[0].allow, vec![3000, 9000]);
+        // Clearing is an exact replacement with the empty set.
+        replace_allow_exact(&mut config, "dev", &[]).unwrap();
+        assert_eq!(config.boxes[0].allow, Vec::<u16>::new());
+        // An unknown box changes nothing and says so.
+        assert!(replace_allow_exact(&mut config, "ghost", &[1]).is_err());
+        assert_eq!(config.boxes[0].allow, Vec::<u16>::new());
+    }
+
+    #[tokio::test]
+    async fn allow_mutation_failure_persists_and_commits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        // Poison the config directory (a file, not a directory) so the save
+        // fails; the in-memory config must stay untouched.
+        std::fs::write(&paths.config_dir, "not a directory").unwrap();
+        let config = Arc::new(tokio::sync::Mutex::new(Config::default()));
+        config.lock().await.boxes.push(BoxConfig {
+            name: "dev".into(),
+            host: "h".into(),
+            index: 1,
+            allow: vec![3000],
+            deny: vec![],
+            enabled: true,
+        });
+        let result = mutate_api_config(&config, &paths, |next| {
+            replace_allow_exact(next, "dev", &[5173])
+        })
+        .await;
+        assert!(result.is_err(), "a failed save must surface as an error");
+        assert_eq!(
+            config.lock().await.boxes[0].allow,
+            vec![3000],
+            "a failed save leaves the live config exactly as it was"
+        );
+    }
+
     #[test]
     fn status_json_shape() {
-        let s = status_json(&[BoxStatus {
+        let configured = vec![BoxConfig {
             name: "devbox1".into(),
             host: "h".into(),
             index: 1,
-            connected: true,
-            agent_sha: Some("cafe".into()),
-            forwards: vec![(18000, 8000)],
-            clipsync_synced: true,
-            clipsync_change_id: 7,
-        }]);
+            allow: vec![9000, 8080],
+            deny: vec![],
+            enabled: true,
+        }];
+        let s = status_json(
+            &[BoxStatus {
+                name: "devbox1".into(),
+                host: "h".into(),
+                index: 1,
+                connected: true,
+                agent_sha: Some("cafe".into()),
+                forwards: vec![(18000, 8000)],
+                clipsync_synced: true,
+                clipsync_change_id: 7,
+            }],
+            &configured,
+        );
         assert!(s.contains("\"devbox1\""));
         assert!(s.contains("18000"));
         let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed[0]["clipsync_change_id"], 7);
+        assert_eq!(parsed[0]["enabled"], true);
+        assert_eq!(parsed[0]["pinned"], 2);
+    }
+
+    #[test]
+    fn status_json_lists_disabled_boxes_as_disabled() {
+        let configured = vec![
+            BoxConfig {
+                name: "live".into(),
+                host: "h1".into(),
+                index: 1,
+                allow: vec![],
+                deny: vec![],
+                enabled: true,
+            },
+            BoxConfig {
+                name: "paused".into(),
+                host: "h2".into(),
+                index: 2,
+                allow: vec![3000],
+                deny: vec![],
+                enabled: false,
+            },
+        ];
+        let s = status_json(
+            &[BoxStatus {
+                name: "live".into(),
+                host: "h1".into(),
+                index: 1,
+                connected: true,
+                agent_sha: None,
+                forwards: vec![],
+                clipsync_synced: false,
+                clipsync_change_id: 0,
+            }],
+            &configured,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let array = parsed.as_array().unwrap();
+        assert_eq!(array.len(), 2, "disabled boxes stay visible");
+        let paused = array
+            .iter()
+            .find(|b| b["name"] == "paused")
+            .expect("disabled box is listed");
+        assert_eq!(paused["enabled"], false);
+        assert_eq!(paused["connected"], false);
+        assert_eq!(paused["forwards"].as_array().unwrap().len(), 0);
+        // The paused-forward count rides along so the menu can state it.
+        assert_eq!(paused["pinned"], 1);
     }
 }

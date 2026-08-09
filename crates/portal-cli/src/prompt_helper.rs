@@ -52,6 +52,8 @@ fn show_alert(req: &PromptRequest) -> PromptDecision {
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
+    use crate::activation::activate_app;
+
     // This subcommand IS the main thread (fresh process).
     let Some(mtm) = MainThreadMarker::new() else {
         return PromptDecision {
@@ -130,7 +132,8 @@ fn show_alert(req: &PromptRequest) -> PromptDecision {
     if let Some(field) = field.as_ref() {
         alert.window().setInitialFirstResponder(Some(field));
     }
-    app.activate();
+    // Bring the alert forward through the shared macOS 13-safe gate.
+    activate_app(&app);
     let response = alert.runModal();
     let idx = (response - NSAlertFirstButtonReturn) as usize;
     let chosen = buttons.get(idx).copied().unwrap_or("Deny");

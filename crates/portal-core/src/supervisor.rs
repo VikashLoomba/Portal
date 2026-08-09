@@ -118,6 +118,10 @@ pub struct BoxStack {
     cancel: CancellationToken,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     status: watch::Receiver<BoxStatus>,
+    /// Shared local-port claims. A stack removes every forward it owned after
+    /// its tasks stop so disabling and re-enabling a box can reclaim the same
+    /// identity ports without requiring a daemon restart.
+    taken: Arc<Mutex<BTreeSet<u16>>>,
     /// Held for the stack's lifetime: dropping it would kill live filter
     /// updates (the hub owns the watch Sender).
     filter: Arc<FilterHub>,
@@ -145,6 +149,21 @@ impl BoxStack {
         self.cancel.cancel();
         for t in self.tasks {
             let _ = t.await;
+        }
+        // Read after every task has stopped: this is the final assignment set,
+        // including a forward established concurrently with cancellation.
+        // Without releasing these claims, a normal Disable → Enable cycle
+        // translated all ports until the whole daemon restarted.
+        let locals = self
+            .status
+            .borrow()
+            .forwards
+            .iter()
+            .map(|(local, _)| *local)
+            .collect::<Vec<_>>();
+        let mut taken = self.taken.lock().unwrap();
+        for local in locals {
+            taken.remove(&local);
         }
     }
 }
@@ -289,7 +308,14 @@ impl Supervisor {
     /// (index/allow/deny changes apply live via `apply_config`); removed or
     /// host-changed boxes are torn down; new boxes spawn. Stays same-type
     /// (no watcher rebuild) by construction.
-    pub async fn reconcile(&mut self, config: &Config) {
+    ///
+    /// Broadcasts one state invalidation when — and only when — a running
+    /// stack changed, and returns whether it did. A caller holding a config
+    /// it knows was mutated (the local API, the file watcher) emits the
+    /// invalidation itself when this returns false, so every rendered
+    /// config change — including disabled-box edits and removals, which
+    /// touch no stack — reaches subscribers exactly once.
+    pub async fn reconcile(&mut self, config: &Config) -> bool {
         let mut desired: Vec<BoxConfig> = config.enabled_boxes().cloned().collect();
         let mut changed = false;
         let mut i = 0;
@@ -317,7 +343,10 @@ impl Supervisor {
             }
         }
         let Some(deps) = &self.deps else {
-            return;
+            if changed {
+                let _ = self.state_tx.send(());
+            }
+            return changed;
         };
         for b in desired {
             changed = true;
@@ -334,6 +363,7 @@ impl Supervisor {
         if changed {
             let _ = self.state_tx.send(());
         }
+        changed
     }
 
     /// Subscribe to aggregate state invalidations. Events deliberately carry
@@ -525,6 +555,7 @@ fn spawn_box_stack(
     // ---- reconcile loop task ----
     let (url_tx, mut url_rx) = mpsc::channel::<String>(4);
     let filter_hub_reconciler = filter_hub.clone();
+    let reconciler_taken = taken.clone();
     tasks.push(tokio::spawn({
         let cancel = cancel.clone();
         let status_tx = status_tx.clone();
@@ -548,7 +579,7 @@ fn spawn_box_stack(
                     skip_local: Vec::new(),
                     pins: PinSet::new(),
                 },
-                taken,
+                taken: reconciler_taken,
                 status_tx,
                 filter: filter_hub_reconciler,
             };
@@ -699,6 +730,7 @@ fn spawn_box_stack(
         cancel,
         tasks,
         status: status_rx,
+        taken,
         filter: filter_hub,
     }
 }

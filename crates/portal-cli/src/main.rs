@@ -2,6 +2,8 @@
 //! uses the versioned owner-only local API; existing CLI verbs retain their
 //! command shapes and lifecycle recovery paths.
 
+#[cfg(target_os = "macos")]
+mod activation;
 mod app_install;
 mod daemon;
 mod deployment;
