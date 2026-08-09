@@ -47,7 +47,7 @@ fn show_alert(req: &PromptRequest) -> PromptDecision {
     use objc2::rc::Retained;
     use objc2::{MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{
-        NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy,
+        NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy, NSImage,
         NSSecureTextField,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
@@ -63,8 +63,19 @@ fn show_alert(req: &PromptRequest) -> PromptDecision {
     // Dock icon.
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    // `runModal` can otherwise finish application launch lazily while the
+    // alert is already animating in. That made the accessory field appear a
+    // moment after the buttons and left users looking at an incomplete prompt.
+    app.finishLaunching();
 
     let alert = NSAlert::new(mtm);
+    if let Some(icon) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str("lock.shield.fill"),
+        Some(&NSString::from_str("Secure credential approval")),
+    ) {
+        // SAFETY: the retained NSImage remains alive for the alert's lifetime.
+        unsafe { alert.setIcon(Some(&icon)) };
+    }
     let delivery = match req.mode.as_str() {
         "askpass" => "a sudo password prompt".to_string(),
         "env" => format!("environment variable {:?}", req.target),
@@ -106,12 +117,19 @@ fn show_alert(req: &PromptRequest) -> PromptDecision {
     let field: Option<Retained<NSSecureTextField>> = if req.remembered {
         None
     } else {
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(260.0, 24.0));
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(280.0, 28.0));
         let field = NSSecureTextField::initWithFrame(NSSecureTextField::alloc(mtm), frame);
+        field.setPlaceholderString(Some(&NSString::from_str("Password")));
         alert.setAccessoryView(Some(&field));
         Some(field)
     };
 
+    // Force the complete alert—including its accessory—to lay out before it
+    // becomes visible, and put keyboard focus in the password field.
+    alert.layout();
+    if let Some(field) = field.as_ref() {
+        alert.window().setInitialFirstResponder(Some(field));
+    }
     app.activate();
     let response = alert.runModal();
     let idx = (response - NSAlertFirstButtonReturn) as usize;
