@@ -56,6 +56,7 @@ pub fn install_verified_app(
         .parent()
         .ok_or_else(|| format!("{} has no parent", destination.display()))?;
     std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    cleanup_abandoned_app_staging(parent);
 
     // Copy into the destination filesystem and re-run platform verification
     // before stopping a single live process.
@@ -73,6 +74,7 @@ pub fn install_verified_app(
 
     let pid = process_id();
     std::fs::create_dir_all(&paths.bin_dir).map_err(|e| e.to_string())?;
+    cleanup_abandoned_cli_links(&paths.bin_dir);
     let staged_cli = paths.bin_dir.join(format!(".portal.app-link.{pid}"));
     if std::fs::symlink_metadata(&staged_cli).is_ok() {
         return Err(format!(
@@ -171,6 +173,37 @@ pub fn install_verified_app(
         tracing::warn!(%error, "could not sync CLI installation directory");
     }
     Ok(report)
+}
+
+fn cleanup_abandoned_app_staging(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(".portal-app-stage.")
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && let Err(error) = std::fs::remove_dir_all(entry.path())
+        {
+            tracing::warn!(%error, path = %entry.path().display(), "could not remove abandoned app staging directory");
+        }
+    }
+}
+
+fn cleanup_abandoned_cli_links(bin_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(bin_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(".portal.app-link.")
+            && std::fs::symlink_metadata(entry.path())
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+            && let Err(error) = std::fs::remove_file(entry.path())
+        {
+            tracing::warn!(%error, path = %entry.path().display(), "could not remove abandoned CLI staging link");
+        }
+    }
 }
 
 fn destination(paths: &Paths) -> Result<PathBuf, String> {
@@ -386,6 +419,30 @@ mod tests {
         rollback(&paths, &destination, &state).unwrap();
         assert_eq!(std::fs::read(destination.join("old")).unwrap(), b"old");
         assert_eq!(std::fs::read(paths.bin_path).unwrap(), b"old-cli");
+    }
+
+    #[test]
+    fn abandoned_v2_0_16_staging_is_cleaned_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_stage = dir.path().join(".portal-app-stage.abandoned");
+        let unrelated_dir = dir.path().join("keep");
+        std::fs::create_dir(&app_stage).unwrap();
+        std::fs::create_dir(&unrelated_dir).unwrap();
+        cleanup_abandoned_app_staging(dir.path());
+        assert!(!app_stage.exists());
+        assert!(unrelated_dir.exists());
+
+        let stale_link = dir.path().join(".portal.app-link.10837");
+        let lookalike_file = dir.path().join(".portal.app-link.not-a-link");
+        std::os::unix::fs::symlink(
+            "/Applications/Portal.app/Contents/MacOS/portal",
+            &stale_link,
+        )
+        .unwrap();
+        std::fs::write(&lookalike_file, b"keep").unwrap();
+        cleanup_abandoned_cli_links(dir.path());
+        assert!(std::fs::symlink_metadata(&stale_link).is_err());
+        assert!(lookalike_file.exists());
     }
 
     #[test]

@@ -287,8 +287,8 @@ pub async fn run(paths: Paths) -> Result<(), String> {
     });
 
     // Only release compatibility binaries carry the build flag that enables
-    // this one-time, out-of-process app migration. Source builds never
-    // auto-download anything.
+    // this one-time migration in a separate one-shot launchd job. Source
+    // builds never auto-download anything.
     crate::spawn_app_migration_if_needed(&paths);
 
     // Config hot-reload: poll mtime (2s), reconcile on change. allow/unallow

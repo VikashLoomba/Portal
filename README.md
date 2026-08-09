@@ -112,9 +112,10 @@ daemon and menu-bar UI. Any failed health gate restores the previous app and CLI
 
 Pre-app versions know only the compatibility binary asset. Their existing
 `portal upgrade` installs that signed bridge normally; when its daemon starts,
-it waits for the old upgrade transaction to finish and automatically completes
-the same verified Portal.app migration. This makes the transition a single
-user command. Portal installs in `/Applications` when writable and otherwise in
+it submits a distinct one-shot launchd migration job, waits for the old upgrade
+transaction to finish, and completes the same verified Portal.app migration.
+The separate job survives replacement of the daemon and menu-bar agent, making
+the transition a single user command. Portal installs in `/Applications` when writable and otherwise in
 `~/Applications`. Nothing on the dev box is discarded: the embedded agent and
 clipboard shims reconverge after the local daemon restarts.
 

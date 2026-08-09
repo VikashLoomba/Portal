@@ -979,7 +979,7 @@ fn apply_prepared_upgrade(
     // `exec` bypassed TempDir::drop. The helper's mapped inode remains valid
     // while its staging pathname is removed.
     let _ = std::fs::remove_dir_all(staging);
-    match result {
+    let code = match result {
         Ok(report) => {
             println!("portal: upgraded to {tag}");
             println!(
@@ -995,7 +995,9 @@ fn apply_prepared_upgrade(
             eprintln!("portal upgrade: {error}");
             1
         }
-    }
+    };
+    cleanup_migration_job();
+    code
 }
 
 /// Release compatibility binaries use this once: an older `portal upgrade`
@@ -1003,6 +1005,31 @@ fn apply_prepared_upgrade(
 /// daemon launches this stable child to finish the signed app-bundle migration.
 fn auto_app_migration_enabled() -> bool {
     option_env!("PORTAL_AUTO_APP_MIGRATION") == Some("1")
+}
+
+const MIGRATION_JOB_PREFIX: &str = "local.portal.app-migration.";
+const MIGRATION_JOB_ENV: &str = "PORTAL_MIGRATION_JOB_LABEL";
+
+fn migration_submit_command(
+    label: &str,
+    current: &std::path::Path,
+    paths: &Paths,
+) -> std::process::Command {
+    let mut command = std::process::Command::new("launchctl");
+    command
+        .args(["submit", "-l"])
+        .arg(label)
+        .arg("-o")
+        .arg(&paths.log)
+        .arg("-e")
+        .arg(&paths.log)
+        .arg("--")
+        .arg("/usr/bin/env")
+        .arg(format!("HOME={}", paths.home.display()))
+        .arg(format!("{MIGRATION_JOB_ENV}={label}"))
+        .arg(current)
+        .arg("_complete-app-migration");
+    command
 }
 
 pub(crate) fn spawn_app_migration_if_needed(paths: &Paths) {
@@ -1029,31 +1056,80 @@ pub(crate) fn spawn_app_migration_if_needed(paths: &Paths) {
         return;
     }
 
+    // A plain child remains part of this launchd service. Booting out the old
+    // daemon during installation therefore SIGTERMs that child halfway
+    // through migration. Submit a distinct one-shot launchd job instead; it
+    // survives daemon/tray replacement and removes itself when finished.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let label = format!(
+        "{MIGRATION_JOB_PREFIX}{}.{}.{nonce}",
+        unsafe { libc_getuid() },
+        std::process::id()
+    );
     let _ = std::fs::create_dir_all(paths.log.parent().unwrap_or(&paths.home));
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.log)
-        .ok();
-    let mut command = std::process::Command::new(current);
-    command
-        .arg("_complete-app-migration")
-        .stdin(std::process::Stdio::null());
-    if let Some(log) = log {
-        if let Ok(stdout) = log.try_clone() {
-            command.stdout(std::process::Stdio::from(stdout));
+    let output = migration_submit_command(&label, &current, paths).output();
+    match output {
+        Ok(output) if output.status.success() => {
+            tracing::info!(%label, "scheduled standalone-to-Portal.app migration")
         }
-        command.stderr(std::process::Stdio::from(log));
+        Ok(output) => tracing::warn!(
+            %label,
+            error = %String::from_utf8_lossy(&output.stderr).trim(),
+            "could not schedule Portal.app migration"
+        ),
+        Err(error) => tracing::warn!(%label, %error, "could not schedule Portal.app migration"),
     }
-    match command.spawn() {
-        Ok(_) => tracing::info!("scheduled standalone-to-Portal.app migration"),
-        Err(error) => tracing::warn!(%error, "could not schedule Portal.app migration"),
+}
+
+struct MigrationJobCleanup;
+
+impl Drop for MigrationJobCleanup {
+    fn drop(&mut self) {
+        cleanup_migration_job();
+    }
+}
+
+fn cleanup_migration_job() {
+    use std::io::Write as _;
+
+    let Some(label) = std::env::var_os(MIGRATION_JOB_ENV) else {
+        return;
+    };
+    let label = label.to_string_lossy();
+    if !label.starts_with(MIGRATION_JOB_PREFIX)
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        tracing::warn!(%label, "refusing to remove malformed migration job label");
+        return;
+    }
+    // Flush diagnostics before `launchctl remove` tears down this one-shot
+    // service and every process in its coalition.
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    match std::process::Command::new("launchctl")
+        .arg("remove")
+        .arg(label.as_ref())
+        .status()
+    {
+        // A successful self-removal normally terminates us before `status`
+        // returns. These branches cover launchctl failures that leave us live.
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::warn!(%status, "could not remove completed migration job"),
+        Err(error) => tracing::warn!(%error, "could not remove completed migration job"),
     }
 }
 
 fn complete_app_migration(paths: &Paths) -> i32 {
     use fs2::FileExt as _;
 
+    // All ordinary returns clean up the submitted launchd job. A successful
+    // updater `exec` bypasses Drop, so `_apply-upgrade` performs the same
+    // cleanup after installation and health gating.
+    let _migration_job_cleanup = MigrationJobCleanup;
     if !app_install::app_is_needed(paths) {
         return 0;
     }
@@ -1203,5 +1279,39 @@ fn features(paths: &Paths, name: Option<String>, state: Option<String>) -> i32 {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod migration_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn migration_runs_as_a_distinct_launchd_job() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::derive(home.path(), 501);
+        let command = migration_submit_command(
+            "local.portal.app-migration.501.42.7",
+            std::path::Path::new("/tmp/portal"),
+            &paths,
+        );
+        assert_eq!(command.get_program(), "launchctl");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            &args[..3],
+            ["submit", "-l", "local.portal.app-migration.501.42.7"]
+        );
+        assert!(args.iter().any(|arg| arg == "/usr/bin/env"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "PORTAL_MIGRATION_JOB_LABEL=local.portal.app-migration.501.42.7")
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("_complete-app-migration")
+        );
     }
 }
