@@ -873,6 +873,122 @@ fn logs(paths: &Paths, follow: bool, lines: usize) -> i32 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UiUpgradeSubmission {
+    NoChange(String),
+    Submitted(String),
+}
+
+/// Prepare and verify an update for the native UI, then hand only the final
+/// replacement phase to an independent launchd job. The job must not be a
+/// child of the tray LaunchAgent: installing the app boots that agent out,
+/// which would otherwise kill its own updater halfway through the swap.
+pub(crate) fn submit_ui_upgrade(paths: &Paths) -> Result<UiUpgradeSubmission, String> {
+    let install_dir = paths
+        .bin_path
+        .parent()
+        .expect("installed binary has a parent directory");
+    let plan = {
+        let rt = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+        let runner = OsRunner;
+        let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+        rt.block_on(upgrade::prepare(
+            &runner,
+            install_dir,
+            &current,
+            false,
+            false,
+            app_install::app_is_needed(paths),
+        ))?
+    };
+    match plan {
+        upgrade::UpgradePlan::NoChange(message) => Ok(UiUpgradeSubmission::NoChange(message)),
+        upgrade::UpgradePlan::Candidate(prepared) => {
+            let tag = prepared.tag.clone();
+            submit_prepared_ui_upgrade(prepared, paths)?;
+            Ok(UiUpgradeSubmission::Submitted(tag))
+        }
+    }
+}
+
+fn submit_prepared_ui_upgrade(
+    prepared: upgrade::PreparedUpgrade,
+    paths: &Paths,
+) -> Result<(), String> {
+    let helper = stage_upgrade_helper(&prepared)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let label = format!(
+        "local.portal.ui-upgrade.{}.{}.{nonce}",
+        paths.uid,
+        std::process::id()
+    );
+    let mut command = ui_upgrade_submit_command(
+        &label,
+        &helper,
+        prepared.candidate(),
+        &prepared.tag,
+        prepared.staging_dir(),
+        prepared.kind == upgrade::ArtifactKind::AppBundle,
+        paths,
+    );
+    let output = command
+        .output()
+        .map_err(|error| format!("submit updater job: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "submit updater job: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    // launchd now owns the helper/candidate paths. `_apply-upgrade` removes
+    // the directory after the transaction; dropping TempDir here would race
+    // the freshly submitted job before it opens the helper.
+    let _ = prepared.keep_staging();
+    Ok(())
+}
+
+fn ui_upgrade_submit_command(
+    label: &str,
+    helper: &std::path::Path,
+    candidate: &std::path::Path,
+    tag: &str,
+    staging: &std::path::Path,
+    app: bool,
+    paths: &Paths,
+) -> std::process::Command {
+    let script = r#"helper=$1
+shift
+"$helper" "$@"
+status=$?
+/bin/launchctl remove "$PORTAL_UI_UPGRADE_LABEL" >/dev/null 2>&1 || true
+exit "$status""#;
+    let mut command = std::process::Command::new("/bin/launchctl");
+    command
+        .args(["submit", "-l"])
+        .arg(label)
+        .arg("-o")
+        .arg(&paths.log)
+        .arg("-e")
+        .arg(&paths.log)
+        .arg("--")
+        .arg("/usr/bin/env")
+        .arg(format!("HOME={}", paths.home.display()))
+        .arg(format!("PORTAL_UI_UPGRADE_LABEL={label}"))
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .arg("portal-ui-upgrade")
+        .arg(helper)
+        .arg("_apply-upgrade");
+    if app {
+        command.arg("--app");
+    }
+    command.arg(candidate).arg(tag).arg(staging);
+    command
+}
+
 fn upgrade(paths: &Paths, check: bool, force: bool) -> i32 {
     if !check {
         let _ = std::fs::remove_file(paths.config_dir.join("app-migration.failed"));
@@ -912,29 +1028,33 @@ fn upgrade(paths: &Paths, check: bool, force: bool) -> i32 {
 /// Move execution to a stable hard link BEFORE replacing the installed path.
 /// macOS denies child processes from a running executable whose own path was
 /// replaced; launchctl must therefore run from this unchanged helper inode.
-fn exec_upgrade_helper(prepared: upgrade::PreparedUpgrade) -> i32 {
-    use std::os::unix::process::CommandExt as _;
-
-    let current = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("portal upgrade: cannot locate updater executable: {e}");
-            return 1;
-        }
-    };
+fn stage_upgrade_helper(prepared: &upgrade::PreparedUpgrade) -> Result<PathBuf, String> {
+    let current = std::env::current_exe()
+        .map_err(|error| format!("cannot locate updater executable: {error}"))?;
     let helper = prepared.staging_dir().join("portal-upgrade-helper");
     if let Err(link_error) = std::fs::hard_link(&current, &helper) {
         // Same-filesystem staging makes hard-link the normal path. Copy is a
         // safe fallback for filesystems that disable links; it still gives the
         // helper a stable pathname distinct from the installation target.
-        if let Err(copy_error) = std::fs::copy(&current, &helper) {
-            eprintln!(
-                "portal upgrade: stage updater helper: hard link failed ({link_error}); copy failed ({copy_error})"
-            );
+        std::fs::copy(&current, &helper).map_err(|copy_error| {
+            format!(
+                "stage updater helper: hard link failed ({link_error}); copy failed ({copy_error})"
+            )
+        })?;
+    }
+    Ok(helper)
+}
+
+fn exec_upgrade_helper(prepared: upgrade::PreparedUpgrade) -> i32 {
+    use std::os::unix::process::CommandExt as _;
+
+    let helper = match stage_upgrade_helper(&prepared) {
+        Ok(helper) => helper,
+        Err(error) => {
+            eprintln!("portal upgrade: {error}");
             return 1;
         }
-    }
-
+    };
     let mut command = std::process::Command::new(&helper);
     command.arg("_apply-upgrade");
     if prepared.kind == upgrade::ArtifactKind::AppBundle {
@@ -1307,6 +1427,42 @@ fn features(paths: &Paths, name: Option<String>, state: Option<String>) -> i32 {
 #[cfg(test)]
 mod migration_bridge_tests {
     use super::*;
+
+    #[test]
+    fn ui_upgrade_runs_as_a_distinct_self_cleaning_launchd_job() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::derive(home.path(), 501);
+        let command = ui_upgrade_submit_command(
+            "local.portal.ui-upgrade.501.42.7",
+            std::path::Path::new("/tmp/portal-upgrade-helper"),
+            std::path::Path::new("/tmp/Portal.app"),
+            "v2.1.0",
+            std::path::Path::new("/tmp/portal-upgrade-stage"),
+            true,
+            &paths,
+        );
+        assert_eq!(command.get_program(), "/bin/launchctl");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            &args[..3],
+            ["submit", "-l", "local.portal.ui-upgrade.501.42.7"]
+        );
+        assert!(args.iter().any(|arg| arg == "/bin/sh"));
+        assert!(args.iter().any(|arg| arg.contains("launchctl remove")));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "PORTAL_UI_UPGRADE_LABEL=local.portal.ui-upgrade.501.42.7")
+        );
+        assert!(args.iter().any(|arg| arg == "_apply-upgrade"));
+        assert!(args.iter().any(|arg| arg == "--app"));
+        assert_eq!(
+            &args[args.len() - 3..],
+            ["/tmp/Portal.app", "v2.1.0", "/tmp/portal-upgrade-stage"]
+        );
+    }
 
     #[test]
     fn migration_runs_as_a_distinct_launchd_job() {

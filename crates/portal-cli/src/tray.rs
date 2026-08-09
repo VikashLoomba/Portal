@@ -21,6 +21,63 @@
 use std::io::Read;
 use std::time::Duration;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateCheck {
+    Current(String),
+    Available { tag: String, message: String },
+}
+
+fn classify_update_check(success: bool, stdout: &str, stderr: &str) -> Result<UpdateCheck, String> {
+    let message = stdout
+        .trim()
+        .strip_prefix("portal: ")
+        .unwrap_or(stdout.trim());
+    if !success {
+        let error = stderr.trim();
+        return Err(if error.is_empty() {
+            message.to_string()
+        } else {
+            error
+                .strip_prefix("portal upgrade: ")
+                .unwrap_or(error)
+                .to_string()
+        });
+    }
+    if let Some(rest) = message.strip_prefix("new release available: ") {
+        let tag = rest
+            .split_whitespace()
+            .next()
+            .filter(|tag| tag.starts_with('v'))
+            .ok_or_else(|| format!("unexpected update response: {message}"))?;
+        return Ok(UpdateCheck::Available {
+            tag: tag.to_string(),
+            message: message.to_string(),
+        });
+    }
+    if message.starts_with("Portal.app migration available") {
+        return Ok(UpdateCheck::Available {
+            tag: "Portal.app".into(),
+            message: message.to_string(),
+        });
+    }
+    if message.contains(" is up to date ") {
+        return Ok(UpdateCheck::Current(message.to_string()));
+    }
+    Err(format!("unexpected update response: {message}"))
+}
+
+fn run_update_check(executable: &std::path::Path) -> Result<UpdateCheck, String> {
+    let output = std::process::Command::new(executable)
+        .args(["upgrade", "--check"])
+        .output()
+        .map_err(|error| format!("could not run the updater: {error}"))?;
+    classify_update_check(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
 /// One rendered menu row. Pure data so the AppKit layer stays a dumb painter
 /// and everything above it is unit-testable off-Mac.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,7 +262,10 @@ pub fn run_app() -> i32 {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{Dot, Row, daemon_down_row, fetch_status, rows_from_status, version_row};
+    use super::{
+        Dot, Row, UpdateCheck, daemon_down_row, fetch_status, rows_from_status, run_update_check,
+        version_row,
+    };
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
@@ -236,6 +296,7 @@ mod macos {
     }
 
     struct TrayIvars {
+        paths: portal_core::paths::Paths,
         api_sock: PathBuf,
         window: OnceCell<Retained<NSWindow>>,
         heading: OnceCell<Retained<NSTextField>>,
@@ -247,6 +308,8 @@ mod macos {
         content: OnceCell<Retained<NSTextView>>,
         management_buttons: OnceCell<Vec<Retained<NSButton>>>,
         log_refresh_button: OnceCell<Retained<NSButton>>,
+        update_button: RefCell<Option<Retained<NSButton>>>,
+        update_in_flight: Cell<bool>,
         main_view: Cell<MainView>,
         state: RefCell<Option<State>>,
         feature_names: RefCell<Vec<String>>,
@@ -259,9 +322,19 @@ mod macos {
         Error(String),
     }
 
+    enum UpdateDelivery {
+        Checked(Result<UpdateCheck, String>),
+        Submitted(Result<crate::UiUpgradeSubmission, String>),
+    }
+
     struct StateDeliveryContext {
         tray: usize,
         delivery: StateDelivery,
+    }
+
+    struct UpdateDeliveryContext {
+        tray: usize,
+        delivery: UpdateDelivery,
     }
 
     unsafe extern "C" {
@@ -289,6 +362,25 @@ mod macos {
                 (&raw mut _dispatch_main_q).cast(),
                 Box::into_raw(context).cast(),
                 deliver_state_on_main,
+            );
+        }
+    }
+
+    extern "C" fn deliver_update_on_main(context: *mut c_void) {
+        // SAFETY: created exclusively for one main-queue dispatch; Tray lives
+        // for the duration of NSApplication.run.
+        let context = unsafe { Box::from_raw(context.cast::<UpdateDeliveryContext>()) };
+        let tray = unsafe { &*(context.tray as *const Tray) };
+        tray.receive_update(context.delivery);
+    }
+
+    fn dispatch_update_to_main(tray: usize, delivery: UpdateDelivery) {
+        let context = Box::new(UpdateDeliveryContext { tray, delivery });
+        unsafe {
+            dispatch_async_f(
+                (&raw mut _dispatch_main_q).cast(),
+                Box::into_raw(context).cast(),
+                deliver_update_on_main,
             );
         }
     }
@@ -368,6 +460,11 @@ mod macos {
             #[unsafe(method(refreshPortal:))]
             fn refresh_portal(&self, _sender: Option<&NSObject>) {
                 self.refresh_current_view();
+            }
+
+            #[unsafe(method(checkPortalUpdates:))]
+            fn check_for_updates(&self, _sender: Option<&NSObject>) {
+                self.begin_update_check();
             }
 
             #[unsafe(method(switchPortalView:))]
@@ -654,8 +751,10 @@ mod macos {
     }
 
     impl Tray {
-        fn new(mtm: MainThreadMarker, api_sock: PathBuf) -> Retained<Self> {
+        fn new(mtm: MainThreadMarker, paths: portal_core::paths::Paths) -> Retained<Self> {
+            let api_sock = paths.api_sock.clone();
             let this = Self::alloc(mtm).set_ivars(TrayIvars {
+                paths,
                 api_sock,
                 window: OnceCell::new(),
                 heading: OnceCell::new(),
@@ -667,6 +766,8 @@ mod macos {
                 content: OnceCell::new(),
                 management_buttons: OnceCell::new(),
                 log_refresh_button: OnceCell::new(),
+                update_button: RefCell::new(None),
+                update_in_flight: Cell::new(false),
                 main_view: Cell::new(MainView::Overview),
                 state: RefCell::new(None),
                 feature_names: RefCell::new(Vec::new()),
@@ -709,6 +810,90 @@ mod macos {
                     .is_some_and(|window| window.isVisible())
             {
                 self.refresh_overview();
+            }
+        }
+
+        fn set_update_activity(&self, busy: bool, title: &str) {
+            self.ivars().update_in_flight.set(busy);
+            if let Some(button) = self.ivars().update_button.borrow().as_ref() {
+                button.setEnabled(!busy);
+                button.setTitle(&NSString::from_str(title));
+            }
+        }
+
+        fn begin_update_check(&self) {
+            if self.ivars().update_in_flight.get() {
+                return;
+            }
+            self.set_update_activity(true, "Checking…");
+            let executable = match std::env::current_exe() {
+                Ok(executable) => executable,
+                Err(error) => {
+                    self.receive_update(UpdateDelivery::Checked(Err(format!(
+                        "could not locate Portal: {error}"
+                    ))));
+                    return;
+                }
+            };
+            let tray = self as *const Self as usize;
+            std::thread::spawn(move || {
+                dispatch_update_to_main(
+                    tray,
+                    UpdateDelivery::Checked(run_update_check(&executable)),
+                );
+            });
+        }
+
+        fn begin_update_install(&self) {
+            if self.ivars().update_in_flight.get() {
+                return;
+            }
+            self.set_update_activity(true, "Downloading Update…");
+            let tray = self as *const Self as usize;
+            let paths = self.ivars().paths.clone();
+            std::thread::spawn(move || {
+                dispatch_update_to_main(
+                    tray,
+                    UpdateDelivery::Submitted(crate::submit_ui_upgrade(&paths)),
+                );
+            });
+        }
+
+        fn receive_update(&self, delivery: UpdateDelivery) {
+            match delivery {
+                UpdateDelivery::Checked(Ok(UpdateCheck::Current(message))) => {
+                    self.set_update_activity(false, "Check for Updates…");
+                    show_information(self.mtm(), "Portal is up to date", &message);
+                }
+                UpdateDelivery::Checked(Ok(UpdateCheck::Available { tag, message })) => {
+                    self.set_update_activity(false, "Check for Updates…");
+                    if confirm_update(self.mtm(), &tag, &message) {
+                        self.begin_update_install();
+                    }
+                }
+                UpdateDelivery::Checked(Err(error)) => {
+                    self.set_update_activity(false, "Check for Updates…");
+                    show_error(
+                        self.mtm(),
+                        &format!("Could not check for updates.\n\n{error}"),
+                    );
+                }
+                UpdateDelivery::Submitted(Ok(crate::UiUpgradeSubmission::NoChange(message))) => {
+                    self.set_update_activity(false, "Check for Updates…");
+                    show_information(self.mtm(), "Portal is up to date", &message);
+                }
+                UpdateDelivery::Submitted(Ok(crate::UiUpgradeSubmission::Submitted(tag))) => {
+                    // The independent updater now owns the transaction and
+                    // will restart this tray process after the health gate.
+                    self.set_update_activity(true, &format!("Installing {tag}…"));
+                }
+                UpdateDelivery::Submitted(Err(error)) => {
+                    self.set_update_activity(false, "Check for Updates…");
+                    show_error(
+                        self.mtm(),
+                        &format!("Could not install the update.\n\n{error}"),
+                    );
+                }
             }
         }
 
@@ -839,7 +1024,7 @@ mod macos {
             let title = label(
                 self.mtm(),
                 &hero_title,
-                NSRect::new(NSPoint::new(50.0, 58.0), NSSize::new(width - 72.0, 24.0)),
+                NSRect::new(NSPoint::new(50.0, 58.0), NSSize::new(width - 240.0, 24.0)),
                 17.0,
                 true,
                 None,
@@ -848,12 +1033,33 @@ mod macos {
             let detail = label(
                 self.mtm(),
                 &hero_detail,
-                NSRect::new(NSPoint::new(50.0, 28.0), NSSize::new(width - 72.0, 22.0)),
+                NSRect::new(NSPoint::new(50.0, 28.0), NSSize::new(width - 240.0, 22.0)),
                 12.0,
                 false,
                 Some(&NSColor::secondaryLabelColor()),
             );
             hero_content.addSubview(&detail);
+            let checking = self.ivars().update_in_flight.get();
+            let update_button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str(if checking {
+                        "Updating…"
+                    } else {
+                        "Check for Updates…"
+                    }),
+                    Some(self),
+                    Some(sel!(checkPortalUpdates:)),
+                    self.mtm(),
+                )
+            };
+            update_button.setEnabled(!checking);
+            update_button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+            update_button.setFrame(NSRect::new(
+                NSPoint::new(width - 174.0, 37.0),
+                NSSize::new(152.0, 32.0),
+            ));
+            hero_content.addSubview(&update_button);
+            *self.ivars().update_button.borrow_mut() = Some(update_button);
             top -= 104.0;
             let tint = hero_color.colorWithAlphaComponent(0.10);
             let hero = glass_panel(
@@ -1317,6 +1523,17 @@ mod macos {
             };
             unsafe { open.setTarget(Some(self)) };
             menu.addItem(&open);
+            let update = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    ns_string!("Check for Updates…"),
+                    Some(sel!(checkPortalUpdates:)),
+                    ns_string!(""),
+                )
+            };
+            update.setEnabled(!self.ivars().update_in_flight.get());
+            unsafe { update.setTarget(Some(self)) };
+            menu.addItem(&update);
             menu.addItem(&NSMenuItem::separatorItem(mtm));
             for row in rows {
                 let item = NSMenuItem::new(mtm);
@@ -1488,6 +1705,27 @@ mod macos {
         alert.runModal() == NSAlertFirstButtonReturn
     }
 
+    fn confirm_update(mtm: MainThreadMarker, tag: &str, message: &str) -> bool {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(&format!("Portal {tag} is available")));
+        alert.setInformativeText(&NSString::from_str(&format!(
+            "{message}\n\nPortal will download, verify, and install the signed update, then restart automatically. Active forwards are restored after the daemon health check."
+        )));
+        alert.addButtonWithTitle(ns_string!("Update Now"));
+        alert.addButtonWithTitle(ns_string!("Later"));
+        NSApplication::sharedApplication(mtm).activate();
+        alert.runModal() == NSAlertFirstButtonReturn
+    }
+
+    fn show_information(mtm: MainThreadMarker, title: &str, message: &str) {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(title));
+        alert.setInformativeText(&NSString::from_str(message));
+        alert.addButtonWithTitle(ns_string!("OK"));
+        NSApplication::sharedApplication(mtm).activate();
+        alert.runModal();
+    }
+
     fn show_error(mtm: MainThreadMarker, message: &str) {
         let alert = NSAlert::new(mtm);
         alert.setMessageText(ns_string!("Portal could not complete that action"));
@@ -1501,6 +1739,10 @@ mod macos {
         let menu = NSMenu::new(mtm);
         let app_item = NSMenuItem::new(mtm);
         let app_menu = NSMenu::new(mtm);
+        // These items target the retained Tray directly. Disable AppKit's
+        // responder-chain validation so Check for Updates is not discarded
+        // before the application has finished launching.
+        app_menu.setAutoenablesItems(false);
         let open = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
@@ -1511,6 +1753,17 @@ mod macos {
         };
         unsafe { open.setTarget(Some(tray)) };
         app_menu.addItem(&open);
+        let update = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                ns_string!("Check for Updates…"),
+                Some(sel!(checkPortalUpdates:)),
+                ns_string!(""),
+            )
+        };
+        update.setEnabled(true);
+        unsafe { update.setTarget(Some(tray)) };
+        app_menu.addItem(&update);
         app_menu.addItem(&NSMenuItem::separatorItem(mtm));
         let quit = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -1552,7 +1805,7 @@ mod macos {
         // Accessory: status item + menus, no Dock icon, no app switcher entry.
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-        let tray = Tray::new(mtm, paths.api_sock.clone());
+        let tray = Tray::new(mtm, paths.clone());
         app.setDelegate(Some(ProtocolObject::from_ref(&*tray)));
         install_main_menu(&app, &tray, mtm);
 
@@ -1609,6 +1862,43 @@ mod tests {
 
     fn labels(rows: &[Row]) -> Vec<&str> {
         rows.iter().map(|r| r.label.as_str()).collect()
+    }
+
+    #[test]
+    fn update_check_classifies_available_release() {
+        assert_eq!(
+            classify_update_check(
+                true,
+                "portal: new release available: v2.1.0 (current v2.0.21)\n",
+                "",
+            ),
+            Ok(UpdateCheck::Available {
+                tag: "v2.1.0".into(),
+                message: "new release available: v2.1.0 (current v2.0.21)".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn update_check_classifies_current_release() {
+        assert_eq!(
+            classify_update_check(
+                true,
+                "portal: current (v2.0.21) is up to date (latest v2.0.21)\n",
+                "",
+            ),
+            Ok(UpdateCheck::Current(
+                "current (v2.0.21) is up to date (latest v2.0.21)".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn update_check_surfaces_upgrader_failure() {
+        assert_eq!(
+            classify_update_check(false, "", "portal upgrade: network unavailable\n"),
+            Err("network unavailable".into())
+        );
     }
 
     #[test]

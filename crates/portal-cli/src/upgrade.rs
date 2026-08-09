@@ -98,6 +98,12 @@ impl PreparedUpgrade {
     pub fn staging_dir(&self) -> &std::path::Path {
         self._staging.path()
     }
+
+    /// Transfer cleanup ownership to an independently submitted updater job.
+    /// The staged helper removes this directory after applying the candidate.
+    pub fn keep_staging(self) -> std::path::PathBuf {
+        self._staging.keep()
+    }
 }
 
 /// Resolve, download, signature-check, Gatekeeper-check and execute-check an

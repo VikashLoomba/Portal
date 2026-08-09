@@ -179,9 +179,10 @@ daemon keeps every connection and forward alive.
 The desktop window uses AppKit's Liquid Glass views on macOS 26, with a native
 vibrancy fallback on earlier supported macOS versions. Glass status cards add,
 remove, enable, and configure boxes; active forwards open directly; native
-switches manage feature gates; and the separate Logs view reads a sanitized,
-bounded daemon-log tail. The CLI remains available and uses the same
-configuration and service model.
+switches manage feature gates; the separate Logs view reads a sanitized,
+bounded daemon-log tail; and **Check for Updates…** verifies and installs the
+latest signed app release without leaving Portal. The CLI remains available
+and uses the same configuration and service model.
 
 The window has no polling or refresh timer. It owns one versioned local-API
 subscription: the daemon publishes an initial snapshot and then invalidates it
@@ -194,6 +195,7 @@ forwards that are actually live:
 
 ```
 Open Portal…
+Check for Updates…
 ─────────────────────────
 ● devbox1
       3000 → localhost:13000
@@ -207,7 +209,11 @@ Quit Portal
 
 The status portion still reads one bounded legacy snapshot only when the menu
 opens and does nothing while idle. **Open Portal…** presents the event-driven
-Liquid Glass management window, whose actions use the versioned local API.
+Liquid Glass management window, whose daemon actions use the versioned local
+API. Update checks are explicitly user-initiated—never timed—and reuse the
+same minisign, Gatekeeper, transactional swap, rollback, and health gates as
+`portal upgrade`. The final replacement runs as an independent one-shot
+launchd job so restarting the tray cannot kill its own updater.
 
 ## Port mapping
 
