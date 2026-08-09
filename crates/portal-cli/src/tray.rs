@@ -4,11 +4,11 @@
 //! - The daemon owns ALL state. The status menu preserves its zero-idle-work
 //!   legacy snapshot path; the management window uses the versioned local API
 //!   for state, configuration mutations, and bounded logs.
-//! - ZERO idle activity: no timers, no persistent connections. The ONLY
-//!   data fetch happens in `menuWillOpen:` — a sub-millisecond local Unix
-//!   socket round trip performed synchronously while AppKit prepares the
-//!   menu, so every open shows point-in-time truth and a closed menu costs
-//!   nothing (the process parks in the NSApp mach-port wait).
+//! - The status menu has zero idle work: its only fetch happens in
+//!   `menuWillOpen:`. The management window owns one daemon state subscription;
+//!   AppKit redraws only after a real connection/config/feature event. There
+//!   are no UI refresh timers, and secondary views keep explicit navigation
+//!   state.
 //! - Consequence, by design: the BAR ICON is a static template glyph; the
 //!   red/yellow/green indicators live on the per-host rows inside the menu.
 //!   A live-colored icon would require the daemon to push state; the status
@@ -208,27 +208,113 @@ mod macos {
     use super::{Dot, Row, daemon_down_row, fetch_status, rows_from_status, version_row};
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
-    use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
+    use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
     use objc2_app_kit::{
         NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy,
         NSApplicationDelegate, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor,
-        NSFont, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSScrollView, NSStatusBar,
-        NSStatusItem, NSTextField, NSTextView, NSVariableStatusItemLength, NSView, NSWindow,
-        NSWindowStyleMask,
+        NSControlStateValueOff, NSControlStateValueOn, NSFont, NSGlassEffectContainerView,
+        NSGlassEffectView, NSGlassEffectViewStyle, NSImage, NSMenu, NSMenuDelegate, NSMenuItem,
+        NSScrollView, NSSegmentStyle, NSSegmentSwitchTracking, NSSegmentedControl, NSStatusBar,
+        NSStatusItem, NSSwitch, NSTextField, NSTextView, NSVariableStatusItemLength, NSView,
+        NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
+        NSVisualEffectView, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
+        NSWindowToolbarStyle,
     };
     use objc2_foundation::{
         MainThreadMarker, NSAttributedString, NSDictionary, NSObject, NSObjectProtocol, NSPoint,
-        NSRect, NSSize, NSString, NSTimer, ns_string,
+        NSRect, NSSize, NSString, ns_string,
     };
-    use portal_core::localapi::{Request, Response, State};
-    use std::cell::OnceCell;
+    use portal_core::localapi::{KNOWN_FEATURES, Request, Response, State};
+    use std::cell::{Cell, OnceCell, RefCell};
+    use std::ffi::c_void;
     use std::path::PathBuf;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MainView {
+        Overview,
+        Logs,
+    }
 
     struct TrayIvars {
         api_sock: PathBuf,
         window: OnceCell<Retained<NSWindow>>,
+        heading: OnceCell<Retained<NSTextField>>,
+        navigation: OnceCell<Retained<NSSegmentedControl>>,
+        overview_scroll: OnceCell<Retained<NSScrollView>>,
+        overview_host: OnceCell<Retained<NSView>>,
+        overview_document: OnceCell<Retained<NSView>>,
+        logs_panel: OnceCell<Retained<NSView>>,
         content: OnceCell<Retained<NSTextView>>,
-        refresh_timer: OnceCell<Retained<NSTimer>>,
+        management_buttons: OnceCell<Vec<Retained<NSButton>>>,
+        log_refresh_button: OnceCell<Retained<NSButton>>,
+        main_view: Cell<MainView>,
+        state: RefCell<Option<State>>,
+        feature_names: RefCell<Vec<String>>,
+        state_error: RefCell<Option<String>>,
+        subscription_started: Cell<bool>,
+    }
+
+    enum StateDelivery {
+        State(State),
+        Error(String),
+    }
+
+    struct StateDeliveryContext {
+        tray: usize,
+        delivery: StateDelivery,
+    }
+
+    unsafe extern "C" {
+        static mut _dispatch_main_q: c_void;
+        fn dispatch_async_f(
+            queue: *mut c_void,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+    }
+
+    extern "C" fn deliver_state_on_main(context: *mut c_void) {
+        // SAFETY: the context is created exclusively for this dispatch and the
+        // Tray lives for the duration of NSApplication.run. libdispatch invokes
+        // this function on the main queue.
+        let context = unsafe { Box::from_raw(context.cast::<StateDeliveryContext>()) };
+        let tray = unsafe { &*(context.tray as *const Tray) };
+        tray.receive_state(context.delivery);
+    }
+
+    fn dispatch_state_to_main(tray: usize, delivery: StateDelivery) {
+        let context = Box::new(StateDeliveryContext { tray, delivery });
+        unsafe {
+            dispatch_async_f(
+                (&raw mut _dispatch_main_q).cast(),
+                Box::into_raw(context).cast(),
+                deliver_state_on_main,
+            );
+        }
+    }
+
+    define_class!(
+        // SAFETY: NSView has no additional subclassing requirements here.
+        #[unsafe(super = NSView)]
+        #[thread_kind = MainThreadOnly]
+        #[ivars = ()]
+        struct FlippedDocumentView;
+
+        unsafe impl NSObjectProtocol for FlippedDocumentView {}
+
+        impl FlippedDocumentView {
+            #[unsafe(method(isFlipped))]
+            fn is_flipped(&self) -> bool {
+                true
+            }
+        }
+    );
+
+    impl FlippedDocumentView {
+        fn with_frame(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(());
+            unsafe { msg_send![super(this), initWithFrame: frame] }
+        }
     }
 
     define_class!(
@@ -281,19 +367,147 @@ mod macos {
 
             #[unsafe(method(refreshPortal:))]
             fn refresh_portal(&self, _sender: Option<&NSObject>) {
-                self.refresh_window();
+                self.refresh_current_view();
             }
 
-            #[unsafe(method(refreshPortalIfVisible:))]
-            fn refresh_portal_if_visible(&self, _sender: Option<&NSTimer>) {
-                if self
-                    .ivars()
-                    .window
-                    .get()
-                    .is_some_and(|window| window.isVisible())
-                {
-                    self.refresh_window();
+            #[unsafe(method(switchPortalView:))]
+            fn switch_portal_view(&self, sender: Option<&NSSegmentedControl>) {
+                let view = if sender.is_some_and(|control| control.selectedSegment() == 1) {
+                    MainView::Logs
+                } else {
+                    MainView::Overview
+                };
+                self.ivars().main_view.set(view);
+                if let Some(overview) = self.ivars().overview_scroll.get() {
+                    overview.setHidden(view != MainView::Overview);
                 }
+                if let Some(logs) = self.ivars().logs_panel.get() {
+                    logs.setHidden(view != MainView::Logs);
+                }
+                if let Some(buttons) = self.ivars().management_buttons.get() {
+                    for button in buttons {
+                        button.setHidden(view != MainView::Overview);
+                    }
+                }
+                if let Some(button) = self.ivars().log_refresh_button.get() {
+                    button.setHidden(view != MainView::Logs);
+                }
+                self.refresh_current_view();
+            }
+
+            #[unsafe(method(toggleBoxFromCard:))]
+            fn toggle_box_from_card(&self, sender: Option<&NSButton>) {
+                let Some(index) = sender.and_then(|button| usize::try_from(button.tag()).ok()) else {
+                    return;
+                };
+                let Some(box_config) = self
+                    .ivars()
+                    .state
+                    .borrow()
+                    .as_ref()
+                    .and_then(|state| state.boxes.get(index))
+                    .cloned()
+                else {
+                    return;
+                };
+                self.perform(Request::SetBoxEnabled {
+                    name: box_config.name,
+                    enabled: !box_config.enabled,
+                });
+            }
+
+            #[unsafe(method(removeBoxFromCard:))]
+            fn remove_box_from_card(&self, sender: Option<&NSButton>) {
+                let Some(index) = sender.and_then(|button| usize::try_from(button.tag()).ok()) else {
+                    return;
+                };
+                let Some(name) = self
+                    .ivars()
+                    .state
+                    .borrow()
+                    .as_ref()
+                    .and_then(|state| state.boxes.get(index))
+                    .map(|box_config| box_config.name.clone())
+                else {
+                    return;
+                };
+                if confirm_action(
+                    self.mtm(),
+                    "Remove this box?",
+                    &format!("Portal will close forwards for {name}. Remote files are left intact."),
+                    "Remove Box",
+                ) {
+                    self.perform(Request::RemoveBox { name });
+                }
+            }
+
+            #[unsafe(method(configurePortsFromCard:))]
+            fn configure_ports_from_card(&self, sender: Option<&NSButton>) {
+                let Some(index) = sender.and_then(|button| usize::try_from(button.tag()).ok()) else {
+                    return;
+                };
+                let Some(name) = self
+                    .ivars()
+                    .state
+                    .borrow()
+                    .as_ref()
+                    .and_then(|state| state.boxes.get(index))
+                    .map(|box_config| box_config.name.clone())
+                else {
+                    return;
+                };
+                let Some(ports) = prompt_one_field(
+                    self.mtm(),
+                    &format!("Always forward ports for {name}"),
+                    "Enter comma- or space-separated remote ports. Prefix the list with remove to stop forcing them.",
+                    "3000, 8000 — or: remove 3000",
+                    "Apply",
+                ) else {
+                    return;
+                };
+                let trimmed = ports.trim();
+                let (allowed, values) = match trimmed.strip_prefix("remove") {
+                    Some(values) => (false, values),
+                    None => (true, trimmed),
+                };
+                let ports = values
+                    .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                    .filter(|part| !part.is_empty())
+                    .map(str::parse::<u16>)
+                    .collect::<Result<Vec<_>, _>>();
+                match ports {
+                    Ok(ports) if !ports.is_empty() => self.perform(Request::SetAllow {
+                        name,
+                        ports,
+                        allowed,
+                    }),
+                    _ => show_error(self.mtm(), "Enter at least one valid port"),
+                }
+            }
+
+            #[unsafe(method(toggleFeatureFromCard:))]
+            fn toggle_feature_from_card(&self, sender: Option<&NSSwitch>) {
+                let Some(sender) = sender else { return };
+                let Ok(index) = usize::try_from(sender.tag()) else { return };
+                let Some(name) = self.ivars().feature_names.borrow().get(index).cloned() else {
+                    return;
+                };
+                self.perform(Request::SetFeature {
+                    name,
+                    enabled: sender.state() == NSControlStateValueOn,
+                });
+            }
+
+            #[unsafe(method(openForwardButton:))]
+            fn open_forward_button(&self, sender: Option<&NSButton>) {
+                let Some(port) = sender
+                    .map(|button| button.tag())
+                    .and_then(|tag| u16::try_from(tag).ok())
+                    .filter(|port| *port != 0)
+                else {
+                    return;
+                };
+                crate::daemon::open_url(format!("http://127.0.0.1:{port}"));
             }
 
             #[unsafe(method(addBox:))]
@@ -317,119 +531,6 @@ mod macos {
                     name,
                     index: None,
                 });
-            }
-
-            #[unsafe(method(removeBox:))]
-            fn remove_box(&self, _sender: Option<&NSObject>) {
-                let Some(name) = prompt_one_field(
-                    self.mtm(),
-                    "Remove a remote box",
-                    "The daemon will close this box's forwards. Remote files are left intact.",
-                    "Box name",
-                    "Remove",
-                ) else {
-                    return;
-                };
-                if !name.trim().is_empty() {
-                    self.perform(Request::RemoveBox {
-                        name: name.trim().to_string(),
-                    });
-                }
-            }
-
-            #[unsafe(method(configureBox:))]
-            fn configure_box(&self, _sender: Option<&NSObject>) {
-                let Some((name, state)) = prompt_two_fields(
-                    self.mtm(),
-                    "Enable or disable a box",
-                    "Enter on to connect the box, or off to keep it configured but disconnected.",
-                    ("Box name", ""),
-                    ("State: on or off", "on"),
-                ) else {
-                    return;
-                };
-                let enabled = match state.trim().to_ascii_lowercase().as_str() {
-                    "on" | "enabled" | "true" => true,
-                    "off" | "disabled" | "false" => false,
-                    _ => {
-                        show_error(self.mtm(), "State must be on or off");
-                        return;
-                    }
-                };
-                self.perform(Request::SetBoxEnabled {
-                    name: name.trim().to_string(),
-                    enabled,
-                });
-            }
-
-            #[unsafe(method(configurePorts:))]
-            fn configure_ports(&self, _sender: Option<&NSObject>) {
-                let Some((name, ports)) = prompt_two_fields(
-                    self.mtm(),
-                    "Manage force-forwarded ports",
-                    "Enter comma- or space-separated remote ports. Prefix the list with remove to unallow them.",
-                    ("Box name", ""),
-                    ("Ports, or: remove 3000, 8000", "3000, 8000"),
-                ) else {
-                    return;
-                };
-                let trimmed = ports.trim();
-                let (allowed, values) = match trimmed.strip_prefix("remove") {
-                    Some(values) => (false, values),
-                    None => (true, trimmed),
-                };
-                let ports = values
-                    .split(|c: char| c == ',' || c.is_ascii_whitespace())
-                    .filter(|part| !part.is_empty())
-                    .map(str::parse::<u16>)
-                    .collect::<Result<Vec<_>, _>>();
-                match ports {
-                    Ok(ports) if !ports.is_empty() => self.perform(Request::SetAllow {
-                        name: name.trim().to_string(),
-                        ports,
-                        allowed,
-                    }),
-                    _ => show_error(self.mtm(), "Enter at least one valid port"),
-                }
-            }
-
-            #[unsafe(method(configureFeature:))]
-            fn configure_feature(&self, _sender: Option<&NSObject>) {
-                let Some((name, state)) = prompt_two_fields(
-                    self.mtm(),
-                    "Configure a Portal feature",
-                    "Features: clip-text, clip-image, clip-write, notify, cred, cred-touchid.",
-                    ("Feature name", ""),
-                    ("State: on or off", "on"),
-                ) else {
-                    return;
-                };
-                let enabled = match state.trim().to_ascii_lowercase().as_str() {
-                    "on" | "enabled" | "true" => true,
-                    "off" | "disabled" | "false" => false,
-                    _ => {
-                        show_error(self.mtm(), "State must be on or off");
-                        return;
-                    }
-                };
-                self.perform(Request::SetFeature {
-                    name: name.trim().to_string(),
-                    enabled,
-                });
-            }
-
-            #[unsafe(method(showLogs:))]
-            fn show_logs(&self, _sender: Option<&NSObject>) {
-                self.show_window();
-                match crate::local_client::request(&self.ivars().api_sock, Request::GetLogs { lines: 500 }) {
-                    Ok(Response::Logs { lines }) => self.set_content(&format!(
-                        "Portal daemon log — last {} lines\n\n{}",
-                        lines.len(),
-                        lines.join("\n")
-                    )),
-                    Ok(_) => show_error(self.mtm(), "The daemon returned an unexpected log response"),
-                    Err(error) => show_error(self.mtm(), &error),
-                }
             }
 
             /// Click a forward row → open it in the default browser. The local
@@ -466,22 +567,162 @@ mod macos {
         }
     );
 
+    fn clear_subviews(view: &NSView) {
+        let subviews = view.subviews();
+        for subview in subviews.iter() {
+            subview.removeFromSuperview();
+        }
+    }
+
+    fn label(
+        mtm: MainThreadMarker,
+        text: &str,
+        frame: NSRect,
+        size: f64,
+        bold: bool,
+        color: Option<&NSColor>,
+    ) -> Retained<NSTextField> {
+        let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+        label.setFrame(frame);
+        let font = if bold {
+            NSFont::boldSystemFontOfSize(size)
+        } else {
+            NSFont::systemFontOfSize(size)
+        };
+        label.setFont(Some(&font));
+        if let Some(color) = color {
+            label.setTextColor(Some(color));
+        }
+        label
+    }
+
+    fn glass_panel(
+        mtm: MainThreadMarker,
+        frame: NSRect,
+        content: &NSView,
+        tint: Option<&NSColor>,
+        corner_radius: f64,
+    ) -> Retained<NSView> {
+        content.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
+        content.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        let panel = if objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some() {
+            let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), frame);
+            glass.setCornerRadius(corner_radius);
+            glass.setStyle(NSGlassEffectViewStyle::Regular);
+            glass.setTintColor(tint);
+            glass.setContentView(Some(content));
+            Retained::into_super(glass)
+        } else {
+            let visual = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), frame);
+            visual.setMaterial(NSVisualEffectMaterial::ContentBackground);
+            visual.setBlendingMode(NSVisualEffectBlendingMode::WithinWindow);
+            visual.setState(NSVisualEffectState::FollowsWindowActiveState);
+            visual.addSubview(content);
+            Retained::into_super(visual)
+        };
+        panel.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+        panel
+    }
+
+    fn glass_document(mtm: MainThreadMarker, frame: NSRect, content: &NSView) -> Retained<NSView> {
+        content.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
+        content.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        let material = if objc2::runtime::AnyClass::get(c"NSGlassEffectContainerView").is_some() {
+            let container = NSGlassEffectContainerView::initWithFrame(
+                NSGlassEffectContainerView::alloc(mtm),
+                frame,
+            );
+            container.setSpacing(18.0);
+            container.setContentView(Some(content));
+            Retained::into_super(container)
+        } else {
+            content.retain()
+        };
+        material.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        let host = FlippedDocumentView::with_frame(mtm, frame);
+        host.addSubview(&material);
+        Retained::into_super(host)
+    }
+
     impl Tray {
         fn new(mtm: MainThreadMarker, api_sock: PathBuf) -> Retained<Self> {
             let this = Self::alloc(mtm).set_ivars(TrayIvars {
                 api_sock,
                 window: OnceCell::new(),
+                heading: OnceCell::new(),
+                navigation: OnceCell::new(),
+                overview_scroll: OnceCell::new(),
+                overview_host: OnceCell::new(),
+                overview_document: OnceCell::new(),
+                logs_panel: OnceCell::new(),
                 content: OnceCell::new(),
-                refresh_timer: OnceCell::new(),
+                management_buttons: OnceCell::new(),
+                log_refresh_button: OnceCell::new(),
+                main_view: Cell::new(MainView::Overview),
+                state: RefCell::new(None),
+                feature_names: RefCell::new(Vec::new()),
+                state_error: RefCell::new(None),
+                subscription_started: Cell::new(false),
             });
             unsafe { msg_send![super(this), init] }
         }
 
+        fn start_state_subscription(&self) {
+            if self.ivars().subscription_started.replace(true) {
+                return;
+            }
+            let tray = self as *const Self as usize;
+            let socket = self.ivars().api_sock.clone();
+            let _ = crate::local_client::subscribe_state(socket, move |result| {
+                let delivery = match result {
+                    Ok(state) => StateDelivery::State(state),
+                    Err(error) => StateDelivery::Error(error),
+                };
+                dispatch_state_to_main(tray, delivery);
+            });
+        }
+
+        fn receive_state(&self, delivery: StateDelivery) {
+            match delivery {
+                StateDelivery::State(state) => {
+                    *self.ivars().state.borrow_mut() = Some(state);
+                    self.ivars().state_error.borrow_mut().take();
+                }
+                StateDelivery::Error(error) => {
+                    *self.ivars().state_error.borrow_mut() = Some(error);
+                }
+            }
+            if self.ivars().main_view.get() == MainView::Overview
+                && self
+                    .ivars()
+                    .window
+                    .get()
+                    .is_some_and(|window| window.isVisible())
+            {
+                self.refresh_overview();
+            }
+        }
+
         fn perform(&self, request: Request) {
             match crate::local_client::request(&self.ivars().api_sock, request) {
-                Ok(Response::Ok { .. }) => self.refresh_window(),
-                Ok(_) => show_error(self.mtm(), "The daemon returned an unexpected response"),
-                Err(error) => show_error(self.mtm(), &error),
+                Ok(Response::Ok { .. }) => {}
+                Ok(_) => {
+                    show_error(self.mtm(), "The daemon returned an unexpected response");
+                    self.refresh_overview();
+                }
+                Err(error) => {
+                    show_error(self.mtm(), &error);
+                    self.refresh_overview();
+                }
             }
         }
 
@@ -491,13 +732,398 @@ mod macos {
             }
         }
 
-        fn refresh_window(&self) {
-            match crate::local_client::request(&self.ivars().api_sock, Request::GetState) {
-                Ok(Response::State { state }) => self.set_content(&render_state(&state)),
-                Ok(_) => self.set_content("The daemon returned an unexpected response."),
-                Err(error) => self.set_content(&format!(
-                    "Portal daemon is not reachable.\n\n{error}\n\nUse the portal CLI to start or diagnose the local service."
+        fn refresh_current_view(&self) {
+            match self.ivars().main_view.get() {
+                MainView::Overview => self.refresh_overview(),
+                MainView::Logs => self.refresh_logs(),
+            }
+        }
+
+        fn refresh_overview(&self) {
+            if let Some(heading) = self.ivars().heading.get() {
+                heading.setStringValue(ns_string!("Portal"));
+            }
+            let Some(document) = self.ivars().overview_document.get() else {
+                return;
+            };
+            clear_subviews(document);
+
+            let state = self.ivars().state.borrow().clone();
+            let error = self.ivars().state_error.borrow().clone();
+            let box_heights = state
+                .as_ref()
+                .map(|state| {
+                    state
+                        .boxes
+                        .iter()
+                        .map(|box_config| {
+                            let forwards = state
+                                .statuses
+                                .iter()
+                                .find(|status| status.name == box_config.name)
+                                .map_or(0, |status| status.forwards.len().min(5));
+                            122.0 + forwards as f64 * 24.0
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let empty_box_height = if state.as_ref().is_some_and(|state| state.boxes.is_empty()) {
+                112.0
+            } else {
+                0.0
+            };
+            let feature_count = state.as_ref().map_or(0, |state| state.features.len());
+            let feature_height = if feature_count == 0 {
+                0.0
+            } else {
+                64.0 + feature_count.div_ceil(2) as f64 * 42.0
+            };
+            let total_height = 24.0
+                + 104.0
+                + box_heights.iter().sum::<f64>()
+                + box_heights.len() as f64 * 16.0
+                + if empty_box_height > 0.0 {
+                    empty_box_height + 16.0
+                } else {
+                    0.0
+                }
+                + if feature_height > 0.0 {
+                    feature_height + 16.0
+                } else {
+                    0.0
+                }
+                + 24.0;
+            let width = self
+                .ivars()
+                .overview_scroll
+                .get()
+                .map_or(744.0, |scroll| scroll.contentSize().width.max(640.0));
+            let document_size = NSSize::new(width, total_height.max(430.0));
+            document.setFrameSize(document_size);
+            if let Some(host) = self.ivars().overview_host.get() {
+                host.setFrameSize(document_size);
+            }
+            let mut top = total_height.max(430.0) - 16.0;
+
+            // Local daemon hero.
+            let hero_content = NSView::initWithFrame(
+                NSView::alloc(self.mtm()),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, 104.0)),
+            );
+            let (hero_title, hero_detail, hero_color) = match (&state, &error) {
+                (_, Some(error)) => (
+                    "Local daemon unavailable".to_string(),
+                    error.clone(),
+                    NSColor::systemRedColor(),
+                ),
+                (Some(state), None) => (
+                    "Local daemon connected".to_string(),
+                    format!("Portal {}  •  build {}", state.version, state.build_sha),
+                    NSColor::systemGreenColor(),
+                ),
+                _ => (
+                    "Connecting to the local daemon…".to_string(),
+                    "Waiting for the event stream".to_string(),
+                    NSColor::systemOrangeColor(),
+                ),
+            };
+            let dot = label(
+                self.mtm(),
+                "●",
+                NSRect::new(NSPoint::new(22.0, 58.0), NSSize::new(24.0, 24.0)),
+                18.0,
+                false,
+                Some(&hero_color),
+            );
+            hero_content.addSubview(&dot);
+            let title = label(
+                self.mtm(),
+                &hero_title,
+                NSRect::new(NSPoint::new(50.0, 58.0), NSSize::new(width - 72.0, 24.0)),
+                17.0,
+                true,
+                None,
+            );
+            hero_content.addSubview(&title);
+            let detail = label(
+                self.mtm(),
+                &hero_detail,
+                NSRect::new(NSPoint::new(50.0, 28.0), NSSize::new(width - 72.0, 22.0)),
+                12.0,
+                false,
+                Some(&NSColor::secondaryLabelColor()),
+            );
+            hero_content.addSubview(&detail);
+            top -= 104.0;
+            let tint = hero_color.colorWithAlphaComponent(0.10);
+            let hero = glass_panel(
+                self.mtm(),
+                NSRect::new(NSPoint::new(0.0, top), NSSize::new(width, 104.0)),
+                &hero_content,
+                Some(&tint),
+                22.0,
+            );
+            document.addSubview(&hero);
+            top -= 16.0;
+
+            if let Some(state) = &state {
+                if state.boxes.is_empty() {
+                    let empty_content = NSView::initWithFrame(
+                        NSView::alloc(self.mtm()),
+                        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, empty_box_height)),
+                    );
+                    let title = label(
+                        self.mtm(),
+                        "No remote boxes yet",
+                        NSRect::new(
+                            NSPoint::new(22.0, empty_box_height - 44.0),
+                            NSSize::new(width - 44.0, 24.0),
+                        ),
+                        17.0,
+                        true,
+                        None,
+                    );
+                    empty_content.addSubview(&title);
+                    let detail = label(
+                        self.mtm(),
+                        "Add an SSH host to begin forwarding its local services.",
+                        NSRect::new(
+                            NSPoint::new(22.0, empty_box_height - 74.0),
+                            NSSize::new(width - 44.0, 22.0),
+                        ),
+                        13.0,
+                        false,
+                        Some(&NSColor::secondaryLabelColor()),
+                    );
+                    empty_content.addSubview(&detail);
+                    top -= empty_box_height;
+                    let card = glass_panel(
+                        self.mtm(),
+                        NSRect::new(NSPoint::new(0.0, top), NSSize::new(width, empty_box_height)),
+                        &empty_content,
+                        None,
+                        20.0,
+                    );
+                    document.addSubview(&card);
+                    top -= 16.0;
+                }
+
+                for (index, (box_config, height)) in state.boxes.iter().zip(box_heights).enumerate()
+                {
+                    let status = state
+                        .statuses
+                        .iter()
+                        .find(|status| status.name == box_config.name);
+                    let (connection, status_color) = if !box_config.enabled {
+                        ("Disabled", NSColor::secondaryLabelColor())
+                    } else if status.is_some_and(|status| status.connected) {
+                        ("Connected", NSColor::systemGreenColor())
+                    } else {
+                        ("Connecting", NSColor::systemOrangeColor())
+                    };
+                    let card_content = NSView::initWithFrame(
+                        NSView::alloc(self.mtm()),
+                        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height)),
+                    );
+                    let name = label(
+                        self.mtm(),
+                        &box_config.name,
+                        NSRect::new(
+                            NSPoint::new(22.0, height - 42.0),
+                            NSSize::new(width - 300.0, 24.0),
+                        ),
+                        17.0,
+                        true,
+                        None,
+                    );
+                    card_content.addSubview(&name);
+                    let status_label = label(
+                        self.mtm(),
+                        connection,
+                        NSRect::new(NSPoint::new(22.0, height - 68.0), NSSize::new(120.0, 20.0)),
+                        12.0,
+                        true,
+                        Some(&status_color),
+                    );
+                    card_content.addSubview(&status_label);
+                    let host = label(
+                        self.mtm(),
+                        &format!("{}  •  box {}", box_config.host, box_config.index),
+                        NSRect::new(
+                            NSPoint::new(142.0, height - 68.0),
+                            NSSize::new(width - 360.0, 20.0),
+                        ),
+                        12.0,
+                        false,
+                        Some(&NSColor::secondaryLabelColor()),
+                    );
+                    card_content.addSubview(&host);
+
+                    let card_buttons = [
+                        (
+                            if box_config.enabled {
+                                "Disable"
+                            } else {
+                                "Enable"
+                            },
+                            sel!(toggleBoxFromCard:),
+                            width - 254.0,
+                            78.0,
+                        ),
+                        ("Ports…", sel!(configurePortsFromCard:), width - 168.0, 70.0),
+                        ("Remove", sel!(removeBoxFromCard:), width - 90.0, 68.0),
+                    ];
+                    for (title, action, x, button_width) in card_buttons {
+                        let button = unsafe {
+                            NSButton::buttonWithTitle_target_action(
+                                &NSString::from_str(title),
+                                Some(self),
+                                Some(action),
+                                self.mtm(),
+                            )
+                        };
+                        button.setTag(index as isize);
+                        button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+                        button.setFrame(NSRect::new(
+                            NSPoint::new(x, height - 48.0),
+                            NSSize::new(button_width, 28.0),
+                        ));
+                        card_content.addSubview(&button);
+                    }
+
+                    let mut forwards =
+                        status.map_or_else(Vec::new, |status| status.forwards.clone());
+                    forwards.sort_by_key(|&(local, remote)| (remote, local));
+                    for (row, (local, remote)) in forwards.iter().take(5).enumerate() {
+                        let y = height - 100.0 - row as f64 * 24.0;
+                        let forward = unsafe {
+                            NSButton::buttonWithTitle_target_action(
+                                &NSString::from_str(&format!(":{remote}  →  localhost:{local}")),
+                                Some(self),
+                                Some(sel!(openForwardButton:)),
+                                self.mtm(),
+                            )
+                        };
+                        forward.setTag(*local as isize);
+                        forward.setBordered(false);
+                        forward.setContentTintColor(Some(&NSColor::linkColor()));
+                        forward
+                            .setFrame(NSRect::new(NSPoint::new(22.0, y), NSSize::new(280.0, 22.0)));
+                        card_content.addSubview(&forward);
+                    }
+                    if forwards.is_empty() && box_config.enabled {
+                        let empty = label(
+                            self.mtm(),
+                            "No active forwards",
+                            NSRect::new(
+                                NSPoint::new(22.0, height - 100.0),
+                                NSSize::new(240.0, 22.0),
+                            ),
+                            12.0,
+                            false,
+                            Some(&NSColor::tertiaryLabelColor()),
+                        );
+                        card_content.addSubview(&empty);
+                    }
+                    top -= height;
+                    let tint = status_color.colorWithAlphaComponent(0.07);
+                    let card = glass_panel(
+                        self.mtm(),
+                        NSRect::new(NSPoint::new(0.0, top), NSSize::new(width, height)),
+                        &card_content,
+                        Some(&tint),
+                        20.0,
+                    );
+                    document.addSubview(&card);
+                    top -= 16.0;
+                }
+
+                if feature_height > 0.0 {
+                    let feature_content = NSView::initWithFrame(
+                        NSView::alloc(self.mtm()),
+                        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, feature_height)),
+                    );
+                    let heading = label(
+                        self.mtm(),
+                        "Features",
+                        NSRect::new(
+                            NSPoint::new(22.0, feature_height - 42.0),
+                            NSSize::new(220.0, 24.0),
+                        ),
+                        17.0,
+                        true,
+                        None,
+                    );
+                    feature_content.addSubview(&heading);
+                    let names = KNOWN_FEATURES
+                        .iter()
+                        .filter(|name| state.features.contains_key(**name))
+                        .map(|name| (*name).to_string())
+                        .collect::<Vec<_>>();
+                    *self.ivars().feature_names.borrow_mut() = names.clone();
+                    for (index, name) in names.iter().enumerate() {
+                        let column = index % 2;
+                        let row = index / 2;
+                        let x = 22.0 + column as f64 * (width / 2.0);
+                        let y = feature_height - 82.0 - row as f64 * 42.0;
+                        let title = label(
+                            self.mtm(),
+                            &feature_display_name(name),
+                            NSRect::new(NSPoint::new(x, y), NSSize::new(210.0, 24.0)),
+                            13.0,
+                            false,
+                            None,
+                        );
+                        feature_content.addSubview(&title);
+                        let toggle = NSSwitch::initWithFrame(
+                            NSSwitch::alloc(self.mtm()),
+                            NSRect::new(NSPoint::new(x + 226.0, y - 1.0), NSSize::new(42.0, 24.0)),
+                        );
+                        toggle.setTag(index as isize);
+                        toggle.setToolTip(Some(&NSString::from_str(&feature_display_name(name))));
+                        toggle.setState(if state.features.get(name).copied().unwrap_or(false) {
+                            NSControlStateValueOn
+                        } else {
+                            NSControlStateValueOff
+                        });
+                        unsafe {
+                            toggle.setTarget(Some(self));
+                            toggle.setAction(Some(sel!(toggleFeatureFromCard:)));
+                        }
+                        feature_content.addSubview(&toggle);
+                    }
+                    top -= feature_height;
+                    let feature_card = glass_panel(
+                        self.mtm(),
+                        NSRect::new(NSPoint::new(0.0, top), NSSize::new(width, feature_height)),
+                        &feature_content,
+                        None,
+                        20.0,
+                    );
+                    document.addSubview(&feature_card);
+                }
+            }
+        }
+
+        fn refresh_logs(&self) {
+            if let Some(heading) = self.ivars().heading.get() {
+                heading.setStringValue(ns_string!("Daemon Logs"));
+            }
+            if let Some(content) = self.ivars().content.get() {
+                content.setDrawsBackground(true);
+                content.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(12.0, 0.0)));
+            }
+            match crate::local_client::request(
+                &self.ivars().api_sock,
+                Request::GetLogs { lines: 500 },
+            ) {
+                Ok(Response::Logs { lines }) => self.set_content(&format!(
+                    "Last {} lines\n\n{}",
+                    lines.len(),
+                    lines.join("\n")
                 )),
+                Ok(_) => self.set_content("The daemon returned an unexpected log response."),
+                Err(error) => self.set_content(&format!("Could not load daemon logs.\n\n{error}")),
             }
         }
 
@@ -507,88 +1133,173 @@ mod macos {
                 let window = unsafe {
                     NSWindow::initWithContentRect_styleMask_backing_defer(
                         NSWindow::alloc(mtm),
-                        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(820.0, 600.0)),
+                        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(820.0, 640.0)),
                         NSWindowStyleMask::Titled
                             | NSWindowStyleMask::Closable
                             | NSWindowStyleMask::Miniaturizable
-                            | NSWindowStyleMask::Resizable,
+                            | NSWindowStyleMask::Resizable
+                            | NSWindowStyleMask::FullSizeContentView,
                         NSBackingStoreType::Buffered,
                         false,
                     )
                 };
                 unsafe { window.setReleasedWhenClosed(false) };
                 window.setTitle(ns_string!("Portal"));
-                window.setContentMinSize(NSSize::new(680.0, 460.0));
+                window.setContentMinSize(NSSize::new(760.0, 560.0));
+                window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+                window.setTitlebarAppearsTransparent(true);
+                window.setToolbarStyle(NSWindowToolbarStyle::Unified);
+                window.setMovableByWindowBackground(true);
                 window.center();
 
                 let root = window.contentView().expect("window has a content view");
+                let background = NSVisualEffectView::initWithFrame(
+                    NSVisualEffectView::alloc(mtm),
+                    root.bounds(),
+                );
+                background.setAutoresizingMask(
+                    NSAutoresizingMaskOptions::ViewWidthSizable
+                        | NSAutoresizingMaskOptions::ViewHeightSizable,
+                );
+                background.setMaterial(NSVisualEffectMaterial::UnderWindowBackground);
+                background.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+                background.setState(NSVisualEffectState::FollowsWindowActiveState);
+                root.addSubview(&background);
+
                 let heading = NSTextField::labelWithString(ns_string!("Portal"), mtm);
                 heading.setFrame(NSRect::new(
-                    NSPoint::new(24.0, 550.0),
-                    NSSize::new(760.0, 30.0),
+                    NSPoint::new(38.0, 574.0),
+                    NSSize::new(300.0, 32.0),
                 ));
-                heading.setFont(Some(&NSFont::boldSystemFontOfSize(22.0)));
-                heading.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+                heading.setFont(Some(&NSFont::boldSystemFontOfSize(26.0)));
+                heading.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
                 root.addSubview(&heading);
+                let _ = self.ivars().heading.set(heading);
 
-                let scroll = NSScrollView::initWithFrame(
-                    NSScrollView::alloc(mtm),
-                    NSRect::new(NSPoint::new(24.0, 88.0), NSSize::new(772.0, 450.0)),
+                let navigation = NSSegmentedControl::initWithFrame(
+                    NSSegmentedControl::alloc(mtm),
+                    NSRect::new(NSPoint::new(562.0, 575.0), NSSize::new(220.0, 30.0)),
                 );
-                scroll.setHasVerticalScroller(true);
-                scroll.setAutoresizingMask(
+                navigation.setSegmentCount(2);
+                navigation.setLabel_forSegment(ns_string!("Overview"), 0);
+                navigation.setLabel_forSegment(ns_string!("Logs"), 1);
+                navigation.setTrackingMode(NSSegmentSwitchTracking::SelectOne);
+                navigation.setSegmentStyle(NSSegmentStyle::Separated);
+                navigation.setSelectedSegment(0);
+                navigation.setAutoresizingMask(
+                    NSAutoresizingMaskOptions::ViewMinXMargin
+                        | NSAutoresizingMaskOptions::ViewMinYMargin,
+                );
+                unsafe {
+                    navigation.setTarget(Some(self));
+                    navigation.setAction(Some(sel!(switchPortalView:)));
+                }
+                root.addSubview(&navigation);
+                let _ = self.ivars().navigation.set(navigation);
+
+                let overview_scroll = NSScrollView::initWithFrame(
+                    NSScrollView::alloc(mtm),
+                    NSRect::new(NSPoint::new(38.0, 78.0), NSSize::new(744.0, 480.0)),
+                );
+                overview_scroll.setHasVerticalScroller(true);
+                overview_scroll.setDrawsBackground(false);
+                overview_scroll.setAutoresizingMask(
+                    NSAutoresizingMaskOptions::ViewWidthSizable
+                        | NSAutoresizingMaskOptions::ViewHeightSizable,
+                );
+                let overview_document = NSView::initWithFrame(
+                    NSView::alloc(mtm),
+                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(744.0, 480.0)),
+                );
+                let overview_glass_document = glass_document(
+                    mtm,
+                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(744.0, 480.0)),
+                    &overview_document,
+                );
+                overview_scroll.setDocumentView(Some(&overview_glass_document));
+                root.addSubview(&overview_scroll);
+                let _ = self.ivars().overview_document.set(overview_document);
+                let _ = self.ivars().overview_host.set(overview_glass_document);
+                let _ = self.ivars().overview_scroll.set(overview_scroll);
+
+                let logs_content = NSView::initWithFrame(
+                    NSView::alloc(mtm),
+                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(744.0, 480.0)),
+                );
+                let logs_scroll = NSScrollView::initWithFrame(
+                    NSScrollView::alloc(mtm),
+                    NSRect::new(NSPoint::new(12.0, 12.0), NSSize::new(720.0, 456.0)),
+                );
+                logs_scroll.setHasVerticalScroller(true);
+                logs_scroll.setAutoresizingMask(
                     NSAutoresizingMaskOptions::ViewWidthSizable
                         | NSAutoresizingMaskOptions::ViewHeightSizable,
                 );
                 let content = NSTextView::initWithFrame(
                     NSTextView::alloc(mtm),
-                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(772.0, 450.0)),
+                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(720.0, 456.0)),
                 );
                 content.setEditable(false);
                 content.setSelectable(true);
-                content.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(13.0, 0.0)));
-                scroll.setDocumentView(Some(&content));
-                root.addSubview(&scroll);
+                content.setTextContainerInset(NSSize::new(14.0, 14.0));
+                content.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(12.0, 0.0)));
+                logs_scroll.setDocumentView(Some(&content));
+                logs_content.addSubview(&logs_scroll);
+                let logs_panel = glass_panel(
+                    mtm,
+                    NSRect::new(NSPoint::new(38.0, 78.0), NSSize::new(744.0, 480.0)),
+                    &logs_content,
+                    None,
+                    22.0,
+                );
+                logs_panel.setAutoresizingMask(
+                    NSAutoresizingMaskOptions::ViewWidthSizable
+                        | NSAutoresizingMaskOptions::ViewHeightSizable,
+                );
+                logs_panel.setHidden(true);
+                root.addSubview(&logs_panel);
+                let _ = self.ivars().logs_panel.set(logs_panel);
                 let _ = self.ivars().content.set(content);
 
-                let buttons = [
-                    ("Refresh", sel!(refreshPortal:), 24.0, 82.0),
-                    ("Add Box…", sel!(addBox:), 114.0, 94.0),
-                    ("Remove…", sel!(removeBox:), 216.0, 94.0),
-                    ("Enable/Disable…", sel!(configureBox:), 318.0, 128.0),
-                    ("Allow Ports…", sel!(configurePorts:), 454.0, 112.0),
-                    ("Features…", sel!(configureFeature:), 574.0, 98.0),
-                    ("Logs", sel!(showLogs:), 680.0, 82.0),
-                ];
-                for (title, action, x, width) in buttons {
-                    let button = unsafe {
-                        NSButton::buttonWithTitle_target_action(
-                            &NSString::from_str(title),
-                            Some(self),
-                            Some(action),
-                            mtm,
-                        )
-                    };
-                    button.setFrame(NSRect::new(NSPoint::new(x, 38.0), NSSize::new(width, 32.0)));
-                    button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
-                    root.addSubview(&button);
-                }
-                let timer = unsafe {
-                    NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                        2.0,
-                        self,
-                        sel!(refreshPortalIfVisible:),
-                        None,
-                        true,
+                let add_button = unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        ns_string!("Add Box…"),
+                        Some(self),
+                        Some(sel!(addBox:)),
+                        mtm,
                     )
                 };
-                let _ = self.ivars().refresh_timer.set(timer);
+                add_button.setFrame(NSRect::new(
+                    NSPoint::new(38.0, 28.0),
+                    NSSize::new(106.0, 32.0),
+                ));
+                add_button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
+                root.addSubview(&add_button);
+                let _ = self.ivars().management_buttons.set(vec![add_button]);
+
+                let log_refresh = unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        ns_string!("Refresh Logs"),
+                        Some(self),
+                        Some(sel!(refreshPortal:)),
+                        mtm,
+                    )
+                };
+                log_refresh.setFrame(NSRect::new(
+                    NSPoint::new(38.0, 28.0),
+                    NSSize::new(112.0, 32.0),
+                ));
+                log_refresh.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
+                log_refresh.setHidden(true);
+                root.addSubview(&log_refresh);
+                let _ = self.ivars().log_refresh_button.set(log_refresh);
                 window
             });
 
             NSApplication::sharedApplication(mtm)
                 .setActivationPolicy(NSApplicationActivationPolicy::Regular);
-            self.refresh_window();
+            self.start_state_subscription();
+            self.refresh_current_view();
             window.makeKeyAndOrderFront(None);
             NSApplication::sharedApplication(mtm).activate();
         }
@@ -687,55 +1398,16 @@ mod macos {
         }
     }
 
-    fn render_state(state: &State) -> String {
-        let mut out = format!(
-            "Portal {} ({})\nLocal daemon connected\n\n",
-            state.version, state.build_sha
-        );
-        if state.boxes.is_empty() {
-            out.push_str("No remote boxes configured.\n\nChoose Add Box… to get started.\n");
+    fn feature_display_name(name: &str) -> String {
+        match name {
+            "clip-text" => "Sync text clipboard".into(),
+            "clip-image" => "Sync image clipboard".into(),
+            "clip-write" => "Allow remote clipboard writes".into(),
+            "notify" => "Remote notifications".into(),
+            "cred" => "Credential forwarding".into(),
+            "cred-touchid" => "Require Touch ID".into(),
+            _ => name.replace('-', " "),
         }
-        for box_config in &state.boxes {
-            let status = state
-                .statuses
-                .iter()
-                .find(|status| status.name == box_config.name);
-            let connection = if !box_config.enabled {
-                "disabled"
-            } else if status.is_some_and(|status| status.connected) {
-                "connected"
-            } else {
-                "reconnecting"
-            };
-            out.push_str(&format!(
-                "● {}  [{}]\n  host: {}\n  index: {}\n",
-                box_config.name, connection, box_config.host, box_config.index
-            ));
-            if !box_config.allow.is_empty() {
-                out.push_str(&format!("  forced ports: {:?}\n", box_config.allow));
-            }
-            match status {
-                Some(status) if !status.forwards.is_empty() => {
-                    out.push_str("  live forwards:\n");
-                    let mut forwards = status.forwards.clone();
-                    forwards.sort_by_key(|&(local, remote)| (remote, local));
-                    for (local, remote) in forwards {
-                        out.push_str(&format!("    remote :{remote} → localhost:{local}\n"));
-                    }
-                }
-                Some(_) if box_config.enabled => out.push_str("  no live forwards\n"),
-                _ => {}
-            }
-            out.push('\n');
-        }
-        out.push_str("Features\n");
-        for (name, enabled) in &state.features {
-            out.push_str(&format!(
-                "  {name}: {}\n",
-                if *enabled { "on" } else { "off" }
-            ));
-        }
-        out
     }
 
     fn prompt_one_field(
@@ -801,6 +1473,21 @@ mod macos {
         })
     }
 
+    fn confirm_action(
+        mtm: MainThreadMarker,
+        title: &str,
+        information: &str,
+        confirm: &str,
+    ) -> bool {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(title));
+        alert.setInformativeText(&NSString::from_str(information));
+        alert.addButtonWithTitle(&NSString::from_str(confirm));
+        alert.addButtonWithTitle(ns_string!("Cancel"));
+        NSApplication::sharedApplication(mtm).activate();
+        alert.runModal() == NSAlertFirstButtonReturn
+    }
+
     fn show_error(mtm: MainThreadMarker, message: &str) {
         let alert = NSAlert::new(mtm);
         alert.setMessageText(ns_string!("Portal could not complete that action"));
@@ -854,11 +1541,12 @@ mod macos {
         };
         let uid = unsafe { crate::libc_getuid() };
         let paths = portal_core::paths::Paths::derive(&home, uid);
-        let startup_error = if open_on_launch {
-            crate::prepare_desktop_app(&paths).err()
-        } else {
-            None
-        };
+        let startup_error =
+            if open_on_launch && std::env::var_os("PORTAL_DEVELOPMENT_APP").is_none() {
+                crate::prepare_desktop_app(&paths).err()
+            } else {
+                None
+            };
 
         let app = NSApplication::sharedApplication(mtm);
         // Accessory: status item + menus, no Dock icon, no app switcher entry.
@@ -902,6 +1590,16 @@ mod macos {
         }
         app.run();
         0
+    }
+
+    #[cfg(test)]
+    mod view_state_tests {
+        use super::MainView;
+
+        #[test]
+        fn logs_have_explicit_navigation_state() {
+            assert_ne!(MainView::Overview, MainView::Logs);
+        }
     }
 }
 

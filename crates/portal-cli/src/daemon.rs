@@ -457,22 +457,29 @@ async fn handle_local_api_connection(
     }
 
     if request.request == Request::SubscribeState {
-        let mut previous = None;
-        let mut tick = tokio::time::interval(Duration::from_millis(500));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut changes = supervisor.lock().await.subscribe_state_changes();
+        let initial = local_api_state(&supervisor, &config, &paths).await;
+        if write_api_response(
+            &mut stream,
+            &ResponseEnvelope::new(request.id, Response::State { state: initial }),
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return,
-                _ = tick.tick() => {
-                    let state = local_api_state(&supervisor, &config, &paths).await;
-                    if previous.as_ref() == Some(&state) {
-                        continue;
+                changed = changes.recv() => match changed {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let state = local_api_state(&supervisor, &config, &paths).await;
+                        let response = ResponseEnvelope::new(request.id, Response::State { state });
+                        if write_api_response(&mut stream, &response).await.is_err() {
+                            return;
+                        }
                     }
-                    previous = Some(state.clone());
-                    let response = ResponseEnvelope::new(request.id, Response::State { state });
-                    if write_api_response(&mut stream, &response).await.is_err() {
-                        return;
-                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
         }
@@ -520,6 +527,14 @@ async fn handle_local_api_request(
     paths: &Paths,
 ) -> ResponseEnvelope {
     let id = request.id;
+    let mutates_config = matches!(
+        &request.request,
+        Request::AddBox { .. }
+            | Request::RemoveBox { .. }
+            | Request::SetBoxEnabled { .. }
+            | Request::SetAllow { .. }
+    );
+    let mutates_feature = matches!(&request.request, Request::SetFeature { .. });
     let result: Result<Response, String> = match request.request {
         Request::GetState => Ok(Response::State {
             state: local_api_state(supervisor, config, paths).await,
@@ -621,7 +636,15 @@ async fn handle_local_api_request(
     };
 
     match result {
-        Ok(response) => ResponseEnvelope::new(id, response),
+        Ok(response) => {
+            if mutates_config {
+                let next = config.lock().await.clone();
+                supervisor.lock().await.reconcile(&next).await;
+            } else if mutates_feature {
+                supervisor.lock().await.notify_state_changed();
+            }
+            ResponseEnvelope::new(id, response)
+        }
         Err(message) => ResponseEnvelope::error(id, "operation_failed", message),
     }
 }
@@ -661,8 +684,39 @@ fn read_log_tail(path: &std::path::Path, lines: usize) -> Result<Vec<String>, St
     let count = lines.clamp(1, MAX_LINES);
     Ok(all[all.len().saturating_sub(count)..]
         .iter()
-        .map(|line| (*line).to_string())
+        .map(|line| strip_ansi(line))
         .collect())
+}
+
+/// Remove terminal color/control sequences before logs cross the local API.
+/// This handles both real ESC bytes and `\\x1b[` sequences quoted inside a
+/// nested agent log message.
+fn strip_ansi(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let sequence_start = if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
+            Some(index + 2)
+        } else if bytes.get(index..index + 5) == Some(b"\\x1b[") {
+            Some(index + 5)
+        } else {
+            None
+        };
+        if let Some(mut end) = sequence_start {
+            while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+                end += 1;
+            }
+            index = (end + 1).min(bytes.len());
+            continue;
+        }
+        let Some(ch) = line[index..].chars().next() else {
+            break;
+        };
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
 }
 
 /// File-backed gates adapter for the pasteboard watcher.
@@ -737,6 +791,14 @@ mod tests {
         assert!(!gates("clip-text"));
         std::fs::write(dir.path().join("feature.clip-text"), "on\n").unwrap();
         assert!(gates("clip-text"));
+    }
+
+    #[test]
+    fn log_api_removes_terminal_sequences() {
+        assert_eq!(
+            strip_ansi("\u{1b}[2m2026 INFO\u{1b}[0m nested \\x1b[33mWARN\\x1b[0m"),
+            "2026 INFO nested WARN"
+        );
     }
 
     #[test]

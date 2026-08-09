@@ -206,6 +206,9 @@ pub struct Supervisor {
     /// Cross-box local-port claims (portmap fallback correctness).
     taken: Arc<Mutex<BTreeSet<u16>>>,
     clip_tx: broadcast::Sender<WatchEvent>,
+    /// Event-driven local API invalidation. Box stacks publish after each
+    /// connection, forward, or clipboard status mutation.
+    state_tx: broadcast::Sender<()>,
     watcher_task: Option<tokio::task::JoinHandle<()>>,
     cancel: CancellationToken,
     deps: Option<Deps>,
@@ -227,10 +230,12 @@ impl Supervisor {
     {
         let taken = Arc::new(Mutex::new(BTreeSet::new()));
         let (clip_tx, _) = broadcast::channel::<WatchEvent>(16);
+        let (state_tx, _) = broadcast::channel::<()>(64);
         let mut sup = Self {
             stacks: Vec::new(),
             taken,
             clip_tx,
+            state_tx,
             watcher_task: None,
             cancel: cancel.clone(),
             deps: None,
@@ -244,6 +249,7 @@ impl Supervisor {
                     deps,
                     sup.taken.clone(),
                     sup.clip_tx.clone(),
+                    sup.state_tx.clone(),
                     &cancel,
                 )
             })
@@ -285,6 +291,7 @@ impl Supervisor {
     /// (no watcher rebuild) by construction.
     pub async fn reconcile(&mut self, config: &Config) {
         let mut desired: Vec<BoxConfig> = config.enabled_boxes().cloned().collect();
+        let mut changed = false;
         let mut i = 0;
         while i < self.stacks.len() {
             let current = &self.stacks[i].cfg;
@@ -294,11 +301,15 @@ impl Supervisor {
             match pos {
                 Some(idx) => {
                     let new_cfg = desired.swap_remove(idx);
-                    self.stacks[i].apply_config(&new_cfg);
-                    self.stacks[i].cfg = new_cfg;
+                    if self.stacks[i].cfg != new_cfg {
+                        changed = true;
+                        self.stacks[i].apply_config(&new_cfg);
+                        self.stacks[i].cfg = new_cfg;
+                    }
                     i += 1;
                 }
                 None => {
+                    changed = true;
                     tracing::info!(box_name = %current.name, "removing box stack (config hot-reload)");
                     let stack = self.stacks.remove(i);
                     stack.shutdown().await;
@@ -309,15 +320,31 @@ impl Supervisor {
             return;
         };
         for b in desired {
+            changed = true;
             tracing::info!(box_name = %b.name, "spawning box stack (config hot-reload)");
             self.stacks.push(spawn_box_stack(
                 b,
                 deps,
                 self.taken.clone(),
                 self.clip_tx.clone(),
+                self.state_tx.clone(),
                 &self.cancel,
             ));
         }
+        if changed {
+            let _ = self.state_tx.send(());
+        }
+    }
+
+    /// Subscribe to aggregate state invalidations. Events deliberately carry
+    /// no snapshot; receivers fetch the latest state after each notification.
+    pub fn subscribe_state_changes(&self) -> broadcast::Receiver<()> {
+        self.state_tx.subscribe()
+    }
+
+    /// Invalidate state after daemon-owned config or feature mutations.
+    pub fn notify_state_changed(&self) {
+        let _ = self.state_tx.send(());
     }
 
     pub fn stacks(&self) -> &[BoxStack] {
@@ -377,6 +404,7 @@ fn spawn_box_stack(
     deps: &Deps,
     taken: Arc<Mutex<BTreeSet<u16>>>,
     clip_tx: broadcast::Sender<WatchEvent>,
+    state_tx: broadcast::Sender<()>,
     parent: &CancellationToken,
 ) -> BoxStack {
     let cancel = parent.child_token();
@@ -470,14 +498,20 @@ fn spawn_box_stack(
                             .unwrap()
                             .as_ref()
                             .map(|a| a.agent_git_sha.clone());
-                        status_tx.send_modify(|s| {
-                            s.connected = true;
-                            s.agent_sha = sha;
+                        status_tx.send_if_modified(|status| {
+                            let changed = !status.connected || status.agent_sha != sha;
+                            status.connected = true;
+                            status.agent_sha = sha;
+                            changed
                         });
                         let _ = pub_connected_tx.try_send(());
                     }
                     Event::Disconnected { .. } => {
-                        status_tx.send_modify(|s| s.connected = false);
+                        status_tx.send_if_modified(|status| {
+                            let changed = status.connected;
+                            status.connected = false;
+                            changed
+                        });
                     }
                     _ => {}
                 }
@@ -559,10 +593,36 @@ fn spawn_box_stack(
                         None => return,
                     },
                 }
-                status_tx.send_modify(|s| {
-                    s.clipsync_synced = publisher.synced();
-                    s.clipsync_change_id = publisher.current_change_id();
+                status_tx.send_if_modified(|status| {
+                    let synced = publisher.synced();
+                    let change_id = publisher.current_change_id();
+                    let changed =
+                        status.clipsync_synced != synced || status.clipsync_change_id != change_id;
+                    status.clipsync_synced = synced;
+                    status.clipsync_change_id = change_id;
+                    changed
                 });
+            }
+        }
+    }));
+
+    // ---- event-driven aggregate status invalidation ----
+    // watch::Receiver wakes only when this stack's status changes. The local
+    // API then snapshots all stacks once; no UI or daemon polling timer.
+    tasks.push(tokio::spawn({
+        let cancel = cancel.clone();
+        let mut status_events = status_rx.clone();
+        async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    changed = status_events.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        let _ = state_tx.send(());
+                    }
+                }
             }
         }
     }));
@@ -673,7 +733,14 @@ impl StackReconciler {
             .assignments()
             .map(|(r, l)| (l, r))
             .collect();
-        self.status_tx.send_modify(|s| s.forwards = forwards);
+        self.status_tx.send_if_modified(|status| {
+            if status.forwards == forwards {
+                false
+            } else {
+                status.forwards = forwards;
+                true
+            }
+        });
         tracing::info!(target: "portal::supervisor", box_name = %self.state.box_name,
             local = spec.local, remote = spec.remote,
             "on-demand forward established for callback url");
@@ -721,7 +788,14 @@ impl Reconciler for StackReconciler {
                     .assignments()
                     .map(|(r, l)| (l, r))
                     .collect();
-                self.status_tx.send_modify(|s| s.forwards = forwards);
+                self.status_tx.send_if_modified(|status| {
+                    if status.forwards == forwards {
+                        false
+                    } else {
+                        status.forwards = forwards;
+                        true
+                    }
+                });
             }
             Err(err) => {
                 tracing::debug!(target: "portal::supervisor",

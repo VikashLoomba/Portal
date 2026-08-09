@@ -70,11 +70,13 @@ The Rust request and response schema is defined in
 | `set_feature` | Toggle a known capability gate |
 | `get_logs` | Read a bounded tail of the local daemon log |
 
-`subscribe_state` emits a state response immediately and then only when its
-rendered state changes. Clients should reconnect after EOF or a daemon restart.
+`subscribe_state` emits a state response immediately and then wakes only on a
+real supervisor/configuration/feature invalidation; it has no polling interval.
+Clients should reconnect after EOF or a daemon restart.
 
-Configuration-changing methods validate and atomically write `config.toml`.
-The daemon's existing hot-reload reconciles SSH stacks from the new document.
+Configuration-changing methods validate and atomically write `config.toml` and
+reconcile SSH stacks before returning. The filesystem watcher remains only for
+external edits made outside the API.
 The socket verifies the peer uid in addition to filesystem mode `0600`; there
 are no bearer tokens, so it must not be proxied to a less-trusted process.
 

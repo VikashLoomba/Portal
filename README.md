@@ -176,10 +176,17 @@ status item. Closing the window leaves Portal and its status item running;
 **Quit Portal** removes the UI and status item, while the independent local
 daemon keeps every connection and forward alive.
 
-The desktop window adds/removes and enables/disables boxes, manages forced
-ports and feature gates, displays live state, and reads a bounded daemon-log
-tail through the versioned owner-only local API. The CLI remains available and
-uses the same configuration and service model.
+The desktop window uses AppKit's Liquid Glass views on macOS 26, with a native
+vibrancy fallback on earlier supported macOS versions. Glass status cards add,
+remove, enable, and configure boxes; active forwards open directly; native
+switches manage feature gates; and the separate Logs view reads a sanitized,
+bounded daemon-log tail. The CLI remains available and uses the same
+configuration and service model.
+
+The window has no polling or refresh timer. It owns one versioned local-API
+subscription: the daemon publishes an initial snapshot and then invalidates it
+only after a real connection, forwarding, configuration, clipboard, or feature
+change. AppKit redraws on those events on its main queue.
 
 The menu-bar item shows each configured box
 with a colored dot for its connection state and, indented beneath it, the
@@ -199,8 +206,8 @@ Quit Portal
 ```
 
 The status portion still reads one bounded legacy snapshot only when the menu
-opens and does nothing while idle. **Open Portal…** presents the full management
-window, whose actions use the versioned local API.
+opens and does nothing while idle. **Open Portal…** presents the event-driven
+Liquid Glass management window, whose actions use the versioned local API.
 
 ## Port mapping
 

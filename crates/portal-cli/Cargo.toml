@@ -34,4 +34,4 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry", "NSAttributedString", "NSDictionary", "NSEnumerator", "NSNotification"] }
-objc2-app-kit = { version = "0.3", features = ["NSAlert", "NSApplication", "NSResponder", "NSRunningApplication", "NSControl", "NSTextField", "NSSecureTextField", "NSView", "NSWindow", "NSGraphics", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSImage", "NSButton", "NSCell", "NSFont", "NSColor", "NSAttributedString"] }
+objc2-app-kit = { version = "0.3", features = ["NSAlert", "NSApplication", "NSResponder", "NSRunningApplication", "NSControl", "NSTextField", "NSSecureTextField", "NSView", "NSWindow", "NSGraphics", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSImage", "NSButton", "NSCell", "NSFont", "NSColor", "NSAttributedString", "NSSegmentedControl", "NSGlassEffectView", "NSVisualEffectView", "NSSwitch"] }

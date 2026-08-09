@@ -1267,15 +1267,38 @@ fn features(paths: &Paths, name: Option<String>, state: Option<String>) -> i32 {
             0
         }
         (Some(f), Some(state)) => {
-            let _ = std::fs::create_dir_all(&paths.config_dir);
-            match std::fs::write(paths.feature_file(&f), format!("{state}\n")) {
-                Ok(()) => {
-                    println!("{f}: {state} (picked up live by the daemon)");
+            let enabled = state == "on";
+            match local_client::request(
+                &paths.api_sock,
+                portal_core::localapi::Request::SetFeature {
+                    name: f.clone(),
+                    enabled,
+                },
+            ) {
+                Ok(portal_core::localapi::Response::Ok { .. }) => {
+                    println!("{f}: {state} (applied live)");
                     0
                 }
-                Err(e) => {
-                    eprintln!("portal features: {e}");
+                Ok(_) => {
+                    eprintln!("portal features: daemon returned an unexpected response");
                     1
+                }
+                Err(api_error) => {
+                    // Preserve the CLI's offline configuration behavior. A
+                    // future daemon reads this file on startup; a live daemon
+                    // always goes through the API so subscribed UI updates are
+                    // event-driven.
+                    let _ = std::fs::create_dir_all(&paths.config_dir);
+                    match std::fs::write(paths.feature_file(&f), format!("{state}\n")) {
+                        Ok(()) => {
+                            println!("{f}: {state} (saved; daemon unavailable: {api_error})");
+                            0
+                        }
+                        Err(error) => {
+                            eprintln!("portal features: {error}");
+                            1
+                        }
+                    }
                 }
             }
         }

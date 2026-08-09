@@ -713,7 +713,9 @@ async fn config_hot_reload_adds_updates_and_removes_stacks() {
     let rig = rig().await; // one box "devbox1" @ "devbox1"
     assert_eq!(sup_stacks_len(&rig).await, 1);
 
-    // 1. In-place update: allowlist change applies WITHOUT respawning.
+    // 1. In-place update: allowlist change applies WITHOUT respawning and
+    // publishes one event-driven local API invalidation (no status poller).
+    let mut state_changes = rig.supervisor.lock().await.subscribe_state_changes();
     let mut cfg2 = Config::parse(
         r#"
 [[boxes]]
@@ -725,9 +727,12 @@ allow = [9000]
     )
     .unwrap();
     rig.supervisor_apply(&cfg2).await;
+    tokio::time::timeout(Duration::from_secs(1), state_changes.recv())
+        .await
+        .expect("config reconcile did not publish state invalidation")
+        .expect("state invalidation channel closed");
     assert_eq!(sup_stacks_len(&rig).await, 1);
     assert_eq!(filter_for(&sup_first_cfg(&rig).await).allow, vec![9000]);
-
     // 2. Add a box → new stack spawns.
     cfg2.boxes.push(BoxConfig {
         name: "gpu-box".into(),
