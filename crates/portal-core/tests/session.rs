@@ -12,7 +12,8 @@ use portal_core::agentclient::{Event, EventChannels, ServiceRequest};
 use portal_proto::codec::asynchronous::{read_frame, write_frame};
 use portal_proto::envelope::Envelope;
 use portal_proto::messages::{
-    ClipResponse, HelloAck, Msg, Notify, Port, PortAdded, Snapshot, SubscribeAck, marshal_payload,
+    ClipResponse, CredRequest, HelloAck, Msg, Notify, Port, PortAdded, Snapshot, SubscribeAck,
+    marshal_payload,
 };
 use portal_transport::testing::{FakeTransport, duplex_session};
 use tokio::sync::{mpsc, watch};
@@ -164,7 +165,7 @@ async fn full_session_flow() {
         .unwrap();
         // The queued clip response arrives after Subscribe.
         let msg = read_frame(&mut agent.stdin).await.unwrap().msg.unwrap();
-        // Notify service frame → dedicated channel.
+        // Notify and credential service frames → dedicated channels.
         write_frame(
             &mut agent.stdout,
             &Envelope::of_msg(Msg {
@@ -180,6 +181,27 @@ async fn full_session_flow() {
                         verified: Some(true),
                         source: Some("claude_hook".into()),
                         sound: None,
+                    })
+                    .unwrap(),
+                ),
+            }),
+        )
+        .await
+        .unwrap();
+        write_frame(
+            &mut agent.stdout,
+            &Envelope::of_msg(Msg {
+                service: "cred".into(),
+                kind: "req".into(),
+                seq: None,
+                payload: Some(
+                    marshal_payload(&CredRequest {
+                        nonce: 42,
+                        epoch: 9,
+                        label: "sudo".into(),
+                        requester: Some("pid 7: sudo askpass".into()),
+                        mode: "askpass".into(),
+                        target: Some("Password:".into()),
                     })
                     .unwrap(),
                 ),
@@ -228,6 +250,14 @@ async fn full_session_flow() {
             assert_eq!(seq, 7);
         }
         other => panic!("expected Notify, got {other:?}"),
+    }
+
+    match ch.cred.recv().await {
+        Some(ServiceRequest::Cred(request)) => {
+            assert_eq!(request.label, "sudo");
+            assert_eq!(request.nonce, 42);
+        }
+        other => panic!("expected Cred, got {other:?}"),
     }
 
     // The snapshot cache reflects snapshot + fresh deltas (stale 9999 dropped).

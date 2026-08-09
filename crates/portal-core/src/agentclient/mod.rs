@@ -180,12 +180,9 @@ impl SnapshotCache {
 }
 
 /// The services this client advertises in Hello (v4 symmetric negotiation).
-/// The services this client advertises in Hello (v4 symmetric negotiation).
-/// HONEST advertisement: only what the daemon actually serves today.
-/// The agent answers "none"/"no-client" IMMEDIATELY for anything a client did
-/// not advertise — so not advertising is the graceful degrade, while
-/// advertising without a handler costs a 9s timeout. `clipwrite` and `cred`
-/// join this map when their Mac-side handlers land.
+/// HONEST advertisement: only what the daemon actually serves today. The
+/// agent answers "none"/"no-client" immediately for anything a client did not
+/// advertise, while advertising without a handler costs a request timeout.
 pub fn client_services() -> BTreeMap<String, u32> {
     BTreeMap::from([
         ("openurl".to_string(), 1),

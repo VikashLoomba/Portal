@@ -1253,11 +1253,10 @@ fn doctor(paths: &Paths) -> i32 {
 }
 
 fn features(paths: &Paths, name: Option<String>, state: Option<String>) -> i32 {
-    const KNOWN: [&str; 4] = ["clip-text", "clip-image", "clip-write", "notify"];
     let gates = daemon::feature_gates(paths.config_dir.clone());
     match (name, state) {
         (None, _) => {
-            for f in KNOWN {
+            for f in portal_core::localapi::KNOWN_FEATURES {
                 println!("{f}: {}", if gates(f) { "on" } else { "off" });
             }
             0

@@ -2,6 +2,7 @@
 //! source) driven by portal-core's session client over duplex pipes — the
 //! same code paths a production Mac↔box session exercises, in one process.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -88,6 +89,7 @@ async fn handshake(rig: &mut Rig) {
                     ("notify".to_string(), 1),
                     ("openurl".to_string(), 1),
                     ("cred".to_string(), 1),
+                    ("clipwrite".to_string(), 1),
                 ]
                 .into_iter()
                 .collect(),
@@ -103,7 +105,17 @@ async fn handshake(rig: &mut Rig) {
         .hello_ack
         .unwrap();
     assert_eq!(ack.agent_git_sha, "cafe");
-    assert!(ack.services.unwrap().contains_key("clipsync"));
+    assert_eq!(
+        ack.services,
+        Some(BTreeMap::from([
+            ("clipsync".to_string(), 1),
+            ("notify".to_string(), 1),
+            ("openurl".to_string(), 1),
+            ("cred".to_string(), 1),
+            ("clipwrite".to_string(), 1),
+        ])),
+        "the production handshake must advertise every implemented service"
+    );
 }
 
 async fn subscribe(rig: &mut Rig, rsid: u64) -> Snapshot {
@@ -394,7 +406,7 @@ async fn recv_ack(rig: &mut Rig) -> ClipSyncAck {
 #[tokio::test]
 async fn cred_flow_shim_to_mac_and_back() {
     let mut rig = rig();
-    handshake(&mut rig).await; // client advertises "cred" in the rig? — no: add it there
+    handshake(&mut rig).await;
     let _ = subscribe(&mut rig, 1).await;
 
     // Shim side: a keychain request arrives over the relay channel.

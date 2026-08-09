@@ -20,7 +20,7 @@
 pub mod filter;
 pub mod watcher;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use portal_proto::codec::CodecError;
@@ -90,6 +90,19 @@ impl Default for AgentConfig {
             ephem: (32768, 60999),
         }
     }
+}
+
+/// Service families this production agent actually handles. Negotiation is
+/// symmetric: a service must be advertised by both peers before either side
+/// accepts its frames, regardless of which side originates the request.
+pub fn advertised_services() -> BTreeMap<String, u32> {
+    BTreeMap::from([
+        ("clipsync".to_string(), 1),
+        ("notify".to_string(), 1),
+        ("openurl".to_string(), 1),
+        ("cred".to_string(), 1),
+        ("clipwrite".to_string(), 1),
+    ])
 }
 
 pub struct Agent<S: ListenerSource> {
@@ -217,15 +230,7 @@ impl<S: ListenerSource> Agent<S> {
                 ephem_min: self.cfg.ephem.0,
                 ephem_max: self.cfg.ephem.1,
                 now_unix_nano: now_nano(),
-                services: Some(
-                    [
-                        ("clipsync".to_string(), 1u32),
-                        ("notify".to_string(), 1),
-                        ("openurl".to_string(), 1),
-                    ]
-                    .into_iter()
-                    .collect(),
-                ),
+                services: Some(advertised_services()),
             }),
         )
         .await?;
