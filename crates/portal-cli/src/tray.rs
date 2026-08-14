@@ -349,23 +349,43 @@ const CARD_ROW: f64 = 22.0;
 const CARD_BOTTOM: f64 = 14.0;
 const CARD_HEADER: f64 = CARD_TOP + CARD_NAME + 4.0 + CARD_STATUS + 6.0;
 
-/// Forward rows listed on a card before an elision line carries the rest.
+/// Forward rows listed on a card before its disclosure control.
 const MAX_CARD_FORWARD_ROWS: usize = 5;
 
-/// Lines below the header: the listed forwards, plus an elision line when
-/// some are hidden, plus one "none" line when there is nothing to list.
-fn card_forward_lines(forward_count: usize) -> usize {
-    if forward_count == 0 {
-        1
+fn card_forward_disclosure_title(forward_count: usize, expanded: bool) -> Option<String> {
+    let hidden = forward_count.checked_sub(MAX_CARD_FORWARD_ROWS)?;
+    if hidden == 0 {
+        None
+    } else if expanded {
+        Some("Show fewer forwards".to_string())
+    } else if hidden == 1 {
+        Some("Show 1 more forward".to_string())
     } else {
-        forward_count.min(MAX_CARD_FORWARD_ROWS)
-            + usize::from(forward_count > MAX_CARD_FORWARD_ROWS)
+        Some(format!("Show {hidden} more forwards"))
     }
 }
 
-fn card_height(enabled: bool, forward_count: usize) -> f64 {
+/// Lines below the header: visible forwards, plus a Show more/Show fewer
+/// control for a long list, plus one "none" line when there is nothing to
+/// list. Long lists start collapsed but can always reveal every forward.
+fn card_forward_lines(forward_count: usize, expanded: bool) -> usize {
+    if forward_count == 0 {
+        1
+    } else if forward_count > MAX_CARD_FORWARD_ROWS {
+        let visible = if expanded {
+            forward_count
+        } else {
+            MAX_CARD_FORWARD_ROWS
+        };
+        visible + 1
+    } else {
+        forward_count
+    }
+}
+
+fn card_height(enabled: bool, forward_count: usize, expanded: bool) -> f64 {
     let lines = if enabled {
-        card_forward_lines(forward_count)
+        card_forward_lines(forward_count, expanded)
     } else {
         1
     };
@@ -591,10 +611,10 @@ pub fn run_app() -> i32 {
 mod macos {
     use super::{
         Dot, EMPTY_CARD_HEIGHT, MAX_CARD_FORWARD_ROWS, Row, RowAction, Status, UpdateActivity,
-        UpdateCheck, card_height, daemon_down_row, feature_card_height, fetch_status,
-        forward_label, forward_tooltip, migration_copy, parse_up_to_date_version,
-        paused_forwards_summary, rows_from_status, run_update_check, up_to_date_copy,
-        validate_port_entries, version_row,
+        UpdateCheck, card_forward_disclosure_title, card_height, daemon_down_row,
+        feature_card_height, fetch_status, forward_label, forward_tooltip, migration_copy,
+        parse_up_to_date_version, paused_forwards_summary, rows_from_status, run_update_check,
+        up_to_date_copy, validate_port_entries, version_row,
     };
     use objc2::rc::Retained;
     use objc2::runtime::{Bool, ProtocolObject};
@@ -620,6 +640,7 @@ mod macos {
     };
     use portal_core::localapi::{KNOWN_FEATURES, Request, Response, State};
     use std::cell::{Cell, OnceCell, RefCell};
+    use std::collections::HashSet;
     use std::ffi::c_void;
     use std::path::PathBuf;
     use std::ptr::NonNull;
@@ -655,6 +676,10 @@ mod macos {
         update_activity: RefCell<UpdateActivity>,
         main_view: Cell<MainView>,
         state: RefCell<Option<State>>,
+        /// Box names whose long forward lists are currently expanded. This is
+        /// presentation state, deliberately local to the app and preserved
+        /// across daemon state refreshes.
+        expanded_forward_boxes: RefCell<HashSet<String>>,
         feature_names: RefCell<Vec<String>>,
         state_error: RefCell<Option<String>>,
         subscription_started: Cell<bool>,
@@ -1361,6 +1386,30 @@ mod macos {
                 crate::daemon::open_url(format!("http://127.0.0.1:{port}"));
             }
 
+            #[unsafe(method(toggleForwardListFromCard:))]
+            fn toggle_forward_list_from_card(&self, sender: Option<&NSButton>) {
+                let Some(index) = sender.and_then(|button| usize::try_from(button.tag()).ok()) else {
+                    return;
+                };
+                let Some(name) = self
+                    .ivars()
+                    .state
+                    .borrow()
+                    .as_ref()
+                    .and_then(|state| state.boxes.get(index))
+                    .map(|box_config| box_config.name.clone())
+                else {
+                    return;
+                };
+                {
+                    let mut expanded = self.ivars().expanded_forward_boxes.borrow_mut();
+                    if !expanded.insert(name.clone()) {
+                        expanded.remove(&name);
+                    }
+                }
+                self.refresh_overview();
+            }
+
             #[unsafe(method(addBox:))]
             fn add_box(&self, _sender: Option<&NSObject>) {
                 self.present_add_box_prompt();
@@ -1509,6 +1558,7 @@ mod macos {
                 app_update_item: RefCell::new(None),
                 main_view: Cell::new(MainView::Overview),
                 state: RefCell::new(None),
+                expanded_forward_boxes: RefCell::new(HashSet::new()),
                 feature_names: RefCell::new(Vec::new()),
                 state_error: RefCell::new(None),
                 subscription_started: Cell::new(false),
@@ -1724,6 +1774,7 @@ mod macos {
 
             let state = self.ivars().state.borrow().clone();
             let error = self.ivars().state_error.borrow().clone();
+            let expanded_forward_boxes = self.ivars().expanded_forward_boxes.borrow().clone();
             let box_heights = state
                 .as_ref()
                 .map(|state| {
@@ -1736,7 +1787,11 @@ mod macos {
                                 .iter()
                                 .find(|status| status.name == box_config.name)
                                 .map_or(0, |status| status.forwards.len());
-                            card_height(box_config.enabled, forwards)
+                            card_height(
+                                box_config.enabled,
+                                forwards,
+                                expanded_forward_boxes.contains(&box_config.name),
+                            )
                         })
                         .collect::<Vec<_>>()
                 })
@@ -2107,6 +2162,7 @@ mod macos {
                     let mut forwards =
                         status.map_or_else(Vec::new, |status| status.forwards.clone());
                     forwards.sort_by_key(|&(local, remote)| (remote, local));
+                    let forwards_expanded = expanded_forward_boxes.contains(&box_config.name);
                     let first_row_y = height - 92.0;
                     if !box_config.enabled {
                         // Disabled boxes have no live forwards to list; the
@@ -2132,8 +2188,13 @@ mod macos {
                         card_content.addSubview(&empty);
                     } else {
                         let mono = NSFont::monospacedDigitSystemFontOfSize_weight(12.0, 0.0);
+                        let visible_forward_count = if forwards_expanded {
+                            forwards.len()
+                        } else {
+                            forwards.len().min(MAX_CARD_FORWARD_ROWS)
+                        };
                         for (row, (local, remote)) in
-                            forwards.iter().take(MAX_CARD_FORWARD_ROWS).enumerate()
+                            forwards.iter().take(visible_forward_count).enumerate()
                         {
                             let y = first_row_y - row as f64 * 22.0;
                             let title = forward_label(*local, *remote);
@@ -2166,21 +2227,40 @@ mod macos {
                             ));
                             card_content.addSubview(&forward);
                         }
-                        if let Some(rest) = forwards
-                            .len()
-                            .checked_sub(MAX_CARD_FORWARD_ROWS)
-                            .filter(|n| *n > 0)
+                        if let Some(title) =
+                            card_forward_disclosure_title(forwards.len(), forwards_expanded)
                         {
-                            let y = first_row_y - MAX_CARD_FORWARD_ROWS as f64 * 22.0;
-                            let more = label(
-                                self.mtm(),
-                                &format!("… and {rest} more forwards"),
-                                NSRect::new(NSPoint::new(22.0, y), NSSize::new(240.0, 22.0)),
-                                12.0,
-                                false,
-                                Some(&NSColor::tertiaryLabelColor()),
-                            );
-                            card_content.addSubview(&more);
+                            let y = first_row_y - visible_forward_count as f64 * 22.0;
+                            let disclosure = unsafe {
+                                NSButton::buttonWithTitle_target_action(
+                                    &NSString::from_str(&title),
+                                    Some(self),
+                                    Some(sel!(toggleForwardListFromCard:)),
+                                    self.mtm(),
+                                )
+                            };
+                            disclosure.setTag(index as isize);
+                            disclosure.setBordered(false);
+                            disclosure.setAccessibilityElement(true);
+                            disclosure.setAlignment(NSTextAlignment::Left);
+                            disclosure.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+                            disclosure.setContentTintColor(Some(&NSColor::linkColor()));
+                            let accessibility = if forwards_expanded {
+                                format!("Collapse forwards for {}", box_config.name)
+                            } else {
+                                format!(
+                                    "Show all {} forwards for {}",
+                                    forwards.len(),
+                                    box_config.name
+                                )
+                            };
+                            disclosure
+                                .setAccessibilityLabel(Some(&NSString::from_str(&accessibility)));
+                            disclosure.setFrame(NSRect::new(
+                                NSPoint::new(22.0, y),
+                                NSSize::new(280.0, 22.0),
+                            ));
+                            card_content.addSubview(&disclosure);
                         }
                     }
                     top -= height;
@@ -3506,18 +3586,43 @@ mod tests {
     }
 
     #[test]
-    fn card_height_tracks_visible_content() {
+    fn card_height_tracks_collapsed_and_expanded_content() {
         // A disabled card reserves exactly one summary line.
-        assert_eq!(card_height(false, 0), card_height(true, 0));
+        assert_eq!(card_height(false, 0, false), card_height(true, 0, false));
         // Listing lines grow the card one row each; nothing is reserved for
         // rows that do not exist.
-        let one = card_height(true, 1);
-        let three = card_height(true, 3);
+        let one = card_height(true, 1, false);
+        let three = card_height(true, 3, false);
         assert!((three - one - 2.0 * CARD_ROW).abs() < f64::EPSILON);
-        // Past the visible cap the card grows only by the elision line.
+
+        let long_count = MAX_CARD_FORWARD_ROWS + 4;
+        // Collapsed long lists use the cap plus one disclosure row.
         assert_eq!(
-            card_height(true, MAX_CARD_FORWARD_ROWS + 4),
-            card_height(true, MAX_CARD_FORWARD_ROWS) + CARD_ROW
+            card_height(true, long_count, false),
+            card_height(true, MAX_CARD_FORWARD_ROWS, false) + CARD_ROW
+        );
+        // Expanding reveals every hidden row and retains one collapse control.
+        assert_eq!(
+            card_height(true, long_count, true) - card_height(true, long_count, false),
+            4.0 * CARD_ROW
+        );
+        assert_eq!(card_forward_lines(long_count, true), long_count + 1);
+    }
+
+    #[test]
+    fn long_card_lists_offer_clear_expand_and_collapse_controls() {
+        assert_eq!(card_forward_disclosure_title(5, false), None);
+        assert_eq!(
+            card_forward_disclosure_title(6, false).as_deref(),
+            Some("Show 1 more forward")
+        );
+        assert_eq!(
+            card_forward_disclosure_title(9, false).as_deref(),
+            Some("Show 4 more forwards")
+        );
+        assert_eq!(
+            card_forward_disclosure_title(9, true).as_deref(),
+            Some("Show fewer forwards")
         );
     }
 
