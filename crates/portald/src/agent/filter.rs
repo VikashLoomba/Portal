@@ -1,4 +1,4 @@
-//! Port admission filter: a listening loopback port is DESIRED iff
+//! Port admission filter: a loopback-reachable listener is DESIRED iff
 //!   `allow.contains(port) || (!deny.contains(port) && !(exclude_ephemeral && in_ephem))`
 //! — the allowlist FORCE-forwards (wins over deny and the ephemeral cut).
 

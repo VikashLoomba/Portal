@@ -1,11 +1,13 @@
-//! Loopback LISTEN watcher. v2 ships the /proc/net/tcp[6] poller at the same
-//! 75ms cadence v1's netlink dump ran at — identical observable latency, no
-//! netlink dependency, and the parser is unit-testable on any OS. (A netlink
-//! + destroy-multicast upgrade is a possible later optimization; TASKS.md.)
+//! Loopback-reachable LISTEN watcher. v2 ships the /proc/net/tcp[6] poller at
+//! the same 75ms cadence v1's netlink dump ran at — identical observable
+//! latency, no netlink dependency, and the parser is unit-testable on any OS.
+//! Explicit loopback and wildcard binds are forwardable; a specific
+//! non-loopback interface bind is not. (A netlink + destroy-multicast upgrade
+//! is a possible later optimization; TASKS.md.)
 
 use portal_proto::messages::Port;
 
-/// Something that can enumerate loopback LISTEN ports right now.
+/// Something that can enumerate loopback-reachable LISTEN ports right now.
 pub trait ListenerSource: Send {
     fn listening(&mut self) -> Vec<Port>;
 }
@@ -29,7 +31,11 @@ impl ListenerSource for ProcNetSource {
 }
 
 /// Parse one /proc/net/tcp[6] dump: keep LISTEN (state 0A) rows whose local
-/// address is loopback (127.0.0.0/8 for v4, ::1 for v6).
+/// address is explicitly loopback (127.0.0.0/8 or ::1) or wildcard
+/// (0.0.0.0 or ::). Wildcard listeners are reachable through loopback, so a
+/// forward targeting `127.0.0.1:port` works. A bind to a specific non-loopback
+/// interface remains excluded because forwarding it through loopback is not
+/// guaranteed to work and may be unintended.
 ///
 /// Format per row: `sl local_address:port rem_address:port st ...` where the
 /// v4 address is a little-endian u32 in hex (so `0100007F` = 127.0.0.1 —
@@ -53,18 +59,17 @@ pub fn parse_proc_net(contents: &str, family: u8) -> Vec<Port> {
         if port == 0 {
             continue;
         }
-        let loopback = match family {
-            4 => addr_hex.len() == 8 && addr_hex[6..8].eq_ignore_ascii_case("7F"),
-            6 => addr_hex.eq_ignore_ascii_case("00000000000000000000000001000000"),
-            _ => false,
+        let addr = match family {
+            4 if addr_hex.eq_ignore_ascii_case("00000000") => "0.0.0.0",
+            4 if addr_hex.len() == 8 && addr_hex[6..8].eq_ignore_ascii_case("7F") => "127.0.0.1",
+            6 if addr_hex.eq_ignore_ascii_case("00000000000000000000000000000000") => "::",
+            6 if addr_hex.eq_ignore_ascii_case("00000000000000000000000001000000") => "::1",
+            _ => continue,
         };
-        if !loopback {
-            continue;
-        }
         out.push(Port {
             port,
             family,
-            addr: if family == 4 { "127.0.0.1" } else { "::1" }.to_string(),
+            addr: addr.to_string(),
             inode_ns: fields
                 .get(9)
                 .and_then(|s| s.parse().ok())
@@ -104,33 +109,39 @@ mod tests {
   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
    0: 0100007F:1F40 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 123456 1 0000000000000000 100 0 0 10 0
    1: 3500007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   101        0 23456 1 0000000000000000 100 0 0 10 0
-   2: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 3456 1 0000000000000000 100 0 0 10 0
-   3: 0100007F:8CA0 0100007F:1F40 01 00000000:00000000 00:00000000 00000000  1000        0 45678 1 0000000000000000 20 4 30 10 -1
+   2: 00000000:1F4A 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 3456 1 0000000000000000 100 0 0 10 0
+   3: 0101A8C0:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 5678 1 0000000000000000 100 0 0 10 0
+   4: 0100007F:8CA0 0100007F:1F40 01 00000000:00000000 00:00000000 00000000  1000        0 45678 1 0000000000000000 20 4 30 10 -1
 ";
 
     const TCP6: &str = "\
   sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
    0: 00000000000000000000000001000000:1F41 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 7777 1 0000000000000000 100 0 0 10 0
-   1: 00000000000000000000000000000000:1BB9 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 8888 1 0000000000000000 100 0 0 10 0
+   1: 00000000000000000000000000000000:1F4A 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 8888 1 0000000000000000 100 0 0 10 0
+   2: 0000000000000000FE80000000000001:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 9999 1 0000000000000000 100 0 0 10 0
 ";
 
     #[test]
-    fn v4_keeps_loopback_listen_only() {
+    fn v4_keeps_loopback_and_wildcard_listeners() {
         let ports = parse_proc_net(TCP4, 4);
         let nums: Vec<u16> = ports.iter().map(|p| p.port).collect();
-        // 0x1F40=8000 (127.0.0.1), 0x0035=53 (127.0.0.53 — resolvers count),
-        // NOT 0x0016=22 (wildcard bind), NOT the ESTABLISHED row.
-        assert_eq!(nums, vec![8000, 53]);
+        // 0x1F40=8000 (127.0.0.1), 0x0035=53 (127.0.0.53), and
+        // 0x1F4A=8010 (0.0.0.0) are forwardable. The specific-interface bind
+        // and ESTABLISHED row are not.
+        assert_eq!(nums, vec![8000, 53, 8010]);
         assert_eq!(ports[0].addr, "127.0.0.1");
         assert_eq!(ports[0].inode_ns, 123456);
+        assert_eq!(ports[2].addr, "0.0.0.0");
+        assert_eq!(ports[2].inode_ns, 3456);
     }
 
     #[test]
-    fn v6_keeps_only_v6_loopback() {
+    fn v6_keeps_loopback_and_wildcard_listeners() {
         let ports = parse_proc_net(TCP6, 6);
         let nums: Vec<u16> = ports.iter().map(|p| p.port).collect();
-        assert_eq!(nums, vec![0x1F41]); // ::1 listener; wildcard :: excluded
+        assert_eq!(nums, vec![8001, 8010]);
         assert_eq!(ports[0].addr, "::1");
+        assert_eq!(ports[1].addr, "::");
     }
 
     #[test]

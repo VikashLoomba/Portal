@@ -1,6 +1,6 @@
-//! The agent serve loop: speaks v4 frames on stdin/stdout, watches loopback
-//! listeners, applies clipsync updates to the store, and relays cmd-socket
-//! events (notify/open) up the pipe.
+//! The agent serve loop: speaks v4 frames on stdin/stdout, watches
+//! loopback-reachable listeners, applies clipsync updates to the store, and
+//! relays cmd-socket events (notify/open) up the pipe.
 //!
 //! Contracts:
 //! - stdout is EXCLUSIVELY protocol frames; logs go to stderr;
