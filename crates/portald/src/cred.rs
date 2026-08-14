@@ -8,7 +8,7 @@
 //!   SUDO_ASKPASS contract (label is fixed to "sudo").
 //! - cmd-socket verb `cred\t<base64(json CredShimReq)>` — the one-shot CLI
 //!   relays through the RUNNING agent, which forwards a CredRequest up the
-//!   pipe and correlates the CredResponse by nonce (see agent::cred_waiters).
+//!   pipe and resolves the FIFO head by nonce (see `agent::start_next_cred`).
 //!   Reply: `ok\t<base64(secret)>\n` or `deny\t<reason>\n`.
 //!
 //! Wire caps enforced HERE too (agent-side defense in depth): label ≤ 200,
@@ -95,7 +95,7 @@ pub fn explain_deny(reason: &str) -> &'static str {
         "gui-unavailable" => "no GUI session on the Mac to show the consent dialog",
         "label-invalid" => "invalid credential label",
         "no-client" => "no Mac client connected",
-        "busy" => "another credential request is pending",
+        "busy" => "credential request queue is full — retry shortly",
         _ => "request denied or unavailable",
     }
 }

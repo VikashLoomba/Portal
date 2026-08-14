@@ -251,6 +251,7 @@ fn cred_deps(bin_path: PathBuf) -> Option<Arc<portal_core::cred::CredDeps>> {
             biometry: Some(Box::new(portal_cred::macos::MacBiometry)),
             keychain: Box::new(portal_cred::macos::MacKeychain),
             cooldown: portal_cred::cooldown::Cooldown::default(),
+            prompt_queue: Arc::new(tokio::sync::Mutex::new(())),
         }))
     }
     #[cfg(not(target_os = "macos"))]

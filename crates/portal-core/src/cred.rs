@@ -1,8 +1,8 @@
 //! The Mac-side credential handler task: drains the dedicated cred channel,
 //! runs portal-cred's (blocking, tested) policy core on a blocking task, and
-//! sends the CredResponse up the pipe. Serialization: ONE prompt at a time
-//! per box (the policy core is modal by nature); requests arriving while one
-//! is pending are denied "busy" (v1 semantics).
+//! sends the CredResponse up the pipe. All boxes share one fair prompt mutex:
+//! credential requests wait FIFO instead of racing modal UI or being denied
+//! merely because another request is in progress.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,6 +27,9 @@ pub struct CredDeps {
     pub biometry: Option<Box<dyn Biometry>>,
     pub keychain: Box<dyn Keychain>,
     pub cooldown: Cooldown,
+    /// Tokio's mutex grants locks in call order, making this the global FIFO
+    /// admission gate for modal credential UI across every configured box.
+    pub prompt_queue: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub struct CredHandler {
@@ -59,8 +62,8 @@ impl CredHandler {
     }
 
     /// One request end-to-end. The policy core (dialog + Touch ID) blocks for
-    /// up to ~2 minutes, so it runs on a blocking task; the channel (cap 2)
-    /// plus this sequential loop bound concurrent prompts at one-per-box.
+    /// up to ~2 minutes, so it runs on a blocking task. The shared fair mutex
+    /// queues requests across boxes and guarantees only one modal prompt.
     async fn serve_one(&self, req: CredRequest) -> CredResponse {
         let (nonce, epoch) = (req.nonce, req.epoch);
         let deny = |reason: &str| CredResponse {
@@ -73,6 +76,7 @@ impl CredHandler {
         let Some(deps) = self.deps.clone() else {
             return deny("gui-unavailable");
         };
+        let _turn = deps.prompt_queue.clone().lock_owned().await;
         let gates = self.gates.clone();
         let host = self.host.clone();
         let box_name = self.box_name.clone();
@@ -159,6 +163,7 @@ mod tests {
             biometry: None,
             keychain: Box::new(MemoryKeychain::default()),
             cooldown: Cooldown::default(),
+            prompt_queue: Arc::new(tokio::sync::Mutex::new(())),
         });
         let (h, _rx) = handler(Some(deps));
         let resp = h.serve_one(req()).await;
@@ -173,5 +178,88 @@ mod tests {
         let resp = h.serve_one(req()).await;
         assert!(!resp.ok);
         assert_eq!(resp.err.as_deref(), Some("gui-unavailable"));
+    }
+
+    struct QueueProbe {
+        entered: std::sync::mpsc::Sender<String>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Prompter for QueueProbe {
+        fn prompt(&self, req: &Request) -> Decision {
+            self.entered.send(req.requester.clone()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            Decision {
+                outcome: Outcome::AllowOnce,
+                secret: b"pw".to_vec(),
+            }
+        }
+    }
+
+    async fn next_prompt(rx: &std::sync::mpsc::Receiver<String>) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match rx.try_recv() {
+                    Ok(value) => return value,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("prompt probe disconnected")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("prompt did not start")
+    }
+
+    #[tokio::test]
+    async fn shared_prompt_gate_serializes_requests_across_boxes() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let deps = Arc::new(CredDeps {
+            prompter: Box::new(QueueProbe {
+                entered: entered_tx,
+                release: std::sync::Mutex::new(release_rx),
+            }),
+            biometry: None,
+            keychain: Box::new(MemoryKeychain::default()),
+            cooldown: Cooldown::default(),
+            prompt_queue: Arc::new(tokio::sync::Mutex::new(())),
+        });
+        let (first_handler, _first_outbound) = handler(Some(deps.clone()));
+        let (mut second_handler, _second_outbound) = handler(Some(deps));
+        second_handler.box_name = "devbox2".into();
+        second_handler.host = "devbox2.internal".into();
+
+        let mut first_req = req();
+        first_req.nonce = 1;
+        let first = tokio::spawn(async move { first_handler.serve_one(first_req).await });
+        assert!(next_prompt(&entered_rx).await.contains("on devbox1"));
+
+        let mut second_req = req();
+        second_req.nonce = 2;
+        let second = tokio::spawn(async move { second_handler.serve_one(second_req).await });
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        let early_second = entered_rx.try_recv();
+
+        // Always release both blocking probes before asserting so a failure
+        // cannot strand a spawn_blocking thread during runtime shutdown.
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
+        let second_seen = match &early_second {
+            Ok(value) => value.clone(),
+            Err(std::sync::mpsc::TryRecvError::Empty) => next_prompt(&entered_rx).await,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("prompt probe disconnected")
+            }
+        };
+
+        assert!(first.await.unwrap().ok);
+        assert!(second.await.unwrap().ok);
+        assert!(second_seen.contains("on devbox2"));
+        assert!(
+            matches!(early_second, Err(std::sync::mpsc::TryRecvError::Empty)),
+            "a second box must wait instead of presenting concurrent modal UI"
+        );
     }
 }

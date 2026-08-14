@@ -403,6 +403,41 @@ async fn recv_ack(rig: &mut Rig) -> ClipSyncAck {
     }
 }
 
+async fn recv_cred_request(rig: &mut Rig) -> portal_proto::messages::CredRequest {
+    loop {
+        let env = read_frame(&mut rig.client_out).await.unwrap();
+        if let Some(msg) = env.msg
+            && msg.service == "cred"
+            && msg.kind == "req"
+        {
+            return unmarshal_payload(msg.payload.as_ref().unwrap()).unwrap();
+        }
+    }
+}
+
+async fn answer_cred(rig: &mut Rig, req: &portal_proto::messages::CredRequest, secret: &[u8]) {
+    write_frame(
+        &mut rig.client_in,
+        &Envelope::of_msg(portal_proto::messages::Msg {
+            service: "cred".into(),
+            kind: "resp".into(),
+            seq: None,
+            payload: Some(
+                marshal_payload(&portal_proto::messages::CredResponse {
+                    nonce: req.nonce,
+                    epoch: req.epoch,
+                    ok: true,
+                    secret: Some(serde_bytes::ByteBuf::from(secret)),
+                    err: None,
+                })
+                .unwrap(),
+            ),
+        }),
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn cred_flow_shim_to_mac_and_back() {
     let mut rig = rig();
@@ -425,38 +460,10 @@ async fn cred_flow_shim_to_mac_and_back() {
         .unwrap();
 
     // Mac side: the CredRequest lands as a Msg; answer it.
-    let msg = loop {
-        let env = read_frame(&mut rig.client_out).await.unwrap();
-        if let Some(m) = env.msg
-            && m.service == "cred"
-        {
-            break m;
-        }
-    };
-    let req: portal_proto::messages::CredRequest =
-        unmarshal_payload(msg.payload.as_ref().unwrap()).unwrap();
+    let req = recv_cred_request(&mut rig).await;
     assert_eq!(req.label, "sudo");
     assert_eq!(req.mode, "askpass");
-    write_frame(
-        &mut rig.client_in,
-        &Envelope::of_msg(portal_proto::messages::Msg {
-            service: "cred".into(),
-            kind: "resp".into(),
-            seq: None,
-            payload: Some(
-                marshal_payload(&portal_proto::messages::CredResponse {
-                    nonce: req.nonce,
-                    epoch: req.epoch,
-                    ok: true,
-                    secret: Some(serde_bytes::ByteBuf::from(&b"s3kr3t"[..])),
-                    err: None,
-                })
-                .unwrap(),
-            ),
-        }),
-    )
-    .await
-    .unwrap();
+    answer_cred(&mut rig, &req, b"s3kr3t").await;
 
     // Shim side: the secret comes back through the oneshot.
     let secret = tokio::time::timeout(Duration::from_secs(5), reply_rx)
@@ -465,5 +472,57 @@ async fn cred_flow_shim_to_mac_and_back() {
         .unwrap()
         .unwrap();
     assert_eq!(secret, b"s3kr3t");
+    rig.agent_task.abort();
+}
+
+#[tokio::test]
+async fn concurrent_credential_requests_wait_in_fifo_order() {
+    let mut rig = rig();
+    handshake(&mut rig).await;
+    let _ = subscribe(&mut rig, 1).await;
+
+    let mut replies = Vec::new();
+    for (i, label) in ["first", "second", "third"].into_iter().enumerate() {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        replies.push(reply_rx);
+        rig.relay
+            .send(Relay::Cred {
+                req: portald::cred::CredShimReq {
+                    label: label.into(),
+                    requester: format!("pid {}: sudo askpass", i + 1),
+                    mode: "askpass".into(),
+                    target: "Password:".into(),
+                },
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+    }
+
+    let first = recv_cred_request(&mut rig).await;
+    assert_eq!(first.label, "first");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), recv_cred_request(&mut rig))
+            .await
+            .is_err(),
+        "the second request must stay queued until the first has a response"
+    );
+
+    answer_cred(&mut rig, &first, b"pw1").await;
+    let second = recv_cred_request(&mut rig).await;
+    assert_eq!(second.label, "second");
+    answer_cred(&mut rig, &second, b"pw2").await;
+    let third = recv_cred_request(&mut rig).await;
+    assert_eq!(third.label, "third");
+    answer_cred(&mut rig, &third, b"pw3").await;
+
+    for (reply, expected) in replies.into_iter().zip([&b"pw1"[..], b"pw2", b"pw3"]) {
+        let secret = tokio::time::timeout(Duration::from_secs(2), reply)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(secret, expected);
+    }
     rig.agent_task.abort();
 }

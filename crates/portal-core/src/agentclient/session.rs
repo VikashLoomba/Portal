@@ -420,7 +420,7 @@ impl Client {
                                 tokio::time::Instant::now() + self.cfg.coalesce_window);
                         }
                     } else if let Some(msg) = env.msg {
-                        self.route_msg(msg, &agent_services, &mut warned);
+                        self.route_msg(msg, &agent_services, &mut warned).await;
                     } else if let Some(ae) = env.agent_error {
                         return Err(SessionError::Agent { code: ae.code, msg: ae.msg });
                     } else if env.bye.is_some() {
@@ -454,7 +454,7 @@ impl Client {
     /// Route an inbound service frame to its dedicated sink (registry-lite).
     /// Unknown services and decode failures are logged drops — the session
     /// lives (v1 contract).
-    fn route_msg(
+    async fn route_msg(
         &self,
         msg: Msg,
         agent_services: &std::collections::BTreeMap<String, u32>,
@@ -498,7 +498,25 @@ impl Client {
             }
             ("clip", "req") => deliver!(self.sinks.clip, ServiceRequest::Clip),
             ("clipwrite", "req") => deliver!(self.sinks.clip_write, ServiceRequest::ClipWrite),
-            ("cred", "req") => deliver!(self.sinks.cred, ServiceRequest::Cred),
+            // Credential requests require an answer. Backpressure here rather
+            // than `try_send`: a full handler queue must delay the pipe, never
+            // silently discard an askpass request and leave sudo timing out.
+            ("cred", "req") => match payload.deserialized() {
+                Ok(req) => {
+                    if self
+                        .sinks
+                        .cred
+                        .send(ServiceRequest::Cred(req))
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!(target: "portal::agent",
+                            "credential handler unavailable; request could not be delivered");
+                    }
+                }
+                Err(e) => tracing::warn!(target: "portal::agent",
+                    service = %msg.service, err = %e, "payload decode failed; dropping"),
+            },
             ("clipsync", "ack") => deliver!(self.sinks.clipsync, ServiceRequest::ClipSyncAck),
             (svc, kind) => {
                 if warned.insert(format!("{svc}/{kind}")) {

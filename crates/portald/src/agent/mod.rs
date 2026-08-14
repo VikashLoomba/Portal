@@ -20,7 +20,7 @@
 pub mod filter;
 pub mod watcher;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use portal_proto::codec::CodecError;
@@ -38,6 +38,18 @@ use tokio::sync::mpsc;
 use crate::store::{ClipKind, ClipStore, Manifest, StoreError};
 use filter::PortFilter;
 use watcher::ListenerSource;
+
+/// Maximum credential requests retained per box session, including the one
+/// currently awaiting the Mac. This is a DoS bound, not a normal concurrency
+/// limit: accepted requests are dispatched one-at-a-time in FIFO order.
+pub const MAX_PENDING_CRED_REQUESTS: usize = 8;
+
+type CredReply = tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>;
+
+struct QueuedCred {
+    req: crate::cred::CredShimReq,
+    reply: CredReply,
+}
 
 /// Inbound cmd-socket events relayed up the pipe (see [`crate::cmdsock`]).
 #[derive(Debug)]
@@ -242,12 +254,12 @@ impl<S: ListenerSource> Agent<S> {
         let mut current: BTreeSet<u16> = BTreeSet::new();
         let mut msg_seq: u64 = 0;
         let mut pending_nonce: Option<u64> = None;
-        // Pending credential waiters, keyed by nonce (epoch = this pid).
-        // Cap 2: same DoS bound as the v1 agent's maxInflight discipline.
-        let mut cred_waiters: std::collections::HashMap<
-            u64,
-            tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
-        > = Default::default();
+        // Credential requests are FIFO and only one is sent to the Mac at a
+        // time. Keeping the queue here means the Mac never receives competing
+        // modal prompts and no accepted askpass request can disappear into a
+        // full downstream channel.
+        let mut cred_queue = VecDeque::<QueuedCred>::new();
+        let mut active_cred: Option<(u64, CredReply)> = None;
         let mut clipwrite_waiters: std::collections::HashMap<
             u64,
             tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -312,14 +324,25 @@ impl<S: ListenerSource> Agent<S> {
                             if let Some(payload) = &msg.payload
                                 && let Ok(resp) = unmarshal_payload::<CredResponse>(payload)
                                 && resp.epoch == epoch
-                                && let Some(waiter) = cred_waiters.remove(&resp.nonce)
+                                && active_cred.as_ref().is_some_and(|(nonce, _)| *nonce == resp.nonce)
                             {
+                                let (_, waiter) = active_cred.take().unwrap();
                                 let answer = if resp.ok {
                                     Ok(resp.secret.map(|s| s.into_vec()).unwrap_or_default())
                                 } else {
                                     Err(resp.err.unwrap_or_else(|| "denied".into()))
                                 };
                                 let _ = waiter.send(answer);
+                                if let Some(frame) = start_next_cred(
+                                    &mut cred_queue,
+                                    &mut active_cred,
+                                    &mut cred_nonce,
+                                    epoch,
+                                    &mut msg_seq,
+                                ) {
+                                    write_frame(stdout, &frame).await?;
+                                    hb.reset();
+                                }
                             }
                         } else if msg.service == "clipwrite" && msg.kind == "resp" {
                             if let Some(payload) = &msg.payload
@@ -368,6 +391,37 @@ impl<S: ListenerSource> Agent<S> {
                 }
                 relay = self.relay.recv() => {
                     let Some(relay) = relay else { continue };
+                    // Credential requests are special: queue every accepted
+                    // request and expose only the FIFO head to the Mac.
+                    let relay = match relay {
+                        Relay::Cred { req, reply } => {
+                            if !client_services.contains_key("cred") {
+                                let _ = reply.send(Err("no-client".into()));
+                                continue;
+                            }
+                            let pending = cred_queue.len() + usize::from(active_cred.is_some());
+                            if pending >= MAX_PENDING_CRED_REQUESTS {
+                                tracing::warn!(target: "portald", pending,
+                                    "credential FIFO is full; rejecting request explicitly");
+                                let _ = reply.send(Err("busy".into()));
+                                continue;
+                            }
+                            cred_queue.push_back(QueuedCred { req, reply });
+                            if let Some(frame) = start_next_cred(
+                                &mut cred_queue,
+                                &mut active_cred,
+                                &mut cred_nonce,
+                                epoch,
+                                &mut msg_seq,
+                            ) {
+                                write_frame(stdout, &frame).await?;
+                                hb.reset();
+                            }
+                            continue;
+                        }
+                        other => other,
+                    };
+
                     // Only relay when the client advertised the service (S4).
                     msg_seq += 1;
                     let frame = match relay {
@@ -383,30 +437,6 @@ impl<S: ListenerSource> Agent<S> {
                                 service: "openurl".into(), kind: "event".into(),
                                 seq: Some(msg_seq),
                                 payload: marshal_payload(&OpenUrl { url, seq: msg_seq }).ok(),
-                            })
-                        }
-                        Relay::Cred { req, reply } => {
-                            if !client_services.contains_key("cred") {
-                                let _ = reply.send(Err("no-client".into()));
-                                continue;
-                            }
-                            if cred_waiters.len() >= 2 {
-                                let _ = reply.send(Err("busy".into()));
-                                continue;
-                            }
-                            cred_nonce += 1;
-                            cred_waiters.insert(cred_nonce, reply);
-                            Envelope::of_msg(Msg {
-                                service: "cred".into(), kind: "req".into(),
-                                seq: Some(msg_seq),
-                                payload: marshal_payload(&CredRequest {
-                                    nonce: cred_nonce,
-                                    epoch,
-                                    label: req.label,
-                                    requester: (!req.requester.is_empty()).then_some(req.requester),
-                                    mode: req.mode,
-                                    target: (!req.target.is_empty()).then_some(req.target),
-                                }).ok(),
                             })
                         }
                         Relay::ClipWrite { req, reply } => {
@@ -569,6 +599,52 @@ impl<S: ListenerSource> Agent<S> {
             }
         }
     }
+}
+
+/// Dispatch the next live FIFO entry when no credential request is active.
+/// Canceled askpass processes are skipped before they can bother the user.
+fn start_next_cred(
+    queue: &mut VecDeque<QueuedCred>,
+    active: &mut Option<(u64, CredReply)>,
+    nonce: &mut u64,
+    epoch: u64,
+    msg_seq: &mut u64,
+) -> Option<Envelope> {
+    if active.is_some() {
+        return None;
+    }
+    while let Some(QueuedCred { req, reply }) = queue.pop_front() {
+        if reply.is_closed() {
+            continue;
+        }
+        *nonce = nonce.wrapping_add(1);
+        let request = CredRequest {
+            nonce: *nonce,
+            epoch,
+            label: req.label,
+            requester: (!req.requester.is_empty()).then_some(req.requester),
+            mode: req.mode,
+            target: (!req.target.is_empty()).then_some(req.target),
+        };
+        let payload = match marshal_payload(&request) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::error!(target: "portald", %err,
+                    "credential request encode failed; rejecting explicitly");
+                let _ = reply.send(Err("denied".into()));
+                continue;
+            }
+        };
+        *msg_seq += 1;
+        *active = Some((*nonce, reply));
+        return Some(Envelope::of_msg(Msg {
+            service: "cred".into(),
+            kind: "req".into(),
+            seq: Some(*msg_seq),
+            payload: Some(payload),
+        }));
+    }
+    None
 }
 
 fn port4(p: u16) -> Port {

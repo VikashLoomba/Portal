@@ -47,8 +47,7 @@ pub struct ServeDeps<'a> {
 }
 
 /// Serve one CredRequest. Blocking (dialog + biometry are modal); the daemon
-/// runs it on a blocking task with the cap-1 in-flight semaphore it already
-/// holds for prompts.
+/// runs it on a blocking task while holding its global FIFO prompt gate.
 pub fn serve_cred_request(deps: &ServeDeps<'_>, req: &CredRequest) -> CredResponse {
     let resp = CredResponse {
         nonce: req.nonce,

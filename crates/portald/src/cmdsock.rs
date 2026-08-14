@@ -154,9 +154,11 @@ async fn handle_conn(stream: UnixStream, relay: mpsc::Sender<Relay>) -> std::io:
     Ok(())
 }
 
-/// Outer bound on a cred decision: the Mac's dialog budget is 115s; leave
-/// margin so the Mac's own timeout answer wins the race (v1 budget doctrine).
-pub const CRED_WAIT: std::time::Duration = std::time::Duration::from_secs(130);
+/// Outer bound for an accepted FIFO entry. One Mac decision has a 115-second
+/// budget; allow that budget plus margin for every position in the bounded
+/// box-side queue so later requests do not expire before reaching the user.
+pub const CRED_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(130 * crate::agent::MAX_PENDING_CRED_REQUESTS as u64);
 
 /// Outer bound on a clipboard write (Mac pull + pasteboard set is ~instant;
 /// generous for big blobs on slow links).

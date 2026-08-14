@@ -53,9 +53,10 @@ pub enum ServiceRequest {
 }
 
 /// Sink bundle: the session pushes into these; the supervisor owns the
-/// receive ends. Sends are non-blocking (`try_send`); a full engine channel
-/// drops (reconcile re-derives from the snapshot anyway), while the QoS
-/// channels are sized so drops mean the handler is genuinely wedged.
+/// receive ends. Most sends are non-blocking (`try_send`); a full engine
+/// channel drops because reconcile re-derives from the snapshot. Credential
+/// delivery is the exception: the session awaits capacity because every
+/// accepted askpass request requires an explicit response.
 #[derive(Clone)]
 pub struct EventSinks {
     pub engine: mpsc::Sender<Event>,
@@ -69,6 +70,8 @@ pub struct EventSinks {
 }
 
 /// Capacities mirror v1 (events 64, clip 8, clipwrite 8, notify 16, cred 2).
+/// The box agent exposes only one FIFO head at a time; two cred slots also
+/// preserve compatibility with older agents during a rolling upgrade.
 pub struct EventChannels {
     pub sinks: EventSinks,
     pub engine: mpsc::Receiver<Event>,

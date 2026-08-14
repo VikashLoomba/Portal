@@ -57,12 +57,13 @@ Rule: no silent TODOs in code. Anything deferred lives HERE, explicitly.
       "portal.credentials"), list via ItemSearch, absent-delete tolerated
 - [x] supervisor cred handler task: dedicated channel → spawn_blocking policy
       core → CredResponse; box attribution in the dialog requester; ONE
-      cooldown map shared across boxes; `cred@1` advertised
+      cooldown map and global FIFO prompt gate shared across boxes; `cred@1`
+      advertised
 - [x] portald: `keychain run --label [--env|--stdin] -- cmd` (secret → child
       env/stdin ONLY; exit 111 on deny) + `keychain askpass`; cmd-socket
-      `cred` verb (base64 JSON, request/response with 130s outer bound);
-      agent serve loop mints nonces + correlates CredResponse by nonce+epoch
-      (pid), cap-2 inflight; e2e test shim→agent→Mac→shim
+      `cred` verb (base64 JSON, queue-depth-aware outer timeout); agent serve
+      loop mints nonces + correlates CredResponse by nonce+epoch (pid), bounded
+      FIFO with one active request; e2e test shim→agent→Mac→shim
 - [x] box shims: sudo wrapper (fires ONLY with no controlling tty — fail-safe
       around human sessions; respects user SUDO_ASKPASS) + portal-askpass;
       shim VERSION bumped to 10 (auto-redeploy on reconnect)
