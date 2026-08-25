@@ -12,9 +12,12 @@
 //! Agent mode: stdout is EXCLUSIVELY protocol frames; logs go to stderr
 //! (the Mac tees them into its daemon log, "agent:"-prefixed).
 
+use std::io::Write as _;
+
 use portald::agent::{Agent, AgentConfig, watcher};
 use portald::cli::{self, Tool};
 use portald::cmdsock;
+use portald::cred::AskpassAction;
 use portald::store::{ClipKind, ClipStore};
 
 fn git_sha() -> &'static str {
@@ -142,6 +145,10 @@ fn dispatch(args: &[String]) -> i32 {
         Some("notify") => run_notify(&args[1..]),
         Some("open") => run_open(&args[1..]),
         Some("keychain") => run_keychain(&args[1..]),
+        Some("help" | "-h" | "--help") => {
+            print!("{TOP_LEVEL_HELP}");
+            0
+        }
         Some(other) if !other.starts_with('-') => usage(&mut std::io::stderr().lock(), other),
         _ => run_agent(args),
     }
@@ -318,35 +325,103 @@ fn relay_line(line: &str, all: bool) -> i32 {
     }
 }
 
-/// `portald keychain run --label L [--env VAR | --stdin] -- cmd args…` and
-/// `portald keychain askpass [prompt]`. The secret reaches ONLY the child's
-/// env or stdin (askpass: our stdout, which sudo reads) — never argv, disk,
-/// or logs. Exit 111 = denied/unavailable (v1 contract).
+const TOP_LEVEL_HELP: &str = r#"portal is the agent-facing command installed on this dev box.
+
+Secure inputs:
+  portal keychain run --label <description> --env NAME -- <command> [args...]
+  portal keychain run --label <description> --stdin -- <command> [args...]
+
+The approved secret is delivered only to the child command's environment or
+stdin; it is never printed for the calling agent. For examples and the quoting
+rules, run:
+  portal keychain --help
+
+Other box-side commands:
+  portal clip <paste|copy|targets|status> ...
+  portal notify --hook | --title <title> [options]
+  portal open <url>
+
+Do not run `portal keychain askpass` directly. sudo invokes that helper and is
+the only process that should read its secret-bearing stdout.
+"#;
+
+const KEYCHAIN_HELP: &str = r#"portal keychain requests a credential from the connected Mac without printing it to the agent.
+
+Usage:
+  portal keychain run --label <L> --env NAME -- <command> [args...]
+  portal keychain run --label <L> --stdin -- <command> [args...]
+
+Examples:
+  portal keychain run --label "staging admin" --env PW -- sh -c 'curl -d "pass=$PW" ...'
+  portal keychain run --label "registry token" --stdin -- docker login --password-stdin
+
+The SINGLE quotes in the first example make the child shell expand $PW. The
+caller's shell must not expand it. A denied or unavailable request exits 111.
+
+`portal keychain askpass` is an internal sudo/ssh helper. Do not run it to
+request a secret; use `portal keychain run` instead.
+"#;
+
+const KEYCHAIN_RUN_HELP: &str = r#"Request a credential, then deliver it only to a child process.
+
+Usage:
+  portal keychain run --label <L> --env NAME -- <command> [args...]
+  portal keychain run --label <L> --stdin -- <command> [args...]
+
+Examples:
+  portal keychain run --label "staging admin" --env PW -- sh -c 'curl -d "pass=$PW" ...'
+  portal keychain run --label "database password" --stdin -- psql
+
+The SINGLE quotes in the first example make the child shell expand $PW. The
+calling shell and agent never receive the approved secret.
+"#;
+
+const ASKPASS_HELP: &str = r#"portal keychain askpass is the SUDO_ASKPASS helper sudo calls for you. It is not meant to be run by hand.
+
+On approval it writes the secret to stdout for sudo to read. To prevent that
+secret from entering an agent transcript, portald refuses unless sudo, sudoedit,
+sudo-rs, or ssh invoked it.
+
+To exercise the credential path deliberately, use:
+  portal keychain run --label "test" --env PW -- sh -c 'echo "len=${#PW}"'
+
+Set PORTAL_ASKPASS_ALLOW_ANY=1 only when wiring this helper into another
+askpass-protocol consumer that reads its stdout.
+"#;
+
+fn is_help_arg(arg: &str) -> bool {
+    matches!(arg, "help" | "-h" | "--help")
+}
+
+/// `portal keychain run --label L [--env VAR | --stdin] -- cmd args…` and
+/// the internal `portal keychain askpass [prompt]`. Direct run mode keeps the
+/// secret inside the child; askpass is separately gated to a known consumer
+/// before a request can reach the Mac.
 fn run_keychain(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
+        Some(help) if is_help_arg(help) => {
+            print!("{KEYCHAIN_HELP}");
+            0
+        }
         Some("askpass") => {
-            let prompt = args.get(1).cloned().unwrap_or_default();
-            let req = portald::cred::CredShimReq {
-                label: "sudo".into(),
-                requester: format!("pid {}: sudo askpass", std::process::id()),
-                mode: "askpass".into(),
-                target: prompt,
-            };
-            match request_secret(&req) {
-                Ok(secret) => {
-                    use std::io::Write;
-                    let mut out = std::io::stdout().lock();
-                    let _ = out.write_all(&secret);
-                    let _ = out.write_all(b"\n"); // sudo strips the newline
-                    0
-                }
-                Err(reason) => {
-                    eprintln!("portal keychain: {}", portald::cred::explain_deny(&reason));
-                    111
-                }
-            }
+            let askpass_args = &args[1..];
+            let action = portald::cred::current_askpass_action(askpass_args);
+            let requester = portald::cred::requester_context();
+            let mut request = request_secret;
+            run_keychain_askpass(
+                askpass_args,
+                action,
+                requester,
+                &mut request,
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            )
         }
         Some("run") => {
+            if args.len() == 2 && is_help_arg(&args[1]) {
+                print!("{KEYCHAIN_RUN_HELP}");
+                return 0;
+            }
             let mut label = None;
             let mut env_var: Option<String> = None;
             let mut use_stdin = false;
@@ -362,14 +437,14 @@ fn run_keychain(args: &[String]) -> i32 {
                         break;
                     }
                     other => {
-                        eprintln!("portald keychain run: unknown flag {other:?}");
+                        eprintln!("portal keychain run: unknown flag {other:?}");
                         return 2;
                     }
                 }
             }
             let Some(label) = label else {
                 eprintln!(
-                    "usage: portald keychain run --label L [--env VAR | --stdin] -- cmd args…"
+                    "usage: portal keychain run --label L [--env VAR | --stdin] -- cmd args…"
                 );
                 return 2;
             };
@@ -378,7 +453,7 @@ fn run_keychain(args: &[String]) -> i32 {
                 || (env_var.is_some() && use_stdin)
             {
                 eprintln!(
-                    "usage: portald keychain run --label L [--env VAR | --stdin] -- cmd args…"
+                    "usage: portal keychain run --label L [--env VAR | --stdin] -- cmd args…"
                 );
                 return 2;
             }
@@ -409,26 +484,80 @@ fn run_keychain(args: &[String]) -> i32 {
             }
             match child.spawn() {
                 Ok(mut c) => {
-                    if use_stdin {
-                        use std::io::Write;
-                        if let Some(mut stdin) = c.stdin.take() {
-                            let _ = stdin.write_all(&secret);
-                        } // drop closes: child sees EOF
-                    }
+                    if use_stdin && let Some(mut stdin) = c.stdin.take() {
+                        let _ = stdin.write_all(&secret);
+                    } // drop closes: child sees EOF
                     match c.wait() {
                         Ok(status) => status.code().unwrap_or(1),
                         Err(_) => 1,
                     }
                 }
                 Err(e) => {
-                    eprintln!("portald keychain run: spawn {}: {e}", cmd[0]);
+                    eprintln!("portal keychain run: spawn {}: {e}", cmd[0]);
                     127
                 }
             }
         }
         _ => {
-            eprintln!("usage: portald keychain <run|askpass> …");
+            eprintln!("usage: portal keychain <run|askpass> …");
+            eprintln!("run 'portal keychain --help' for secure-input examples");
             2
+        }
+    }
+}
+
+/// Safety-critical askpass path with an injectable request seam. Help and
+/// refusal return before `request` is called, which guarantees they cannot
+/// open a Mac prompt or put an approved secret in stdout.
+fn run_keychain_askpass(
+    args: &[String],
+    action: AskpassAction,
+    requester: String,
+    request: &mut dyn FnMut(&portald::cred::CredShimReq) -> Result<Vec<u8>, String>,
+    stdout: &mut dyn std::io::Write,
+    stderr: &mut dyn std::io::Write,
+) -> i32 {
+    match action {
+        AskpassAction::Help => {
+            let _ = write!(stdout, "{ASKPASS_HELP}");
+            return 0;
+        }
+        AskpassAction::Refuse => {
+            let _ = writeln!(
+                stderr,
+                "portal keychain askpass: refusing to request a credential — this helper writes the approved secret to stdout and must be invoked by sudo or ssh"
+            );
+            let _ = writeln!(
+                stderr,
+                "portal keychain askpass: use 'portal keychain run --help' for a safe direct request"
+            );
+            return 2;
+        }
+        AskpassAction::Request => {}
+    }
+
+    let prompt = portald::cred::truncate_utf8(&args.join(" "), portald::cred::CONTEXT_MAX);
+    let req = portald::cred::CredShimReq {
+        label: "sudo".into(),
+        requester,
+        mode: "askpass".into(),
+        target: prompt,
+    };
+    match request(&req) {
+        Ok(secret) => {
+            if stdout.write_all(&secret).is_err() || stdout.write_all(b"\n").is_err() {
+                let _ = writeln!(stderr, "portal keychain: could not write to askpass stdout");
+                return 111;
+            }
+            0
+        }
+        Err(reason) => {
+            let _ = writeln!(
+                stderr,
+                "portal keychain: {}",
+                portald::cred::explain_deny(&reason)
+            );
+            111
         }
     }
 }
@@ -504,4 +633,80 @@ fn usage(stderr: &mut dyn std::io::Write, what: &str) -> i32 {
          \x20      portald --sha"
     );
     2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    /// End-to-end through the safety-critical helper: neither a help probe nor
+    /// a refused direct call may invoke the request closure or write a secret.
+    #[test]
+    fn askpass_help_and_refusal_cannot_request_or_disclose() {
+        for (args, action, expected_code) in [
+            (strings(&["--help"]), AskpassAction::Help, 0),
+            (strings(&["Password:"]), AskpassAction::Refuse, 2),
+        ] {
+            let mut requests = 0;
+            let mut request = |_req: &portald::cred::CredShimReq| {
+                requests += 1;
+                Ok(b"MUST-NOT-BE-DISCLOSED".to_vec())
+            };
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = run_keychain_askpass(
+                &args,
+                action,
+                "pid 7: test".into(),
+                &mut request,
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(code, expected_code);
+            assert_eq!(requests, 0);
+            assert!(
+                !stdout
+                    .windows(b"MUST-NOT-BE-DISCLOSED".len())
+                    .any(|w| { w == b"MUST-NOT-BE-DISCLOSED" })
+            );
+        }
+    }
+
+    #[test]
+    fn askpass_request_writes_only_for_an_allowed_consumer() {
+        let mut seen = None;
+        let mut request = |req: &portald::cred::CredShimReq| {
+            seen = Some(req.clone());
+            Ok(b"approved".to_vec())
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_keychain_askpass(
+            &strings(&["[sudo] password for dev:"]),
+            AskpassAction::Request,
+            "pid 42: sudo -A whoami".into(),
+            &mut request,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(stdout, b"approved\n");
+        assert!(stderr.is_empty());
+        let req = seen.unwrap();
+        assert_eq!(req.mode, "askpass");
+        assert_eq!(req.target, "[sudo] password for dev:");
+        assert_eq!(req.requester, "pid 42: sudo -A whoami");
+    }
+
+    #[test]
+    fn agent_facing_help_explains_the_non_disclosing_path() {
+        assert!(TOP_LEVEL_HELP.contains("portal keychain run"));
+        assert!(TOP_LEVEL_HELP.contains("never printed for the calling agent"));
+        assert!(KEYCHAIN_HELP.contains("SINGLE quotes"));
+        assert!(ASKPASS_HELP.contains("not meant to be run by hand"));
+    }
 }

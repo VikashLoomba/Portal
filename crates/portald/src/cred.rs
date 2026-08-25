@@ -20,6 +20,100 @@ pub const LABEL_MAX: usize = 200;
 pub const CONTEXT_MAX: usize = 300;
 pub const SECRET_MAX: usize = 4096;
 
+/// Escape hatch for deliberately wiring portal-askpass into another
+/// askpass-protocol consumer. The normal path fails closed unless sudo or ssh
+/// is the invoking process.
+pub const ASKPASS_ALLOW_ANY_ENV: &str = "PORTAL_ASKPASS_ALLOW_ANY";
+
+/// Result of the askpass safety gate. This classification happens before the
+/// cmd socket is touched, so help probes and direct invocations cannot trigger
+/// a consent dialog or receive a secret on stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskpassAction {
+    Help,
+    Request,
+    Refuse,
+}
+
+/// Classify an askpass invocation using explicit inputs (kept pure so the
+/// credential-disclosure invariant is exhaustively testable).
+pub fn classify_askpass(
+    args: &[String],
+    allow_any_parent: bool,
+    parent_name: Option<&str>,
+) -> AskpassAction {
+    if args.len() == 1 && matches!(args[0].as_str(), "help" | "-h" | "--help") {
+        return AskpassAction::Help;
+    }
+    if allow_any_parent || matches!(parent_name, Some("sudo" | "sudoedit" | "sudo-rs" | "ssh")) {
+        AskpassAction::Request
+    } else {
+        AskpassAction::Refuse
+    }
+}
+
+/// Apply the production askpass gate. An unreadable or indeterminate parent
+/// is intentionally treated as a refusal.
+pub fn current_askpass_action(args: &[String]) -> AskpassAction {
+    let allow_any = std::env::var(ASKPASS_ALLOW_ANY_ENV).as_deref() == Ok("1");
+    let parent = parent_process_name();
+    classify_askpass(args, allow_any, parent.as_deref())
+}
+
+/// Linux parent process name from `/proc/<ppid>/cmdline`. portald is deployed
+/// only to Linux boxes; any other platform (or procfs failure) fails closed.
+pub fn parent_process_name() -> Option<String> {
+    let pid = parent_pid()?;
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    process_name_from_cmdline(&raw)
+}
+
+/// Context shown in the Mac approval prompt. Unlike the old `pid <self>`
+/// placeholder, this identifies the process that will actually consume the
+/// secret.
+pub fn requester_context() -> String {
+    let Some(pid) = parent_pid() else {
+        return String::new();
+    };
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return String::new();
+    };
+    let cmdline = String::from_utf8_lossy(&raw)
+        .replace('\0', " ")
+        .trim()
+        .to_string();
+    truncate_utf8(&format!("pid {pid}: {cmdline}"), CONTEXT_MAX)
+}
+
+fn parent_pid() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        line.strip_prefix("PPid:")
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|pid| *pid != 0)
+    })
+}
+
+/// Extract argv[0]'s basename from Linux procfs cmdline bytes.
+pub fn process_name_from_cmdline(raw: &[u8]) -> Option<String> {
+    let argv0 = raw.split(|byte| *byte == 0).next()?;
+    let argv0 = String::from_utf8_lossy(argv0);
+    let name = std::path::Path::new(argv0.trim()).file_name()?.to_str()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Truncate at a UTF-8 boundary to the credential wire's byte cap.
+pub fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
 /// The socket request (JSON, base64-wrapped onto the tab-framed line).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CredShimReq {
@@ -194,5 +288,64 @@ mod tests {
         // Oversized secret fails closed.
         let big = encode_reply_ok(&vec![b'x'; SECRET_MAX + 1]);
         assert_eq!(parse_reply(&big).unwrap_err(), "denied");
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    /// Regression: an agent probing `portal keychain askpass --help` must
+    /// never reach the request path, where an approved secret goes to stdout.
+    #[test]
+    fn lone_askpass_help_tokens_never_request() {
+        for token in ["help", "-h", "--help"] {
+            assert_eq!(
+                classify_askpass(&strings(&[token]), false, Some("sudo")),
+                AskpassAction::Help,
+                "{token}"
+            );
+        }
+        // A token inside sudo's actual prompt remains opaque prompt text.
+        assert_eq!(
+            classify_askpass(&strings(&["--help", "for user:"]), false, Some("sudo")),
+            AskpassAction::Request
+        );
+    }
+
+    #[test]
+    fn askpass_refuses_non_consumers_and_unknown_parents() {
+        for parent in [Some("bash"), Some("zsh"), Some("node"), None] {
+            assert_eq!(
+                classify_askpass(&strings(&["Password:"]), false, parent),
+                AskpassAction::Refuse,
+                "{parent:?}"
+            );
+        }
+        for parent in ["sudo", "sudoedit", "sudo-rs", "ssh"] {
+            assert_eq!(
+                classify_askpass(&strings(&["Password:"]), false, Some(parent)),
+                AskpassAction::Request,
+                "{parent}"
+            );
+        }
+        assert_eq!(
+            classify_askpass(&strings(&["Password:"]), true, Some("custom-consumer")),
+            AskpassAction::Request
+        );
+    }
+
+    #[test]
+    fn proc_cmdline_name_and_context_truncation_are_safe() {
+        assert_eq!(
+            process_name_from_cmdline(b"sudo\0-A\0ls\0").as_deref(),
+            Some("sudo")
+        );
+        assert_eq!(
+            process_name_from_cmdline(b"/usr/bin/sudo-rs\0-A\0").as_deref(),
+            Some("sudo-rs")
+        );
+        assert_eq!(process_name_from_cmdline(b"\0").as_deref(), None);
+        assert_eq!(truncate_utf8("abc", 3), "abc");
+        assert_eq!(truncate_utf8("éé", 3), "é");
     }
 }

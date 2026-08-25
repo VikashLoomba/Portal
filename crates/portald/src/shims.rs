@@ -17,7 +17,7 @@
 //! content marker that makes redeploys a cheap grep, exactly like v1.
 
 /// Bump when any shim text changes (drives daemon-driven re-deploys).
-pub const VERSION: &str = "12";
+pub const VERSION: &str = "13";
 
 /// Marker every shim carries; version-independent prefix owns backup/restore
 /// decisions (v1 doctrine: a portal shim of ANY version is never mistaken
@@ -280,6 +280,24 @@ exec "$_real" "$@"
     )
 }
 
+/// Agent-facing `portal` command. The Mac-side CLI is not copied to the box;
+/// this stable wrapper dispatches box-side verbs to the current embedded
+/// portald, including the secure `portal keychain run` surface.
+pub fn portal() -> String {
+    format!(
+        r#"#!/bin/sh
+# {marker}. Agent-facing portal command; dispatches to the current portald.
+_portald="${{HOME}}/.cache/portal/portald"
+if [ -x "$_portald" ]; then
+    exec "$_portald" "$@"
+fi
+echo "portal: portald is unavailable" >&2
+exit 127
+"#,
+        marker = marker()
+    )
+}
+
 /// SUDO_ASKPASS helper: sudo invokes it with the prompt as argv; the secret
 /// comes back on stdout (portald keychain askpass owns the socket protocol).
 pub fn portal_askpass() -> String {
@@ -338,6 +356,7 @@ pub fn all() -> Vec<(&'static str, String)> {
         ("pbpaste", pbpaste()),
         ("wl-copy", wl_copy()),
         ("pbcopy", pbcopy()),
+        ("portal", portal()),
         ("sudo", sudo()),
         ("portal-askpass", portal_askpass()),
         ("xdg-open", xdg_open()),
@@ -350,6 +369,8 @@ mod tests {
 
     #[test]
     fn every_shim_carries_the_version_marker_and_shape() {
+        assert_eq!(VERSION, "13");
+        assert!(all().iter().any(|(name, _)| *name == "portal"));
         for (name, script) in all() {
             assert!(script.starts_with("#!/bin/sh\n"), "{name}: shebang");
             assert!(script.contains(&marker()), "{name}: version marker");
@@ -402,6 +423,8 @@ mod tests {
         assert!(s.contains(r#"[ -z "${SUDO_ASKPASS:-}" ]"#), "{s}");
         // …and never shadow itself in PATH resolution.
         assert!(s.contains("portal-askpass"), "{s}");
+        let p = portal();
+        assert!(p.contains(r#"exec "$_portald" "$@""#), "{p}");
         let a = portal_askpass();
         assert!(a.contains("keychain askpass"), "{a}");
     }

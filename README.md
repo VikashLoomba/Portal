@@ -283,7 +283,7 @@ so the secret goes directly into the child process instead of through the
 conversation:
 
 ```sh
-portald keychain run --label "staging admin" --env PW -- sh -c 'curl -d "pass=$PW" …'
+portal keychain run --label "staging admin" --env PW -- sh -c 'curl -d "pass=$PW" …'
 ```
 
 The single quotes are important: they make the child shell expand `$PW`; the
@@ -307,7 +307,7 @@ shims only if that parent supplied a PATH containing `~/.local/bin`.
 > **Heads-up — transparent `sudo` is deliberately fail-safe around shared
 > terminals.** It fires only for an agent with **no controlling terminal**. In a
 > shared interactive SSH session the agent shares the human's tty, so portal
-> does not auto-intercept; use `portald keychain run …` there, or approve sudo
+> does not auto-intercept; use `portal keychain run …` there, or approve sudo
 > yourself. This prevents portal from hijacking a human password prompt,
 > including when sudo's stdin has been redirected.
 
