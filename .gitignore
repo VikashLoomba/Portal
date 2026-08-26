@@ -1,4 +1,7 @@
 /target/
+/native/Dependencies/
+/native/Generated/
+/native/Sources/PortalFFIGenerated/
 /portal
 /portal-darwin-arm64
 /portal-v2-darwin-arm64

@@ -266,9 +266,13 @@ async fn verify_app_bundle(
     app: &std::path::Path,
     tag: &str,
 ) -> Result<(), String> {
-    let binary = app.join("Contents/MacOS/portal");
-    if !app.join("Contents/Info.plist").is_file() || !binary.is_file() {
-        return Err("app archive does not contain Portal.app/Contents/MacOS/portal".into());
+    let binary = app.join("Contents/MacOS/Portal");
+    let launcher = app.join("Contents/Resources/bin/portal");
+    if !app.join("Contents/Info.plist").is_file() || !binary.is_file() || !launcher.is_file() {
+        return Err(
+            "app archive does not contain Portal.app/Contents/MacOS/Portal and its bundled CLI launcher"
+                .into(),
+        );
     }
     for (program, args, label) in [
         (
@@ -300,7 +304,7 @@ async fn verify_app_bundle(
             return Err(format!("app {label} failed: {}", out.stderr_lossy()));
         }
     }
-    verify_reported_version(runner, &binary, tag).await
+    verify_reported_version_with_args(runner, &binary, &["--cli", "--version"], tag).await
 }
 
 async fn verify_reported_version(
@@ -308,10 +312,22 @@ async fn verify_reported_version(
     binary: &std::path::Path,
     tag: &str,
 ) -> Result<(), String> {
+    verify_reported_version_with_args(runner, binary, &["--version"], tag).await
+}
+
+async fn verify_reported_version_with_args(
+    runner: &dyn portal_transport::runner::Runner,
+    binary: &std::path::Path,
+    arguments: &[&str],
+    tag: &str,
+) -> Result<(), String> {
     let out = runner
         .run(
             binary.to_string_lossy().as_ref(),
-            &["--version".into()],
+            &arguments
+                .iter()
+                .map(|argument| (*argument).into())
+                .collect::<Vec<_>>(),
             b"",
         )
         .await

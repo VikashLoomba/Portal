@@ -2,16 +2,13 @@
 //! uses the versioned owner-only local API; existing CLI verbs retain their
 //! command shapes and lifecycle recovery paths.
 
-#[cfg(target_os = "macos")]
-mod activation;
 mod app_install;
 mod daemon;
 mod deployment;
 mod launchd;
 mod local_client;
-mod prompt_helper;
 mod services;
-mod tray;
+mod ui_update;
 mod upgrade;
 
 use std::io::Write as _;
@@ -114,12 +111,18 @@ enum Command {
         tag: String,
         staging: PathBuf,
     },
+    /// Install an already signed and verified local Portal.app candidate.
+    /// Used only by the maintainer's signed local release gate.
+    #[command(name = "_install-verified-app", hide = true)]
+    InstallVerifiedApp { candidate: PathBuf, tag: String },
     /// Finish the one-time standalone-to-Portal.app migration after an older
     /// upgrader has installed this compatibility binary.
     #[command(name = "_complete-app-migration", hide = true)]
     CompleteAppMigration,
     #[command(name = "_app-migration-mode", hide = true)]
     AppMigrationMode,
+    #[command(name = "_signed-build-mode", hide = true)]
+    SignedBuildMode,
     /// Run the daemon in the foreground (launchd entry point)
     #[command(hide = true)]
     Daemon,
@@ -164,37 +167,97 @@ pub fn version_string() -> String {
     format!("portal v{} (sha {})", env!("CARGO_PKG_VERSION"), BUILD_SHA)
 }
 
-fn main() {
-    // Hidden helper subcommand, dispatched before clap (it must own the
-    // process: AppKit wants the main thread, and the arg shape is internal).
-    let raw: Vec<String> = std::env::args().collect();
-    if raw.get(1).map(String::as_str) == Some("_prompt") {
-        std::process::exit(prompt_helper::run());
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiUpdateCheck {
+    Current(String),
+    Available { tag: String, message: String },
+    Migration { tag: String },
+}
+
+pub fn check_ui_update() -> Result<UiUpdateCheck, String> {
+    let executable =
+        std::env::current_exe().map_err(|error| format!("could not locate Portal: {error}"))?;
+    match ui_update::run_update_check(&executable)? {
+        ui_update::UpdateCheck::Current(version) => Ok(UiUpdateCheck::Current(version)),
+        ui_update::UpdateCheck::Available { tag, message } => {
+            Ok(UiUpdateCheck::Available { tag, message })
+        }
+        ui_update::UpdateCheck::Migration { tag } => Ok(UiUpdateCheck::Migration { tag }),
     }
-    tracing_subscriber::fmt()
+}
+
+/// Run the existing clap command surface from the app-owned `portal`
+/// launcher. `arguments` excludes argv[0].
+pub fn run_cli_arguments(arguments: Vec<String>) -> i32 {
+    let mut raw = Vec::with_capacity(arguments.len() + 1);
+    raw.push("portal".to_string());
+    raw.extend(arguments);
+    run_arguments(raw)
+}
+
+/// Run the persistent daemon directly from the Swift process dispatcher.
+pub fn run_daemon_mode() -> i32 {
+    initialize_tracing();
+    match production_paths() {
+        Ok(paths) => block_on_daemon(paths),
+        Err(error) => {
+            eprintln!("portal daemon: {error}");
+            1
+        }
+    }
+}
+
+/// Install/converge the app-owned CLI and both launchd jobs, then prove the
+/// independent daemon is healthy. Called once by the Swift GUI at launch.
+pub fn prepare_swift_app() -> Result<(), String> {
+    initialize_tracing();
+    prepare_desktop_app(&production_paths()?)
+}
+
+fn run_arguments(raw: Vec<String>) -> i32 {
+    initialize_tracing();
+    // `--version` needs the build SHA (the box-side agent-heal compares it),
+    // so intercept before clap's plain version printer. The bare `version`
+    // subcommand is v1 parity.
+    if matches!(
+        raw.get(1).map(String::as_str),
+        Some("--version") | Some("version")
+    ) {
+        println!("{}", version_string());
+        return 0;
+    }
+    let cli = match Cli::try_parse_from(raw) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = error.exit_code();
+            let _ = error.print();
+            return code;
+        }
+    };
+    let paths = match production_paths() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("portal: {error}");
+            return 1;
+        }
+    };
+    run(cli.command.unwrap_or(Command::App), paths)
+}
+
+fn initialize_tracing() {
+    let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
-        .init();
-    // `--version` needs the build SHA (the box-side agent-heal compares it),
-    // so intercept before clap's plain version printer. The bare `version`
-    // subcommand is v1 parity — v1's `portal upgrade` self-tests a downloaded
-    // binary by running `<binary> version` and checking the release tag
-    // appears in the output; without it a v1→v2 upgrade refuses the swap.
-    if matches!(
-        std::env::args().nth(1).as_deref(),
-        Some("--version") | Some("version")
-    ) {
-        println!("{}", version_string());
-        std::process::exit(0);
-    }
-    let cli = Cli::parse();
-    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME not set"));
-    let uid = unsafe { libc_getuid() };
-    let paths = Paths::derive(&home, uid);
-    let code = run(cli.command.unwrap_or(Command::App), paths);
-    std::process::exit(code);
+        .try_init();
+}
+
+fn production_paths() -> Result<Paths, String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME not set".to_string())?;
+    Ok(Paths::derive(&home, unsafe { libc_getuid() }))
 }
 
 // getuid without a libc dependency line for one call.
@@ -208,8 +271,8 @@ pub(crate) unsafe fn libc_getuid() -> u32 {
 fn run(cmd: Command, paths: Paths) -> i32 {
     match cmd {
         Command::Daemon | Command::Run => block_on_daemon(paths),
-        Command::App => tray::run_app(),
-        Command::Tray => tray::run(),
+        Command::App => open_swift_app(),
+        Command::Tray => exec_swift_tray(),
         Command::Install { host, name, index } => install(&paths, &host, name, index),
         Command::Uninstall => uninstall(&paths),
         Command::Start => launchctl_verb(&paths, Verb::Start),
@@ -228,6 +291,21 @@ fn run(cmd: Command, paths: Paths) -> i32 {
             tag,
             staging,
         } => apply_prepared_upgrade(&paths, &candidate, &tag, &staging, app),
+        Command::InstallVerifiedApp { candidate, tag } => {
+            match app_install::install_verified_app(&candidate, &paths, &tag) {
+                Ok(report) => {
+                    if let Some(warning) = report.tray_warning {
+                        eprintln!("portal install: {warning} (forwarding is healthy)");
+                    }
+                    println!("portal: installed {tag}");
+                    0
+                }
+                Err(error) => {
+                    eprintln!("portal install: {error}");
+                    1
+                }
+            }
+        }
         Command::CompleteAppMigration => complete_app_migration(&paths),
         Command::AppMigrationMode => {
             println!(
@@ -240,9 +318,84 @@ fn run(cmd: Command, paths: Paths) -> i32 {
             );
             0
         }
+        Command::SignedBuildMode => {
+            #[cfg(target_os = "macos")]
+            println!(
+                "{}",
+                if portal_cred::macos::signed_binary() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            #[cfg(not(target_os = "macos"))]
+            println!("disabled");
+            0
+        }
         Command::Features { name, state } => features(&paths, name, state),
         Command::Keychain(cmd) => keychain(cmd),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn open_swift_app() -> i32 {
+    match std::process::Command::new("open")
+        .args(["-b", "com.vikashloomba.portal"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => return 0,
+        Ok(_) | Err(_) => {}
+    }
+
+    // A transitional standalone copy of this same Swift executable can be
+    // installed while the Portal.app migration is still pending. Preserve
+    // `portal app` there by launching its GUI process mode directly.
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            eprintln!("portal app: locate Portal executable: {error}");
+            return 1;
+        }
+    };
+    match std::process::Command::new(executable).spawn() {
+        Ok(_) => 0,
+        Err(error) => {
+            eprintln!("portal app: launch Portal: {error}");
+            1
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_swift_app() -> i32 {
+    eprintln!("portal app: only supported on macOS");
+    1
+}
+
+#[cfg(target_os = "macos")]
+fn exec_swift_tray() -> i32 {
+    use std::os::unix::process::CommandExt as _;
+
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            eprintln!("portal tray: locate Portal executable: {error}");
+            return 1;
+        }
+    };
+    let error = std::process::Command::new(executable)
+        .arg("--background")
+        .exec();
+    eprintln!("portal tray: enter background GUI mode: {error}");
+    1
+}
+
+#[cfg(not(target_os = "macos"))]
+fn exec_swift_tray() -> i32 {
+    eprintln!("portal tray: only supported on macOS");
+    1
 }
 
 #[cfg(target_os = "macos")]
@@ -305,9 +458,12 @@ fn prepare_desktop_app(paths: &Paths) -> Result<(), String> {
         return Ok(());
     }
     let current = std::env::current_exe().map_err(|e| e.to_string())?;
-    let bundled = current
-        .ancestors()
-        .any(|path| path.extension().is_some_and(|extension| extension == "app"));
+    let bundled_app = app_install::app_from_executable(&current);
+    let bundled = bundled_app.is_some();
+    let cli_target = bundled_app
+        .as_deref()
+        .map(app_install::app_cli_launcher)
+        .unwrap_or_else(|| current.clone());
     if bundled
         && (current.starts_with("/Volumes")
             || current.to_string_lossy().contains("/AppTranslocation/"))
@@ -322,10 +478,10 @@ fn prepare_desktop_app(paths: &Paths) -> Result<(), String> {
         match std::fs::symlink_metadata(&paths.bin_path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 let target = std::fs::read_link(&paths.bin_path).map_err(|e| e.to_string())?;
-                if target != current {
+                if target != cli_target {
                     let staged = paths.bin_dir.join(".portal.app-link");
                     let _ = std::fs::remove_file(&staged);
-                    std::os::unix::fs::symlink(&current, &staged).map_err(|e| e.to_string())?;
+                    std::os::unix::fs::symlink(&cli_target, &staged).map_err(|e| e.to_string())?;
                     std::fs::rename(&staged, &paths.bin_path).map_err(|e| e.to_string())?;
                 }
                 runtime_is_bundled = true;
@@ -353,7 +509,7 @@ fn prepare_desktop_app(paths: &Paths) -> Result<(), String> {
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::os::unix::fs::symlink(&current, &paths.bin_path)
+                std::os::unix::fs::symlink(&cli_target, &paths.bin_path)
                     .map_err(|e| format!("install portal CLI link: {e}"))?;
                 runtime_is_bundled = true;
             }
@@ -388,7 +544,7 @@ fn prepare_desktop_app(paths: &Paths) -> Result<(), String> {
         let install_result = (|| {
             let staged = paths.bin_dir.join(".portal.app-link");
             let _ = std::fs::remove_file(&staged);
-            std::os::unix::fs::symlink(&current, &staged)
+            std::os::unix::fs::symlink(&cli_target, &staged)
                 .map_err(|e| format!("stage portal app CLI link: {e}"))?;
             std::fs::rename(&staged, &paths.bin_path)
                 .map_err(|e| format!("install portal app CLI link: {e}"))?;
@@ -601,17 +757,24 @@ fn install(paths: &Paths, host: &str, name: Option<String>, index: Option<u8>) -
             return 1;
         }
     };
-    let candidate =
-        (self_path != paths.bin_path).then_some(DeployCandidate::Copy(self_path.as_path()));
-    let report = match deploy_binary(paths, candidate) {
-        Ok(report) => report,
-        Err(e) => {
-            eprintln!("portal install: {e}");
+    if app_install::app_from_executable(&self_path).is_some() {
+        if let Err(error) = prepare_desktop_app(paths) {
+            eprintln!("portal install: {error}");
             return 1;
         }
-    };
-    if let Some(warning) = report.tray_warning {
-        eprintln!("portal install: {warning} (forwarding is healthy)");
+    } else {
+        let candidate =
+            (self_path != paths.bin_path).then_some(DeployCandidate::Copy(self_path.as_path()));
+        let report = match deploy_binary(paths, candidate) {
+            Ok(report) => report,
+            Err(e) => {
+                eprintln!("portal install: {e}");
+                return 1;
+            }
+        };
+        if let Some(warning) = report.tray_warning {
+            eprintln!("portal install: {warning} (forwarding is healthy)");
+        }
     }
     println!(
         "portal: installed. `portal status` shows per-box state; logs: {}",
@@ -876,7 +1039,7 @@ fn logs(paths: &Paths, follow: bool, lines: usize) -> i32 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum UiUpgradeSubmission {
+pub enum UiUpgradeSubmission {
     NoChange(String),
     Submitted(String),
 }
@@ -885,7 +1048,12 @@ pub(crate) enum UiUpgradeSubmission {
 /// replacement phase to an independent launchd job. The job must not be a
 /// child of the tray LaunchAgent: installing the app boots that agent out,
 /// which would otherwise kill its own updater halfway through the swap.
-pub(crate) fn submit_ui_upgrade(paths: &Paths) -> Result<UiUpgradeSubmission, String> {
+pub fn submit_swift_ui_upgrade() -> Result<UiUpgradeSubmission, String> {
+    let paths = production_paths()?;
+    submit_ui_upgrade(&paths)
+}
+
+pub fn submit_ui_upgrade(paths: &Paths) -> Result<UiUpgradeSubmission, String> {
     let install_dir = paths
         .bin_path
         .parent()

@@ -11,6 +11,16 @@ use crate::deployment::Deployment;
 use crate::services::{LoginAgents, StartReport};
 
 const BUNDLE_ID: &str = "com.vikashloomba.portal";
+const APP_EXECUTABLE: &str = "Contents/MacOS/Portal";
+const APP_CLI_LAUNCHER: &str = "Contents/Resources/bin/portal";
+
+pub(crate) fn app_executable(app: &Path) -> PathBuf {
+    app.join(APP_EXECUTABLE)
+}
+
+pub(crate) fn app_cli_launcher(app: &Path) -> PathBuf {
+    app.join(APP_CLI_LAUNCHER)
+}
 
 pub fn app_from_executable(executable: &Path) -> Option<PathBuf> {
     executable
@@ -20,7 +30,7 @@ pub fn app_from_executable(executable: &Path) -> Option<PathBuf> {
 }
 
 pub fn installed_app(paths: &Paths) -> Option<PathBuf> {
-    let has_runtime = |app: &Path| app.join("Contents/MacOS/portal").is_file();
+    let has_runtime = |app: &Path| app_executable(app).is_file() && app_cli_launcher(app).is_file();
     if let Ok(current) = std::env::current_exe()
         && let Some(app) = app_from_executable(&current)
         && has_runtime(&app)
@@ -82,7 +92,7 @@ pub fn install_verified_app(
             staged_cli.display()
         ));
     }
-    std::os::unix::fs::symlink(destination.join("Contents/MacOS/portal"), &staged_cli)
+    std::os::unix::fs::symlink(app_cli_launcher(&destination), &staged_cli)
         .map_err(|e| format!("stage CLI link: {e}"))?;
 
     let runner = OsRunner;
@@ -124,6 +134,11 @@ pub fn install_verified_app(
             std::fs::rename(&staged_cli, &paths.bin_path)
                 .map_err(|e| format!("install CLI link: {e}"))?;
             state.cli_installed = true;
+        }
+        if std::env::var_os("PORTAL_INSTALL_FAULT").as_deref()
+            == Some(std::ffi::OsStr::new("after-cli-swap"))
+        {
+            return Err("injected failure after app and CLI swap".into());
         }
         agents.write_manifests()?;
         runtime.block_on(agents.start_fresh())
@@ -275,9 +290,9 @@ fn verify_app(app: &Path, expected_tag: &str) -> Result<(), String> {
         ],
         "assess installed app with Gatekeeper",
     )?;
-    let binary = app.join("Contents/MacOS/portal");
+    let binary = app_executable(app);
     let output = Command::new(&binary)
-        .arg("--version")
+        .args(["--cli", "--version"])
         .output()
         .map_err(|e| format!("execute {}: {e}", binary.display()))?;
     let reported = String::from_utf8_lossy(&output.stdout);
@@ -435,7 +450,7 @@ mod tests {
         let stale_link = dir.path().join(".portal.app-link.10837");
         let lookalike_file = dir.path().join(".portal.app-link.not-a-link");
         std::os::unix::fs::symlink(
-            "/Applications/Portal.app/Contents/MacOS/portal",
+            "/Applications/Portal.app/Contents/Resources/bin/portal",
             &stale_link,
         )
         .unwrap();
@@ -448,7 +463,7 @@ mod tests {
     #[test]
     fn finds_bundle_ancestor() {
         assert_eq!(
-            app_from_executable(Path::new("/Applications/Portal.app/Contents/MacOS/portal")),
+            app_from_executable(Path::new("/Applications/Portal.app/Contents/MacOS/Portal")),
             Some(PathBuf::from("/Applications/Portal.app"))
         );
         assert_eq!(app_from_executable(Path::new("/tmp/portal")), None);

@@ -38,7 +38,7 @@ if [ -f "$ROOT/.env" ]; then
 fi
 
 OUT="$ROOT/target/aarch64-apple-darwin/release"
-BIN="$OUT/portal"
+BIN="$ROOT/target/swift/arm64-apple-macosx/release/Portal"
 ARTIFACT="portal-v2-darwin-arm64"
 APP="$OUT/Portal.app"
 APP_ARTIFACT="$OUT/Portal-v2-darwin-arm64.app.zip"
@@ -97,7 +97,7 @@ fi
 # a portal binary without embedded agents cannot come out of any flow.
 AUTO_APP_MIGRATION=1
 [ "$TAG" = "local" ] && AUTO_APP_MIGRATION=0
-make --no-print-directory build SHA="$SHA" PORTAL_AUTO_APP_MIGRATION="$AUTO_APP_MIGRATION"
+PORTAL_SIGNED=1 make --no-print-directory build SHA="$SHA" PORTAL_AUTO_APP_MIGRATION="$AUTO_APP_MIGRATION"
 
 # --- 3. Sign (Developer ID, hardened runtime) ------------------------------
 DEVELOPER_ID="${DEVELOPER_ID:-$(security find-identity -v -p codesigning | grep -o 'Developer ID Application: [^"]*' | head -1)}"
@@ -107,12 +107,12 @@ codesign --sign "$DEVELOPER_ID" --options runtime --timestamp --force \
   --entitlements "$ROOT/portal.entitlements" "$BIN"
 codesign --verify --deep --strict --verbose=2 "$BIN"
 
-# Assemble the app only after the standalone compatibility binary is signed,
-# then sign the complete bundle. The CLI symlink installed by first launch
-# points at the app's executable, so its GUI + CLI + daemon carry one SHA.
+# Assemble the app only after the single multi-mode executable is signed,
+# then sign the complete bundle. The installed CLI points at the bundled
+# launcher, which execs this same file with --cli.
 "$ROOT/scripts/package-app.sh" "$BIN" "$APP"
 codesign --sign "$DEVELOPER_ID" --options runtime --timestamp --force \
-  --entitlements "$ROOT/portal.entitlements" "$APP/Contents/MacOS/portal"
+  --entitlements "$ROOT/portal.entitlements" "$APP/Contents/MacOS/Portal"
 codesign --sign "$DEVELOPER_ID" --options runtime --timestamp --force \
   --entitlements "$ROOT/portal.entitlements" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
@@ -138,6 +138,11 @@ EXPECTED_MODE=enabled
 [ "$TAG" = "local" ] && EXPECTED_MODE=disabled
 [ "$MIGRATION_MODE" = "$EXPECTED_MODE" ] || {
   echo "portal: app migration bridge is $MIGRATION_MODE (want $EXPECTED_MODE)" >&2
+  exit 1
+}
+SIGNED_MODE="$("$BIN" _signed-build-mode)"
+[ "$SIGNED_MODE" = enabled ] || {
+  echo "portal: signed credential build mode is $SIGNED_MODE (want enabled)" >&2
   exit 1
 }
 
@@ -221,19 +226,25 @@ fi
 # --- 6. Publish or install --------------------------------------------------
 if [ "${INSTALL:-0}" = "1" ]; then
   : "${INSTALL_HOST:?set INSTALL_HOST=<ssh-host> to install locally}"
-  echo "==> installing locally (no publish) on $INSTALL_HOST"
-  "$BIN" install "$INSTALL_HOST"
+  echo "==> installing local signed Portal.app (no publish)"
+  "$BIN" _install-verified-app "$APP" "v$CRATE_VER"
+
+  # Add/converge the requested smoke-test box through the app-owned CLI.
+  INSTALLED="$HOME/.local/bin/portal"
+  "$INSTALLED" install "$INSTALL_HOST"
 
   # A command-line smoke test cannot catch launchd's cached code-requirement
-  # failures. The install transaction waits on real launchd/API conditions;
-  # now assert that the exact signed bytes survived the swap and that BOTH
-  # freshly registered jobs are running. No fixed sleeps or timing guesses.
-  INSTALLED="$HOME/.local/bin/portal"
-  cmp "$BIN" "$INSTALLED" || {
-    echo "portal: installed binary differs from signed artifact" >&2
+  # failures. Assert the app-owned launcher resolves to the installed bundle,
+  # the exact signed executable survived the transaction, and BOTH freshly
+  # registered jobs are running.
+  CLI_TARGET="$(readlink "$INSTALLED")"
+  INSTALLED_APP="${CLI_TARGET%%.app/*}.app"
+  INSTALLED_EXECUTABLE="$INSTALLED_APP/Contents/MacOS/Portal"
+  cmp "$APP/Contents/MacOS/Portal" "$INSTALLED_EXECUTABLE" || {
+    echo "portal: installed app executable differs from signed app artifact" >&2
     exit 1
   }
-  codesign --verify --deep --strict --verbose=2 "$INSTALLED"
+  codesign --verify --deep --strict --verbose=2 "$INSTALLED_APP"
   "$INSTALLED" status >/dev/null
   UID_NOW="$(id -u)"
   for LABEL in local.portal.autoforward local.portal.tray; do
@@ -259,7 +270,47 @@ if [ "${INSTALL:-0}" = "1" ]; then
     fi
   done
   printf '%s\n' "$DOCTOR_OUT"
-  echo "==> local signed install verified"
+
+  # Exercise the real transactional rollback path after both the app and CLI
+  # link have been swapped. The injected failure is deliberately later than
+  # the filesystem replacement and must restore byte-identical signed bytes,
+  # the original launcher target, manifests, and healthy LaunchAgents.
+  echo "==> injecting post-swap update failure to verify rollback"
+  BEFORE_APP_SHA="$(shasum -a 256 "$INSTALLED_EXECUTABLE" | awk '{print $1}')"
+  BEFORE_CLI_TARGET="$(readlink "$INSTALLED")"
+  set +e
+  ROLLBACK_OUT="$(PORTAL_INSTALL_FAULT=after-cli-swap \
+    "$INSTALLED_EXECUTABLE" --cli _install-verified-app "$APP" "v$CRATE_VER" 2>&1)"
+  ROLLBACK_CODE=$?
+  set -e
+  [ "$ROLLBACK_CODE" -ne 0 ] || {
+    echo "portal: injected update failure unexpectedly succeeded" >&2
+    exit 1
+  }
+  case "$ROLLBACK_OUT" in
+    *"previous installation restored"*) ;;
+    *) echo "portal: rollback did not report restoration: $ROLLBACK_OUT" >&2; exit 1 ;;
+  esac
+  AFTER_APP_SHA="$(shasum -a 256 "$INSTALLED_EXECUTABLE" | awk '{print $1}')"
+  AFTER_CLI_TARGET="$(readlink "$INSTALLED")"
+  [ "$AFTER_APP_SHA" = "$BEFORE_APP_SHA" ] || {
+    echo "portal: rollback changed the installed app executable" >&2
+    exit 1
+  }
+  [ "$AFTER_CLI_TARGET" = "$BEFORE_CLI_TARGET" ] || {
+    echo "portal: rollback changed the installed CLI target" >&2
+    exit 1
+  }
+  codesign --verify --deep --strict --verbose=2 "$INSTALLED_APP"
+  for LABEL in local.portal.autoforward local.portal.tray; do
+    STATE="$(launchctl print "gui/$UID_NOW/$LABEL" | awk '$1 == "state" && $2 == "=" { print $3; exit }')"
+    [ "$STATE" = "running" ] || {
+      echo "portal: $LABEL did not recover after rollback (state=${STATE:-missing})" >&2
+      exit 1
+    }
+  done
+  "$INSTALLED" status >/dev/null
+  echo "==> local signed install and rollback verified"
   exit 0
 fi
 echo "==> publishing $TAG"

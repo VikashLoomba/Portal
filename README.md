@@ -26,8 +26,8 @@ portal ships as a signed, notarized **Apple Silicon** macOS application.
 Download `Portal-v2-darwin-arm64.dmg` from the latest release, open it, and drag
 **Portal** to Applications. The first launch:
 
-1. installs the `portal` CLI at `~/.local/bin/portal`;
-2. registers and starts the independent local daemon;
+1. installs an app-owned `portal` launcher at `~/.local/bin/portal`;
+2. registers and starts the independent local daemon using the same app executable;
 3. installs the menu-bar login agent; and
 4. opens the native box-management window.
 
@@ -41,7 +41,7 @@ portal box add <ssh-host>
 background daemon connects headlessly, so **key-based passwordless SSH is
 required** (`ssh-copy-id <ssh-host>` if you haven't set it up).
 
-Every app archive, DMG, and compatibility CLI binary is also signed with
+Every app archive, DMG, and transitional compatibility copy of the same Portal executable is also signed with
 [minisign](https://jedisct1.github.io/minisign/); [`minisign.pub`](minisign.pub)
 is the key. Existing command-line installations remain upgradeable during the
 app transition.
@@ -56,10 +56,13 @@ portal box remove devbox2
 
 ### Build from source
 
-Requires the **Rust** toolchain via [rustup](https://rustup.rs) — the pinned
-version comes from [`rust-toolchain.toml`](rust-toolchain.toml). The build also
-cross-compiles the Linux dev-box agent (`portald`, musl static) and embeds it
-into the `portal` binary, so you also need the Linux targets:
+Requires the **Rust** toolchain via [rustup](https://rustup.rs), Xcode/Swift 6,
+and the exactly pinned BoltFFI CLI (`cargo install boltffi_cli --version 0.30.1
+--locked`). The Rust version comes from [`rust-toolchain.toml`](rust-toolchain.toml).
+The build cross-compiles the Linux dev-box agent (`portald`, musl static), packs
+the Rust application logic into a static macOS XCFramework, and links everything
+into the one native SwiftUI `Portal` executable, so you also need the Linux
+targets:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
@@ -68,26 +71,28 @@ rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 ```sh
 git clone https://github.com/VikashLoomba/Portal.git
 cd Portal
-make build              # build the CLI/daemon with both embedded agents
+make build              # agents + PortalFFI XCFramework + SwiftUI executable
 make app                # assemble target/aarch64-apple-darwin/release/Portal.app
 make dmg                # assemble a drag-to-Applications Portal.dmg
 make install HOST=box   # legacy CLI install + login-agent reload
 ```
 
 Use `make`, not raw `cargo`: the Makefile stamps **one** git SHA across the
-portal binary and both embedded agents, and verifies the agents actually landed
-in the binary. A SHA mismatch between the Mac binary and the agent it uploads is
+Swift application executable, its Rust CLI/daemon modes, and both embedded
+agents, and verifies the agents actually landed in the final Mach-O. A SHA
+mismatch between the Mac executable and the agent it uploads is
 what causes a reconnect loop, so the check is not cosmetic.
 
 | Target | What it does |
 |---|---|
-| `make build` | cross-build both agents, embed, build `portal` |
-| `make app` | assemble an unsigned `Portal.app` for development/signing |
+| `make build` | cross-build both agents, package PortalFFI, build the Swift host |
+| `make ffi` | build the agents and macOS-only static XCFramework |
+| `make app` | assemble an unsigned one-executable `Portal.app` for signing |
 | `make dmg` | assemble an unsigned drag-to-Applications DMG |
 | `make test` | workspace tests |
 | `make lint` | `cargo fmt --check` + `clippy -D warnings` |
 | `make check` | `test` + `lint` |
-| `make install` | `build`, install to `~/.local/bin`, reload the agents |
+| `make install` | build Portal.app, install its CLI launcher, reload the agents |
 | `make release` | gated signed + notarized release (maintainers) |
 
 > **Only one Rust toolchain may write to `target/`.** If you see
@@ -171,13 +176,15 @@ command's flags.
 
 ## Native desktop app and menu bar
 
-Portal.app owns both the full native AppKit management window and the menu-bar
-status item. Closing the window leaves Portal and its status item running;
+Portal.app owns both the native SwiftUI management window and menu-bar status
+item. Swift calls the statically linked Rust implementation through generated
+BoltFFI bindings; the Rust side remains a client of the independent daemon's
+owner-only Unix socket. Closing the window leaves Portal and its status item running;
 **Quit Portal** removes the UI and status item, while the independent local
 daemon keeps every connection and forward alive.
 
-The desktop window uses AppKit's Liquid Glass views on macOS 26, with a native
-vibrancy fallback on earlier supported macOS versions. Glass status cards add,
+The desktop window uses native SwiftUI materials and controls with availability
+fallbacks for the supported macOS 13 minimum. Native status cards add,
 remove, enable, and configure boxes; active forwards open directly; native
 switches manage feature gates; the separate Logs view reads a sanitized,
 bounded daemon-log tail; and **Check for Updates…** verifies and installs the
@@ -187,7 +194,10 @@ and uses the same configuration and service model.
 The window has no polling or refresh timer. It owns one versioned local-API
 subscription: the daemon publishes an initial snapshot and then invalidates it
 only after a real connection, forwarding, configuration, clipboard, or feature
-change. AppKit redraws on those events on its main queue.
+change. A generated `AsyncStream` updates one `@MainActor` application model,
+and SwiftUI redraws from that authoritative state.
+
+![Portal SwiftUI management window](docs/images/portal-swiftui.png)
 
 The menu-bar item shows each configured box
 with a colored dot for its connection state and, indented beneath it, the
@@ -203,14 +213,16 @@ Check for Updates…
 ● devbox2 — no forwards
 ● oldbox — reconnecting
 ─────────────────────────
-portal 2.0.15 (abc1234)
+portal 2.0.28 (abc1234)
 Quit Portal
 ```
 
-The status portion still reads one bounded legacy snapshot only when the menu
-opens and does nothing while idle. **Open Portal…** presents the event-driven
-Liquid Glass management window, whose daemon actions use the versioned local
-API. Update checks are explicitly user-initiated—never timed—and reuse the
+![Portal menu-bar connection status](docs/images/portal-menu.png)
+
+The menu bar and management window share the same event-driven application
+model and do no periodic state polling. **Open Portal…** presents the native
+management window; its generated async operations use the versioned local API
+through Rust. Update checks are explicitly user-initiated—never timed—and reuse the
 same minisign, Gatekeeper, transactional swap, rollback, and health gates as
 `portal upgrade`. The final replacement runs as an independent one-shot
 launchd job so restarting the tray cannot kill its own updater.
@@ -325,8 +337,10 @@ releases it down the existing connection. Cancel denies the request. If
 biometrics are unavailable, locked out, or fail to evaluate, portal falls back
 to the click-to-approve dialog.
 
-The dialog and the Touch ID sheet are both native (AppKit `NSAlert` and
-LocalAuthentication, in a helper process portal owns). **No security-critical
+The dialog and the Touch ID sheet are both native. The credential dialog is
+presented by Swift/AppKit in a short-lived prompt mode of the same Portal.app
+executable; LocalAuthentication and the surrounding credential policy remain
+Rust-owned. **No security-critical
 path shells out to AppleScript** — that was v1's cgo-free workaround, and it is
 why the sheet used to be attributed to "osascript" rather than to portal.
 

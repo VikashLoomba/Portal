@@ -1,0 +1,31 @@
+[package]
+name = "portal_ffi"
+crate = "portal-ffi"
+description = "Rust application logic for the native Portal macOS app"
+
+[targets.apple]
+enabled = true
+include_macos = true
+ios_architectures = []
+simulator_architectures = []
+macos_architectures = ["arm64"]
+
+[targets.apple.swift]
+module_name = "PortalFFIGenerated"
+ffi_module_name = "PortalFFIGeneratedFFI"
+tools_version = "6.0"
+output = "native/Sources/PortalFFIGenerated"
+error_style = "throwing"
+
+[targets.apple.xcframework]
+name = "PortalFFIGenerated"
+output = "native/Dependencies"
+
+[targets.apple.spm]
+output = "native/Generated/BinaryPackage"
+layout = "split"
+distribution = "local"
+
+[targets.apple.debug_symbols]
+enabled = false
+standalone_archive = false

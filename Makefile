@@ -1,15 +1,16 @@
-# portal build orchestration. Three binaries:
-#   portald (linux musl amd64/arm64) — embedded into portal at build time
-#   portal  (darwin-arm64)           — the user-facing CLI + daemon
+# Portal build orchestration. One macOS application executable plus two
+# embedded Linux agents:
+#   portald (linux musl amd64/arm64) — embedded into PortalFFI at build time
+#   Portal  (Swift arm64 macOS)      — GUI + Rust-backed CLI/daemon modes
 #
-# Both are stamped with the SAME git SHA per invocation: the HelloAck SHA
-# match and the ~/.cache/portal/agent-<sha> remote path both depend on it,
-# and a mismatched pair reconnect-loops.
-# `make build` is THE build path: release.sh delegates here, so a portal
-# binary without embedded agents cannot come out of any supported flow.
+# Every mode and embedded agent is stamped with the SAME git SHA per
+# invocation. `make build` is THE build path: it packages the static BoltFFI
+# XCFramework, compiles the Swift host, and verifies both agents landed in the
+# final application executable.
 #
 # Targets:
-#   make build                 agents + darwin binary (embedded, verified)
+#   make build                 agents + PortalFFI + Swift executable
+#   make ffi                   agents + static macOS XCFramework
 #   make app                   build + assemble unsigned Portal.app
 #   make dmg                   app + assemble unsigned drag-to-install DMG
 #   make test                  workspace tests
@@ -34,20 +35,25 @@ DARWIN     := aarch64-apple-darwin
 MUSL_AMD64 := x86_64-unknown-linux-musl
 MUSL_ARM64 := aarch64-unknown-linux-musl
 AGENTS     := target/agents
-BIN        := target/$(DARWIN)/release/portal
+SWIFT_BIN  := target/swift/arm64-apple-macosx/release/Portal
+BIN        := $(SWIFT_BIN)
 APP        := target/$(DARWIN)/release/Portal.app
 DMG        := target/$(DARWIN)/release/Portal.dmg
 
-.PHONY: build app dmg agents verify-embed test lint check install release release-install clean
+.PHONY: build ffi app dmg agents verify-embed test lint check install release release-install clean
 
-build: agents
-	@echo "==> building portal (darwin-arm64, agents embedded, sha $(SHA))"
+build: ffi
+	@echo "==> building Portal SwiftUI host (darwin-arm64, sha $(SHA))"
+	swift build -c release --package-path native --scratch-path target/swift
+	@$(MAKE) --no-print-directory verify-embed
+
+ffi: agents
+	@echo "==> packaging PortalFFI (macOS arm64, sha $(SHA))"
 	PORTAL_GIT_SHA="$(SHA)" \
 	PORTAL_AUTO_APP_MIGRATION="$(PORTAL_AUTO_APP_MIGRATION)" \
 	PORTAL_AGENT_AMD64_FILE="$(CURDIR)/$(AGENTS)/portald-$(MUSL_AMD64)" \
 	PORTAL_AGENT_ARM64_FILE="$(CURDIR)/$(AGENTS)/portald-$(MUSL_ARM64)" \
-	cargo build --release -p portal-cli --target $(DARWIN) --quiet
-	@$(MAKE) --no-print-directory verify-embed
+	./scripts/build-portal-ffi.sh
 
 agents:
 	@command -v cargo-zigbuild >/dev/null || { echo "install: cargo install cargo-zigbuild (and brew install zig)" >&2; exit 1; }
@@ -58,15 +64,16 @@ agents:
 		cp "target/$$t/release/portald" "$(AGENTS)/portald-$$t" || exit 1; \
 	done
 
-# The daemon cannot provision boxes without the embedded portald bytes —
-# assert they actually landed in the Mac binary (fail here, not at the
-# first user's reconnect loop).
+# The daemon cannot provision boxes without both embedded portald payloads.
+# Assert they landed in the final Swift application executable, not merely in
+# an intermediate Rust archive.
 verify-embed:
-	@python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); a=open(sys.argv[2],"rb").read(); sys.exit(0 if a[:4096] in d else "portal: embedded agent bytes NOT found in binary")' "$(BIN)" "$(AGENTS)/portald-$(MUSL_AMD64)"
-	@echo "==> $(BIN) (embedded agents verified)"
+	@python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); agents=[open(p,"rb").read() for p in sys.argv[2:]]; missing=[p for p,a in zip(sys.argv[2:],agents) if a[:4096] not in d]; sys.exit("Portal: embedded agent bytes NOT found: "+", ".join(missing) if missing else 0)' "$(BIN)" "$(AGENTS)/portald-$(MUSL_AMD64)" "$(AGENTS)/portald-$(MUSL_ARM64)"
+	@echo "==> $(BIN) (both embedded agents verified)"
 
 app: build
 	@./scripts/package-app.sh "$(BIN)" "$(APP)"
+	@./scripts/verify-portal-app.sh "$(APP)"
 
 dmg: app
 	@rm -f "$(DMG)"
@@ -77,20 +84,27 @@ dmg: app
 	hdiutil create -quiet -volname Portal -srcfolder "$$STAGE" -ov -format UDZO "$(DMG)"
 	@echo "==> $(DMG)"
 
-test:
+test: app
 	cargo test --workspace
+	swift test --package-path native --scratch-path target/swift
+	./scripts/test-cli-launcher.sh
+	./scripts/test-native-app-e2e.sh "$(APP)"
+	./scripts/test-native-gui-lifecycle.sh "$(APP)"
+	./scripts/test-native-prompt.sh "$(APP)"
 
-lint:
+lint: ffi
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo fmt --all --check
+	swiftformat --lint --swift-version 6.0 native/Sources/PortalApp native/Sources/PortalFFI native/Tests/PortalFFITests
+	./scripts/verify-swift-boundary.sh
 
 # Every distributable path runs the same correctness gates first. release.sh
 # still owns the one-SHA cross-build/sign/notarize/publish transaction.
 check: test lint
 
-install: build
+install: app
 	@test -n "$(HOST)" || { echo "usage: make install HOST=<ssh-host>" >&2; exit 1; }
-	"$(BIN)" install "$(HOST)"
+	"$(APP)/Contents/MacOS/Portal" --cli install "$(HOST)"
 
 release: check
 	@test -n "$(TAG)" || { echo "usage: make release TAG=v2.x.y" >&2; exit 1; }
@@ -102,3 +116,4 @@ release-install: check
 
 clean:
 	cargo clean
+	rm -rf target/swift native/Dependencies native/Generated native/Sources/PortalFFIGenerated

@@ -22,10 +22,8 @@ pub const SERVICE: &str = "portal.credentials";
 /// the item" caveat. On unsigned dev builds we skip the binding (no
 /// entitlement → SecItemAdd would fail) and the in-process LAContext gate
 /// guards release instead.
-fn signed_binary() -> bool {
-    std::env::var("PORTAL_SIGNED")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+pub fn signed_binary() -> bool {
+    option_env!("PORTAL_SIGNED") == Some("1")
 }
 
 #[derive(Debug, Default)]
@@ -46,16 +44,13 @@ impl Keychain for MacKeychain {
             use security_framework::passwords::PasswordOptions;
             use security_framework::passwords_options::AccessControlOptions;
             let mut options = PasswordOptions::new_generic_password(SERVICE, label);
-            if let Ok(ac) = SecAccessControl::create_with_protection(
+            let access_control = SecAccessControl::create_with_protection(
                 Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
                 AccessControlOptions::BIOMETRY_CURRENT_SET.bits(),
-            ) {
-                options.set_access_control(ac);
-                return kc::set_generic_password_options(secret, options)
-                    .map_err(|e| e.to_string());
-            }
-            // Binding creation failed on a signed build: fall back to the
-            // plain item rather than refusing to remember.
+            )
+            .map_err(|error| format!("create biometric Keychain access control: {error}"))?;
+            options.set_access_control(access_control);
+            return kc::set_generic_password_options(secret, options).map_err(|e| e.to_string());
         }
         kc::set_generic_password(SERVICE, label, secret).map_err(|e| e.to_string())
     }

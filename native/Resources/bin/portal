@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+app_realpath() {
+  local source="$1"
+  local directory
+  local target
+
+  while [ -h "$source" ]; do
+    directory="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
+    target="$(readlink "$source")"
+    if [[ "$target" = /* ]]; then
+      source="$target"
+    else
+      source="$directory/$target"
+    fi
+  done
+
+  directory="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
+  printf '%s\n' "${directory%%${directory#*.app}}"
+}
+
+APP_PATH="$(app_realpath "${BASH_SOURCE[0]}")"
+if [ -z "$APP_PATH" ] || [ ! -x "$APP_PATH/Contents/MacOS/Portal" ]; then
+  echo "portal: unable to locate Portal.app from ${BASH_SOURCE[0]}" >&2
+  exit 1
+fi
+
+exec "$APP_PATH/Contents/MacOS/Portal" --cli "$@"

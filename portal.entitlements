@@ -3,13 +3,10 @@
 <plist version="1.0">
 <dict>
     <!-- Hardened-runtime exceptions portal actually needs. None today:
-         pure Rust, no JIT, no unsigned memory, no library validation
-         exceptions. The keychain-access-groups entitlement was REMOVED: it
-         only does anything inside an app bundle with a real bundle id (a
-         bare CLI gets $(AppIdentifierPrefix) unexpanded, which makes macOS
-         kill the signed binary on exec). The LAContext Touch ID gate and
-         the security-framework Keychain calls work WITHOUT any entitlement
-         on a LaunchAgent CLI. The SecAccessControl item-binding stays a
-         release-gated upgrade for a future .app bundle (TASKS.md). -->
+         native Swift plus statically linked Rust, no JIT, no unsigned memory,
+         and no library-validation exceptions. The application, CLI, daemon,
+         and prompt are modes of the same signed bundle executable. LAContext,
+         security-framework Keychain calls, and the current SecAccessControl
+         item binding require no additional hardened-runtime exception. -->
 </dict>
 </plist>

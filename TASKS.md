@@ -17,6 +17,31 @@ Rule: no silent TODOs in code. Anything deferred lives HERE, explicitly.
 - [x] portald: clip store + local paste verbs + blob put + store-backed shims
 - [x] DESIGN-clipsync.md
 
+## Native SwiftUI + BoltFFI application migration — IN PROGRESS
+- [x] accepted architecture: `docs/DESIGN-swiftui-boltffi.mdx`
+- [x] reusable `portal-client` crate (bounded async requests + reconnecting,
+      cancellation-aware state subscription)
+- [x] pinned BoltFFI 0.30.1 static macOS XCFramework, deterministic Swift 6
+      generator patches, macOS 13 C/Rust deployment target, ownerless public
+      Swift façade
+- [x] one Swift executable dispatching GUI, Rust CLI, Rust daemon, legacy
+      compatibility, and native Swift prompt modes
+- [x] app-owned `portal` launcher with argument/stdio/exit-code tests
+- [x] SwiftUI menu bar, management window, boxes, forwards, atomic allowlist
+      editor, features, logs, updates, daemon reconnect state
+- [x] one-executable app assembly and embedded-agent/minimum-OS verification
+- [x] launchd/app-install/update paths migrated to the Swift executable and
+      bundled launcher while standalone compatibility modes remain accepted
+- [ ] signed/notarized local release transaction through the new bundle layout
+- [x] interactive visual/accessibility QA on the shipping Mac desktop: AX-tree
+      labels, menu commands/shortcuts, status colors, prompt controls, window
+      close, app quit, and daemon independence are scripted release gates
+- [x] remove the Rust macOS binary target and Rust prompt fallback; the native
+      Swift executable is the only compiled shipping host
+- [x] remove the temporary Rust/AppKit tray implementation and its presentation-
+      only dependencies after native parity tests passed
+- [x] update README screenshots and `docs/releases/v2.0.28.md` for SwiftUI
+
 ## In flight (this phase: launchd + CLI + agent mode) — COMPLETE
 - [x] TASKS.md (this file)
 - [x] portald agent mode: serve loop (Hello/HelloAck, Subscribe/Snapshot/deltas,
@@ -47,9 +72,9 @@ Rule: no silent TODOs in code. Anything deferred lives HERE, explicitly.
       include_bytes! embedding is the release-pipeline task
 
 ## Credentials phase — COMPLETE (design: NO osascript in security paths)
-- [x] prompt backend: `portal _prompt` helper process (NSAlert +
-      NSSecureTextField, objc2 AppKit); JSON stdin/stdout; empty-secret
-      allow = deny (mis-click guard); HelperPrompter with backstop kill
+- [x] prompt backend: the app executable's native Swift NSAlert +
+      NSSecureTextField process mode; JSON stdin/stdout; allow/deny/cancel/
+      timeout/remember/forget automation; empty-secret allow = deny
 - [x] biometry backend: in-process LAContext (objc2-local-authentication),
       typed LAError mapping (UserCancel/AppCancel/SystemCancel → Canceled;
       lockout/not-enrolled → Err → dialog fallback), invalidate() on timeout
@@ -76,9 +101,8 @@ Rule: no silent TODOs in code. Anything deferred lives HERE, explicitly.
       follow-up
 - [ ] RELEASE-GATED: SecAccessControl + biometryCurrentSet item binding
       (needs Developer ID signing; see release pipeline)
-- [ ] interactive dialog QA on a real desktop session (the _prompt helper is
-      logic-tested via HelperPrompter fakes; the NSAlert rendering itself
-      needs a human eyeball once)
+- [x] interactive dialog QA on a real desktop session, including AX secure-
+      field labeling and allow/deny/cancel/timeout/remember/forget outcomes
 
 ## Later phases (ordered)
 - [x] clip-write relay (box→Mac) — complete (store-first copy verb, cmd-socket

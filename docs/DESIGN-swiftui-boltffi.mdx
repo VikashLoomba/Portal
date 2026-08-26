@@ -1,0 +1,1354 @@
+---
+title: "Portal SwiftUI and BoltFFI Architecture"
+description: "Accepted implementation design for replacing Portal's Rust/AppKit presentation with one native SwiftUI application executable backed by statically linked Rust through BoltFFI, while retaining the CLI, persistent daemon, security, upgrade, and release behavior."
+---
+
+# Portal SwiftUI and BoltFFI Architecture
+
+## Status
+
+**Accepted design.** This document is the implementation contract for the native SwiftUI migration.
+
+Normative terms such as **must**, **must not**, **should**, and **may** are intentional. If implementation work discovers a conflict with this design, the design must be amended explicitly rather than silently changing the architecture.
+
+## Goal
+
+Replace Portal's Rust/AppKit management window and menu-bar presentation with a native SwiftUI macOS application while retaining Rust as the implementation language for Portal's domain behavior, daemon, CLI behavior, local control client, security policy, update machinery, transport, forwarding, clipboard synchronization, and remote agent.
+
+The shipped product must remain one application:
+
+- one signed and notarized `Portal.app` bundle;
+- one compiled macOS application executable;
+- one bundled `portal` shell launcher exposed on `PATH`;
+- one statically linked Rust implementation delivered through a BoltFFI XCFramework;
+- multiple process modes selected by the application entry point;
+- no separately compiled or separately installed Rust CLI executable.
+
+The daemon must remain an independent process so forwarding, remote agents, clipboard synchronization, notifications, and credential service survive closing or quitting the graphical application.
+
+## Non-negotiable behavioral invariants
+
+The migration is a presentation and host-language change, not a product reset. The completed implementation must retain all existing behavior unless a later design document explicitly supersedes it.
+
+In particular:
+
+1. Closing the management window must leave the menu-bar application running.
+2. Quitting the graphical application must leave the daemon, SSH connections, forwards, clipboard synchronization, and remote agents running.
+3. Stopping or restarting the daemon must remain an explicit operation.
+4. The daemon must continue running headlessly in non-Aqua login contexts.
+5. All current CLI commands, arguments, aliases, help behavior, output contracts, and exit-code behavior must remain available through the installed `portal` command.
+6. The hidden legacy `run` daemon alias must remain supported so old LaunchAgent manifests do not crash-loop after an upgrade.
+7. `portal version`, `portal --version`, and release self-verification must continue reporting the same version and build SHA.
+8. The local API must remain versioned, owner-only, and transported over the existing Unix socket.
+9. The daemon must remain the sole owner of durable and live forwarding state.
+10. Configuration changes must remain atomic and must continue to trigger exactly one authoritative state invalidation.
+11. State delivery must remain event-driven; the GUI must not add a periodic state refresh timer.
+12. The GUI must survive daemon restart and reconnect automatically.
+13. Credential policy, prompt serialization, Touch ID, Keychain handling, cooldowns, queueing, denial behavior, and secret-handling constraints must not regress.
+14. Notification relay and safe URL opening must continue to work even when the GUI is not running.
+15. Existing signed-update verification, rollback, health gating, app migration, and launchd lifecycle ordering must remain intact.
+16. One git SHA must continue to be stamped across the application, daemon mode, CLI mode, and embedded `portald` agents.
+17. Release artifacts must remain Developer ID signed, hardened-runtime compatible, Gatekeeper-valid, notarized, stapled, and minisign verified.
+18. Portal must continue supporting Apple Silicon and the currently declared minimum macOS version, macOS 13.
+
+## Terminology
+
+This design uses these terms precisely:
+
+- **App bundle**: the installed `Portal.app` directory.
+- **Application executable**: `Portal.app/Contents/MacOS/Portal`, the one compiled Swift Mach-O executable.
+- **GUI process**: an invocation of the application executable that enters SwiftUI.
+- **Daemon process**: a separate invocation of the same application executable that enters Rust daemon mode.
+- **CLI process**: a short-lived invocation of the same application executable that enters Rust command mode.
+- **Prompt process**: an on-demand invocation of the same application executable that presents a credential prompt.
+- **PortalFFI**: the statically linked Rust library and generated Swift bindings produced by BoltFFI.
+- **Local API**: the versioned newline-delimited JSON protocol over `~/.config/portal/api.sock` or its existing environment-overridden path.
+
+“Separate process” does not mean “separate application.” The GUI, daemon, CLI, and prompt are separate invocations of the one executable shipped by the one app bundle.
+
+# Current architecture
+
+Portal currently ships one Rust executable that dispatches among CLI, daemon, AppKit GUI, and helper modes:
+
+```text
+Rust main
+├── GUI/tray mode   → Rust + objc2 + AppKit
+├── daemon mode     → Rust + Tokio
+├── CLI mode        → Rust + clap
+└── _prompt mode    → Rust + objc2 + AppKit
+```
+
+launchd starts two independent processes from that executable:
+
+```text
+local.portal.autoforward
+└── portal daemon
+    ├── Supervisor
+    ├── native SSH sessions
+    ├── forward listeners
+    ├── clipboard synchronization
+    ├── remote agent lifecycle
+    ├── notification and URL relays
+    └── owner-only local API socket
+
+local.portal.tray
+└── portal tray
+    ├── AppKit menu-bar item
+    ├── AppKit management window
+    └── local API client
+```
+
+CLI invocations are additional short-lived processes. Although all modes currently execute the same Rust binary, the GUI and daemon do not share memory. They communicate over the Unix local API.
+
+## Current state-subscription lifetime
+
+The current subscription pipeline is:
+
+```text
+Supervisor broadcast::Sender<()> invalidation
+    ↓
+Daemon SubscribeState socket handler
+    ↓
+GUI-side local_client::subscribe_state thread
+    ↓
+AppKit main-queue dispatch
+    ↓
+Tray state and redraw
+```
+
+`local_client::subscribe_state` is a client-side worker inside the GUI/tray process. It is not a daemon task.
+
+Its current lifecycle is:
+
+1. The tray process starts at login.
+2. No management-state subscription exists initially.
+3. Opening the management window for the first time calls `start_state_subscription()`.
+4. That function spawns a Rust thread and discards its `JoinHandle`.
+5. The thread owns its socket connection, reports the initial state, receives subsequent state snapshots, reports distinct connection errors, and reconnects after a one-second backoff.
+6. Closing the management window does not stop the worker because the tray process remains alive.
+7. The worker ends only when the GUI/tray process exits.
+8. Exiting the GUI/tray process does not stop the separate daemon.
+
+# Target architecture
+
+The top-level executable host changes from Rust to Swift, while the one-executable, multi-mode product model remains:
+
+```text
+Swift main
+├── GUI mode      → SwiftUI presentation
+├── daemon mode   → Rust daemon through PortalFFI
+├── CLI mode      → Rust clap dispatch through PortalFFI
+└── prompt mode   → native Swift presentation backed by Rust protocol/policy
+```
+
+## Target app bundle
+
+```text
+Portal.app/
+└── Contents/
+    ├── Info.plist
+    ├── MacOS/
+    │   └── Portal
+    ├── Resources/
+    │   ├── Portal.icns
+    │   └── bin/
+    │       └── portal
+    └── PkgInfo
+```
+
+`Contents/MacOS/Portal` is the only compiled macOS application executable. It is a Swift executable that statically links the Rust PortalFFI library.
+
+`Contents/Resources/bin/portal` is a small bundled shell launcher. It is not a second CLI implementation and contains no Portal business logic. Installation exposes that launcher at `~/.local/bin/portal`, preferably through the existing owner-writable atomic symlink installation.
+
+No dynamic Rust framework is embedded in the final app. The XCFramework is a build-time packaging boundary; its static library is incorporated into `Contents/MacOS/Portal` by the linker.
+
+## Process topology
+
+```text
+Process A: Portal --daemon
+└── Swift process entry dispatcher
+    └── Rust run_portal_daemon()
+        ├── Tokio runtime
+        ├── Supervisor
+        ├── SSH and forwarding
+        ├── clipboard and credential services
+        ├── embedded remote agents
+        └── Unix local API server
+
+Process B: Portal GUI
+├── Swift process entry dispatcher
+├── SwiftUI scenes and @MainActor model
+├── generated BoltFFI Swift bindings
+└── statically linked Rust GUI-client functions
+    └── Unix local API client
+
+Process C: Portal --cli <arguments>
+└── Swift process entry dispatcher
+    └── Rust run_portal_command(arguments)
+        └── existing clap command behavior
+
+Process D: Portal --prompt
+└── Swift process entry dispatcher
+    ├── Rust prompt protocol adapter and security policy types
+    └── native Swift prompt presentation
+```
+
+The daemon remains a separate process because process-lifetime isolation is load-bearing. It is not a separately built, separately installed, or separately versioned application.
+
+# Application entry point
+
+The Swift app target must use a custom `@main` dispatcher rather than allowing the SwiftUI `App` type to be the unconditional process entry point.
+
+This pattern has been verified to type-check under Swift 6 with complete strict concurrency:
+
+```swift
+import Darwin
+import PortalFFI
+import SwiftUI
+
+enum PortalLaunchMode: Sendable {
+    case foreground
+    case background
+
+    static var current: Self {
+        CommandLine.arguments.dropFirst().first == "--background"
+            ? .background
+            : .foreground
+    }
+}
+
+struct PortalGUI: App {
+    private let launchMode = PortalLaunchMode.current
+
+    var body: some Scene {
+        // SwiftUI scenes inspect launchMode as described below.
+    }
+}
+
+@main
+enum PortalEntry {
+    static func main() {
+        let arguments = Array(CommandLine.arguments.dropFirst())
+
+        switch arguments.first {
+        case "--cli":
+            let code = runPortalCommand(
+                arguments: Array(arguments.dropFirst())
+            )
+            Darwin.exit(code)
+
+        case "--daemon":
+            Darwin.exit(runPortalDaemon())
+
+        case "--prompt", "_prompt":
+            Darwin.exit(runPortalPrompt())
+
+        case "--background":
+            PortalGUI.main()
+
+        default:
+            PortalGUI.main()
+        }
+    }
+}
+```
+
+`PortalLaunchMode.current` is a computed value derived from immutable process arguments, not mutable global state. It distinguishes:
+
+- foreground user launch, which opens or activates the management window;
+- background login launch, which creates the menu-bar application without opening the management window.
+
+CLI and daemon modes must not initialize `NSApplication`, SwiftUI scenes, or a WindowServer-dependent path.
+
+Importing or statically linking SwiftUI is acceptable in daemon and CLI processes; those frameworks must not be initialized unless the dispatcher enters GUI mode.
+
+## Bundled CLI launcher
+
+The launcher must follow the same app-owned pattern used by applications such as Visual Studio Code:
+
+1. Resolve symlinks from its own path.
+2. Locate the enclosing `.app` bundle.
+3. Execute that bundle's application executable in explicit CLI mode.
+4. Preserve stdin, stdout, stderr, signals, and the child exit status by using `exec`.
+
+Required implementation shape:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+app_realpath() {
+  local source="$1"
+  local directory
+  local target
+
+  while [ -h "$source" ]; do
+    directory="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
+    target="$(readlink "$source")"
+    if [[ "$target" = /* ]]; then
+      source="$target"
+    else
+      source="$directory/$target"
+    fi
+  done
+
+  directory="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
+  printf '%s\n' "${directory%%${directory#*.app}}"
+}
+
+APP_PATH="$(app_realpath "${BASH_SOURCE[0]}")"
+if [ -z "$APP_PATH" ] || [ ! -x "$APP_PATH/Contents/MacOS/Portal" ]; then
+  echo "portal: unable to locate Portal.app from ${BASH_SOURCE[0]}" >&2
+  exit 1
+fi
+
+exec "$APP_PATH/Contents/MacOS/Portal" --cli "$@"
+```
+
+Tests must cover relative and absolute symlinks, paths containing spaces, a missing/moved app, argument preservation, stdin/stdout/stderr preservation, and exit-status preservation.
+
+The CLI installer must atomically converge:
+
+```text
+~/.local/bin/portal
+    → /Applications/Portal.app/Contents/Resources/bin/portal
+```
+
+or the equivalent path under `~/Applications` when `/Applications` is not writable.
+
+Moving or replacing the app at the same installation path must not require rewriting command semantics. A broken or manually moved app must fail with an actionable launcher error rather than silently invoking another binary.
+
+# Launchd integration
+
+The existing two-job behavior remains, but both jobs invoke the same Swift application executable directly.
+
+## Daemon job
+
+```text
+ProgramArguments:
+- /Applications/Portal.app/Contents/MacOS/Portal
+- --daemon
+```
+
+The existing daemon LaunchAgent properties remain:
+
+- `RunAtLoad = true`;
+- daemon keep-alive semantics where any exit is treated as unexpected;
+- background process type;
+- existing stdout/stderr log path;
+- existing `HOME` and user-domain behavior;
+- existing health probing and stale-socket handling.
+
+The daemon job must not be Aqua-only.
+
+## GUI/menu-bar job
+
+```text
+ProgramArguments:
+- /Applications/Portal.app/Contents/MacOS/Portal
+- --background
+```
+
+The existing GUI LaunchAgent semantics remain:
+
+- `LimitLoadToSessionType = Aqua`;
+- `RunAtLoad = true`;
+- interactive process type;
+- crash relaunches the GUI;
+- a deliberate successful Quit remains quit until the next login, installation, or upgrade;
+- existing GUI log path.
+
+The migration may later adopt `SMAppService`, but that is not part of this implementation. Retaining launchd minimizes behavior and upgrade risk.
+
+## Legacy launchd compatibility
+
+The installed CLI must continue accepting:
+
+```text
+portal run
+portal daemon
+portal tray
+```
+
+as required by existing and legacy manifests.
+
+- `run` remains a hidden alias for daemon mode.
+- `daemon` enters the Rust daemon and blocks for its process lifetime.
+- `tray` replaces or redirects the invoking process into the app's background GUI mode.
+
+Old manifests invoking `~/.local/bin/portal run` must remain functional during migration. New manifests must use direct app-executable modes.
+
+# Rust workspace organization
+
+The current `portal-cli` binary contains reusable behavior that cannot remain private to a Rust `main.rs`. It must be refactored into library crates before the Swift host replaces the Rust entry point.
+
+The target ownership is:
+
+```text
+portal-core
+├── domain configuration and validation
+├── Supervisor and daemon behavior
+├── local API request/response schema
+├── state model
+└── existing daemon-owned behavior
+
+portal-client
+├── one-shot Unix local API requests
+├── async local API transport
+├── state subscription and reconnection
+├── request timeouts
+└── response and protocol validation
+
+portal-app-core
+├── clap command model and parsing
+├── command dispatch
+├── launchd service lifecycle
+├── installation and uninstallation
+├── app installation and rollback
+├── update preparation and application
+├── version/build reporting
+├── daemon composition entry point
+└── compatibility migration behavior
+
+portal-ffi
+├── BoltFFI declarations
+├── stable FFI DTOs
+├── domain-to-FFI conversion
+├── ownerless GUI operations
+├── ownerless state stream
+├── CLI process entry export
+├── daemon process entry export
+├── prompt protocol exports
+└── GUI-process Rust runtime
+
+PortalApp (Xcode/Swift)
+├── process entry dispatcher
+├── SwiftUI scenes
+├── @MainActor application model
+├── menu-bar presentation
+├── window presentation
+├── sheets and alerts
+├── native prompt presentation
+└── generated PortalFFI Swift bindings
+```
+
+Crate names may be adjusted once to fit Cargo naming, but the ownership boundaries must not collapse back into an executable-only crate.
+
+The release workspace must no longer require a shipping Rust `[[bin]]` for macOS. A thin development or test harness may exist only if it is not installed or published as the product CLI.
+
+## Embedded remote agents
+
+The Linux `portald` binaries must be built before PortalFFI and embedded into the Rust static library that is linked into `Contents/MacOS/Portal`.
+
+The build must continue setting the same values used today:
+
+```text
+PORTAL_GIT_SHA
+PORTAL_AGENT_AMD64_FILE
+PORTAL_AGENT_ARM64_FILE
+PORTAL_AUTO_APP_MIGRATION
+```
+
+The current embed-verification gate must be moved from the standalone Rust binary to the final application executable. It must prove that both remote-agent payloads actually landed in:
+
+```text
+Portal.app/Contents/MacOS/Portal
+```
+
+# BoltFFI packaging
+
+## Version policy
+
+BoltFFI is pre-1.0 and must be pinned exactly. The initial implementation must pin the reviewed release, `0.30.1`, across:
+
+- Rust runtime dependency;
+- macros;
+- CLI generator/packer;
+- generated Swift bindings.
+
+An upgrade must be deliberate, regenerate all bindings, pass strict-concurrency and packaging gates, and receive a generated-surface review.
+
+### BoltFFI 0.30.1 generated Swift patch
+
+Strict Swift 6 compilation proved that `0.30.1` emits two invalid concurrency shapes in its async runtime:
+
+- `withTaskCancellationHandler` captures `cancel` and `free` function values in an `@Sendable` cancellation closure without declaring those parameters `@Sendable`;
+- the generic async bridge sends its completion value through `CheckedContinuation.resume(returning:)` without constraining `T` to `Sendable`.
+
+After every generation, `scripts/patch-boltffi-swift.sh` must apply these exact changes:
+
+```swift
+func boltffiAsyncCall<T: Sendable>(...)
+
+cancel: @escaping @Sendable (RustFutureHandle?) -> Void
+free: @escaping @Sendable (RustFutureHandle?) -> Void
+```
+
+The patch is idempotent and must fail closed unless it sees exactly the reviewed old or patched shapes. A BoltFFI upgrade must remove this patch only after unmodified generated source passes the same Swift 6 complete strict-concurrency gate.
+
+## Apple target
+
+The Bolt configuration must build only the slices Portal ships. `scripts/build-portal-ffi.sh` must also set `MACOSX_DEPLOYMENT_TARGET=13.0`: BoltFFI `0.30.1` declares macOS 13 in generated SwiftPM metadata but does not propagate it to Cargo and C/assembly dependency builds. The release gate must inspect representative archive objects and reject a minimum OS above 13.0.
+
+Required configuration:
+
+```toml
+[targets.apple]
+enabled = true
+include_macos = true
+ios_architectures = []
+simulator_architectures = []
+macos_architectures = ["arm64"]
+
+[targets.apple.swift]
+module_name = "PortalFFI"
+tools_version = "6.0"
+
+[targets.apple.spm]
+layout = "split"
+```
+
+Output paths must be set under a dedicated generated/build directory. `boltffi pack apple --release` must produce:
+
+- a static macOS XCFramework;
+- the C header and module map;
+- generated Swift bindings;
+- the split SwiftPM package metadata used by development/tests, even if the Xcode app consumes the generated target directly.
+
+The generated bindings must compile in a dedicated target whose default actor isolation is nonisolated. They must not be compiled as source files inside the app target's default `MainActor` isolation.
+
+Required Swift settings for the generated-binding target:
+
+```text
+SWIFT_VERSION = 6
+SWIFT_STRICT_CONCURRENCY = complete
+SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated
+```
+
+The SwiftUI app target may use `MainActor` default isolation.
+
+## Static linking and signing
+
+The XCFramework must remain static. The final bundle must not contain a dynamically loaded Rust framework requiring separate runtime discovery or signing.
+
+The final sign order is:
+
+1. build and verify embedded agents;
+2. build PortalFFI and generate Swift bindings;
+3. link the final Swift application executable;
+4. sign the final executable with hardened-runtime entitlements;
+5. sign the complete app bundle;
+6. verify deeply and strictly;
+7. notarize, staple, and assess with Gatekeeper;
+8. package app ZIP and DMG;
+9. minisign release assets.
+
+# FFI design rules
+
+## Ownerless and value-oriented surface
+
+The public PortalFFI surface must use ownerless functions, records, enums, errors, and async streams.
+
+It must not export a `PortalClient` class. Portal has no persistent client object in its current Rust architecture:
+
+- every one-shot request opens and owns a fresh Unix socket;
+- path derivation is deterministic from `HOME`, UID, and existing environment seams;
+- subscription connection and reconnection state belong to the individual stream worker;
+- durable state belongs to the daemon process;
+- presentation state belongs to the Swift `@MainActor` model.
+
+Avoiding exported classes makes BoltFFI issue `#778`, generated exported classes lacking Swift `Sendable`, irrelevant to this architecture.
+
+The FFI surface must not export Swift-implemented callback traits. Rust-to-Swift delivery uses BoltFFI async streams, not foreign callback protocols. This also avoids the current strict-concurrency uncertainty around generated async callback wrappers.
+
+### BoltFFI 0.30.1 stream-scanner adapter
+
+Implementation proved a narrower BoltFFI limitation than its binding IR suggests: `0.30.1`'s lowerer, native wrapper generator, and Swift renderer contain ownerless-stream support, but its source scanner deliberately rejects `#[ffi_stream]` on top-level functions. Therefore the Rust source must use one zero-state generated adapter class solely to make the scanner admit the stream:
+
+```rust
+pub struct PortalStateStreamSource;
+
+#[export]
+impl PortalStateStreamSource {
+    pub fn new() -> Self { Self }
+
+    #[boltffi::ffi_stream(item = PortalStateEvent)]
+    pub fn updates(&self)
+        -> Arc<EventSubscription<PortalStateEvent>>;
+}
+```
+
+This class is an internal generator artifact, not the application architecture:
+
+- the generated module is named `PortalFFIGenerated` and is not imported directly by the app;
+- the hand-written `PortalFFI` Swift target instantiates the zero-state source synchronously, obtains its `AsyncStream`, and exposes only ownerless `stateUpdates()`;
+- the source object may deinitialize immediately after creating the independently owned subscription;
+- it is never stored in `PortalAppModel`, captured in a task, sent across an actor boundary, or declared `@unchecked Sendable`;
+- no state, socket, runtime, or daemon handle is stored in it;
+- it must be removed when a pinned BoltFFI version admits ownerless streams through the source scanner.
+
+BoltFFI issue `#778` remains irrelevant to the app-facing boundary because no generated class crosses into app code or a Swift concurrency domain. No local `@unchecked Sendable` workaround may be added.
+
+## Prohibited boundary types
+
+The FFI boundary must not expose:
+
+- Tokio runtimes, tasks, channels, watches, broadcasts, or cancellation tokens;
+- Rust trait objects;
+- borrowed Rust references with foreign lifetimes;
+- `Arc`, `Mutex`, or internal handles as public Swift concepts;
+- daemon `Supervisor` or `BoxStack` objects;
+- internal local API envelopes;
+- tuples where a named record communicates the contract more safely;
+- Rust filesystem path types;
+- secrets except through the narrowly scoped prompt mode where user input already exists in Swift memory.
+
+## FFI DTOs
+
+PortalFFI must define stable boundary types rather than adding Bolt annotations directly to every internal domain type.
+
+The initial state model must contain at least:
+
+```rust
+#[data]
+pub struct PortalForward {
+    pub local_port: u16,
+    pub remote_port: u16,
+}
+
+#[data]
+pub struct PortalBoxConfiguration {
+    pub name: String,
+    pub host: String,
+    pub index: u8,
+    pub allow: Vec<u16>,
+    pub deny: Vec<u16>,
+    pub enabled: bool,
+}
+
+#[data]
+pub struct PortalBoxStatus {
+    pub name: String,
+    pub host: String,
+    pub index: u8,
+    pub connected: bool,
+    pub agent_sha: Option<String>,
+    pub forwards: Vec<PortalForward>,
+    pub clipboard_synced: bool,
+    pub clipboard_change_id: u64,
+}
+
+#[data]
+pub struct PortalFeatureState {
+    pub name: String,
+    pub enabled: bool,
+}
+
+#[data]
+pub struct PortalState {
+    pub version: String,
+    pub build_sha: String,
+    pub boxes: Vec<PortalBoxConfiguration>,
+    pub statuses: Vec<PortalBoxStatus>,
+    pub features: Vec<PortalFeatureState>,
+}
+```
+
+`BTreeMap<String, bool>` must be converted at the boundary to a deterministically sorted `Vec<PortalFeatureState>`. Forward tuples must be converted to named `PortalForward` records.
+
+Generated records and enums must conform to Swift `Sendable`. SwiftUI must not import or decode the daemon's JSON envelopes itself.
+
+## Errors
+
+One-shot FFI operations must throw a structured BoltFFI error:
+
+```rust
+#[error]
+pub struct PortalFfiError {
+    pub code: String,
+    pub message: String,
+}
+```
+
+Error codes must preserve meaningful categories such as:
+
+- `daemon_unavailable`;
+- `timeout`;
+- `protocol_error`;
+- `unsupported_api_version`;
+- `operation_failed`;
+- `invalid_input`;
+- `update_failed`;
+- `internal`.
+
+Swift presentation may localize or contextualize messages, but it must not infer behavior by parsing arbitrary Rust display strings when a stable error code is available.
+
+## Ownerless GUI operations
+
+The initial ownerless exported surface must cover every management-window operation currently performed through the local API:
+
+```rust
+#[export]
+pub async fn get_state() -> Result<PortalState, PortalFfiError>;
+
+#[export]
+pub async fn add_box(
+    host: String,
+    name: Option<String>,
+    index: Option<u8>,
+) -> Result<(), PortalFfiError>;
+
+#[export]
+pub async fn remove_box(
+    name: String,
+) -> Result<(), PortalFfiError>;
+
+#[export]
+pub async fn set_box_enabled(
+    name: String,
+    enabled: bool,
+) -> Result<(), PortalFfiError>;
+
+#[export]
+pub async fn set_allow_exact(
+    name: String,
+    ports: Vec<u16>,
+) -> Result<(), PortalFfiError>;
+
+#[export]
+pub async fn set_feature_enabled(
+    name: String,
+    enabled: bool,
+) -> Result<(), PortalFfiError>;
+
+#[export]
+pub async fn get_logs(
+    lines: u32,
+) -> Result<Vec<String>, PortalFfiError>;
+```
+
+Use the existing atomic `SetAllowExact` request for the structured port editor. The Swift layer must not split one desired allowlist into independent add and remove calls.
+
+Update behavior must also be exposed through typed ownerless operations. The exact DTO names may follow the existing Rust update model, but they must represent:
+
+- current/up-to-date with the current release tag;
+- newer release available with tag and factual update metadata;
+- same-release `Portal.app` migration available;
+- verified update submission accepted;
+- no change;
+- typed failure.
+
+The confirmation dialog and user-facing wording belong to Swift presentation. Downloading, minisign verification, code-sign verification, Gatekeeper checks, staging, launchd submission, rollback, and health gating remain Rust behavior.
+
+# Async execution in the GUI process
+
+## BoltFFI polling is not an I/O runtime
+
+BoltFFI lets Swift drive a Rust future through continuation polling, but it does not provide a Tokio reactor. A Rust `async fn` must not directly call Tokio I/O while being polled only by BoltFFI, and wrapping blocking Unix-socket I/O in an `async fn` does not make it nonblocking.
+
+## GUI Rust runtime
+
+PortalFFI must own one private GUI-process Tokio runtime:
+
+```rust
+static GUI_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+```
+
+It must be created lazily using a named, enabled multi-thread runtime. It is internal Rust state and is never exposed through FFI.
+
+One-shot FFI async functions must:
+
+1. convert Swift parameters into owned Rust values before scheduling;
+2. submit the complete local API operation to `GUI_RUNTIME`;
+3. await the Tokio `JoinHandle` from the BoltFFI future;
+4. convert the response into an FFI DTO;
+5. map transport, protocol, timeout, and daemon errors into `PortalFfiError`.
+
+The preferred `portal-client` implementation uses Tokio `UnixStream` with explicit timeouts rather than retaining the current blocking implementation. If initial extraction temporarily calls the existing synchronous `request`, it must run through `spawn_blocking` and retain the existing two-second read/write bound. It must never execute blocking socket I/O on `MainActor` or on the thread invoking the BoltFFI poll callback.
+
+Swift task cancellation drops/cancels the BoltFFI future. A blocking syscall already running under `spawn_blocking` cannot be preempted; the existing two-second hard timeout bounds that residual work. New async socket code should use cancellation-aware Tokio operations.
+
+# State stream
+
+## Public stream type
+
+Transient daemon disconnection must not permanently terminate GUI observation. BoltFFI generates `AsyncStream`, not an application-specific reconnecting throwing stream, so connection state must be represented as stream values:
+
+```rust
+#[data]
+pub enum PortalStateEvent {
+    Snapshot(PortalState),
+    Unavailable(String),
+}
+
+fn state_updates_subscription()
+    -> Arc<EventSubscription<PortalStateEvent>>;
+```
+
+The zero-state scanner adapter described above delegates to this function. The hand-written `PortalFFI` Swift target exposes the ownerless app-facing surface:
+
+```swift
+public func stateUpdates() -> AsyncStream<PortalStateEvent> {
+    PortalStateStreamSource().updates()
+}
+```
+
+The generated class remains confined to `PortalFFIGenerated`; app and model code see only the ownerless function and `Sendable` value types.
+
+## Rust stream implementation
+
+Each call to `state_updates()` must:
+
+1. derive the existing production `Paths` using `HOME`, UID, and the current environment seams;
+2. allocate one `Arc<EventSubscription<PortalStateEvent>>` with sufficient bounded capacity, initially 256;
+3. spawn one task on `GUI_RUNTIME`;
+4. connect to the daemon local API socket;
+5. send `Request::SubscribeState` using API version 1;
+6. validate every response envelope and response id;
+7. map the initial `Response::State` to `PortalStateEvent::Snapshot`;
+8. map every subsequent state response to another full snapshot;
+9. on transport or protocol failure, emit one `Unavailable` event for each distinct error;
+10. reconnect after the existing one-second backoff;
+11. clear error deduplication after a state snapshot is delivered;
+12. continue until BoltFFI unsubscribes the `EventSubscription` or the process exits.
+
+The worker must check `EventSubscription::is_active()` during connection, reads, and backoff. Cancellation must not leave a permanently blocked thread or task.
+
+The async socket loop must select between socket progress and a short cancellation observation interval. On termination it must drop the socket and its task-owned `Arc`. BoltFFI's generated `AsyncStream.onTermination` calls `unsubscribe`, setting the shared subscription inactive.
+
+If the Rust ring buffer is temporarily full, the producer must not permanently lose the latest authoritative snapshot. It must retain a clone of the latest pending event and retry while the subscription remains active rather than discarding the only copy and waiting for another daemon event that may never arrive.
+
+No UI refresh timer may be introduced. The one-second delay is reconnection backoff after failure, not polling for state.
+
+## Daemon stream behavior
+
+The daemon side remains substantially unchanged:
+
+1. authenticate the local peer UID;
+2. subscribe to `Supervisor::subscribe_state_changes()`;
+3. send one initial full state;
+4. on each invalidation or broadcast lag, compute and send the latest full state;
+5. stop the connection handler when the daemon is cancelled, the broadcast closes, or socket writing fails.
+
+Daemon broadcast events remain invalidations, not public snapshots. Snapshot construction remains centralized in `local_api_state`.
+
+# SwiftUI presentation architecture
+
+## Application model
+
+Because Portal supports macOS 13, the initial model must use `ObservableObject` and `@Published`, not APIs whose deployment availability begins after macOS 13.
+
+```swift
+@MainActor
+final class PortalAppModel: ObservableObject {
+    @Published private(set) var state: PortalState?
+    @Published private(set) var daemonError: String?
+    @Published private(set) var updateActivity: UpdateActivity = .idle
+
+    private var stateTask: Task<Void, Never>?
+
+    func start() {
+        guard stateTask == nil else { return }
+        stateTask = Task {
+            for await event in stateUpdates() {
+                switch event {
+                case .snapshot(let state):
+                    self.state = state
+                    self.daemonError = nil
+                case .unavailable(let message):
+                    self.daemonError = message
+                }
+            }
+        }
+    }
+
+    func stop() {
+        stateTask?.cancel()
+        stateTask = nil
+    }
+}
+```
+
+The exact generated associated-value spelling must follow BoltFFI output. The ownership and lifecycle shown above are normative.
+
+There must be exactly one app-scoped `PortalAppModel` shared by the menu-bar scene and management window. The model starts its state stream once when the GUI process launches.
+
+Starting at GUI launch is an intentional small internal change from the current “first management-window open” start point. It retains visible behavior while allowing both native SwiftUI presentation surfaces to share one event-driven source. It adds no state polling timer.
+
+## Scenes
+
+The SwiftUI app must provide:
+
+- a menu-bar scene, preferably `MenuBarExtra` where its lifecycle and interaction behavior meet requirements;
+- one management window scene;
+- native sheets or alerts for add box, remove confirmation, allowlist editing, update confirmation, information, and errors;
+- commands for opening the management window, selecting Overview and Logs, checking for updates, and quitting the GUI.
+
+AppKit bridging through `NSApplicationDelegateAdaptor` or narrowly scoped `NSApplication` calls is permitted for macOS lifecycle behavior that SwiftUI does not expose adequately. Presentation itself must not be rebuilt through `objc2` in Rust.
+
+## GUI lifecycle
+
+The GUI must preserve these behaviors:
+
+- background login launch shows the menu-bar item without forcing a window;
+- direct app launch opens or reactivates the management window;
+- reopening the app brings the existing window forward;
+- closing the last window does not terminate the GUI process;
+- Quit exits the GUI successfully so launchd does not immediately restart it;
+- Quit does not stop the daemon;
+- menu-bar state remains usable when the management window is closed;
+- when the management window is shown, Portal activates as a normal foreground app as it does today;
+- daemon unavailability is represented in the UI rather than terminating the GUI.
+
+## Presentation ownership
+
+Swift owns:
+
+- layout, navigation, materials, animation, accessibility, focus, and localization;
+- semantic status colors and labels;
+- menu-bar and window presentation;
+- update progress presentation;
+- confirmations and error alerts;
+- validation feedback presentation;
+- expanded/collapsed forward-list presentation state;
+- selected view and sheet state.
+
+Rust owns:
+
+- input validation rules whose result affects behavior or persistence;
+- config mutation and persistence;
+- daemon reconciliation;
+- state construction;
+- socket transport and reconnection;
+- update discovery, cryptographic verification, staging, submission, and rollback;
+- CLI parsing and execution;
+- service installation and lifecycle;
+- transport, forwarding, clipboard, notification, credential, and remote-agent behavior.
+
+Swift may perform immediate presentation validation, such as highlighting an empty host or malformed port field, but Rust remains authoritative and must validate again.
+
+## User action flow
+
+A configuration action follows this sequence:
+
+```text
+SwiftUI control
+    ↓
+@MainActor PortalAppModel async method
+    ↓
+generated ownerless BoltFFI async function
+    ↓
+PortalFFI Rust runtime
+    ↓
+versioned Unix local API request
+    ↓
+daemon persistence and Supervisor reconciliation
+    ↓
+function success or typed error
+    ↓
+daemon state invalidation
+    ↓
+state AsyncStream authoritative snapshot
+    ↓
+@Published state and SwiftUI redraw
+```
+
+The mutation result acknowledges success or failure. The state stream remains the authoritative source for displayed daemon state. Swift must not fabricate a durable state transition that the daemon has not confirmed.
+
+# Process-mode Rust exports
+
+## CLI mode
+
+```rust
+#[export]
+pub fn run_portal_command(arguments: Vec<String>) -> i32;
+```
+
+The implementation must refactor the current `main` and `run` behavior so that clap can parse a supplied argument vector rather than reading process arguments implicitly. It must return the intended exit code rather than calling `process::exit` inside ordinary command paths.
+
+Commands that intentionally replace the process, such as the stable update helper, may continue using `exec` where required by the existing update design.
+
+CLI mode must preserve:
+
+- `app` and no-command behavior, now activating/opening the Swift GUI through the app bundle rather than entering the removed Rust tray;
+- `install` and optional initial host configuration;
+- `uninstall`;
+- `start`, `stop`, and `restart`;
+- `status`;
+- `box list`, `box add`, and `box remove`;
+- `allow` and `unallow`;
+- `logs`, line limits, and follow mode;
+- `doctor`;
+- `upgrade`, `upgrade --check`, and force/internal update modes;
+- `features` display and mutation;
+- `keychain list` and `keychain forget`;
+- `version`, `--version`, and legacy version checks;
+- hidden `daemon`, `run`, `tray`, prompt, migration, and update-helper modes required for compatibility;
+- current stdout/stderr placement;
+- current help text and command-specific help;
+- current exit codes and security defaults.
+
+The no-argument installed `portal` command must open or activate the native Swift application window. If the GUI is already running, it must request activation rather than starting a conflicting GUI instance.
+
+## Daemon mode
+
+```rust
+#[export]
+pub fn run_portal_daemon() -> i32;
+```
+
+This is intentionally synchronous from Swift's perspective. In daemon mode no UI event loop exists; the call owns the process main thread until shutdown.
+
+It must:
+
+1. derive `Paths` exactly as today;
+2. initialize Rust tracing to the configured daemon log destination;
+3. construct the Tokio runtime;
+4. execute the existing daemon `run(paths)` future;
+5. retain SIGTERM and Ctrl-C behavior;
+6. remove the API socket on clean shutdown;
+7. return a meaningful process exit code.
+
+The daemon process must not depend on the GUI process or GUI Rust runtime.
+
+# Credentials, notifications, and URL opening
+
+## Credential prompt
+
+The existing credential helper is an on-demand child process because the daemon cannot safely assume the main GUI is running. That process boundary remains.
+
+The daemon must spawn the same application executable in prompt mode rather than a separately compiled helper:
+
+```text
+Portal.app/Contents/MacOS/Portal --prompt
+```
+
+Legacy `_prompt` must remain accepted during migration.
+
+Prompt mode must preserve the existing stdin/stdout JSON protocol and backstop timeout. The Swift presentation must retain:
+
+- requester/box attribution;
+- secure text entry;
+- remember behavior;
+- explicit allow and deny choices;
+- empty-secret allow treated as denial;
+- cancellation behavior;
+- no secret logging;
+- exactly one serialized response;
+- helper termination after response.
+
+Rust remains responsible for the surrounding credential policy, global FIFO prompt gate, cooldown, Touch ID decision flow, Keychain persistence, response encoding, and secret zeroization where Rust owns the bytes.
+
+Prompt protocol parsing and response encoding should be exposed as narrow ownerless PortalFFI functions so Swift does not duplicate an unstable internal protocol. Swift owns only native prompt presentation and returns a typed decision.
+
+## Touch ID and Keychain
+
+Existing Rust macOS implementations and security behavior remain unless a separate security-reviewed design replaces them. Moving the management UI to Swift does not justify changing Keychain access groups, SecAccessControl, biometry policy, denial vocabulary, or cooldown semantics.
+
+## Notifications and safe URL opening
+
+Notifications and safe URL opening remain daemon-owned system integrations initially:
+
+- notification relay continues even when the GUI has been quit;
+- URL opening remains restricted to safe `http` and `https` URLs;
+- no app-process dependency is introduced.
+
+They need not route through BoltFFI or SwiftUI. This preserves existing availability and security behavior.
+
+# Lifecycle matrix
+
+| Event | GUI process | State stream | Daemon process | Forwards and agents |
+|---|---|---|---|---|
+| Login in Aqua session | launchd starts it in background mode | starts and connects | launchd starts it | converge normally |
+| SSH-only login session | not required | absent | runs | converge normally |
+| Open Portal.app | opens/activates window | same app-scoped stream | unchanged | unchanged |
+| Close management window | remains for menu bar | remains | unchanged | unchanged |
+| Quit Portal GUI | exits successfully | BoltFFI unsubscribes and task exits | remains | remain alive |
+| Daemon crashes | remains | emits unavailable and reconnects | launchd restarts it | reconverge |
+| Explicit `portal stop` | remains | emits unavailable and reconnects | stops | stop by design |
+| Explicit `portal start` | remains | reconnects and receives initial state | starts | reconverge |
+| App upgrade | update helper coordinates shutdown/replacement | old GUI exits | coordinated restart | restored after health gate |
+| Logout | exits | exits | launchd stops it | stop with session |
+
+# Installation and first launch
+
+First launch must continue to:
+
+1. derive the installation paths and select `/Applications/Portal.app` or `~/Applications/Portal.app` according to writability;
+2. install or atomically converge the app-owned `portal` launcher at `~/.local/bin/portal`;
+3. write both launchd manifests;
+4. start and health-check the independent daemon;
+5. start the Aqua GUI/menu-bar job;
+6. permit a genuinely fresh empty configuration;
+7. open the management window for direct first launch;
+8. surface startup failures without leaving an unhealthy crash loop.
+
+The app bundle is the source of truth. The launcher is an app-owned entry point, not an independently updated CLI installation.
+
+Uninstall behavior must continue stopping both jobs and removing installed service artifacts according to current policy while preserving user configuration where it does today.
+
+# Update, rollback, and compatibility migration
+
+The existing app-bundle updater remains Rust behavior and must be adapted to the new bundle layout rather than rewritten in Swift.
+
+## Verification
+
+A candidate app must be rejected unless all current gates pass, updated for the new executable path:
+
+- minisign verification;
+- expected release tag/version;
+- `codesign --verify --deep --strict`;
+- Gatekeeper assessment;
+- final executable runs in CLI version mode;
+- final executable reports the expected build/version;
+- embedded remote agents are present and stamped correctly.
+
+The executable self-test path becomes conceptually:
+
+```text
+Portal.app/Contents/MacOS/Portal --cli --version
+```
+
+## Replacement transaction
+
+The updater must retain the current transaction properties:
+
+1. perform network work and cryptographic verification before stopping live services;
+2. stage on the destination filesystem;
+3. acquire the deployment lock;
+4. submit or exec a stable updater that survives replacing the running app;
+5. quiesce GUI before daemon;
+6. atomically replace the app and app-owned CLI launcher state;
+7. regenerate manifests for the new executable modes;
+8. start and health-check the daemon;
+9. start the GUI when Aqua is available;
+10. roll back the app, launcher, and manifests if any required gate fails;
+11. report GUI restart failure separately when forwarding is healthy, as today;
+12. clean staging and one-shot launchd jobs.
+
+The stable updater may invoke the same application executable in an internal apply-update mode. It is a process mode, not a separate product binary.
+
+## Legacy compatibility asset
+
+Older Portal installations may still know only the historical standalone asset name. Compatibility must be retained without restoring a separate Rust CLI implementation.
+
+If the legacy release asset remains necessary, publish the same signed application executable as a transitional compatibility artifact. Its Swift dispatcher and statically linked Rust support CLI, daemon, updater, and automatic app-migration modes outside a bundle. It must migrate itself to the verified app bundle using the existing one-shot migration transaction.
+
+This is a transitional distribution copy of the same compiled executable, not a second architecture or independently maintained CLI application.
+
+# Release build orchestration
+
+The repository rule remains: supported builds go through `make`, not raw Cargo.
+
+The target build sequence is:
+
+```text
+make agents
+    ↓
+build linux-musl portald for amd64 and arm64 with one SHA
+    ↓
+make ffi
+    ↓
+BoltFFI pack apple, embedding both agents in the Rust static library
+    ↓
+make app
+    ↓
+Xcode builds SwiftUI app and links static PortalFFI XCFramework
+    ↓
+verify final Portal executable contains both embedded agents
+    ↓
+make dmg / make release
+```
+
+The Makefile must expose clear targets for at least:
+
+- Rust agents;
+- PortalFFI generation/build;
+- Swift app build;
+- app assembly if Xcode does not own the complete bundle;
+- tests;
+- lint;
+- strict Swift build/tests;
+- signed release.
+
+`make build`, `make test`, `make lint`, `make check`, `make app`, `make dmg`, `make install`, and `make release` must retain their documented intent, even if their internals change.
+
+The release script must derive the SHA from committed `HEAD`, fail on a dirty or unpushed release state as it currently does, and use the same stamped SHA in every Rust build involved in the final app.
+
+# Behavior-parity implementation map
+
+## Management window and menu bar
+
+The SwiftUI implementation must retain all current functional surfaces:
+
+- menu-bar status item;
+- Overview and Logs navigation;
+- box cards and connection state;
+- forwarded-port display and open actions;
+- expanded/collapsed long forward lists;
+- paused-forward summary for disabled boxes;
+- Add Box;
+- Remove Box with confirmation;
+- enable/disable box;
+- structured Always Forward editor with atomic submission;
+- feature toggles and security-sensitive feature explanation;
+- bounded log loading and copying;
+- version/build display;
+- daemon-down presentation;
+- check-for-update, same-release app migration, download/install activity, success, and failure presentation;
+- menu commands and keyboard shortcuts where applicable;
+- foreground activation and reopening behavior;
+- native accessibility and keyboard focus.
+
+SwiftUI should use current platform-native materials and availability checks so newer macOS versions receive current native appearance while macOS 13 retains a correct fallback. Functional behavior and accessibility take priority over reproducing Rust/AppKit implementation details.
+
+## Daemon and remote behavior
+
+The following remain Rust and must be unchanged except for refactoring needed to make them callable from a library:
+
+- config parsing, migration, validation, persistence, and hot reload;
+- one daemon instance and owner-only socket;
+- native SSH transport and host-key policy;
+- reconnect and bootstrap behavior;
+- embedded-agent upload, SHA matching, pruning, and shim deployment;
+- forward reconciliation and collision-free port mapping;
+- clipboard publishing and remote clipboard writes;
+- notifications and safe URL opening;
+- credential handling;
+- remote agent protocol;
+- feature gates;
+- state invalidation semantics;
+- graceful cancellation and shutdown.
+
+# Testing and acceptance gates
+
+## Rust tests
+
+All existing workspace tests must continue passing through `make test`. Refactoring executable code into libraries must preserve or improve unit-test access; tests must not be deleted merely because ownership moves.
+
+Add Rust tests for:
+
+- conversion of every local API state field to FFI DTOs;
+- deterministic feature ordering;
+- forward tuple conversion;
+- structured error mapping;
+- one-shot request timeouts;
+- ownerless stream initial snapshot;
+- multiple state updates;
+- distinct-error deduplication;
+- successful reconnect after daemon restart;
+- cancellation causing task/socket cleanup;
+- full-buffer retry retaining the latest authoritative state;
+- CLI argument-vector parsing and exit codes;
+- legacy `run`, `tray`, `_prompt`, version, migration, and update-helper dispatch;
+- daemon entry-point error mapping.
+
+## Swift tests
+
+The generated bindings and app must compile with:
+
+```text
+Swift 6
+complete strict concurrency
+Xcode 26 settings used by the application
+```
+
+Add Swift tests for:
+
+- generated DTO `Sendable` use across actor boundaries;
+- app model state-event handling;
+- daemon unavailable/recovery presentation state;
+- mutation errors;
+- state task starts once and cancels cleanly;
+- update presentation-state transitions;
+- window-close versus app-quit lifecycle;
+- CLI/daemon modes do not initialize SwiftUI.
+
+No test may solve concurrency diagnostics by weakening strict-concurrency settings globally.
+
+## End-to-end tests
+
+At minimum, automated or scripted integration gates must verify:
+
+1. start the daemon using the final application executable's daemon mode;
+2. call ownerless PortalFFI state APIs from Swift;
+3. receive the initial state stream snapshot;
+4. mutate config through FFI and observe the authoritative stream update;
+5. restart the daemon and observe unavailable then recovery without recreating the app model;
+6. cancel the Swift task and prove the Rust subscription worker exits;
+7. run representative CLI commands through the bundled launcher and compare behavior with current commands;
+8. close the GUI window and prove the daemon and forwards remain;
+9. quit the GUI and prove the daemon and forwards remain;
+10. stop the daemon and prove forwards stop;
+11. exercise prompt allow, deny, cancel, timeout, and empty-secret-deny paths;
+12. build, sign, notarize, staple, install, launch, and Gatekeeper-assess the final app;
+13. perform a real update transaction with rollback fault injection;
+14. verify both embedded remote-agent architectures and the common SHA.
+
+## Release gates
+
+A release must not proceed unless:
+
+- Rust tests and lint pass;
+- Swift tests and strict-concurrency builds pass;
+- generated bindings match the pinned generator output;
+- the final app executable reports the release version and SHA in CLI mode;
+- embedded agents are verified in the final app executable;
+- the app and executable signatures validate;
+- notarization is Accepted and stapled;
+- Gatekeeper accepts the installed app;
+- minisign verification passes;
+- daemon health passes after installation;
+- GUI failure cannot falsely report forwarding failure when the daemon is healthy.
+
+# Migration order
+
+Implementation should proceed in dependency order:
+
+1. Add and pin BoltFFI configuration without changing shipping behavior.
+2. Extract `portal-client` from executable-only code and retain current AppKit callers.
+3. Extract CLI/daemon/update/service behavior into `portal-app-core` library entry points.
+4. Add `portal-ffi` DTOs, ownerless one-shot functions, state stream, process-mode exports, and tests.
+5. Generate the macOS-only static XCFramework and compile generated bindings under strict Swift 6.
+6. Create the Swift app target and custom process dispatcher.
+7. Implement CLI launcher and prove full CLI parity while the old Rust AppKit GUI still exists as a temporary development fallback.
+8. Implement SwiftUI app-scoped model, menu bar, management window, actions, logs, and update presentation.
+9. Implement prompt mode with native Swift presentation and preserve security tests.
+10. Point launchd manifests at the single Swift application executable modes.
+11. Move embedded-agent verification to the final application executable.
+12. Adapt installation, app discovery, update verification, stable updater, rollback, and compatibility migration to the new layout.
+13. Remove the Rust/AppKit tray and prompt presentation only after parity gates pass.
+14. Remove the shipping Rust macOS binary target only after the Swift executable handles every required mode.
+15. Update README, build documentation, release documentation, and user-facing installation instructions.
+16. Ship only after signed/notarized end-to-end verification.
+
+At no intermediate point may a release silently lose the daemon, CLI, legacy upgrade path, prompt path, or existing state-management behavior.
+
+# Explicit rulings
+
+1. **One app bundle:** yes.
+2. **One compiled macOS application executable:** yes.
+3. **Separate shipping Rust CLI executable:** no.
+4. **Bundled shell command launcher:** yes.
+5. **CLI logic remains Rust:** yes, invoked through BoltFFI by the Swift process dispatcher.
+6. **Daemon remains a separate process:** yes, using the same app executable in daemon mode.
+7. **Daemon moves into the GUI process:** no.
+8. **Unix local API remains the GUI/daemon process seam:** yes.
+9. **BoltFFI replaces the Unix local API:** no.
+10. **PortalClient exported class:** no.
+11. **Internal zero-state BoltFFI stream-scanner adapter class:** yes, confined to `PortalFFIGenerated` until upstream admits ownerless source streams.
+12. **Public `@unchecked Sendable` workaround:** no.
+13. **Swift-implemented BoltFFI callback traits:** no.
+14. **Ownerless app-facing functions and `AsyncStream`:** yes.
+15. **App-scoped state model and one stream:** yes.
+16. **State polling timer:** no.
+17. **Private GUI-process Tokio runtime:** yes.
+18. **Static XCFramework:** yes.
+19. **Generated bindings in a separate nonisolated Swift target:** yes.
+20. **Swift 6 complete strict concurrency gate:** yes.
+21. **Rust owns behavior; Swift owns presentation:** yes.
+22. **Prompt remains an independent process mode:** yes, but from the same app executable.
+23. **Notifications and safe URL opening remain daemon-owned initially:** yes.
+24. **Current CLI and compatibility aliases retained:** yes.
+25. **Current update, rollback, signing, notarization, and SHA guarantees retained:** yes.
+26. **Behavior parity is a release gate, not a best-effort goal:** yes.

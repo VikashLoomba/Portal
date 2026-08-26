@@ -90,7 +90,13 @@ pub fn render_plist(
 ///   user's deliberate Quit (exit 0) STAYS quit until next login/upgrade —
 ///   KeepAlive=true would make Quit a lie;
 /// - `ProcessType=Interactive`: it services a click, not a batch queue.
-pub fn render_tray_plist(label: &str, bin_path: &Path, home: &Path, log: &Path) -> String {
+pub fn render_tray_plist(
+    label: &str,
+    bin_path: &Path,
+    mode_argument: &str,
+    home: &Path,
+    log: &Path,
+) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -102,7 +108,7 @@ pub fn render_tray_plist(label: &str, bin_path: &Path, home: &Path, log: &Path) 
     <key>ProgramArguments</key>
     <array>
         <string>{bin}</string>
-        <string>tray</string>
+        <string>{mode_argument}</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -139,6 +145,7 @@ pub fn render_tray_plist(label: &str, bin_path: &Path, home: &Path, log: &Path) 
 </plist>
 "#,
         bin = bin_path.display(),
+        mode_argument = mode_argument,
         home = home.display(),
         log = log.display(),
     )
@@ -339,6 +346,7 @@ mod tests {
         let p = render_tray_plist(
             "local.portal.tray",
             &PathBuf::from("/Users/u/.local/bin/portal"),
+            "tray",
             &PathBuf::from("/Users/u"),
             &PathBuf::from("/Users/u/Library/Logs/portal-tray.log"),
         );

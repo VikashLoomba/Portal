@@ -4,6 +4,8 @@ members = [
     "crates/portal-proto",
     "crates/portal-transport",
     "crates/portal-core",
+    "crates/portal-client",
+    "crates/portal-ffi",
     "crates/portal-clip",
     "crates/portal-cred",
     "crates/portal-cli",
@@ -11,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.0.27"
+version = "2.0.28"
 edition = "2024"
 repository = "https://github.com/VikashLoomba/Portal"
 authors = ["Vikash Loomba"]
@@ -21,6 +23,8 @@ authors = ["Vikash Loomba"]
 portal-proto = { path = "crates/portal-proto" }
 portal-transport = { path = "crates/portal-transport" }
 portal-core = { path = "crates/portal-core" }
+portal-client = { path = "crates/portal-client" }
+portal-ffi = { path = "crates/portal-ffi" }
 portal-clip = { path = "crates/portal-clip" }
 portal-cred = { path = "crates/portal-cred" }
 portald = { path = "crates/portald" }
@@ -38,6 +42,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 anyhow = "1"
 thiserror = "2"
+boltffi = "=0.30.1"
 
 # config / cli / logging
 toml = "0.8"
