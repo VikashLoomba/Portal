@@ -17,7 +17,7 @@ Rule: no silent TODOs in code. Anything deferred lives HERE, explicitly.
 - [x] portald: clip store + local paste verbs + blob put + store-backed shims
 - [x] DESIGN-clipsync.md
 
-## Native SwiftUI + BoltFFI application migration — IN PROGRESS
+## Native SwiftUI + BoltFFI application migration — COMPLETE
 - [x] accepted architecture: `docs/DESIGN-swiftui-boltffi.mdx`
 - [x] reusable `portal-client` crate (bounded async requests + reconnecting,
       cancellation-aware state subscription)
@@ -32,7 +32,10 @@ Rule: no silent TODOs in code. Anything deferred lives HERE, explicitly.
 - [x] one-executable app assembly and embedded-agent/minimum-OS verification
 - [x] launchd/app-install/update paths migrated to the Swift executable and
       bundled launcher while standalone compatibility modes remain accepted
-- [ ] signed/notarized local release transaction through the new bundle layout
+- [x] signed/notarized local release transaction through the new bundle layout:
+      Accepted app/binary/DMG tickets, staples validated, Gatekeeper accepted,
+      canonical `/Applications` install, healthy agents/doctor, and real post-
+      swap rollback fault injection
 - [x] interactive visual/accessibility QA on the shipping Mac desktop: AX-tree
       labels, menu commands/shortcuts, status colors, prompt controls, window
       close, app quit, and daemon independence are scripted release gates
@@ -99,8 +102,9 @@ Rule: no silent TODOs in code. Anything deferred lives HERE, explicitly.
 - [ ] audit log (Mac side): cred served/denied/forgotten, clip published —
       currently tracing-only; a persistent append-only audit file is a small
       follow-up
-- [ ] RELEASE-GATED: SecAccessControl + biometryCurrentSet item binding
-      (needs Developer ID signing; see release pipeline)
+- [x] RELEASE-GATED: signed builds compile in SecAccessControl +
+      biometryCurrentSet item binding, verify `_signed-build-mode=enabled`, and
+      fail closed if access-control creation fails
 - [x] interactive dialog QA on a real desktop session, including AX secure-
       field labeling and allow/deny/cancel/timeout/remember/forget outcomes
 
