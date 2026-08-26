@@ -218,7 +218,7 @@ Check for Updates…
 ● devbox2 — no forwards
 ● oldbox — reconnecting
 ─────────────────────────
-portal 2.0.29 (abc1234)
+portal 2.0.30 (abc1234)
 Quit Portal
 ```
 

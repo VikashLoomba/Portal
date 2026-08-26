@@ -36,7 +36,7 @@ final class PortalAppModel: ObservableObject {
 
     enum UploadActivity: Equatable {
         case uploading(itemCount: Int, destination: String)
-        case completed(itemCount: Int, destination: String)
+        case completed(paths: [String])
         case failed(String)
 
         var inFlight: Bool {
@@ -178,8 +178,9 @@ final class PortalAppModel: ObservableObject {
             )
             operationError = nil
             uploadActivities[boxName] = .completed(
-                itemCount: urls.count,
-                destination: destination
+                paths: urls.map {
+                    remoteUploadPath(destination: destination, itemName: $0.lastPathComponent)
+                }
             )
         } catch {
             let message = error.portalMessage
@@ -194,6 +195,15 @@ final class PortalAppModel: ObservableObject {
 
     func createRemoteDirectory(boxName: String, path: String) async throws {
         try await PortalFFI.createRemoteDirectory(name: boxName, path: path)
+    }
+
+    private func remoteUploadPath(destination: String, itemName: String) -> String {
+        if destination == "/" { return "/\(itemName)" }
+        var base = destination
+        while base.hasSuffix("/") {
+            base.removeLast()
+        }
+        return "\(base)/\(itemName)"
     }
 
     func checkForUpdates() async {

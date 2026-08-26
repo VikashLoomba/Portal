@@ -435,13 +435,22 @@ private struct PortalBoxCard: View {
             .accessibilityHint("Drop files and folders, or press to choose them")
 
             switch model.uploadActivity(for: configuration.name) {
-            case let .completed(itemCount, destination):
-                Label(
-                    "Uploaded \(itemLabel(itemCount)) to \(destination)",
-                    systemImage: "checkmark.circle.fill"
-                )
+            case let .completed(paths):
+                VStack(alignment: .leading, spacing: 5) {
+                    Label(
+                        "Uploaded \(itemLabel(paths.count))",
+                        systemImage: "checkmark.circle.fill"
+                    )
+                    .foregroundStyle(.green)
+                    ForEach(paths, id: \.self) { path in
+                        Text(path)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
                 .font(.caption)
-                .foregroundStyle(.green)
             case let .failed(message):
                 Label(message, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
