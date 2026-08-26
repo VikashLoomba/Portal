@@ -225,9 +225,24 @@ fn destination(paths: &Paths) -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("PORTAL_APP_PATH") {
         return Ok(PathBuf::from(path));
     }
-    if let Some(existing) = installed_app(paths) {
+
+    // An updater launched from an app always replaces that exact app. A
+    // standalone release helper, however, must prefer the canonical installed
+    // locations over ~/.local/bin: a development launcher may legitimately
+    // point into target/, and treating that as the install destination would
+    // leave the real /Applications copy stale.
+    if let Ok(current) = std::env::current_exe()
+        && let Some(app) = app_from_executable(&current)
+    {
+        return Ok(app);
+    }
+    if let Some(existing) = canonical_installed_app(
+        &PathBuf::from("/Applications/Portal.app"),
+        &paths.home.join("Applications/Portal.app"),
+    ) {
         return Ok(existing);
     }
+
     let system = Path::new("/Applications");
     if tempfile::Builder::new()
         .prefix(".portal-write-test.")
@@ -239,6 +254,13 @@ fn destination(paths: &Paths) -> Result<PathBuf, String> {
     let user = paths.home.join("Applications");
     std::fs::create_dir_all(&user).map_err(|e| format!("create {}: {e}", user.display()))?;
     Ok(user.join("Portal.app"))
+}
+
+fn canonical_installed_app(system: &Path, user: &Path) -> Option<PathBuf> {
+    [system, user]
+        .into_iter()
+        .find(|app| app_executable(app).is_file() && app_cli_launcher(app).is_file())
+        .map(Path::to_path_buf)
 }
 
 struct RollbackState {
@@ -458,6 +480,20 @@ mod tests {
         cleanup_abandoned_cli_links(dir.path());
         assert!(std::fs::symlink_metadata(&stale_link).is_err());
         assert!(lookalike_file.exists());
+    }
+
+    #[test]
+    fn canonical_install_location_wins_over_noncanonical_launchers() {
+        let dir = tempfile::tempdir().unwrap();
+        let system = dir.path().join("Applications/Portal.app");
+        let user = dir.path().join("home/Applications/Portal.app");
+        for app in [&system, &user] {
+            std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+            std::fs::create_dir_all(app.join("Contents/Resources/bin")).unwrap();
+            std::fs::write(app_executable(app), b"portal").unwrap();
+            std::fs::write(app_cli_launcher(app), b"launcher").unwrap();
+        }
+        assert_eq!(canonical_installed_app(&system, &user), Some(system));
     }
 
     #[test]

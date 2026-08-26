@@ -229,9 +229,23 @@ if [ "${INSTALL:-0}" = "1" ]; then
   echo "==> installing local signed Portal.app (no publish)"
   "$BIN" _install-verified-app "$APP" "v$CRATE_VER"
 
-  # Add/converge the requested smoke-test box through the app-owned CLI.
+  # Add/converge the requested smoke-test box through the app-owned CLI. A
+  # repeated local release is intentionally idempotent: an existing matching
+  # box is restarted rather than turning a healthy reinstall into a failure.
   INSTALLED="$HOME/.local/bin/portal"
-  "$INSTALLED" install "$INSTALL_HOST"
+  set +e
+  INSTALL_OUT="$("$INSTALLED" install "$INSTALL_HOST" 2>&1)"
+  INSTALL_CODE=$?
+  set -e
+  if [ "$INSTALL_CODE" -ne 0 ]; then
+    case "$INSTALL_OUT" in
+      *"already exists with host"*)
+        echo "==> smoke-test box already configured; restarting services"
+        "$INSTALLED" restart
+        ;;
+      *) printf '%s\n' "$INSTALL_OUT" >&2; exit "$INSTALL_CODE" ;;
+    esac
+  fi
 
   # A command-line smoke test cannot catch launchd's cached code-requirement
   # failures. Assert the app-owned launcher resolves to the installed bundle,
