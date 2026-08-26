@@ -235,7 +235,9 @@ private struct PortalBoxCard: View {
 
     @State private var showingRemoveConfirmation = false
     @State private var showingPortEditor = false
+    @State private var showingDestinationPicker = false
     @State private var forwardsExpanded = false
+    @State private var dropTargeted = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -313,6 +315,11 @@ private struct PortalBoxCard: View {
                     .foregroundStyle(.secondary)
             }
 
+            if configuration.enabled {
+                Divider()
+                uploadSection
+            }
+
             Divider()
             HStack {
                 Button("Always Forward…") {
@@ -352,6 +359,115 @@ private struct PortalBoxCard: View {
                 isPresented: $showingPortEditor
             )
         }
+        .sheet(isPresented: $showingDestinationPicker) {
+            RemoteDestinationPicker(
+                model: model,
+                boxName: configuration.name,
+                initialPath: model.uploadDestination(for: configuration.name),
+                isPresented: $showingDestinationPicker
+            )
+        }
+    }
+
+    private var uploadSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Upload files", systemImage: "arrow.up.doc")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    showingDestinationPicker = true
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "folder")
+                        Text(model.uploadDestination(for: configuration.name))
+                            .font(.caption.monospaced())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+                .help("Choose a destination folder on \(configuration.name)")
+                .disabled(model.uploadActivity(for: configuration.name)?.inFlight == true)
+            }
+
+            Button(action: chooseUploadItems) {
+                VStack(spacing: 6) {
+                    if case let .uploading(itemCount, _) = model.uploadActivity(for: configuration.name) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Uploading \(itemLabel(itemCount))…")
+                            .font(.callout.weight(.medium))
+                    } else {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.title2)
+                        Text("Drop files or folders here")
+                            .font(.callout.weight(.medium))
+                        Text("or click to choose with Finder")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, minHeight: 84)
+                .contentShape(Rectangle())
+                .background(
+                    dropTargeted ? Color.accentColor.opacity(0.13) : Color.primary.opacity(0.035),
+                    in: RoundedRectangle(cornerRadius: 10)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(
+                            dropTargeted ? Color.accentColor : Color.secondary.opacity(0.35),
+                            style: StrokeStyle(lineWidth: dropTargeted ? 2 : 1, dash: [6, 4])
+                        )
+                }
+            }
+            .buttonStyle(.plain)
+            .disabled(model.uploadActivity(for: configuration.name)?.inFlight == true)
+            .dropDestination(for: URL.self) { urls, _ in
+                let files = urls.filter(\.isFileURL)
+                guard !files.isEmpty else { return false }
+                Task { await model.uploadFiles(files, to: configuration.name) }
+                return true
+            } isTargeted: { targeted in
+                dropTargeted = targeted
+            }
+            .accessibilityLabel("Upload files to \(configuration.name)")
+            .accessibilityHint("Drop files and folders, or press to choose them")
+
+            switch model.uploadActivity(for: configuration.name) {
+            case let .completed(itemCount, destination):
+                Label(
+                    "Uploaded \(itemLabel(itemCount)) to \(destination)",
+                    systemImage: "checkmark.circle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.green)
+            case let .failed(message):
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+            case .uploading, nil:
+                EmptyView()
+            }
+        }
+    }
+
+    private func chooseUploadItems() {
+        let panel = NSOpenPanel()
+        panel.title = "Upload to \(configuration.name)"
+        panel.message = "Choose files and folders to upload to \(model.uploadDestination(for: configuration.name))."
+        panel.prompt = "Upload"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.resolvesAliases = false
+        guard panel.runModal() == .OK else { return }
+        Task { await model.uploadFiles(panel.urls, to: configuration.name) }
+    }
+
+    private func itemLabel(_ count: Int) -> String {
+        "\(count) item\(count == 1 ? "" : "s")"
     }
 
     private var statusWord: String {
@@ -374,6 +490,213 @@ private struct PortalBoxCard: View {
     private func openForward(_ port: UInt16) {
         guard let url = URL(string: "http://127.0.0.1:\(port)") else { return }
         NSWorkspace.shared.open(url)
+    }
+}
+
+private struct RemoteDestinationPicker: View {
+    @ObservedObject var model: PortalAppModel
+    let boxName: String
+    let initialPath: String
+    @Binding var isPresented: Bool
+
+    @State private var directory: PortalRemoteDirectory?
+    @State private var pathText: String
+    @State private var loading = false
+    @State private var errorMessage: String?
+    @State private var showingNewFolder = false
+    @State private var newFolderName = ""
+
+    init(
+        model: PortalAppModel,
+        boxName: String,
+        initialPath: String,
+        isPresented: Binding<Bool>
+    ) {
+        self.model = model
+        self.boxName = boxName
+        self.initialPath = initialPath
+        _isPresented = isPresented
+        _pathText = State(initialValue: initialPath)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Choose Upload Destination")
+                    .font(.title2.weight(.semibold))
+                Text("Choose a folder on \(boxName). Uploaded items will be placed inside it.")
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding()
+
+            Divider()
+
+            HStack(spacing: 8) {
+                Button {
+                    if let parent = directory?.parent {
+                        Task { await load(parent) }
+                    }
+                } label: {
+                    Image(systemName: "chevron.up")
+                }
+                .help("Parent folder")
+                .disabled(loading || directory?.parent == nil)
+
+                Button {
+                    Task { await load("~") }
+                } label: {
+                    Image(systemName: "house")
+                }
+                .help("Home folder")
+                .disabled(loading)
+
+                TextField("Remote folder", text: $pathText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body.monospaced())
+                    .onSubmit { Task { await load(pathText) } }
+
+                Button("Go") {
+                    Task { await load(pathText) }
+                }
+                .disabled(loading || pathText.isEmpty)
+
+                Button {
+                    Task { await load(directory?.path ?? pathText) }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help("Refresh")
+                .disabled(loading)
+            }
+            .padding()
+
+            Divider()
+
+            Group {
+                if loading, directory == nil {
+                    ProgressView("Loading folders on \(boxName)…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let directory, directory.directories.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "folder")
+                            .font(.largeTitle)
+                            .foregroundStyle(.secondary)
+                        Text("No Subfolders")
+                            .font(.headline)
+                        Text("Choose this folder or create a new one.")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List(directory?.directories ?? [], id: \.path) { entry in
+                        Button {
+                            Task { await load(entry.path) }
+                        } label: {
+                            HStack {
+                                Image(systemName: "folder.fill")
+                                    .foregroundStyle(.tint)
+                                Text(entry.name)
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .frame(minHeight: 300)
+
+            if let errorMessage {
+                Divider()
+                Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+
+            Divider()
+
+            HStack {
+                Button("New Folder…") {
+                    newFolderName = ""
+                    showingNewFolder = true
+                }
+                .disabled(loading || directory == nil)
+                Spacer()
+                Button("Cancel") { isPresented = false }
+                Button("Choose This Folder") {
+                    guard let path = directory?.path else { return }
+                    model.setUploadDestination(path, for: boxName)
+                    isPresented = false
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(loading || directory == nil)
+            }
+            .padding()
+        }
+        .frame(width: 620, height: 520)
+        .task {
+            await load(
+                initialPath,
+                fallbackToHome: initialPath == PortalAppModel.defaultUploadDestination
+            )
+        }
+        .alert("New Folder", isPresented: $showingNewFolder) {
+            TextField("Folder name", text: $newFolderName)
+            Button("Cancel", role: .cancel) {}
+            Button("Create") {
+                Task { await createFolder() }
+            }
+            .disabled(!validNewFolderName)
+        } message: {
+            Text("Create a folder inside \(directory?.path ?? "the current folder").")
+        }
+    }
+
+    private var validNewFolderName: Bool {
+        let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !name.isEmpty && name != "." && name != ".." && !name.contains("/")
+    }
+
+    private func load(_ path: String, fallbackToHome: Bool = false) async {
+        loading = true
+        errorMessage = nil
+        do {
+            let loaded = try await model.listRemoteDirectory(boxName: boxName, path: path)
+            directory = loaded
+            pathText = loaded.path
+            loading = false
+        } catch {
+            if fallbackToHome, path != "~" {
+                loading = false
+                await load("~")
+                return
+            }
+            loading = false
+            pathText = directory?.path ?? path
+            errorMessage = error.portalMessage
+        }
+    }
+
+    private func createFolder() async {
+        guard validNewFolderName, let parent = directory?.path else { return }
+        let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let path = parent == "/" ? "/\(name)" : "\(parent)/\(name)"
+        loading = true
+        errorMessage = nil
+        do {
+            try await model.createRemoteDirectory(boxName: boxName, path: path)
+            loading = false
+            await load(path)
+        } catch {
+            loading = false
+            errorMessage = error.portalMessage
+        }
     }
 }
 

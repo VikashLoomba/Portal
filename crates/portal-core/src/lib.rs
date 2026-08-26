@@ -26,6 +26,7 @@ pub mod config;
 pub mod cred;
 pub mod doctor;
 pub mod engine;
+pub mod file_transfer;
 pub mod localapi;
 pub mod paths;
 pub mod pins;

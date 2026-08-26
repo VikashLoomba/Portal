@@ -80,6 +80,21 @@ pub enum Request {
         name: String,
         enabled: bool,
     },
+    ListRemoteDirectory {
+        name: String,
+        path: String,
+    },
+    CreateRemoteDirectory {
+        name: String,
+        path: String,
+    },
+    /// Two-phase streaming request. The daemon first returns `Ready`, then
+    /// reads a tar archive from the remainder of the client connection and
+    /// returns a final `Ok` or `Error` response.
+    UploadFiles {
+        name: String,
+        destination: String,
+    },
     GetLogs {
         #[serde(default = "default_log_lines")]
         lines: usize,
@@ -123,8 +138,23 @@ impl ResponseEnvelope {
 pub enum Response {
     State { state: State },
     Logs { lines: Vec<String> },
+    RemoteDirectory { directory: RemoteDirectory },
+    Ready { message: String },
     Ok { message: String },
     Error { code: String, message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteDirectoryEntry {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteDirectory {
+    pub path: String,
+    pub parent: Option<String>,
+    pub directories: Vec<RemoteDirectoryEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -182,6 +212,42 @@ mod tests {
         let response = ResponseEnvelope::error(9, "bad_request", "nope");
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains(r#""result":"error""#));
+        assert_eq!(
+            serde_json::from_str::<ResponseEnvelope>(&json).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn upload_request_and_directory_response_are_stable() {
+        let request = RequestEnvelope::new(
+            11,
+            Request::UploadFiles {
+                name: "dev".into(),
+                destination: "~/tmp/portal".into(),
+            },
+        );
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains(r#""method":"upload_files""#));
+        assert_eq!(
+            serde_json::from_str::<RequestEnvelope>(&json).unwrap(),
+            request
+        );
+
+        let response = ResponseEnvelope::new(
+            11,
+            Response::RemoteDirectory {
+                directory: RemoteDirectory {
+                    path: "/home/me".into(),
+                    parent: Some("/home".into()),
+                    directories: vec![RemoteDirectoryEntry {
+                        name: "src".into(),
+                        path: "/home/me/src".into(),
+                    }],
+                },
+            },
+        );
+        let json = serde_json::to_string(&response).unwrap();
         assert_eq!(
             serde_json::from_str::<ResponseEnvelope>(&json).unwrap(),
             response

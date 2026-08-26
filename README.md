@@ -188,8 +188,13 @@ fallbacks for the supported macOS 13 minimum. Native status cards add,
 remove, enable, and configure boxes; active forwards open directly; native
 switches manage feature gates; the separate Logs view reads a sanitized,
 bounded daemon-log tail; and **Check for Updates…** verifies and installs the
-latest signed app release without leaving Portal. The CLI remains available
-and uses the same configuration and service model.
+latest signed app release without leaving Portal. Each enabled box card also
+accepts files and folders dragged from Finder (or selected with the native open
+panel). Portal streams them directly over its existing SSH connection into
+`~/tmp/portal/<item>` by default. A remote folder browser can select or create a
+different destination; large folders are tar-streamed without buffering the
+archive in memory. The CLI remains available and uses the same configuration
+and service model.
 
 The window has no polling or refresh timer. It owns one versioned local-API
 subscription: the daemon publishes an initial snapshot and then invalidates it
@@ -213,7 +218,7 @@ Check for Updates…
 ● devbox2 — no forwards
 ● oldbox — reconnecting
 ─────────────────────────
-portal 2.0.28 (abc1234)
+portal 2.0.29 (abc1234)
 Quit Portal
 ```
 

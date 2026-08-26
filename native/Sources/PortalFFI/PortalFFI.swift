@@ -4,6 +4,8 @@ public typealias PortalForward = PortalFFIGenerated.PortalForward
 public typealias PortalBoxConfiguration = PortalFFIGenerated.PortalBoxConfiguration
 public typealias PortalBoxStatus = PortalFFIGenerated.PortalBoxStatus
 public typealias PortalFeatureState = PortalFFIGenerated.PortalFeatureState
+public typealias PortalRemoteDirectoryEntry = PortalFFIGenerated.PortalRemoteDirectoryEntry
+public typealias PortalRemoteDirectory = PortalFFIGenerated.PortalRemoteDirectory
 public typealias PortalState = PortalFFIGenerated.PortalState
 public typealias PortalStateEvent = PortalFFIGenerated.PortalStateEvent
 public typealias PortalUpdateCheck = PortalFFIGenerated.PortalUpdateCheck
@@ -81,6 +83,22 @@ public func setAllowExact(name: String, ports: [UInt16]) async throws {
 
 public func setFeatureEnabled(name: String, enabled: Bool) async throws {
     try await PortalFFIGenerated.setFeatureEnabled(name: name, enabled: enabled)
+}
+
+public func listRemoteDirectory(name: String, path: String) async throws -> PortalRemoteDirectory {
+    try await PortalFFIGenerated.listRemoteDirectory(name: name, path: path)
+}
+
+public func createRemoteDirectory(name: String, path: String) async throws {
+    try await PortalFFIGenerated.createRemoteDirectory(name: name, path: path)
+}
+
+public func uploadFiles(name: String, localPaths: [String], destination: String) async throws {
+    try await PortalFFIGenerated.uploadFiles(
+        name: name,
+        localPaths: localPaths,
+        destination: destination
+    )
 }
 
 public func getLogs(lines: UInt32 = 500) async throws -> [String] {

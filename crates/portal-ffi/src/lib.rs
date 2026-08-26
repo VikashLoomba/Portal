@@ -55,6 +55,21 @@ pub struct PortalFeatureState {
 
 #[data]
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortalRemoteDirectoryEntry {
+    pub name: String,
+    pub path: String,
+}
+
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortalRemoteDirectory {
+    pub path: String,
+    pub parent: Option<String>,
+    pub directories: Vec<PortalRemoteDirectoryEntry>,
+}
+
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortalState {
     pub version: String,
     pub build_sha: String,
@@ -242,6 +257,60 @@ pub async fn set_feature_enabled(name: String, enabled: bool) -> Result<(), Port
 }
 
 #[export]
+pub async fn list_remote_directory(
+    name: String,
+    path: String,
+) -> Result<PortalRemoteDirectory, PortalFfiError> {
+    match request_on_gui_runtime_with_timeout(
+        Request::ListRemoteDirectory { name, path },
+        portal_client::REMOTE_OPERATION_TIMEOUT,
+    )
+    .await?
+    {
+        Response::RemoteDirectory { directory } => Ok(directory.into()),
+        _ => Err(protocol_error(
+            "daemon returned a non-directory-listing response",
+        )),
+    }
+}
+
+#[export]
+pub async fn create_remote_directory(name: String, path: String) -> Result<(), PortalFfiError> {
+    expect_ok(
+        request_on_gui_runtime_with_timeout(
+            Request::CreateRemoteDirectory { name, path },
+            portal_client::REMOTE_OPERATION_TIMEOUT,
+        )
+        .await?,
+    )
+}
+
+#[export]
+pub async fn upload_files(
+    name: String,
+    local_paths: Vec<String>,
+    destination: String,
+) -> Result<(), PortalFfiError> {
+    let socket = production_socket();
+    gui_runtime()
+        .spawn_blocking(move || {
+            portal_client::upload_files(
+                &socket,
+                name,
+                destination,
+                local_paths.into_iter().map(PathBuf::from).collect(),
+            )
+        })
+        .await
+        .map_err(|error| PortalFfiError {
+            code: "internal".into(),
+            message: format!("Portal upload task failed: {error}"),
+        })?
+        .map(|_| ())
+        .map_err(PortalFfiError::from_message)
+}
+
+#[export]
 pub async fn get_logs(lines: u32) -> Result<Vec<String>, PortalFfiError> {
     match request_on_gui_runtime(Request::GetLogs {
         lines: lines as usize,
@@ -343,9 +412,18 @@ fn gui_runtime() -> &'static tokio::runtime::Runtime {
 }
 
 async fn request_on_gui_runtime(request: Request) -> Result<Response, PortalFfiError> {
+    request_on_gui_runtime_with_timeout(request, portal_client::IO_TIMEOUT).await
+}
+
+async fn request_on_gui_runtime_with_timeout(
+    request: Request,
+    timeout: Duration,
+) -> Result<Response, PortalFfiError> {
     let socket = production_socket();
     gui_runtime()
-        .spawn(async move { portal_client::request_async(&socket, request).await })
+        .spawn(async move {
+            portal_client::request_async_with_timeout(&socket, request, timeout).await
+        })
         .await
         .map_err(|error| PortalFfiError {
             code: "internal".into(),
@@ -390,6 +468,8 @@ impl PortalFfiError {
             "unsupported_api_version"
         } else if message.starts_with("operation_failed:") {
             "operation_failed"
+        } else if message.starts_with("upload_failed:") {
+            "upload_failed"
         } else if message.starts_with("invalid daemon")
             || message.contains("non-state")
             || message.contains("non-logs")
@@ -437,6 +517,23 @@ impl From<portal_cli::UiUpgradeSubmission> for PortalUpdateSubmission {
         match value {
             portal_cli::UiUpgradeSubmission::NoChange(message) => Self::NoChange { message },
             portal_cli::UiUpgradeSubmission::Submitted(tag) => Self::Submitted { tag },
+        }
+    }
+}
+
+impl From<portal_core::localapi::RemoteDirectory> for PortalRemoteDirectory {
+    fn from(directory: portal_core::localapi::RemoteDirectory) -> Self {
+        Self {
+            path: directory.path,
+            parent: directory.parent,
+            directories: directory
+                .directories
+                .into_iter()
+                .map(|entry| PortalRemoteDirectoryEntry {
+                    name: entry.name,
+                    path: entry.path,
+                })
+                .collect(),
         }
     }
 }
@@ -588,6 +685,26 @@ mod tests {
             PortalFfiError::from_message("operation_failed: no box".into()).code,
             "operation_failed"
         );
+        assert_eq!(
+            PortalFfiError::from_message("upload_failed: disconnected".into()).code,
+            "upload_failed"
+        );
+    }
+
+    #[test]
+    fn remote_directory_conversion_preserves_navigation_data() {
+        let directory = portal_core::localapi::RemoteDirectory {
+            path: "/home/me".into(),
+            parent: Some("/home".into()),
+            directories: vec![portal_core::localapi::RemoteDirectoryEntry {
+                name: "src".into(),
+                path: "/home/me/src".into(),
+            }],
+        };
+        let converted = PortalRemoteDirectory::from(directory);
+        assert_eq!(converted.path, "/home/me");
+        assert_eq!(converted.parent.as_deref(), Some("/home"));
+        assert_eq!(converted.directories[0].name, "src");
     }
 
     #[tokio::test]

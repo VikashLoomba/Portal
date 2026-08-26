@@ -122,6 +122,9 @@ pub struct BoxStack {
     /// its tasks stop so disabling and re-enabling a box can reclaim the same
     /// identity ports without requiring a daemon restart.
     taken: Arc<Mutex<BTreeSet<u16>>>,
+    /// Shared SSH connection used by the stack's agent, forwards, clipboard,
+    /// and explicit UI file transfers.
+    transport: Arc<dyn Transport>,
     /// Held for the stack's lifetime: dropping it would kill live filter
     /// updates (the hub owns the watch Sender).
     filter: Arc<FilterHub>,
@@ -379,6 +382,16 @@ impl Supervisor {
 
     pub fn stacks(&self) -> &[BoxStack] {
         &self.stacks
+    }
+
+    /// Clone the live transport without holding the supervisor lock during a
+    /// potentially long directory query or upload. Disabled and unknown boxes
+    /// have no stack and therefore cannot accept transfers.
+    pub fn transport_for_box(&self, name: &str) -> Option<Arc<dyn Transport>> {
+        self.stacks
+            .iter()
+            .find(|stack| stack.cfg.name == name)
+            .map(|stack| stack.transport.clone())
     }
 
     pub fn status(&self) -> Vec<BoxStatus> {
@@ -731,6 +744,7 @@ fn spawn_box_stack(
         tasks,
         status: status_rx,
         taken,
+        transport,
         filter: filter_hub,
     }
 }

@@ -10,12 +10,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 
 use portal_core::bootstrap::EmbeddedAgent;
 use portal_core::config::{BoxConfig, Config, sanitize_name};
+use portal_core::file_transfer::{
+    create_directory_script, decode_directory_listing, extract_script, list_directory_script,
+};
 use portal_core::localapi::{
     API_VERSION, KNOWN_FEATURES, Request, RequestEnvelope, Response, ResponseEnvelope, State,
 };
@@ -536,9 +539,121 @@ async fn handle_local_api_connection(
         }
     }
 
+    if let Request::UploadFiles { name, destination } = &request.request {
+        handle_file_upload(request.id, name, destination, &mut stream, &supervisor).await;
+        let _ = stream.shutdown().await;
+        return;
+    }
+
     let response = handle_local_api_request(request, &supervisor, &config, &paths).await;
     let _ = write_api_response(&mut stream, &response).await;
     let _ = stream.shutdown().await;
+}
+
+async fn handle_file_upload(
+    id: u64,
+    box_name: &str,
+    destination: &str,
+    stream: &mut UnixStream,
+    supervisor: &Arc<tokio::sync::Mutex<Supervisor>>,
+) {
+    let result = async {
+        let script = extract_script(destination)?;
+        let transport = supervisor
+            .lock()
+            .await
+            .transport_for_box(box_name)
+            .ok_or_else(|| format!("box {box_name:?} is disabled or does not exist"))?;
+        let session = transport
+            .stream(&[
+                "bash".into(),
+                "-c".into(),
+                portal_transport::shell_quote(&script),
+            ])
+            .await
+            .map_err(|error| format!("start remote upload: {error}"))?;
+
+        write_api_response(
+            stream,
+            &ResponseEnvelope::new(
+                id,
+                Response::Ready {
+                    message: format!("ready to upload to {destination}"),
+                },
+            ),
+        )
+        .await
+        .map_err(|error| format!("acknowledge upload: {error}"))?;
+
+        let portal_transport::StreamSession {
+            mut stdin,
+            stdout,
+            stderr,
+            wait,
+        } = session;
+        let send = async {
+            let copied = tokio::io::copy(&mut *stream, &mut stdin)
+                .await
+                .map_err(|error| format!("read local upload stream: {error}"))?;
+            stdin
+                .shutdown()
+                .await
+                .map_err(|error| format!("finish remote upload stream: {error}"))?;
+            Ok::<u64, String>(copied)
+        };
+        let (sent, stdout, stderr, exited) = tokio::join!(
+            send,
+            drain_bounded(stdout, 64 * 1024),
+            drain_bounded(stderr, 64 * 1024),
+            wait,
+        );
+        let bytes = sent?;
+        stdout.map_err(|error| format!("read remote upload output: {error}"))?;
+        let stderr = stderr.map_err(|error| format!("read remote upload error: {error}"))?;
+        match exited {
+            Ok(Ok(())) => Ok(bytes),
+            Ok(Err(error)) => {
+                let detail = String::from_utf8_lossy(&stderr);
+                let detail = detail.trim();
+                Err(if detail.is_empty() {
+                    format!("remote upload failed: {error}")
+                } else {
+                    format!("remote upload failed: {detail}")
+                })
+            }
+            Err(error) => Err(format!("remote upload task failed: {error}")),
+        }
+    }
+    .await;
+
+    let response = match result {
+        Ok(bytes) => ResponseEnvelope::new(
+            id,
+            Response::Ok {
+                message: format!("uploaded {bytes} archive bytes to {destination}"),
+            },
+        ),
+        Err(message) => ResponseEnvelope::error(id, "upload_failed", message),
+    };
+    let _ = write_api_response(stream, &response).await;
+}
+
+/// Drain all output so a noisy remote command cannot deadlock, while retaining
+/// only a bounded prefix for diagnostics.
+async fn drain_bounded(
+    mut reader: Box<dyn AsyncRead + Send + Unpin>,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut retained = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        let keep = read.min(limit.saturating_sub(retained.len()));
+        retained.extend_from_slice(&chunk[..keep]);
+    }
 }
 
 async fn write_api_response(
@@ -610,6 +725,56 @@ async fn handle_local_api_request(
                         message: format!("{name} is now {}", if enabled { "on" } else { "off" }),
                     })
             }
+        }
+        Request::ListRemoteDirectory { name, path } => {
+            let result = async {
+                let script = list_directory_script(&path)?;
+                let transport = supervisor
+                    .lock()
+                    .await
+                    .transport_for_box(&name)
+                    .ok_or_else(|| format!("box {name:?} is disabled or does not exist"))?;
+                let output = transport
+                    .exec(
+                        b"",
+                        &[
+                            "bash".into(),
+                            "-c".into(),
+                            portal_transport::shell_quote(&script),
+                        ],
+                    )
+                    .await
+                    .map_err(|error| format!("list {path}: {error}"))?;
+                decode_directory_listing(&output.stdout)
+            }
+            .await;
+            result.map(|directory| Response::RemoteDirectory { directory })
+        }
+        Request::CreateRemoteDirectory { name, path } => {
+            let result = async {
+                let script = create_directory_script(&path)?;
+                let transport = supervisor
+                    .lock()
+                    .await
+                    .transport_for_box(&name)
+                    .ok_or_else(|| format!("box {name:?} is disabled or does not exist"))?;
+                transport
+                    .exec(
+                        b"",
+                        &[
+                            "bash".into(),
+                            "-c".into(),
+                            portal_transport::shell_quote(&script),
+                        ],
+                    )
+                    .await
+                    .map_err(|error| format!("create {path}: {error}"))?;
+                Ok::<(), String>(())
+            }
+            .await;
+            result.map(|()| Response::Ok {
+                message: format!("created remote directory {path}"),
+            })
         }
         Request::AddBox { host, name, index } => {
             mutate_api_config(config, paths, move |next| {
@@ -690,7 +855,9 @@ async fn handle_local_api_request(
             })
             .await
         }
-        Request::SubscribeState => unreachable!("handled above"),
+        Request::SubscribeState | Request::UploadFiles { .. } => {
+            unreachable!("handled above")
+        }
     };
 
     match result {

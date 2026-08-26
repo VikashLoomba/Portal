@@ -34,9 +34,24 @@ final class PortalAppModel: ObservableObject {
         }
     }
 
+    enum UploadActivity: Equatable {
+        case uploading(itemCount: Int, destination: String)
+        case completed(itemCount: Int, destination: String)
+        case failed(String)
+
+        var inFlight: Bool {
+            if case .uploading = self { return true }
+            return false
+        }
+    }
+
+    static let defaultUploadDestination = "~/tmp/portal"
+
     @Published private(set) var logs: [String] = []
     @Published private(set) var logsLoading = false
     @Published private(set) var updateActivity: UpdateActivity = .idle
+    @Published private(set) var uploadActivities: [String: UploadActivity] = [:]
+    @Published private(set) var uploadDestinations: [String: String] = [:]
     @Published var updateNotice: PortalUpdateCheck?
     @Published var addBoxRequested = false
     @Published var selectedView: View = .overview
@@ -125,6 +140,62 @@ final class PortalAppModel: ObservableObject {
         }
     }
 
+    func uploadDestination(for boxName: String) -> String {
+        uploadDestinations[boxName] ?? Self.defaultUploadDestination
+    }
+
+    func setUploadDestination(_ destination: String, for boxName: String) {
+        uploadDestinations[boxName] = destination
+    }
+
+    func uploadActivity(for boxName: String) -> UploadActivity? {
+        uploadActivities[boxName]
+    }
+
+    func uploadFiles(_ urls: [URL], to boxName: String) async {
+        guard uploadActivities[boxName]?.inFlight != true else { return }
+        let urls = urls.filter(\.isFileURL)
+        guard !urls.isEmpty else {
+            operationError = "Drop one or more files or folders from Finder."
+            return
+        }
+
+        let destination = uploadDestination(for: boxName)
+        uploadActivities[boxName] = .uploading(
+            itemCount: urls.count,
+            destination: destination
+        )
+        let scopedURLs = urls.filter { $0.startAccessingSecurityScopedResource() }
+        defer {
+            scopedURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+        }
+
+        do {
+            try await PortalFFI.uploadFiles(
+                name: boxName,
+                localPaths: urls.map(\.path),
+                destination: destination
+            )
+            operationError = nil
+            uploadActivities[boxName] = .completed(
+                itemCount: urls.count,
+                destination: destination
+            )
+        } catch {
+            let message = error.portalMessage
+            uploadActivities[boxName] = .failed(message)
+            operationError = message
+        }
+    }
+
+    func listRemoteDirectory(boxName: String, path: String) async throws -> PortalRemoteDirectory {
+        try await PortalFFI.listRemoteDirectory(name: boxName, path: path)
+    }
+
+    func createRemoteDirectory(boxName: String, path: String) async throws {
+        try await PortalFFI.createRemoteDirectory(name: boxName, path: path)
+    }
+
     func checkForUpdates() async {
         guard !updateActivity.inFlight else { return }
         updateActivity = .checking
@@ -190,7 +261,7 @@ private extension String {
     }
 }
 
-private extension Error {
+extension Error {
     var portalMessage: String {
         if let error = self as? PortalError {
             return error.message
