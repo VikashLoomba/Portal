@@ -652,7 +652,7 @@ private struct RemoteDestinationPicker: View {
         .task {
             await load(
                 initialPath,
-                fallbackToHome: initialPath == PortalAppModel.defaultUploadDestination
+                fallbackPath: initialPath == PortalAppModel.defaultUploadDestination ? "/tmp" : nil
             )
         }
         .alert("New Folder", isPresented: $showingNewFolder) {
@@ -672,7 +672,7 @@ private struct RemoteDestinationPicker: View {
         return !name.isEmpty && name != "." && name != ".." && !name.contains("/")
     }
 
-    private func load(_ path: String, fallbackToHome: Bool = false) async {
+    private func load(_ path: String, fallbackPath: String? = nil) async {
         loading = true
         errorMessage = nil
         do {
@@ -681,9 +681,9 @@ private struct RemoteDestinationPicker: View {
             pathText = loaded.path
             loading = false
         } catch {
-            if fallbackToHome, path != "~" {
+            if let fallbackPath, path != fallbackPath {
                 loading = false
-                await load("~")
+                await load(fallbackPath)
                 return
             }
             loading = false

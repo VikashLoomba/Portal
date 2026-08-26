@@ -191,7 +191,7 @@ bounded daemon-log tail; and **Check for Updates…** verifies and installs the
 latest signed app release without leaving Portal. Each enabled box card also
 accepts files and folders dragged from Finder (or selected with the native open
 panel). Portal streams them directly over its existing SSH connection into
-`~/tmp/portal/<item>` by default. A remote folder browser can select or create a
+`/tmp/portal/<item>` by default. A remote folder browser can select or create a
 different destination; large folders are tar-streamed without buffering the
 archive in memory. The CLI remains available and uses the same configuration
 and service model.
@@ -218,7 +218,7 @@ Check for Updates…
 ● devbox2 — no forwards
 ● oldbox — reconnecting
 ─────────────────────────
-portal 2.0.30 (abc1234)
+portal 2.0.31 (abc1234)
 Quit Portal
 ```
 

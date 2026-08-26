@@ -45,7 +45,7 @@ final class PortalAppModel: ObservableObject {
         }
     }
 
-    static let defaultUploadDestination = "~/tmp/portal"
+    static let defaultUploadDestination = "/tmp/portal"
 
     @Published private(set) var logs: [String] = []
     @Published private(set) var logsLoading = false
