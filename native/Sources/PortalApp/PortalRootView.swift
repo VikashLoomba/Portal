@@ -70,35 +70,37 @@ private struct PortalOverviewView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 16) {
-                header
+            PortalGlassEffectScope(spacing: 16) {
+                LazyVStack(alignment: .leading, spacing: 16) {
+                    header
 
-                if let error = model.daemonError {
-                    daemonUnavailable(error)
-                }
+                    if let error = model.daemonError {
+                        daemonUnavailable(error)
+                    }
 
-                if let state = model.state {
-                    if state.boxes.isEmpty {
-                        emptyState
-                    } else {
-                        ForEach(state.boxes, id: \.name) { box in
-                            PortalBoxCard(
-                                model: model,
-                                configuration: box,
-                                status: state.statuses.first { $0.name == box.name }
-                            )
+                    if let state = model.state {
+                        if state.boxes.isEmpty {
+                            emptyState
+                        } else {
+                            ForEach(state.boxes, id: \.name) { box in
+                                PortalBoxCard(
+                                    model: model,
+                                    configuration: box,
+                                    status: state.statuses.first { $0.name == box.name }
+                                )
+                            }
                         }
-                    }
 
-                    if !state.features.isEmpty {
-                        featureSection(state.features)
+                        if !state.features.isEmpty {
+                            featureSection(state.features)
+                        }
+                    } else if model.daemonError == nil {
+                        ProgressView("Connecting to the local Portal daemon…")
+                            .frame(maxWidth: .infinity, minHeight: 180)
                     }
-                } else if model.daemonError == nil {
-                    ProgressView("Connecting to the local Portal daemon…")
-                        .frame(maxWidth: .infinity, minHeight: 180)
                 }
+                .padding(24)
             }
-            .padding(24)
         }
         .sheet(isPresented: $model.addBoxRequested) {
             AddBoxSheet(model: model, isPresented: $model.addBoxRequested)
@@ -114,14 +116,19 @@ private struct PortalOverviewView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Button(model.updateActivity.buttonTitle) {
+            Button {
                 Task { await model.checkForUpdates() }
+            } label: {
+                Label(model.updateActivity.buttonTitle, systemImage: "arrow.triangle.2.circlepath")
             }
+            .portalGlassButtonStyle()
             .disabled(model.updateActivity.inFlight)
-            Button("Add Box…") {
+            Button {
                 model.addBoxRequested = true
+            } label: {
+                Label("Add Box…", systemImage: "plus")
             }
-            .buttonStyle(.borderedProminent)
+            .portalGlassButtonStyle(.prominent)
             .disabled(model.daemonError != nil)
         }
     }
@@ -154,10 +161,12 @@ private struct PortalOverviewView: View {
             Text("Portal uses your SSH configuration and requires key-based authentication.")
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Button("Add Box…") {
+            Button {
                 model.addBoxRequested = true
+            } label: {
+                Label("Add Box…", systemImage: "plus")
             }
-            .buttonStyle(.borderedProminent)
+            .portalGlassButtonStyle(.prominent)
         }
         .frame(maxWidth: .infinity, minHeight: 240)
         .padding()
@@ -387,6 +396,7 @@ private struct PortalBoxCard: View {
                     }
                 }
                 .help("Choose a destination folder on \(configuration.name)")
+                .portalGlassButtonStyle()
                 .disabled(model.uploadActivity(for: configuration.name)?.inFlight == true)
             }
 
@@ -409,10 +419,6 @@ private struct PortalBoxCard: View {
                 }
                 .frame(maxWidth: .infinity, minHeight: 84)
                 .contentShape(Rectangle())
-                .background(
-                    dropTargeted ? Color.accentColor.opacity(0.13) : Color.primary.opacity(0.035),
-                    in: RoundedRectangle(cornerRadius: 10)
-                )
                 .overlay {
                     RoundedRectangle(cornerRadius: 10)
                         .strokeBorder(
@@ -420,6 +426,7 @@ private struct PortalBoxCard: View {
                             style: StrokeStyle(lineWidth: dropTargeted ? 2 : 1, dash: [6, 4])
                         )
                 }
+                .portalInteractiveGlassEffect(cornerRadius: 10, isEmphasized: dropTargeted)
             }
             .buttonStyle(.plain)
             .disabled(model.uploadActivity(for: configuration.name)?.inFlight == true)
@@ -578,6 +585,7 @@ private struct RemoteDestinationPicker: View {
                 .help("Refresh")
                 .disabled(loading)
             }
+            .portalGlassButtonStyle()
             .padding()
 
             Divider()
@@ -643,7 +651,7 @@ private struct RemoteDestinationPicker: View {
                     model.setUploadDestination(path, for: boxName)
                     isPresented = false
                 }
-                .buttonStyle(.borderedProminent)
+                .portalGlassButtonStyle(.prominent)
                 .disabled(loading || directory == nil)
             }
             .padding()
@@ -740,7 +748,7 @@ private struct AddBoxSheet: View {
                         if added { isPresented = false }
                     }
                 }
-                .buttonStyle(.borderedProminent)
+                .portalGlassButtonStyle(.prominent)
                 .disabled(host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || submitting)
             }
         }
@@ -789,7 +797,7 @@ private struct PortEditorSheet: View {
                 Spacer()
                 Button("Cancel") { isPresented = false }
                 Button("Apply") { submit() }
-                    .buttonStyle(.borderedProminent)
+                    .portalGlassButtonStyle(.prominent)
                     .disabled(submitting)
             }
         }
@@ -883,10 +891,10 @@ private struct PortalUpdateSheet: View {
                     model.dismissUpdateNotice()
                     Task { await model.submitUpdate() }
                 }
-                .buttonStyle(.borderedProminent)
+                .portalGlassButtonStyle(.prominent)
             } else {
                 Button(primary) { model.dismissUpdateNotice() }
-                    .buttonStyle(.borderedProminent)
+                    .portalGlassButtonStyle(.prominent)
             }
         }
     }
@@ -911,6 +919,7 @@ private struct PortalLogsView: View {
                 }
                 .disabled(model.logsLoading)
             }
+            .portalGlassButtonStyle()
             .padding()
 
             Divider()

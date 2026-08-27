@@ -183,8 +183,9 @@ owner-only Unix socket. Closing the window leaves Portal and its status item run
 **Quit Portal** removes the UI and status item, while the independent local
 daemon keeps every connection and forward alive.
 
-The desktop window uses native SwiftUI materials and controls with availability
-fallbacks for the supported macOS 13 minimum. Native status cards add,
+The desktop window uses native SwiftUI Liquid Glass for functional controls on
+macOS 26 while keeping standard materials in the content layer, with native
+availability fallbacks for the supported macOS 13 minimum. Native status cards add,
 remove, enable, and configure boxes; active forwards open directly; native
 switches manage feature gates; the separate Logs view reads a sanitized,
 bounded daemon-log tail; and **Check for Updates…** verifies and installs the
