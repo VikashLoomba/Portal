@@ -145,6 +145,19 @@ SIGNED_MODE="$("$BIN" _signed-build-mode)"
   echo "portal: signed credential build mode is $SIGNED_MODE (want enabled)" >&2
   exit 1
 }
+# LAContext is reached through objc2's dynamic Objective-C class lookup, so a
+# static Rust archive can link successfully even when the final Swift binary
+# omitted LocalAuthentication.framework. Exercise the real initialization path
+# before notarization; that missing load command otherwise panics only when a
+# remote sudo request arrives.
+KEYCHAIN_SMOKE="$("$BIN" --cli keychain list)" || {
+  echo "portal: signed credential runtime failed to initialize — aborting release" >&2
+  exit 1
+}
+case "$KEYCHAIN_SMOKE" in
+  "touch id: "*) echo "==> signed credential runtime initializes" ;;
+  *) echo "portal: unexpected keychain smoke output — aborting release" >&2; exit 1 ;;
+esac
 
 # --- 4. Notarize the application bundle ------------------------------------
 NOTARY_KEY_ID="${NOTARY_KEY_ID:?set NOTARY_KEY_ID in .env (App Store Connect key id)}"

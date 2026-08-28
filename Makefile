@@ -64,12 +64,14 @@ agents:
 		cp "target/$$t/release/portald" "$(AGENTS)/portald-$$t" || exit 1; \
 	done
 
-# The daemon cannot provision boxes without both embedded portald payloads.
-# Assert they landed in the final Swift application executable, not merely in
-# an intermediate Rust archive.
+# The daemon cannot provision boxes without both embedded portald payloads,
+# and credential requests panic before prompting if the final Swift link drops
+# objc2's transitive LocalAuthentication framework. Assert both requirements on
+# the final application executable, not merely an intermediate Rust archive.
 verify-embed:
 	@python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); agents=[open(p,"rb").read() for p in sys.argv[2:]]; missing=[p for p,a in zip(sys.argv[2:],agents) if a[:4096] not in d]; sys.exit("Portal: embedded agent bytes NOT found: "+", ".join(missing) if missing else 0)' "$(BIN)" "$(AGENTS)/portald-$(MUSL_AMD64)" "$(AGENTS)/portald-$(MUSL_ARM64)"
-	@echo "==> $(BIN) (both embedded agents verified)"
+	@otool -L "$(BIN)" | grep -q 'LocalAuthentication.framework' || { echo "Portal: LocalAuthentication framework NOT linked — Touch ID would panic" >&2; exit 1; }
+	@echo "==> $(BIN) (both embedded agents + LocalAuthentication verified)"
 
 app: build
 	@./scripts/package-app.sh "$(BIN)" "$(APP)"

@@ -40,6 +40,12 @@ let package = Package(
                     "-strict-concurrency=complete",
                     "-default-isolation", "MainActor",
                 ]),
+            ],
+            linkerSettings: [
+                // PortalFFI is a static Rust archive. SwiftPM can't see the
+                // archive's transitive objc2 framework metadata, so keep the
+                // framework that owns LAContext explicit at the final link.
+                .linkedFramework("LocalAuthentication"),
             ]
         ),
         .testTarget(
