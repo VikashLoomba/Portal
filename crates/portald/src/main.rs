@@ -207,7 +207,7 @@ fn run_agent(args: &[String]) -> i32 {
         };
         let mut agent = Agent::new(
             cfg,
-            watcher::ProcNetSource,
+            watcher::ProcNetSource::default(),
             ClipStore::new(store_dir),
             relay_rx,
         );

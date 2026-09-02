@@ -37,7 +37,7 @@ use tokio::sync::mpsc;
 
 use crate::store::{ClipKind, ClipStore, Manifest, StoreError};
 use filter::PortFilter;
-use watcher::ListenerSource;
+use watcher::{ListenerOwners, ListenerSource};
 
 /// Maximum credential requests retained per box session, including the one
 /// currently awaiting the Mac. This is a DoS bound, not a normal concurrency
@@ -291,7 +291,11 @@ impl<S: ListenerSource> Agent<S> {
                         }
                         last_rsid = sub.resubscribe_id;
                         filter = Some(PortFilter::new(
-                            sub.deny, sub.allow, sub.exclude_ephemeral, self.cfg.ephem,
+                            sub.deny,
+                            sub.allow,
+                            sub.exclude_ephemeral,
+                            sub.follow_process_group,
+                            self.cfg.ephem,
                         ));
                         write_frame(stdout, &Envelope::of_subscribe_ack(SubscribeAck {
                             resubscribe_id: last_rsid,
@@ -487,12 +491,25 @@ impl<S: ListenerSource> Agent<S> {
     }
 
     fn desired(&mut self, filter: &PortFilter) -> BTreeSet<u16> {
-        self.source
-            .listening()
-            .into_iter()
-            .map(|p| p.port)
-            .filter(|&p| filter.admits(p))
-            .collect()
+        let listeners = self.source.listening();
+        let has_related_candidates = listeners
+            .iter()
+            .any(|listener| filter.is_related_candidate(listener.port));
+        if !has_related_candidates {
+            return listeners
+                .into_iter()
+                .map(|listener| listener.port)
+                .filter(|&port| filter.admits(port))
+                .collect();
+        }
+
+        let inodes = listeners
+            .iter()
+            .map(|listener| listener.inode_ns)
+            .filter(|&inode| inode != 0)
+            .collect();
+        let owners = self.source.process_identities(&inodes);
+        related_desired_ports(&listeners, filter, &owners)
     }
 
     /// Handle an inbound service frame. clipsync is the only request/response
@@ -601,6 +618,52 @@ impl<S: ListenerSource> Agent<S> {
     }
 }
 
+/// Normal discovery plus companion listeners from an already-admitted
+/// process. PID matching is always enabled. Process-group matching is an
+/// explicit broader mode because a shell job may contain multiple helpers.
+/// Only the ephemeral cut can be bypassed; explicit deny entries remain out.
+fn related_desired_ports(
+    listeners: &[Port],
+    filter: &PortFilter,
+    owners: &ListenerOwners,
+) -> BTreeSet<u16> {
+    let mut selected_pids = BTreeSet::new();
+    let mut selected_process_groups = BTreeSet::new();
+    for listener in listeners
+        .iter()
+        .filter(|listener| filter.admits(listener.port))
+    {
+        if let Some(identities) = owners.get(&listener.inode_ns) {
+            for identity in identities {
+                selected_pids.insert(identity.pid);
+                if filter.follows_process_group() {
+                    selected_process_groups.insert(identity.process_group);
+                }
+            }
+        }
+    }
+
+    listeners
+        .iter()
+        .filter(|listener| {
+            if filter.admits(listener.port) {
+                return true;
+            }
+            if !filter.is_related_candidate(listener.port) {
+                return false;
+            }
+            owners.get(&listener.inode_ns).is_some_and(|identities| {
+                identities.iter().any(|identity| {
+                    selected_pids.contains(&identity.pid)
+                        || (filter.follows_process_group()
+                            && selected_process_groups.contains(&identity.process_group))
+                })
+            })
+        })
+        .map(|listener| listener.port)
+        .collect()
+}
+
 /// Dispatch the next live FIFO entry when no credential request is active.
 /// Canceled askpass processes are skipped before they can bother the user.
 fn start_next_cred(
@@ -668,4 +731,71 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod related_listener_tests {
+    use super::*;
+    use watcher::ProcessIdentity;
+
+    fn listener(port: u16, inode_ns: u32) -> Port {
+        Port {
+            port,
+            family: 4,
+            addr: "127.0.0.1".into(),
+            inode_ns,
+        }
+    }
+
+    fn owners(entries: &[(u32, u32, u32)]) -> ListenerOwners {
+        let mut owners = ListenerOwners::new();
+        for &(inode, pid, process_group) in entries {
+            owners
+                .entry(inode)
+                .or_default()
+                .insert(ProcessIdentity { pid, process_group });
+        }
+        owners
+    }
+
+    #[test]
+    fn same_pid_companion_bypasses_ephemeral_cut_by_default() {
+        let listeners = [listener(8377, 10), listener(35703, 11), listener(22, 12)];
+        let filter = PortFilter::new([22], [], true, false, (32768, 60999));
+        let desired = related_desired_ports(
+            &listeners,
+            &filter,
+            &owners(&[(10, 100, 100), (11, 100, 100), (12, 100, 100)]),
+        );
+        assert_eq!(desired, BTreeSet::from([8377, 35703]));
+    }
+
+    #[test]
+    fn unrelated_ephemeral_listener_stays_filtered() {
+        let listeners = [listener(8377, 10), listener(35703, 11)];
+        let filter = PortFilter::new([], [], true, false, (32768, 60999));
+        let desired = related_desired_ports(
+            &listeners,
+            &filter,
+            &owners(&[(10, 100, 100), (11, 200, 200)]),
+        );
+        assert_eq!(desired, BTreeSet::from([8377]));
+    }
+
+    #[test]
+    fn process_group_companion_requires_opt_in() {
+        let listeners = [listener(8377, 10), listener(35703, 11)];
+        let identities = owners(&[(10, 100, 77), (11, 101, 77)]);
+        let narrow = PortFilter::new([], [], true, false, (32768, 60999));
+        assert_eq!(
+            related_desired_ports(&listeners, &narrow, &identities),
+            BTreeSet::from([8377])
+        );
+
+        let broad = PortFilter::new([], [], true, true, (32768, 60999));
+        assert_eq!(
+            related_desired_ports(&listeners, &broad, &identities),
+            BTreeSet::from([8377, 35703])
+        );
+    }
 }

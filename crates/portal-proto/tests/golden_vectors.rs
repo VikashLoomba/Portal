@@ -74,6 +74,13 @@ fn hello_vector_fields() {
 }
 
 #[test]
+fn subscribe_vector_defaults_process_group_discovery_off() {
+    let env = decode("protocol_subscribe.hex", &load("protocol_subscribe.hex"));
+    let subscribe = env.subscribe.expect("subscribe populated");
+    assert!(!subscribe.follow_process_group);
+}
+
+#[test]
 fn msg_vector_notify_payload_decodes() {
     let env = decode("protocol_msg.hex", &load("protocol_msg.hex"));
     let msg = env.msg.expect("msg populated");

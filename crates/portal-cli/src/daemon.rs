@@ -700,6 +700,7 @@ async fn handle_local_api_request(
             | Request::SetBoxEnabled { .. }
             | Request::SetAllow { .. }
             | Request::SetAllowExact { .. }
+            | Request::SetProcessGroupDiscovery { .. }
     );
     let mutates_feature = matches!(&request.request, Request::SetFeature { .. });
     let result: Result<Response, String> = match request.request {
@@ -796,6 +797,7 @@ async fn handle_local_api_request(
                     index,
                     allow: Vec::new(),
                     deny: Vec::new(),
+                    follow_process_group: false,
                     enabled: true,
                 });
                 Ok(format!("added box {name:?}"))
@@ -829,6 +831,19 @@ async fn handle_local_api_request(
         Request::SetAllowExact { name, ports } => {
             mutate_api_config(config, paths, move |next| {
                 replace_allow_exact(next, &name, &ports)
+            })
+            .await
+        }
+        Request::SetProcessGroupDiscovery { name, enabled } => {
+            mutate_api_config(config, paths, move |next| {
+                let Some(box_config) = next.boxes.iter_mut().find(|b| b.name == name) else {
+                    return Err(format!("no box named {name:?}"));
+                };
+                box_config.follow_process_group = enabled;
+                Ok(format!(
+                    "same-process-group discovery for {name:?} is {}",
+                    if enabled { "enabled" } else { "disabled" }
+                ))
             })
             .await
         }
@@ -1070,6 +1085,7 @@ mod tests {
                 index: 1,
                 allow: vec![],
                 deny: vec![],
+                follow_process_group: false,
                 enabled: true,
             });
             Ok("added".into())
@@ -1137,6 +1153,7 @@ mod tests {
             index: 1,
             allow: vec![3000],
             deny: vec![],
+            follow_process_group: false,
             enabled: false,
         });
         config
@@ -1270,6 +1287,7 @@ mod tests {
             index: 1,
             allow: vec![3000],
             deny: vec![],
+            follow_process_group: false,
             enabled: true,
         });
         // A scripted fake agent answers the bootstrap probes and then holds
@@ -1346,6 +1364,7 @@ mod tests {
             index: 1,
             allow: vec![3000, 8000],
             deny: vec![],
+            follow_process_group: false,
             enabled: true,
         });
         // A mixed edit — remove 8000, add 5173, keep 3000 — lands as one
@@ -1377,6 +1396,7 @@ mod tests {
             index: 1,
             allow: vec![3000],
             deny: vec![],
+            follow_process_group: false,
             enabled: true,
         });
         let result = mutate_api_config(&config, &paths, |next| {
@@ -1399,6 +1419,7 @@ mod tests {
             index: 1,
             allow: vec![9000, 8080],
             deny: vec![],
+            follow_process_group: false,
             enabled: true,
         }];
         let s = status_json(
@@ -1431,6 +1452,7 @@ mod tests {
                 index: 1,
                 allow: vec![],
                 deny: vec![],
+                follow_process_group: false,
                 enabled: true,
             },
             BoxConfig {
@@ -1439,6 +1461,7 @@ mod tests {
                 index: 2,
                 allow: vec![3000],
                 deny: vec![],
+                follow_process_group: false,
                 enabled: false,
             },
         ];

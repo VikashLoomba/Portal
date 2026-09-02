@@ -869,6 +869,7 @@ fn add_box_to_config(
         index,
         allow: Vec::new(),
         deny: Vec::new(),
+        follow_process_group: false,
         enabled: true,
     });
     save_config(paths, &cfg)

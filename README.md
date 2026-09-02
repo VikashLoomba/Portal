@@ -247,6 +247,14 @@ can't express falls back to a deterministic allocation in `60000..=64999`, which
 converges on the same port across restarts. `portal status` always renders the
 mapping that is actually live.
 
+Automatic discovery excludes unrelated listeners in Linux's ephemeral port
+range, but follows companion loopback listeners owned by the same process as an
+admitted service. This covers web applications whose primary page embeds a
+random-port iframe without forwarding every transient service on the box. Per-box
+**Discovery Settings** can additionally include listeners owned by another
+process in the same Linux process group; that broader mode is off by default.
+Process-based expansion does not itself bypass explicit deny entries.
+
 ## Transport
 
 portal reaches every box with **one** built-in SSH client

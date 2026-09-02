@@ -13,6 +13,7 @@
 //! index = 1                  # port-mapping index (1..=5 get the pretty scheme)
 //! allow = [9000]             # per-box force-forwarded ports
 //! deny  = []                 # per-box extra denies (on top of the defaults)
+//! follow_process_group = false # include helper listeners sharing a Linux pgrp
 //! ```
 //!
 //! There is deliberately NO transport selection: v2 has one transport
@@ -37,6 +38,11 @@ pub struct BoxConfig {
     pub allow: Vec<u16>,
     #[serde(default)]
     pub deny: Vec<u16>,
+    /// Same-PID companion listener discovery is always enabled. This broader
+    /// opt-in also includes ephemeral loopback listeners owned by another
+    /// process in the same Linux process group as an admitted listener.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub follow_process_group: bool,
     /// Disabled boxes stay configured but get no stack (no master, no agent).
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -44,6 +50,10 @@ pub struct BoxConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -121,6 +131,7 @@ impl Config {
                 index: 1,
                 allow: allow.to_vec(),
                 deny: Vec::new(),
+                follow_process_group: false,
                 enabled: true,
             }],
         }
@@ -179,6 +190,7 @@ enabled = false
         assert_eq!(cfg.boxes.len(), 2);
         assert_eq!(cfg.enabled_boxes().count(), 1);
         assert_eq!(cfg.boxes[0].allow, vec![9000]);
+        assert!(!cfg.boxes[0].follow_process_group);
     }
 
     #[test]
@@ -233,7 +245,28 @@ index = 1
         assert_eq!(b.name, "dev-box-1");
         assert_eq!(b.index, 1);
         assert_eq!(b.allow, vec![8080]);
+        assert!(!b.follow_process_group);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn process_group_discovery_is_opt_in_and_persisted_when_enabled() {
+        let cfg = Config::parse(
+            r#"
+[[boxes]]
+name = "dev"
+host = "dev"
+index = 1
+follow_process_group = true
+"#,
+        )
+        .unwrap();
+        assert!(cfg.boxes[0].follow_process_group);
+        assert!(
+            toml::to_string(&cfg)
+                .unwrap()
+                .contains("follow_process_group = true")
+        );
     }
 
     #[test]

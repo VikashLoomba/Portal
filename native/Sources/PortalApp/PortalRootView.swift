@@ -244,6 +244,7 @@ private struct PortalBoxCard: View {
 
     @State private var showingRemoveConfirmation = false
     @State private var showingPortEditor = false
+    @State private var showingDiscoverySettings = false
     @State private var showingDestinationPicker = false
     @State private var forwardsExpanded = false
     @State private var dropTargeted = false
@@ -334,6 +335,9 @@ private struct PortalBoxCard: View {
                 Button("Always Forward…") {
                     showingPortEditor = true
                 }
+                Button("Discovery Settings…") {
+                    showingDiscoverySettings = true
+                }
                 Button("Remove Box…", role: .destructive) {
                     showingRemoveConfirmation = true
                 }
@@ -366,6 +370,13 @@ private struct PortalBoxCard: View {
                 boxName: configuration.name,
                 initialPorts: configuration.allow,
                 isPresented: $showingPortEditor
+            )
+        }
+        .sheet(isPresented: $showingDiscoverySettings) {
+            PortDiscoverySettingsSheet(
+                model: model,
+                boxName: configuration.name,
+                isPresented: $showingDiscoverySettings
             )
         }
         .sheet(isPresented: $showingDestinationPicker) {
@@ -714,6 +725,76 @@ private struct RemoteDestinationPicker: View {
             loading = false
             errorMessage = error.portalMessage
         }
+    }
+}
+
+private struct PortDiscoverySettingsSheet: View {
+    @ObservedObject var model: PortalAppModel
+    let boxName: String
+    @Binding var isPresented: Bool
+
+    @State private var submitting = false
+
+    private var followsProcessGroup: Bool {
+        model.state?.boxes.first { $0.name == boxName }?.followProcessGroup ?? false
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Port Discovery")
+                .font(.title2.weight(.semibold))
+            Text("Choose how Portal discovers companion web services on \(boxName).")
+                .foregroundStyle(.secondary)
+
+            Label {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Same process")
+                        .font(.headline)
+                    Text("Additional loopback listeners owned by the same process are forwarded automatically.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            }
+
+            Divider()
+
+            Toggle(
+                isOn: Binding(
+                    get: { followsProcessGroup },
+                    set: { enabled in
+                        submitting = true
+                        Task {
+                            _ = await model.setProcessGroupDiscovery(
+                                name: boxName,
+                                enabled: enabled
+                            )
+                            submitting = false
+                        }
+                    }
+                )
+            ) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Include same process group")
+                        .font(.headline)
+                    Text("Also discover listeners from helper processes in the same Linux process group. This may expose more local services.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .disabled(submitting)
+            .accessibilityValue(followsProcessGroup ? "Enabled" : "Disabled")
+
+            HStack {
+                Spacer()
+                Button("Done") { isPresented = false }
+                    .portalGlassButtonStyle(.prominent)
+            }
+        }
+        .padding(24)
+        .frame(width: 520)
     }
 }
 

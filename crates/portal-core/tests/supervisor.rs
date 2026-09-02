@@ -729,6 +729,7 @@ name = "devbox1"
 host = "devbox1"
 index = 1
 allow = [9000]
+follow_process_group = true
 "#,
     )
     .unwrap();
@@ -738,7 +739,9 @@ allow = [9000]
         .expect("config reconcile did not publish state invalidation")
         .expect("state invalidation channel closed");
     assert_eq!(sup_stacks_len(&rig).await, 1);
-    assert_eq!(filter_for(&sup_first_cfg(&rig).await).allow, vec![9000]);
+    let live_filter = filter_for(&sup_first_cfg(&rig).await);
+    assert_eq!(live_filter.allow, vec![9000]);
+    assert!(live_filter.follow_process_group);
     // 2. Add a box → new stack spawns.
     cfg2.boxes.push(BoxConfig {
         name: "gpu-box".into(),
@@ -746,6 +749,7 @@ allow = [9000]
         index: 2,
         allow: vec![],
         deny: vec![],
+        follow_process_group: false,
         enabled: true,
     });
     rig.supervisor_apply(&cfg2).await;

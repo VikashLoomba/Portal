@@ -76,6 +76,10 @@ pub enum Request {
         name: String,
         ports: Vec<u16>,
     },
+    SetProcessGroupDiscovery {
+        name: String,
+        enabled: bool,
+    },
     SetFeature {
         name: String,
         enabled: bool,
@@ -201,6 +205,23 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""method":"set_allow_exact""#));
         assert!(json.contains(r#""ports":[3000,5173]"#));
+        assert_eq!(
+            serde_json::from_str::<RequestEnvelope>(&json).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn process_group_discovery_request_round_trips() {
+        let request = RequestEnvelope::new(
+            4,
+            Request::SetProcessGroupDiscovery {
+                name: "dev".into(),
+                enabled: true,
+            },
+        );
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains(r#""method":"set_process_group_discovery""#));
         assert_eq!(
             serde_json::from_str::<RequestEnvelope>(&json).unwrap(),
             request

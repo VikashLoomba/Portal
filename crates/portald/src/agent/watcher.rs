@@ -5,17 +5,44 @@
 //! non-loopback interface bind is not. (A netlink + destroy-multicast upgrade
 //! is a possible later optimization; TASKS.md.)
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use portal_proto::messages::Port;
+
+/// Linux process identity for a listening socket. PID matching is the narrow
+/// default used to discover companion listeners; process-group matching is an
+/// optional per-box expansion for applications that delegate services to
+/// helper children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub process_group: u32,
+}
+
+pub type ListenerOwners = BTreeMap<u32, BTreeSet<ProcessIdentity>>;
 
 /// Something that can enumerate loopback-reachable LISTEN ports right now.
 pub trait ListenerSource: Send {
     fn listening(&mut self) -> Vec<Port>;
+
+    /// Resolve socket inode → owning process identities in one batch. Fakes
+    /// and non-Linux sources may leave this empty; ordinary port discovery
+    /// continues to work, while related-listener expansion becomes a no-op.
+    fn process_identities(&mut self, _socket_inodes: &BTreeSet<u32>) -> ListenerOwners {
+        BTreeMap::new()
+    }
 }
 
 /// Production source: /proc/net/tcp + /proc/net/tcp6. On non-Linux (dev
 /// hosts) both files are absent and this yields nothing.
 #[derive(Debug, Default)]
-pub struct ProcNetSource;
+pub struct ProcNetSource {
+    /// Socket inodes are stable for a listener's lifetime. Scanning every
+    /// process fd table on each 75ms poll would be wasteful, so resolve only
+    /// newly observed inodes and discard cache entries when listeners vanish.
+    owner_cache: ListenerOwners,
+    resolved: BTreeSet<u32>,
+}
 
 impl ListenerSource for ProcNetSource {
     fn listening(&mut self) -> Vec<Port> {
@@ -28,6 +55,84 @@ impl ListenerSource for ProcNetSource {
         }
         out
     }
+
+    fn process_identities(&mut self, socket_inodes: &BTreeSet<u32>) -> ListenerOwners {
+        self.owner_cache
+            .retain(|inode, _| socket_inodes.contains(inode));
+        self.resolved.retain(|inode| socket_inodes.contains(inode));
+
+        let missing: BTreeSet<u32> = socket_inodes.difference(&self.resolved).copied().collect();
+        if !missing.is_empty() {
+            // Mark even unresolved inodes as attempted. Permission-restricted
+            // /proc mounts degrade to normal filtering instead of rescanning
+            // every 75ms forever.
+            self.resolved.extend(missing.iter().copied());
+            self.scan_process_fds(&missing);
+        }
+        self.owner_cache.clone()
+    }
+}
+
+impl ProcNetSource {
+    fn scan_process_fds(&mut self, wanted: &BTreeSet<u32>) {
+        let Ok(processes) = std::fs::read_dir("/proc") else {
+            return;
+        };
+        for process in processes.flatten() {
+            let Some(pid) = process
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(fds) = std::fs::read_dir(process.path().join("fd")) else {
+                continue;
+            };
+            let mut matched = BTreeSet::new();
+            for fd in fds.flatten() {
+                let Ok(target) = std::fs::read_link(fd.path()) else {
+                    continue;
+                };
+                let Some(inode) = socket_inode(&target) else {
+                    continue;
+                };
+                if wanted.contains(&inode) {
+                    matched.insert(inode);
+                }
+            }
+            if matched.is_empty() {
+                continue;
+            }
+            let Some(identity) = process_identity(pid) else {
+                continue;
+            };
+            for inode in matched {
+                self.owner_cache.entry(inode).or_default().insert(identity);
+            }
+        }
+    }
+}
+
+fn socket_inode(target: &std::path::Path) -> Option<u32> {
+    let target = target.to_str()?;
+    target
+        .strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+/// `/proc/<pid>/stat` fields after the final `)` are state, ppid, pgrp, … .
+/// Using the final parenthesis handles process names containing spaces or `)`.
+fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = stat
+        .get(stat.rfind(')')? + 1..)?
+        .split_whitespace()
+        .collect();
+    let process_group = fields.get(2)?.parse().ok()?;
+    Some(ProcessIdentity { pid, process_group })
 }
 
 /// Parse one /proc/net/tcp[6] dump: keep LISTEN (state 0A) rows whose local
@@ -148,5 +253,41 @@ mod tests {
     fn ephemeral_fallback_is_kernel_default() {
         let (lo, hi) = ephemeral_range();
         assert!(lo >= 1024 && hi > lo);
+    }
+
+    #[test]
+    fn parses_socket_fd_target() {
+        assert_eq!(
+            socket_inode(std::path::Path::new("socket:[66793217]")),
+            Some(66793217)
+        );
+        assert_eq!(socket_inode(std::path::Path::new("pipe:[42]")), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_current_process_group() {
+        let identity = process_identity(std::process::id()).expect("read own /proc stat");
+        assert_eq!(identity.pid, std::process::id());
+        assert!(identity.process_group > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolves_a_live_listener_inode_to_its_owner() {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let mut source = ProcNetSource::default();
+        let listener = source
+            .listening()
+            .into_iter()
+            .find(|listener| listener.port == port)
+            .expect("live listener appears in /proc/net/tcp");
+        let owners = source.process_identities(&BTreeSet::from([listener.inode_ns]));
+        assert!(owners.get(&listener.inode_ns).is_some_and(|identities| {
+            identities
+                .iter()
+                .any(|identity| identity.pid == std::process::id())
+        }));
     }
 }

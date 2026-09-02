@@ -79,11 +79,13 @@ final class PortalLiveIntegrationTests: XCTestCase {
         }
 
         try await setAllowExact(name: "e2e-box", ports: [3000, 8080])
+        try await setProcessGroupDiscovery(name: "e2e-box", enabled: true)
         try await setBoxEnabled(name: "e2e-box", enabled: false)
         try await waitUntil("atomic allowlist/disable mutation was not authoritative") {
             await recorder.hasSnapshot { state in
                 state.boxes.contains {
                     $0.name == "e2e-box" && !$0.enabled && $0.allow == [3000, 8080]
+                        && $0.followProcessGroup
                 }
             }
         }

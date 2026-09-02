@@ -93,6 +93,7 @@ async fn full_session_flow() {
         deny: vec![22],
         allow: vec![9000],
         exclude_ephemeral: true,
+        follow_process_group: true,
     };
     let (mut client, mut ch, otx, _ftx) = client_for(t.clone(), cfg, filter);
 
@@ -226,6 +227,7 @@ async fn full_session_flow() {
     assert_eq!(sub.deny, vec![22]);
     assert_eq!(sub.allow, vec![9000]);
     assert!(sub.exclude_ephemeral);
+    assert!(sub.follow_process_group);
     assert_eq!(sub.resubscribe_id, 1);
     assert_eq!((msg.service.as_str(), msg.kind.as_str()), ("clip", "resp"));
 

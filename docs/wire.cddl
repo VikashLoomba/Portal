@@ -142,6 +142,7 @@ subscribe = {
   "deny" => [* uint16],
   "allow" => [* uint16],
   "exc_eph" => bool,
+  ? "follow_pgrp" => bool,
   "rsid" => uint64
 }
 

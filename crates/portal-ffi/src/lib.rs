@@ -30,6 +30,7 @@ pub struct PortalBoxConfiguration {
     pub index: u8,
     pub allow: Vec<u16>,
     pub deny: Vec<u16>,
+    pub follow_process_group: bool,
     pub enabled: bool,
 }
 
@@ -249,6 +250,14 @@ pub async fn set_box_enabled(name: String, enabled: bool) -> Result<(), PortalFf
 #[export]
 pub async fn set_allow_exact(name: String, ports: Vec<u16>) -> Result<(), PortalFfiError> {
     expect_ok(request_on_gui_runtime(Request::SetAllowExact { name, ports }).await?)
+}
+
+#[export]
+pub async fn set_process_group_discovery(
+    name: String,
+    enabled: bool,
+) -> Result<(), PortalFfiError> {
+    expect_ok(request_on_gui_runtime(Request::SetProcessGroupDiscovery { name, enabled }).await?)
 }
 
 #[export]
@@ -559,6 +568,7 @@ impl From<State> for PortalState {
                     index: configuration.index,
                     allow: configuration.allow,
                     deny: configuration.deny,
+                    follow_process_group: configuration.follow_process_group,
                     enabled: configuration.enabled,
                 })
                 .collect(),
@@ -622,6 +632,7 @@ mod tests {
                 index: 1,
                 allow: vec![3000],
                 deny: vec![22],
+                follow_process_group: true,
                 enabled: true,
             }],
             statuses: vec![BoxStatus {
@@ -640,6 +651,7 @@ mod tests {
         let converted = PortalState::from(state);
         assert_eq!(converted.version, "2.0.27");
         assert_eq!(converted.boxes[0].allow, [3000]);
+        assert!(converted.boxes[0].follow_process_group);
         assert_eq!(
             converted.statuses[0].forwards,
             [PortalForward {

@@ -66,7 +66,8 @@ The Rust request and response schema is defined in
 | `add_box` | Add and enable a configured SSH box |
 | `remove_box` | Remove a configured box |
 | `set_box_enabled` | Connect/disconnect without forgetting configuration |
-| `set_allow` | Add or remove forced remote ports |
+| `set_allow` / `set_allow_exact` | Mutate or atomically replace forced remote ports |
+| `set_process_group_discovery` | Include companion listeners from a box's Linux process groups |
 | `set_feature` | Toggle a known capability gate |
 | `get_logs` | Read a bounded tail of the local daemon log |
 

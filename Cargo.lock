@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "portal-cli"
-version = "2.0.33"
+version = "2.0.34"
 dependencies = [
  "anyhow",
  "clap",
@@ -1913,7 +1913,7 @@ dependencies = [
 
 [[package]]
 name = "portal-client"
-version = "2.0.33"
+version = "2.0.34"
 dependencies = [
  "portal-core",
  "serde_json",
@@ -1924,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "portal-clip"
-version = "2.0.33"
+version = "2.0.34"
 dependencies = [
  "objc2",
  "objc2-app-kit",
@@ -1935,7 +1935,7 @@ dependencies = [
 
 [[package]]
 name = "portal-core"
-version = "2.0.33"
+version = "2.0.34"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "portal-cred"
-version = "2.0.33"
+version = "2.0.34"
 dependencies = [
  "block2",
  "objc2",
@@ -1978,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "portal-ffi"
-version = "2.0.33"
+version = "2.0.34"
 dependencies = [
  "boltffi",
  "portal-cli",
@@ -1991,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "portal-proto"
-version = "2.0.33"
+version = "2.0.34"
 dependencies = [
  "ciborium",
  "hex",
@@ -2003,7 +2003,7 @@ dependencies = [
 
 [[package]]
 name = "portal-transport"
-version = "2.0.33"
+version = "2.0.34"
 dependencies = [
  "async-trait",
  "rand",
@@ -2016,7 +2016,7 @@ dependencies = [
 
 [[package]]
 name = "portald"
-version = "2.0.33"
+version = "2.0.34"
 dependencies = [
  "anyhow",
  "ciborium",

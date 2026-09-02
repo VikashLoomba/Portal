@@ -134,6 +134,12 @@ final class PortalAppModel: ObservableObject {
         }
     }
 
+    func setProcessGroupDiscovery(name: String, enabled: Bool) async -> Bool {
+        await perform {
+            try await PortalFFI.setProcessGroupDiscovery(name: name, enabled: enabled)
+        }
+    }
+
     func setFeatureEnabled(name: String, enabled: Bool) async -> Bool {
         await perform {
             try await PortalFFI.setFeatureEnabled(name: name, enabled: enabled)

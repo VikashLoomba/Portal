@@ -82,6 +82,7 @@ pub struct Filter {
     pub deny: Vec<u16>,
     pub allow: Vec<u16>,
     pub exclude_ephemeral: bool,
+    pub follow_process_group: bool,
 }
 
 /// A client→agent service frame queued by a handler (clip/cred/… responses).
@@ -444,6 +445,7 @@ impl Client {
                 deny: f.deny,
                 allow: f.allow,
                 exclude_ephemeral: f.exclude_ephemeral,
+                follow_process_group: f.follow_process_group,
                 resubscribe_id: rsid,
             }),
         )

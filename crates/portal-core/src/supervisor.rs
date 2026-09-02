@@ -428,7 +428,7 @@ impl Supervisor {
     }
 }
 
-/// Deny/allow/exclude-ephemeral from a box config (defaults + per-box).
+/// Port discovery policy from a box config (defaults + per-box).
 pub fn filter_for(cfg: &BoxConfig) -> Filter {
     let mut deny: Vec<u16> = DEFAULT_DENY_PORTS.to_vec();
     deny.extend(&cfg.deny);
@@ -438,6 +438,7 @@ pub fn filter_for(cfg: &BoxConfig) -> Filter {
         deny,
         allow: cfg.allow.clone(),
         exclude_ephemeral: true,
+        follow_process_group: cfg.follow_process_group,
     }
 }
 

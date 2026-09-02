@@ -99,8 +99,17 @@ pub struct Subscribe {
     pub allow: Vec<u16>,
     #[serde(rename = "exc_eph")]
     pub exclude_ephemeral: bool,
+    /// Additive v4 field: same-PID listener expansion is always enabled;
+    /// this opts a box into the broader same-process-group relation. Omitted
+    /// false preserves byte-exact decoding/re-encoding of the frozen vectors.
+    #[serde(default, rename = "follow_pgrp", skip_serializing_if = "is_false")]
+    pub follow_process_group: bool,
     #[serde(rename = "rsid")]
     pub resubscribe_id: u64,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// SubscribeAck — agent → client. Confirms filter swap.

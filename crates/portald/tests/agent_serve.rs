@@ -125,6 +125,7 @@ async fn subscribe(rig: &mut Rig, rsid: u64) -> Snapshot {
             deny: vec![22],
             allow: vec![],
             exclude_ephemeral: true,
+            follow_process_group: false,
             resubscribe_id: rsid,
         }),
     )
@@ -273,6 +274,7 @@ async fn dribbled_frames_survive_tick_races() {
         deny: vec![],
         allow: vec![],
         exclude_ephemeral: false,
+        follow_process_group: false,
         resubscribe_id: 2,
     }))
     .unwrap();

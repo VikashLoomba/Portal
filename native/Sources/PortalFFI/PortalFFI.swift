@@ -81,6 +81,10 @@ public func setAllowExact(name: String, ports: [UInt16]) async throws {
     try await PortalFFIGenerated.setAllowExact(name: name, ports: ports)
 }
 
+public func setProcessGroupDiscovery(name: String, enabled: Bool) async throws {
+    try await PortalFFIGenerated.setProcessGroupDiscovery(name: name, enabled: enabled)
+}
+
 public func setFeatureEnabled(name: String, enabled: Bool) async throws {
     try await PortalFFIGenerated.setFeatureEnabled(name: name, enabled: enabled)
 }
